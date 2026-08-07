@@ -11,14 +11,14 @@
 多 Agent 编程的瓶颈不是同时打开多少会话，而是项目状态、未完成义务和可复用知识仍由人类手工搬运。Threadmill 因此管理三类彼此独立但可追溯关联的对象：
 
 1. **Coordination Graph（协调图）**：保存 Task 之间尚未履行的因果义务，以 Phase Endpoint 为编排粒度。
-2. **Workspace Binding（工作区绑定）**：保存一次 Task Attempt 的可变执行现场；同一 Attempt 的 plan、execute、verify 共享它。
+2. **Workspace Binding（工作区绑定）**：保存一个 Task 轮次的可变执行现场；同一轮次的 plan、execute、verify 共享它。
 3. **Context Graph（上下文图）**：保存从运行证据中提炼出的知识节点及其逻辑关系，并为新 Agent 选择可控子图。
 
 核心判断：
 
 ```text
 Task 不属于 Agent Session；
-Task Attempt 拥有 Workspace；
+Task 直接拥有 Workspace Binding；
 Phase Endpoint 是 Manager 的编排端点；
 Context Graph 保存知识关系，不保存未完成工作；
 Agent 是在明确阶段、工作区、上下文切片和权限内临时调用的计算资源。
@@ -40,13 +40,11 @@ Task Contract
   稳定定义要交付什么、为什么、允许边界及怎样算完成；不包含实现步骤。
 
 Task
-  由 Task Contract 约束的持久工作身份；寿命长于任何 Agent Invocation。
-
-Task Attempt
-  对同一 Task Contract 的一次有界尝试；拥有一份 Workspace Binding。
+  由 Task Contract 约束的持久工作身份；寿命长于任何 Agent Invocation；
+  直接拥有一份或多份（按轮次）Workspace Binding。
 
 Phase Endpoint
-  Task Attempt 中可被依赖、阻塞、激活和产出信号的命名端点。
+  Task 中可被依赖、阻塞、激活和产出信号的命名端点。
 
 Agent Invocation
   在指定角色、阶段、工作区、上下文、权限和预算下对 Agent 的一次有界调用。
@@ -60,7 +58,7 @@ Threadmill 只保留两张持久图。Agent Runtime 和 Workspace 是执行边�
 | --- | --- | --- | --- |
 | Coordination Graph | 持久 | 哪个 Phase Endpoint 可以运行、被什么阻塞、阶段交付是否满足 | Task Manager Agent |
 | Context Graph | 持久 | 哪些记忆可见、如何关联、如何检索、哪些订阅需要推送 | Ctx Manager Agent |
-| Agent Runtime / Workspace | 一次 Invocation / Attempt | 如何在权限、工作区和预算内执行并记录证据 | Runtime / Workspace service |
+| Agent Runtime / Workspace | 一次 Invocation / 一个轮次 | 如何在权限、工作区和预算内执行并记录证据 | Runtime / Workspace service |
 
 三者边界必须保持：
 
@@ -71,15 +69,17 @@ Threadmill 只保留两张持久图。Agent Runtime 和 Workspace 是执行边�
 - Workspace 不是图节点，也不承担跨 Agent 通信。
 
 删除 Execution Graph 的理由：phase 内执行步骤和过程上下文属于 Agent Runtime 的内部现场，不需要独立持久实体。只有阶段结束输出和 Agent 主动提交的结构化编排建议进入 Task Manager 的视野。
+
+**Coordination Graph 只向前演化（设计原则）**：失败的轮次结果不可回改，只能作为证据封存；一切变更都是图的向前演化（新增/失效节点、边、端点）并对旧结果显式失效。
  
 
 ---
 
-## 3. Task 的三阶段与 Attempt
+## 3. Task 的三阶段与轮次
 
 ### 3.1 固定工作阶段
 
-每个 Task Attempt 只有三个工作阶段：
+每个 Task 轮次只有三个工作阶段：
 
 ```text
 plan -> execute -> verify
@@ -92,24 +92,35 @@ plan -> execute -> verify
 
 | 阶段 | 责任 | 主要产物 | 禁止事项 |
 | --- | --- | --- | --- |
-| plan | 声明实现方案、影响面、依赖、权限及验证方法 | Approved Plan、Declared Write Set、验证计划、Requirement Candidate | 修改实现、改写 Task Contract、自行写协调图 |
+| plan | 声明实现方案、影响面、依赖、权限及验证方法 | Submitted Plan、Declared Write Set、验证计划、Requirement Candidate | 修改实现、改写 Task Contract、自行写协调图 |
 | execute | 在批准范围内产生候选结果 | diff/产物、工具证据、Observed Write Set、新发现 | 静默扩 scope、写 main、宣布 Task 完成 |
 | verify | 在同一现场独立检查契约与候选结果 | Verify Result、测试/检查证据、风险和缺口 | 修改实现以让自己通过、自我批准旧 revision |
 
-### 3.2 Attempt 与重试
+**提交与通过分离**：`invocation_finished`（Invocation 结束）→ `output_submitted`（PhaseOutput 已提交）→ `endpoint_satisfied / rejected / invalidated`（由授权方判定）。plan 产物叫 **Submitted Plan**，只有经 policy、human decision 或专门 reviewer 批准后才成为 **Approved Plan**；Runtime 只校验输出形状，不代替任何批准。execute completed 只表示候选结果已产生；verify 才判断 Task Contract 是否满足。
+
+### 3.2 轮次与重试
 
 一次正常路径：
 
 ```text
 Task Contract
-  -> Attempt N: plan -> execute -> verify
+  -> Round 1: plan -> execute -> verify
        -> passed + delivery conditions -> done
-       -> failed, contract still valid -> Attempt N+1
+       -> failed, contract still valid -> verifier 提交 Proposal，Task Manager 重开轮次
        -> independent prerequisite found -> new Task + endpoint edge
        -> contract ambiguous/invalid -> blocked + decision endpoint
 ```
 
-验证失败通常创建同一 Task 的新 Attempt，而不是新 Task。只有工作具有独立验收、独立失败/重试、不同权限或 Workspace、跨时间等待、被其他 Task 直接依赖等特征时，Task Manager 才创建新 Task。
+验证失败不创建新 Task，也不创建新 Attempt 实体：verifier 是唯一拥有失败证据的角色，由它提交 `OrchestrationProposal`（retry），Task Manager 裁决后失效旧输出、在图上重开 execute→verify 端点，并从最新有效基线新建 Workspace Binding（旧现场封存为 evidence）。只有工作具有独立验收、独立失败/重试、不同权限或 Workspace、跨时间等待、被其他 Task 直接依赖等特征时，Task Manager 才创建新 Task。
+
+**`done` 由 DeliveryPolicy 决定**。Task Contract 携带：
+
+```text
+DeliveryPolicy: non_code_artifact | code_merge | human_acceptance | external_delivery
+```
+
+- `code_merge` 型 Task（默认代码任务）：`done = verify passed && latest-main targeted verify passed && merge succeeded && dependency/decision conditions satisfied`（按 8.2 全链）；
+- `non_code_artifact` / `human_acceptance` / `external_delivery` 型按交付条件定义，不经过 Merge Queue。
 
 ### 3.3 阶段状态与 revision
 
@@ -119,7 +130,7 @@ Task Contract
 type PhaseResultBinding struct {
     TaskID          string `json:"task_id"`
     TaskContractRef string `json:"task_contract_ref"`
-    AttemptID       string `json:"attempt_id"`
+    WorkspaceRef    string `json:"workspace_ref"` // 轮次标识：Workspace Binding ID + generation
     Phase           string `json:"phase"` // plan | execute | verify
     WorkspaceID     string `json:"workspace_id"`
     InputRevision   string `json:"input_revision"`
@@ -132,18 +143,18 @@ Task Contract、依赖结果、代码基线、Workspace Head 或高影响上下�
 
 ---
 
-## 4. Workspace：一个 Attempt，一份共享现场
+## 4. Workspace：一个 Task 轮次，一份共享现场
 
 ### 4.1 核心规则
 
-**同一个 Task Attempt 的 plan、execute、verify 默认共享同一个 Workspace Binding。** 三个阶段可以由不同 Agent、不同 provider 或不同 Thread 执行，但它们看到的是同一份受控执行现场。
+**同一个 Task 轮次的 plan、execute、verify 默认共享同一个 Workspace Binding。** 三个阶段可以由不同 Agent、不同 provider 或不同 Thread 执行，但它们看到的是同一份受控执行现场。
 
 这解决四个问题：
 
 1. executor 能直接消费 planner 在现场生成的结构化计划和基线信息；
 2. verifier 检查的是真实候选现场，而不是重新拼装的近似副本；
 3. 阶段切换不会丢失未提交文件、生成物和工具状态；
-4. Agent 可替换，而 Attempt 的执行身份和证据链不变。
+4. Agent 可替换，而 Task 的执行身份和证据链不变。
 
 Workspace 可以实现为：
 
@@ -152,7 +163,7 @@ Workspace 可以实现为：
 - 环境依赖复杂任务：容器加持久 volume；
 - 远程任务：远程 sandbox，仍暴露同一逻辑 Workspace Binding。
 
-实现形式可替换，但上层契约相同：稳定 Workspace ID、固定基线、允许写范围、可观测变更、阶段间持久、Attempt 间隔离。
+实现形式可替换，但上层契约相同：稳定 Workspace ID、固定基线、允许写范围、可观测变更、阶段间持久、轮次间隔离。
 
 ### 4.2 数据模型
 
@@ -160,7 +171,7 @@ Workspace 可以实现为：
 type WorkspaceBinding struct {
     ID              string            `json:"id"`
     TaskID          string            `json:"task_id"`
-    AttemptID       string            `json:"attempt_id"`
+    Generation      int               `json:"generation"` // 轮次序号：1 起递增
     Kind            string            `json:"kind"` // git_worktree | clone | container | remote
     Root            string            `json:"root"`
     BranchName      string            `json:"branch_name,omitempty"`
@@ -180,9 +191,9 @@ type WorkspaceBinding struct {
 
 ```text
 Scheduler 激活 T.plan
-  -> Runtime 创建 Attempt + Workspace Binding
+  -> Runtime 创建 Invocation，从 Workspace Service 取得/创建该轮次的 Workspace Binding
   -> planner 只读代码，允许写结构化 plan artifact
-  -> plan 通过后冻结 Approved Plan 与 Declared Write Set
+  -> plan 经审批后冻结 Approved Plan 与 Declared Write Set
 
 Scheduler 激活 T.execute
   -> Runtime 复用同一 Workspace Binding
@@ -195,10 +206,10 @@ Scheduler 激活 T.verify
   -> Verify Result 绑定 Workspace CurrentRevision
 ```
 
-共享 Workspace 不等于共享权限。权限随 phase lease 切换：plan 默认只读源码，execute 可写批准范围，verify 默认不可修改候选实现。任何阶段只能有一个有效写 lease；同 Task 内需要并行工作时，只能并行进行只读准备或由 Task Manager 拆为具有独立 Workspace 的 Task。
+共享 Workspace 不等于共享权限。权限随 phase lease 切换：plan 默认只读源码，execute 可写批准范围，verify 默认不可修改候选实现。任何阶段只能有一个有效写 lease；同 Task 内需要并行工作时，只能并行进行只读准备或由 Task Manager 拆为具有独立 Workspace 的 Task。Runtime 创建的是 Invocation 而不是任何业务对象；Workspace Binding 由 Workspace Service 创建/复用。
 
-### 4.4 Attempt 隔离与废弃
-新 Attempt 默认从最新有效基线创建新的 Workspace，不能在验证失败的旧现场上无审计地继续修改。旧 Workspace 被封存为 evidence，可按保留策略清理。若运行中的 Agent 认为应局部修复、拆分任务或调整依赖，必须提交 `OrchestrationProposal`；Task Manager 审批后热修改 Coordination Graph，并决定复用当前 Attempt、创建新 Attempt 或增加前置 Task。Agent 和 Runtime 都不能自行跳转 phase。
+### 4.4 轮次隔离与废弃
+新轮次默认从最新有效基线创建新的 Workspace，不能在验证失败的旧现场上无审计地继续修改。旧 Workspace 被封存为 evidence，可按保留策略清理。若运行中的 Agent 认为应局部修复、拆分任务或调整依赖，必须提交 `OrchestrationProposal`；Task Manager 审批后热修改 Coordination Graph，并决定重开当前 Task 的 execute→verify 轮次、创建新 Task 或增加前置 Task。Agent 和 Runtime 都不能自行跳转 phase。
 
 ---
 
@@ -272,14 +283,22 @@ Task Manager 不旁观 phase agent 的中间推理、工具输出、探索轨迹
 
 ```go
 type OrchestrationProposal struct {
-    FromEndpoint         PhaseEndpointRef `json:"from_endpoint"`
-    OrchestrationAdvice  string           `json:"orchestration_advice"` // split, dependency, serial/parallel, replan...
-    DeliverySpecAdvice   string           `json:"delivery_spec_advice"`
-    ReportSpecAdvice     string           `json:"report_spec_advice"`
-    Rationale            string           `json:"rationale"`
-    EvidenceRefs         []string         `json:"evidence_refs"`
+    ProposalID               string           `json:"proposal_id"`
+    ClientRef                string           `json:"client_ref"`
+    FromEndpoint             PhaseEndpointRef `json:"from_endpoint"`
+    FromInvocationID         string           `json:"from_invocation_id"`
+    BasedOnGraphRevision     int64            `json:"based_on_graph_revision"`
+    BasedOnWorkspaceRevision string            `json:"based_on_workspace_revision"`
+    BasedOnInputRevision     string           `json:"based_on_input_revision"`
+    OrchestrationAdvice      string           `json:"orchestration_advice"` // split, dependency, serial/parallel, replan, retry...
+    DeliverySpecAdvice       string           `json:"delivery_spec_advice"`
+    ReportSpecAdvice         string           `json:"report_spec_advice"`
+    Rationale                string           `json:"rationale"`
+    EvidenceRefs             []string         `json:"evidence_refs"`
 }
 ```
+
+planner、executor、verifier 三方都可提交建议，但情景不同：planner（契约歧义、方案不可行、依赖变化）→ replan/拆任务；executor（发现缺失前置、范围冲突）→ split/dependency；verifier（验收失败）→ retry，失效旧输出并重开 execute→verify。
 
 拆分机会、缺少前置、执行失败、验证失败和计划失效都使用同一种建议协议。建议是自由文本意图、理由和对未来 endpoint 契约的建议，不是图命令；phase agent 不决定创建哪些 Task、如何连边或哪些 endpoint 失效。Runtime 只记录并转交，Task Manager 结合当前图和可见证据决定接受、改写或拒绝，并热修改 Coordination Graph。无需为不同原因新增 Split Request、Failure Request 或 Rework Task 等实体。
 
@@ -289,20 +308,20 @@ Task Manager 编排每个 Phase Endpoint 时，必须同时规定 `DeliverySpec`
 
 ```go
 type PhaseOutput struct {
-    Endpoint             PhaseEndpointRef `json:"endpoint"`
-    DeliveryRefs         []string         `json:"delivery_refs"`
-    ReportRef            string           `json:"report_ref"`
-    EvidenceRefs         []string         `json:"evidence_refs"`
-    WorkspaceRevision    string           `json:"workspace_revision"`
-    ContextGraphRevision int64            `json:"context_graph_revision"`
+    Binding      PhaseResultBinding `json:"binding"`
+    DeliveryRefs []string           `json:"delivery_refs"`
+    ReportRef    string             `json:"report_ref"`
+    EvidenceRefs []string           `json:"evidence_refs"`
 }
 ```
+
+`PhaseOutput` 必须完整绑定 `PhaseResultBinding`（TaskID / TaskContractRef / WorkspaceRef / Phase / WorkspaceID / InputRevision / WorkspaceHead / ContextSliceRef），以证明输出属于哪个 Task Contract 版本、基于哪个 Input Revision、使用哪份 Context Slice、属于哪个轮次。不再复制残缺的 revision 字段（Workspace 状态走 Binding，图状态走 ContextSliceRef）。
 
 每个 phase 必须按 endpoint 的两项要求提交 `PhaseOutput`，否则不得进入 completed。Runtime 只校验输出形状和必填引用；Task Manager 能读取所有 completed endpoint 的报告、交付物和证据引用，并据此继续编排，但不能读取未提交的运行过程上下文。
 
 | 阶段 | 默认交付物基线 | 默认报告基线 |
 | --- | --- | --- |
-| plan | Approved Plan、Declared Write Set、验证计划 | 方案、假设、依赖、权限、风险和所需 Context Subgraph |
+| plan | Submitted Plan、Declared Write Set、验证计划 | 方案、假设、依赖、权限、风险和所需 Context Subgraph |
 | execute | diff/commit 或其他候选产物、Observed Write Set | 实际变更、偏差、新 Memory Candidate 和未解决问题 |
 | verify | Verify Result、测试和检查证据 | 契约判断、证据、Workspace/Input revision、失败原因或通过理由 |
 
@@ -312,7 +331,14 @@ type PhaseOutput struct {
 
 Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理由和 evidence，再决定是否热修改图。接受拆分建议时，它创建必要 Task/endpoint、为每个新 phase 写交付物和报告要求并连接边；接受失败或重排建议时，它调整尚待执行的计划和受影响 endpoint。拒绝时只返回结构化理由。Scheduler 不解释建议，只在图更新后重算 runnable endpoint。
 
+两条硬规则：
+
+1. **幂等**：Runtime 对重复 `ProposalID` 只转交一次；Task Manager 对已裁决的 `ProposalID` 不重复处理。
+2. **过期校验**：Task Manager 校验 `BasedOnGraphRevision`；若图已更新到更高 revision，拒绝该建议并要求基于新 revision 重提，或明确声明按当前图裁决。
+
 编排建议不结束当前 phase。Task Manager 的裁决必须明确当前 Invocation 是继续、阻塞还是取消；若允许继续，phase agent 最终仍须提交原 endpoint 的 `PhaseOutput`。图变更历史由 Event Log 审计，但审计机制不限制 Coordination Graph 的运行时热修改。
+
+**Coordination Graph 原子审计**：图变更（mutation、graph revision、endpoint invalidation、Proposal 裁决、audit event）必须在同一事务或 transactional outbox 中完成，任一部分失败则整体回滚，避免"图已修改、Event Log 没记录"。
 
 ---
 
@@ -326,7 +352,7 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 | Scheduler | 从可运行 endpoint 中选择下一次 Invocation | Coordination Graph、预算、容量、能力 | 创建/修改 task、edge、blocker，解释编排建议，选择记忆 |
 | Ctx Manager Agent | 响应检索请求并准入 Memory Candidate；维护 Context Graph | Event Log、Artifact Store、权限策略 | 主动巡图或提示、决定普通探索/切片、执行订阅或推送、改 Coordination Graph、批准阶段交付 |
 | Agent Runtime | 启动/取消 Invocation，施加 phase 权限，记录事件并校验输出形状 | Scheduler 的 run request、Context Slice、Workspace Binding | 判断业务完成、暴露未提交过程上下文、写任一图的业务状态 |
-| Workspace Service | 为 Attempt 创建/复用/封存执行现场，观察 write set | Runtime policy、Attempt revision | 调度 Agent、判断验收、写 main |
+| Workspace Service | 为 Task 轮次创建/复用/封存执行现场，观察 write set | Runtime policy、轮次 revision | 调度 Agent、判断验收、写 main |
 | Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上机械检查并合入 | Task Contract、Approved Plan、Workspace、evidence | Verifier 修改实现；Merge Queue 修冲突或直接改 Coordination/Context Graph |
 | Phase Agent | 完成当前 phase；提交 PhaseOutput 或编排建议；使用可见 Context Graph | Task Contract、endpoint 契约、自己的 Context Slice/Delta、子图列表与描述 | 直接改图、直接通信、改 main、宣布 done |
 
@@ -339,7 +365,7 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 Task Manager 是 Coordination Graph 唯一写入口，也是默认编排者：
 
 - 将 Human Requirement 规整为 Task Contract；
-- 创建 Task、Attempt、Phase/Decision Endpoint、edge 和 blocker，并为每个 phase 写入 DeliverySpec 与 ReportSpec；
+- 创建 Task、Phase/Decision Endpoint、edge 和 blocker，并为每个 phase 写入 DeliverySpec 与 ReportSpec；创建轮次（Round）时由 Workspace Service 配套创建 Workspace Binding；
 - 读取所有 completed endpoint 的报告、交付物和证据，决定后续编排；
 - 审批运行中的 Agent 提交的 `OrchestrationProposal`，接受后热修改图并明确当前 Invocation 的处置；
 - 与 phase agent 一样使用 Context Slice、图探索、检索、订阅和自动 Delta，但不读取其未提交过程上下文；
@@ -366,7 +392,7 @@ flowchart TD
   TM --> CG[Coordination Graph]
   CG --> S[Scheduler selects runnable endpoint]
   S --> CS[Context service builds initial slice and subscriptions]
-  S --> W[Runtime creates/reuses Attempt Workspace]
+  S --> W[Workspace Service creates/reuses round Workspace Binding]
   CS --> AR[Agent Runtime]
   W --> AR
   AR --> PEV[plan / execute / verify invocation]
@@ -384,14 +410,14 @@ flowchart TD
 
 Verifier 必须同时读取：Task Contract、Approved Plan、真实 diff/产物、Declared/Observed Write Set、输入 revision、Context Slice binding 和验证证据。通过结果只对该组合有效。
 
-验证者必须与产生候选结果的 active phase invocation 独立，但使用同一 Attempt Workspace。独立性来自角色、Invocation、权限和审批边界，而不是复制一个可能漂移的工作区。
+验证者必须与产生候选结果的 active phase invocation 独立，但使用同一轮次 Workspace。独立性来自角色、Invocation、权限和审批边界，而不是复制一个可能漂移的工作区。
 
 ### 8.2 Merge Queue
 
-代码型 Task 的 `verify passed` 只获得进入 Merge Queue 的资格，不等于 `done`：
+代码型 Task（`DeliveryPolicy=code_merge`）的 `verify passed` 只获得进入 Merge Queue 的资格，不等于 `done`：
 
 ```text
-Verify passed on Attempt Workspace
+Verify passed on round Workspace
   -> MergeCandidate
   -> latest main 上机械应用检查
   -> 临时 merge-check workspace
@@ -405,7 +431,7 @@ Merge Queue 是 main 的唯一写入口。它不修冲突、不重写 Task Graph
 
 ### 8.3 多 Workspace 合并语义
 
-不同 Task Attempt 各有独立 Workspace。合并顺序不由 Agent 私聊决定：
+不同 Task 各有独立 Workspace（按轮次切换）。合并顺序不由 Agent 私聊决定：
 
 - 已通过 verify 并进入队列的 candidate 优先尝试；
 - candidate 必须在 latest main 上仍可应用并通过 targeted verify；
@@ -503,7 +529,7 @@ MVP 至少支持：
 type ContextSliceRequest struct {
     TaskID          string   `json:"task_id,omitempty"`
     TaskContractRef string   `json:"task_contract_ref,omitempty"`
-    AttemptID       string   `json:"attempt_id,omitempty"`
+    WorkspaceRef    string   `json:"workspace_ref,omitempty"` // 轮次标识
     Phase           string   `json:"phase,omitempty"`
     Role            string   `json:"role"`
     Purpose         string   `json:"purpose"`
@@ -567,6 +593,8 @@ Agent 在现有列表和探索不足时提交 intent、scope 和当前推理锚�
 ### 11.3 主动订阅 `Subscribe`
 
 Agent 可从可见子图列表中主动选择子图订阅。Context service 按权限、有效期和当前 Invocation 绑定校验后持久化订阅关系；无需 Ctx Manager 对每次订阅做语义决策。此后匹配更新由自动化订阅执行器产生 Context Delta，不建立 Agent mailbox。
+
+订阅关系属于操作层元数据（Operational Context Metadata，owner：Context Service），不是语义图（Semantic Context Graph）的一部分；语义图的节点、强语义边、子图定义只有 Ctx Manager 能写，读路径（切片、探索、检索、订阅、缓存）不得修改语义图。
 
 读取、探索、检索和订阅行为本身不能创建知识节点或强语义边。只有显式 `MemoryCandidate` 经 Ctx Manager 准入后才能更新 Context Graph。由此，Ctx Manager 只在需要语义判断的两个边界工作：响应检索需求，以及准入 Memory Candidate；它不主动巡图、主动提示或执行推送。
 
@@ -639,6 +667,8 @@ value = reuse_probability
 ---
 
 ## 13. 图整理与缓存命中
+
+> **本节暂不实现（设计决策，2026-08-07）**：MVP 不做读侧整理（切片时调整边权重）与缓存层次；语义图边权重只由 Ctx Manager 在准入/更新节点时写入。以下内容为设计意图，供 MVP 后实现时参考。
 
 Context Graph 不运行独立的周期性“整理 Agent”。图整理只发生在系统已经必须读取或写入相关子图的两个时点：Context service 生成初始/检索切片时执行读侧整理，Ctx Manager 准入 Memory Candidate 时执行写侧整理。两者复用已有候选集，避免额外全图扫描并提高后续 Context Slice 的缓存命中率。
 
@@ -766,7 +796,7 @@ Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Ctx M
 
 - provider detect/auth/capability；
 - 按 role/purpose 或 endpoint 组装 prompt、Context Slice 和输出契约；
-- 创建或复用 Attempt Workspace；
+- 创建 Invocation，从 Workspace Service 取得该轮次的 Workspace Binding；不创建任何业务对象（Task、轮次、端点由 Task Manager 在图上决定）；
 - 施加 phase-specific 工具、路径和写 lease；
 - 运行、取消、恢复和替换 Agent；
 - 归一化 Agent Event，保存 transcript、tool output、diff 和测试证据，但不向 Task Manager 暴露未提交的 phase 过程上下文；
