@@ -1,72 +1,67 @@
 # Event Log / Artifact Store 详细设计
 
-版本：v0.1
+版本：v1.0
 状态：Draft
+定位：本文描述 Threadmill 的 Event Log 与 Artifact Store。**语义以 docs/threadmill-unified-design.md 为准**；本文只展开实现细节与 third_party/agentteams 的复用边界。AgentTeams 本身**没有事件流模型**（无 Event Log / 事件总线 / Artifact 注册表，全仓检索零命中），因此 Event Log 与 Artifact 注册表是 Threadmill 新建服务，AgentTeams 只提供原始证据源与物理存储底座。
 
 ---
 
 ## 1. 定位
 
-Event Log 是系统事实来源，由 Agent Runtime **自动记录**所有 agent 活动和状态变化——agent 不显式"写日志"，它们的消息、工具调用、结论和状态变更被自动捕获。这里的所有 agent 包括 Task Manager Agent、Ctx Manager Agent / Ctx Agent、planner、executor 和 verifier。
+Event Log 是系统事实来源，由 Agent Runtime **自动记录**所有 agent 活动和状态变化——agent 不显式"写日志"，它们的 Invocation 生命周期、结构化边界输出、提交的 MemoryCandidate 和状态变更被自动捕获。这里的所有 Agent 包括 Task Manager Agent、Ctx Manager Agent、planner、executor 和 verifier。
 
-task 表、ctxlib、UI 状态、进度面板都可以视为 event log 的 projection。
-
-Artifact Store 保存大对象，例如 transcript、tool output、test output、diff patch 和 screenshots。
-
----
-
-## 2. 设计原则
+Artifact Store 保存大对象：transcript、tool output、test output、diff patch、screenshots、PhaseOutput 引用的交付物/报告/证据。Event Log 只保存引用（ArtifactRef），不内嵌大对象。
 
 ```text
-1. Event Log 由 Agent Runtime 自动记录所有 agent 活动和状态变化，agent 不显式写日志。
-2. 大对象进 Artifact Store，Event Log 只保存引用。
-3. ctxlib 只从 Event Log / Artifact Store 提取记忆，不接受 agent 直接写入。
-4. Task Graph 由经 Agent Runtime 授权的 Task Manager Agent 权威写入，其写入动作也被自动记入 log。
-5. merge、verify、conflict、human decision 都必须可追溯。
-6. 系统状态应尽可能能从 Event Log 重放。
+Agent Runtime 归一化 Agent Event，保存 transcript、tool output、diff 和测试证据
+  -> Event Log（追加式审计/证据流）
+  -> 各投影：Coordination Graph 审计、Context Graph 证据、UI 状态、进度面板
 ```
+
+Event Log 的语义边界（同统一设计）：
+
+- **自动捕获**：Runtime 记录的是 Agent 的边界活动与结构化输出，不记录也不暴露未提交的 phase 过程上下文（中间推理、工具输出、探索轨迹）；
+- **审计**：Coordination Graph 的热修改历史、MemoryCandidate 的提交与裁决、Context Graph 的写入事务都由 Event Log 审计；审计机制不限制 Coordination Graph 的运行时热修改（§5.7）；
+- **证据链**：verify、merge、human decision、Context Node 的 SourceRefs 都回溯到事件与 artifact；
+- **回放**：系统状态应尽可能能从 Event Log 重放。
 
 ---
 
-## 3. 核心事件
+## 2. 自动事件捕获
 
-```text
-TaskCreated
-TaskPrepared
-TaskPlanned
-TaskBlocked
-TaskUnblocked
-TaskExecuting
-TaskVerifying
-TaskVerifyPassed
-TaskVerifyFailed
-TaskConflictDetected
-TaskMergeQueued
-TaskMerged
-TaskDone
+### 2.1 捕获点（Threadmill 新建的 EventLogAdapter）
 
-AgentStarted
-AgentFinished
-AgentFailed
-TaskGraphExpanded
+Event Log 不是由 agent 显式写日志，而是 Runtime 在以下边界自动归一化事件：
 
-ContextBlockCreated
-ContextBlockSuperseded
-ContextPackSelected
-ContextQueryExecuted
+| 捕获点 | 产生的事件 | 说明 |
+| --- | --- | --- |
+| Invocation 生命周期 | AgentInvocationStarted / Finished / Failed | Runtime 启动、取消、恢复、替换 Agent 时 |
+| Phase Endpoint 编排 | PhaseActivated | Scheduler 选中 runnable endpoint 并请求 Runtime 创建/复用 Task Attempt 的 Workspace Binding |
+| 结构化边界输出 | PhaseOutputSubmitted | 每个 phase 按 DeliverySpec / ReportSpec 提交输出；Runtime 只校验形状与必填引用 |
+| 编排建议 | OrchestrationProposalSubmitted / OrchestrationProposalDecided | 运行中 Agent 主动提交建议；Task Manager 裁决（接受/改写/拒绝）并明确当前 Invocation 处置 |
+| MemoryCandidate | MemoryCandidateSubmitted / Admitted / Rejected | Runtime 自动记录候选；Ctx Manager 准入后记录裁决（含低价值候选的审计事件） |
+| Context Graph 写入 | ContextGraphCommitted | 节点/边/子图 revision 的原子提交 |
+| 订阅与推送 | ContextSubscriptionCreated / Expired、ContextDeltaDelivered / Consumed | Runtime 记录订阅关系与 Delta 是否被 Agent 消费 |
+| 验证与合并 | VerifyPassed / VerifyFailed、MergeCandidateQueued / Merged | merge event 附 commit/diff/test evidence |
+| 人工决定 | HumanDecisionRequested / HumanDecisionRecorded | 显式记录，含理由与 revision |
+| 结果失效 | PhaseResultInvalidated | Task Contract、依赖结果、代码基线、Workspace Head 或高影响上下文变化后由 Task Manager 按影响范围触发 |
 
-WorktreeCreated
-WorktreeDiffObserved
-WorktreeAbandoned
+### 2.2 原始证据源（AgentTeams 现状，只作证据不当作事件流）
 
-ConflictContextBroadcasted
-HumanDecisionRequested
-HumanDecisionRecorded
-```
+AgentTeams 没有统一事件模型；它散落着四类**原始证据源**，由 Threadmill 的 EventLogAdapter 归一化消费：
+
+| 原始证据源 | 内容 | 依据路径 |
+| --- | --- | --- |
+| Matrix 房间时间线 | 所有 agent 消息、m.file 媒体事件、人工干预；房间拓扑 `TASK：<projectId>` / `project:{id}` | third_party/agentteams/plugins/teamharness/mcp/server.py；third_party/agentteams/plugins/teamharness/mcp/roomflow_tool.py |
+| 各运行时私有 sessions/ | 每 agent 的私有对话历史与转出消息记录（`workspace_dir/sessions/<channel>/`） | third_party/agentteams/plugins/teamharness/mcp/server.py（`_record_outbound_to_session`）；third_party/agentteams/qwenpaw/src/qwenpaw_worker/worker.py（SESSION_FILE_PROMPT_POLICY） |
+| heartbeat 快照 | 每 worker 的 `heartbeat.json`（status/message/details/updatedAt）与控制器 ready 上报 | third_party/agentteams/qwenpaw/src/qwenpaw_worker/heartbeat.py |
+| taskflow/projectflow 文件态 | `shared/projects/{id}/meta.json`、`shared/tasks/{id}/meta.json` 的分配→进行中→提交状态迁移（当前态快照，无 revision/审计） | third_party/agentteams/copaw/src/copaw_worker/task.py（FileSystemTaskStore）；third_party/agentteams/plugins/teamharness/mcp/server.py（projectflow/taskflow） |
+
+此外，OTel span（third_party/agentteams/plugins/teamharness/adapters/qwenpaw/task_trace.py 把 room_id 关联到 task/project 打在每次 turn 根 span）可复用于**事件关联**，但 span 是观测信号不是事件流：它不保证顺序、不可重放、无业务事件类型。EventLogAdapter 把这些证据归一化成追加式事件后才具有审计与回放语义。
 
 ---
 
-## 4. Event 数据模型
+## 3. Event 数据模型
 
 ```go
 type Event struct {
@@ -75,42 +70,30 @@ type Event struct {
 	// Type 是事件类型；上层投影按类型分发。
 	Type string `json:"type"`
 
-	// 以下外键均可选，用于把事件关联到 task、agent run、worktree 或 context block。
+	// 以下外键均可选，用于把事件关联到 task、agent run、workspace 或 context graph 对象。
 	TaskID string `json:"task_id,omitempty"`
+	AttemptID string `json:"attempt_id,omitempty"`
+	PhaseEndpoint string `json:"phase_endpoint,omitempty"`
 	AgentInvocationID string `json:"agent_invocation_id,omitempty"`
-	WorktreeID string `json:"worktree_id,omitempty"`
-	ContextBlockID string `json:"context_block_id,omitempty"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
 
 	// Payload 保存小型结构化载荷；大对象必须进入 Artifact Store。
 	Payload any `json:"payload"`
 	// ArtifactRefs 指向 transcript、diff、test output 等大对象。
 	ArtifactRefs []string `json:"artifact_refs"`
+	// GraphRevision 记录事件相关的 Coordination/Context Graph revision（如适用）。
+	GraphRevision int64 `json:"graph_revision,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 ```
 
----
-
-## 5. Artifact Store 保存内容
-
-Artifact Store 保存较大的对象：
-
-```text
-- 原始日志
-- agent transcript
-- tool output
-- test output
-- diff patch
-- screenshots
-- benchmark result
-- generated reports
-```
-
-ctxlib 只引用 artifact，不直接内嵌大文件。
+关键事件清单见 §2.1。事件类型命名与统一设计的实体一一对应（PhaseOutput、OrchestrationProposal、MemoryCandidate、ContextSubscription、Context Delta、Verify Result、MergeCandidate），不新增设计外实体。
 
 ---
 
-## 6. Artifact 数据模型
+## 4. Artifact Store
+
+### 4.1 ArtifactRef 与内容哈希
 
 ```go
 type Artifact struct {
@@ -141,24 +124,96 @@ const (
 )
 ```
 
+ArtifactRef 出现在统一设计的各处引用点上：
+
+- `PhaseOutput`：DeliveryRefs / ReportRef / EvidenceRefs（endpoint 输出的交付物、报告、证据）；
+- `CoordinationEdge.Data`：沿边传递的交付物/报告/证据；
+- `MemoryCandidate.SourceRefs` 与 `ContextNode/ContextEdge.SourceRefs`：Context Graph 的证据溯源；
+- `Event.ArtifactRefs`：事件载荷的大对象引用。
+
+**ContentHash 注册表是 Threadmill 新建语义**：AgentTeams 的 MinIO 是路径寻址对象存储，没有内容哈希注册、没有 ArtifactType 索引、没有"同内容只存一份"的引用语义。Threadmill 在 MinIO 之上登记 `Artifact{ID, Type, ContentHash, PathOrBlobRef}`，实现：
+
+- 去重：相同 ContentHash 的写入返回既有 ID，避免重复上传；
+- 完整性校验：读取时核对哈希；
+- 审计：PhaseOutput / Verify Result / Merge 可回溯到确切字节内容。
+
+### 4.2 物理存储（直接复用 MinIO）
+
+Artifact 的物理层直接复用 AgentTeams 的 MinIO + filesync 协议：
+
+- 统一文件系统布局（`agents/<name>/`、`shared/tasks/{id}/` 的 meta/spec/result/workspace/deliverables、`workers/` 前缀）——third_party/agentteams/docs/k8s-native-agent-orch.md §3.6；
+- 写者推送 + 增量 mirror + 回退拉取的同步协议——third_party/agentteams/shared/lib/worker-file-sync.sh、third_party/agentteams/qwenpaw/src/qwenpaw_worker/sync.py、third_party/agentteams/worker/scripts/worker-entrypoint.sh；
+- 路径约束与敏感扫描（发布前拒绝敏感文件名/内容）——third_party/agentteams/plugins/teamharness/mcp/server.py。
+
+**不应复用**：AgentTeams 的 `artifact` 工具（`publish_file` 把工作区文件作为 m.file 上传到 Matrix 房间媒体）是**人工可见的交付通道**，不是 Artifact Store 的写入路径；Threadmill 的 Artifact Store 走对象存储 + 注册表，Matrix m.file 只作为可选的对外发布动作。
+
+---
+
+## 5. Process Transcript 隔离
+
+### 5.1 原则
+
+Runtime 保存 transcript、tool output、diff 和测试证据，**但不向 Task Manager 暴露未提交的 phase 过程上下文**（统一设计 §16）。Task Manager 只能读取：Requirement、所有 completed PhaseOutput / report / evidence、自己的 Context Slice / Delta 和可见 Context Graph。运行中的 phase agent 的中间推理、工具输出、探索轨迹和未提交上下文默认留在 Invocation 内；只有以下结构化边界输出可以离开 Invocation 进入 Task Manager：
+
+1. 阶段结束时的 `PhaseOutput`；
+2. 运行中主动提交的 `OrchestrationProposal`；
+3. 显式标注的 `MemoryCandidate`（由 Runtime 记录进 Event Log，交 Ctx Manager 准入，不经 Task Manager 语义读取）。
+
+### 5.2 AgentTeams 的现成隔离策略（直接复用语义）
+
+QwenPaw 运行时的 sessions/ 目录策略与 Threadmill 的隔离目标一致，可原样采纳为 Runtime 约束：
+
+```text
+Do not read, list, grep, glob, summarize, copy, or expose files under sessions/.
+Session files are runtime-private state and may contain private conversation history.
+```
+
+——third_party/agentteams/qwenpaw/src/qwenpaw_worker/worker.py（SESSION_FILE_PROMPT_POLICY，注入 AGENTS.md / SOUL.md）
+
+AgentTeams 中 session 文件（`workspace_dir/sessions/<channel>/`，含外发消息记录）是**运行时私有**的；Threadmill 沿用这一隔离：transcript 作为 Artifact 保存（类型 `agent_transcript`），但**只有审计/重放侧可读，不进入 Task Manager 的编排输入，也不进入 Context Graph**（Context Graph 只吃 MemoryCandidate 准入后的节点，见 docs/ctxlib.md）。
+
+### 5.3 哪些事件可被 Manager 看
+
+| 可见性 | 事件/内容 | 依据 |
+| --- | --- | --- |
+| Task Manager 可读 | 所有 completed PhaseOutput 及其 DeliveryRefs/ReportRef/EvidenceRefs；OrchestrationProposalSubmitted / Decided；VerifyPassed/Failed；MergeCandidateQueued/Merged；HumanDecisionRequested/Recorded；自己的 Context Slice/Delta 与可见 Context Graph | 统一设计 §6、§7.1 |
+| Ctx Manager 可读 | Event Log、Artifact Store、权限策略（MemoryCandidateSubmitted / Admitted / Rejected、ContextGraphCommitted） | 统一设计 §6 |
+| 任何人不可读（运行时私有） | 未提交的 phase 过程上下文：中间推理、单步工具输出、探索轨迹、sessions/ transcript 内容 | 统一设计 §5.5、§16；worker.py SESSION_FILE_PROMPT_POLICY |
+| 仅审计侧 | 全部事件（含被拒绝的 MemoryCandidate、订阅关系、Delta 消费记录） | 统一设计 §5.7、§14.2 |
+
+人工可见性（AgentTeams 的 Matrix 房间全员可见模型）与 Task Manager 的编排读取是两个通道：房间消息对人工是特性，但 Manager 的编排决策输入只来自结构化边界事件，不解析聊天文本。
+
+---
+
+## 6. 适配边界：MinIO / filesync / Matrix / session / OTel
+
+| 基座 | 边界 | 依据路径 |
+| --- | --- | --- |
+| MinIO | **直接复用为物理存储**：对象存储 + 统一文件布局 + 敏感扫描。**不提供** Artifact 注册表、ContentHash 索引、ArtifactType 分类——这些由 Threadmill 新建的 ArtifactStoreAdapter 覆盖 | third_party/agentteams/docs/k8s-native-agent-orch.md §3.6；third_party/agentteams/plugins/teamharness/mcp/server.py |
+| filesync | **直接复用为同步协议**：写者推送 + watermark 增量 + 回退拉取。**不承担**事件顺序、游标语义或事件流——Event Log 的追加顺序由 EventLogAdapter 自己保证；`.last-pull`/mtime 水位不能当事件游标（third_party/agentteams/docs/issue-1107-file-sync-io-amplification.md §4.1 已证伪） | third_party/agentteams/shared/lib/worker-file-sync.sh；third_party/agentteams/worker/scripts/worker-entrypoint.sh |
+| Matrix | **只作原始证据源与人工可见性通道**：房间时间线可被 EventLogAdapter 归一化，m.file 可作可选对外发布。**不是事件总线、不是 Context Graph、不是控制面协议**：消息文本（mention、TASK_COMPLETED/TASK_BLOCKED）不解析为编排或记忆信号 | third_party/agentteams/plugins/teamharness/mcp/server.py；third_party/agentteams/plugins/teamharness/mcp/message_tool.py |
+| session | **直接复用隔离语义**：sessions/ 运行时私有，agent 与 Manager 均不可读（SESSION_FILE_PROMPT_POLICY）；transcript 落 Artifact Store 但仅审计/重放侧可读 | third_party/agentteams/qwenpaw/src/qwenpaw_worker/worker.py；third_party/agentteams/scripts/export-debug-log.py（证明 transcript 分散于 Matrix 时间线与各运行时 sessions/，无统一 Event Log） |
+| OTel | **只作观测与关联信号**：task_trace.py 的 span 关联逻辑可复用于事件关联；CMS/OTel 通道承载 trace/metrics。**不是事件流**：span 无业务事件类型、不可重放、不保证顺序，Event Log 的审计/回放语义必须新建 | third_party/agentteams/plugins/teamharness/adapters/qwenpaw/task_trace.py；third_party/agentteams/docs/cms-integration.md |
+
 ---
 
 ## 7. Projection
 
-Event Log 可以生成多个 projection：
+Event Log 可以生成多个 projection（与统一设计的两图一 Runtime 对齐）：
 
 ```text
-TaskProjection:
-  当前 task 状态、phase、依赖和 blocker。
+CoordinationProjection:
+  当前 Coordination Graph 状态、Phase Endpoint runnable/blocker、阶段交付满足度；
+  图的热修改历史由 Event Log 审计（审计不限制热修改）。
 
 AgentProjection:
-  当前 active agents、历史 invocation 和结果。
+  当前 active Invocations、历史 Invocation 和结果。
 
-CtxProjection:
-  当前可用 context blocks、supersede 关系和索引。
+ContextProjection:
+  当前 Context Graph revision、节点/子图索引；MemoryCandidate 裁决记录。
 
 MergeProjection:
-  当前 merge queue、已合入 task 和冲突关系。
+  当前 Merge Queue、已合入 candidate 与冲突关系。
 
 UIPanelProjection:
   用户界面展示的进度、预算和风险。
@@ -166,30 +221,15 @@ UIPanelProjection:
 
 ---
 
-## 8. 与 ctxlib 的关系
+## 8. 不变量
 
-ctxlib 不直接从 agent session 读取长期记忆，也不接受 agent 主动推送；它**只从 Event Log / Artifact Store 中提取**结构化 context，由 Ctx Agent（含 Context Curator）负责。
-
-```text
-AgentFinished / TaskVerifyFailed / TaskMerged 等事件（Agent Runtime 自动记录）
-  -> Agent Runtime(role=ctx_manager) 启动 Ctx Manager Agent 读取 log 中的 summary，并按 ref 取 artifact
-  -> 提炼 / 去重 / supersede，生成 ContextBlock
-  -> ContextBlock 的产生本身也作为事件被记录
-```
-
-Event Log 是 ctxlib 的唯一上游；经 Agent Runtime 授权的 Ctx Manager Agent / Ctx Agent 是 ctxlib 的唯一写入者。
-
----
-
-## 9. 不变量
-
-```text
-1. 关键状态变化必须进入 Event Log（由 Agent Runtime 自动记录，非 agent 显式写）。
+1. 关键状态变化必须进入 Event Log（由 Agent Runtime 自动记录，非 agent 显式写）；AgentTeams 无此机制，EventLogAdapter 为新建服务。
 2. Task Manager Agent 和 Ctx Manager Agent 也必须经 Agent Runtime 运行，它们不是日志旁路。
-3. 大对象必须进 Artifact Store，并用 ref 引用。
-4. Verify failure 必须可追溯到测试输出或人工判断。
-5. Merge 必须可追溯到 verify result、diff 和 commit。
-6. Human decision 必须显式记录。
-7. ctxlib 中的高影响 context 必须有 event 或 artifact evidence。
-8. ctxlib 只从 Event Log / Artifact Store 构建，不接受普通 agent 直接写入。
-```
+3. 大对象必须进 Artifact Store，并用 ArtifactRef 引用；Event Log 不内嵌大对象。
+4. Verify failure 必须可追溯到测试输出或人工判断；Merge 必须可追溯到 verify result、diff 和 commit。
+5. Human decision 必须显式记录。
+6. Process transcript 是 Artifact（`agent_transcript`），但运行时私有：Task Manager 只读结构化边界输出（PhaseOutput / OrchestrationProposal / 已完成 endpoint 的 report、delivery、evidence），不读未提交过程上下文。
+7. Context Graph 的高影响节点必须有 Event 或 Artifact 证据（SourceRefs），只经 MemoryCandidate 准入落图。
+8. 订阅与 Delta 的记录（创建、过期、投递、消费）必须进入 Event Log；Delta 增量、可合并、可重放。
+9. 图变更历史由 Event Log 审计，但审计机制不限制 Coordination Graph 的运行时热修改。
+10. 系统状态应尽可能能从 Event Log 重放；事件顺序由 EventLogAdapter 保证，不复用 filesync 水位或 Matrix 时间线作游标。

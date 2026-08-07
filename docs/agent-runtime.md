@@ -1,1159 +1,302 @@
-# Agent Runtime 核心设计
+# Agent Runtime 设计（AgentTeams 基座）
 
-版本：v0.5
+版本：v0.6（重写）
 状态：Draft
+定位：Agent Runtime 是所有 Agent Invocation 的统一执行边界。本文说明 Threadmill 的 Runtime 语义如何在 third_party/agentteams（AgentTeams v1.2.x 归档基座）上实现。
+> 语义以 docs/threadmill-unified-design.md 为准（下称《统一设计》），本文只补充实现映射；术语冲突时以《统一设计》为准。
 
 ---
 
 ## 1. 定位
 
-Agent Runtime 负责把 Claude Code、Codex、Gemini CLI 和其他 headless CLI agent 包装成统一 worker，供 Control Plane 调度。系统内所有 agent 都经这条边界运行：Task Manager Agent、Ctx Manager Agent / Ctx Agent、planner、executor、verifier 都是 Agent Runtime 管理的 invocation。
+《统一设计》第 16 节：Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Ctx Manager、planner、executor 和 verifier。它负责 provider detect/auth/capability、按 role/purpose 组装 prompt、Context Slice 和输出契约、创建或复用 Attempt Workspace、施加 phase 权限与写 lease、运行/取消/恢复/替换 Agent、归一化事件、观察真实 write set、执行 Context 读请求并传递自动订阅的 Context Delta、把 `PhaseOutput` / `OrchestrationProposal` / Requirement / MemoryCandidate 交给相应唯一 owner。Runtime 不判断 Task 是否完成，不写 Coordination Graph，不替 Ctx Manager 检索或接受记忆，不合并 main。
 
-它的目标不是抹平所有 agent 的能力差异，而是提供一条稳定边界：
+AgentTeams 基座提供的不是"与 CLI 无关的通用 adapter 层"，而是一套可部署、可观测的 agent 运行时与协作基座：
+
+| AgentTeams 组件 | 作用 |
+| --- | --- |
+| agentteams-controller | Go 算子：Worker/Team/Human/Manager CR 的 reconcile、REST API（:8090）、worker 容器生命周期、`agt` CLI |
+| Worker | 持久 worker 容器（OpenClaw 或 QwenPaw runtime）；无状态，配置与记忆都在 MinIO，可随时销毁重建 |
+| QwenPaw worker daemon | 期望状态 apply 循环、心跳、对象存储同步（`qwenpaw_worker` 包） |
+| TeamHarness | 协作协议：角色 prompt、team skills、MCP 工具（health / message / roomflow / filesync / artifact / projectflow / taskflow） |
+| WorkerFlow | 单个 Worker 内部的临时 agent 编排（`worker_agentflow`） |
+
+Threadmill 的 Runtime 在这套基座上分两层落地：
 
 ```text
-Control Plane / Scheduler
-  -> Agent Runtime
-  -> Agent Adapter / System Agent Role
-  -> Claude Code / Codex / Gemini / Custom CLI
-  -> Task Manager Agent / Ctx Manager Agent / planner / executor / verifier
+基座层（直接复用）:
+  controller 生命周期 / QwenPaw 进程与 API / TeamHarness 委派-提交协议
+  / WorkerFlow 临时 agent / MinIO 同步 / 心跳与 trace 关联
+
+Threadmill 适配层（新建）:
+  Invocation 记录与事件投影 / phase 语义与写 lease / Context Slice 组装与 Context 读工具
+  / 输出契约（PhaseOutput 形状）/ OrchestrationProposal 转交 / 观察 write set
 ```
 
-第一阶段只实现 Claude Code 的最小完整包装：
-
-```text
-- 检测 Claude Code CLI 和认证状态。
-- 声明能力。
-- 在指定 worktree / cwd 中 headless 启动。
-- 注入 system prompt、task prompt 和 context pack。
-- 控制允许工具和权限模式。
-- 解析 stream-json 输出为统一 AgentEvent。
-- 记录 Event Log 和 Artifact Store 引用。
-- 汇总 AgentResult 返回给 Control Plane；Task Manager Agent、Ctx Manager Agent、Verifier 和 Merge Queue 分别按权责消费。
-- 对 Task Manager Agent / Ctx Manager Agent 也使用同一套启动、权限、事件、artifact 和取消语义。
-```
+AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge Queue；这些概念在本文与 workspace-merge.md 中一律标注为 Threadmill 新建，不声称基座已提供。
 
 ---
 
-## 2. 设计判断
+## 2. 基座能力盘点与复用判定
 
-参考 Open Design 的 agent runtime / adapter 架构，Agent Runtime 采用两层包装：
+每份能力都按四类判定：**直接复用**、**适配封装**、**Threadmill 新建**、**不应复用**。
 
-```text
-1. Agent Adapter Layer
-   面向不同 CLI agent，处理 detect / capabilities / run / cancel / resume / stream parse。
+### 2.1 直接复用
 
-2. Runtime Orchestration Layer
-   面向本系统，处理 task attempt、worktree、context pack、event log、artifact、result 汇总。
-```
+| 能力 | 位置（third_party/agentteams） | 说明 |
+| --- | --- | --- |
+| Worker 生命周期 | `agentteams-controller/api/v1beta1/types.go`（Worker / WorkerSpec / WorkerStatus / TeamMemberStatus）；`agentteams-controller/cmd/agt/`（`agt create/apply worker`） | Worker CR → Pod 的 reconcile；`spec.state` Running/Sleeping/Stopped；`spec.containerManaged`、`backendRuntime=pod`、`deployMode` Local/Edge；状态 `phase`：Pending/Starting/Running/Updating/Stopping/Sleeping/Stopped/Failed，`lastHeartbeat`、`lastActiveAt` |
+| 期望状态注入 | `qwenpaw/src/qwenpaw_worker/worker.py`、`update.py`（MemberRuntimeConfig）；`docs/member-runtime-config-contract.md` | controller 写 `runtime.yaml`（默认 `agents/{memberName}/runtime/runtime.yaml`）；daemon 每 5s apply `desired.model / mcpServers / channelPolicy / agentPackage`，不重启 Pod |
+| Agent 进程与 API | `qwenpaw/src/qwenpaw_worker/api.py`；`qwenpaw/README.md` §1.1 | QwenPaw localhost HTTP API：`/api/version`（必须精确 2.0.1）、`/api/agents`、`/api/mcp`、`/api/access-control/agentteams_matrix`、`/api/agents/default/agent-status`、Skill API |
+| 委派-执行-提交协议 | `plugins/teamharness/mcp/server.py`（taskflow）；`plugins/teamharness/skills/team/task-execution/SKILL.md` | `delegate_task / ack_task / submit_task / check_task / cancel_task`；TaskMeta `assigned → in_progress → submitted`；`submit_task` 记录结构化状态并自动发布 result.md 与 deliverables 为 Matrix `m.file` |
+| 角色提示词与团队契约 | `plugins/teamharness/prompts/agent/worker.md`、`leader.md`、`remote-member.md`；`prompts/team/TEAMS.md`；`prompts/manager/AGENTS.md`、`TOOLS.md`、`HEARTBEAT.md` | Worker/Leader/Remote Member 角色边界、Matrix 提及纪律、Credential Safety（不可覆盖规则） |
+| 文件同步与共享目录 | `qwenpaw/src/qwenpaw_worker/sync.py`（FileSync）；`shared/lib/worker-file-sync.sh`；`worker/scripts/worker-entrypoint.sh` | 写者推送 + @mention 按需拉取；排除 credentials / sessions / logs / tool results / media / file store / runtime cache；`.last-pull` 标记防回推 |
+| 心跳与就绪 | `qwenpaw/src/qwenpaw_worker/heartbeat.py` | 本地 `heartbeat.json`；`POST /api/v1/workers/{name}/ready`、`/heartbeat`；`lastActiveAt` 取自 agent-status |
+| 输出清洗与敏感拦截 | `plugins/teamharness/adapters/qwenpaw/plugin.py`（`AGENTTEAMS_OUTPUT_SANITIZE_KEYWORDS`）；`plugins/teamharness/mcp/server.py`（SENSITIVE_ARTIFACT_NAME_RE / TEXT_RE） | artifact 发布前按名称/正文拦截 secret、token、private key、Authorization 头等 |
+| 运行关联 trace | `plugins/teamharness/adapters/qwenpaw/task_trace.py` | OTel SpanProcessor 给每轮 entry span 打 `agentteams.task.id` / `agentteams.project.id`，从 `shared/tasks/*/meta.json` 解析 |
+| 会话隐私 | `qwenpaw/src/qwenpaw_worker/worker.py`（SESSION_FILE_PROMPT_POLICY） | agent 被禁止读取 `sessions/` 下的会话文件 |
+| 工具权限 | `agentteams-controller/api/v1beta1/types.go`（AccessEntry、CredentialBinding.ToolWhitelist、MCPServer）；`qwenpaw/README.md` §1.3 | 默认对象存储权限 scoped 到 `agents/<name>/*` 与 `shared/*`；MCP 客户端与 allow policy 经 `/api/mcp` 与 MCP Policy API |
 
-Open Design 对应关系：
+### 2.2 适配封装
 
-```text
-Open Design AgentAdapter.detect       -> 本系统 AgentAdapter.detect
-Open Design AgentAdapter.capabilities -> 本系统 AgentCapabilities
-Open Design AgentAdapter.run          -> 本系统 AgentAdapter.run(params)
-Open Design AgentEvent                -> 本系统统一 AgentEvent，并额外保留 raw provider event
-Open Design artifact workspace        -> 本系统 task attempt worktree / artifact refs
-Open Design product run               -> 本系统 Control Plane / Scheduler 管理的 task phase attempt
-```
+| Threadmill 语义 | 适配方式 |
+| --- | --- |
+| Phase Endpoint invocation ↔ taskflow 委派 | 一次 `delegate_task` = 一次有界执行；`spec.md` 由 Task Manager 写入 Task Contract + DeliverySpec/ReportSpec + phase lease 声明；worker 按 spec 执行并提交 |
+| PhaseOutput ↔ submit_task + result.md | `submit_task(summary, deliverables, status)` 是现成载荷骨架；result.md 内嵌 Threadmill 结构化 JSON 块（PhaseOutput 形状），不改变 AgentTeams 协议 |
+| Agent Invocation（临时计算资源）↔ WorkerFlow 临时 agent | `workflow_run / create_temp_agent` 创建 `tmp-` 前缀 agent（独立 workspace、自定义 AGENTS.md/skills 模板），bounded 任务结束即删除 |
+| Context 读工具注入 ↔ QwenPaw MCP 机制 | 注入机制直接复用（`desired.mcpServers` → `/api/mcp`）；工具本身是 Threadmill 新建的 `threadmill-ctx` MCP server |
+| Workspace 目录语义 ↔ shared/tasks 布局 | `shared/tasks/{attempt_id}/`（含 workspace/、progress/、result.md）作为 Attempt 的目录落点；目录所有权规则直接复用 task-execution SKILL.md |
+| 输出状态映射 ↔ TaskResult 状态机 | `SUCCESS → passed`；`SUCCESS_WITH_NOTES → passed + notes`；`REVISION_NEEDED / BLOCKED / FAILED → failed`（见 §6.2） |
+| 验收机械部分 ↔ check_task | `check_task` 返回 `effective = status==submitted && 无 deliverable 校验错误`（deliverables 必须位于 `shared/tasks/{task_id}` 下）；语义验收由 Threadmill verifier 完成 |
 
-本系统不会照搬 Open Design 的设计 artifact / preview / plugin marketplace，但 Agent Runtime 这部分需求基本一致：都是把外部 CLI/stdio agent 包装成可检测、可运行、可取消、可恢复、可观测的 worker。因此不只借鉴 adapter 接口，也可以借鉴它的 runtime 分层、run lifecycle、session/cancel 策略和事件归一化方式。
+### 2.3 Threadmill 新建
 
-关键判断：
+- AgentInvocation 记录与 run 生命周期投影（AgentTeams 无此实体）。
+- phase lease 的声明与强制（AgentTeams 无 phase 概念，见 §5.1）。
+- Context Slice 组装、Context Graph 读接口（ListSubgraphs / Explore / Retrieve / Subscribe）与自动订阅执行器（AgentTeams 无 Context Graph）。
+- PhaseOutput / OrchestrationProposal / MemoryCandidate 的形状校验与路由。
+- Event Log 投影（AgentTeams 没有 Event Log；从 heartbeat、trace、meta.json/result.md、委派事件投影）。
+- Observed Write Set 观察器（目录快照对比 / git diff / deliverables 交叉核对）。
+- 输出 JSON Schema 校验（针对 result.md 内嵌载荷）。
 
-```text
-1. adapter 是 CLI 归一化边界。
-   Scheduler 不知道 claude/codex/gemini 的具体 flags。
+### 2.4 不应复用
 
-2. capability 只表达调度和产品真正需要的能力。
-   底层 flags 留在 adapter 内部。
-
-3. event 要小而稳定。
-   provider 原始事件保存在 raw 中，向上只暴露统一 AgentEvent。
-
-4. workspace / artifact 是一等对象。
-   Runtime 不只保存 stdout，还要观察 diff、文件写入、transcript 和测试证据。
-
-5. fallback 不能静默发生。
-   从一个 adapter 切到另一个 adapter 必须显式记录，并受策略控制。
-
-6. Task Manager Agent 和 Ctx Manager Agent 不是 runtime 旁路。
-   它们是带有特殊 tool/capability 授权的系统 agent invocation；Task Graph / ctxlib 的实际写入由 Go backend 受控 service/tool 承接。
-```
-
----
-
-### 2.1 Open Design Agent Runtime 架构可借鉴点
-
-这一层可以更直接参考 Open Design，因为两边的 Agent Runtime 需求是同构的：
-
-```text
-- 管理外部 agent CLI / stdio runtime，而不是实现模型本身。
-- 在运行前做 detect / version / auth / capability probe。
-- 把统一的 AgentRunParams 翻译成 provider-specific argv / env / stdin / JSON-RPC。
-- 管理 cwd、allowed dirs、prompt transport、session handle、cancel 和 process lifecycle。
-- 把 provider stream 解析成小而稳定的 AgentEvent，并持久化 raw event / event log。
-- 把权限、工具/MCP 注入、sandbox/trust/yolo 等危险能力收口到 runtime policy。
-```
-
-因此 Agent Runtime 建议按 Open Design 的 daemon runtime 结构拆成以下内部模块：
-
-```text
-AgentProviderSpec / RuntimeAgentDef
-  声明 provider 如何 detect、如何 buildArgs、如何 parse stream、如何 resume/cancel。
-
-AgentRegistry
-  注册 Claude / Codex / Gemini / OpenCode / ACP 等 provider，并向 Control Plane 暴露稳定 AgentInfo。
-
-AgentRunService
-  维护 AgentAttempt / run state / pid / session handle / event refs，负责统一 invoke 和状态流转。
-
-ProcessRunner / PromptTransport
-  统一处理 cwd、env、stdio、stdin_text、stdin_jsonl、prompt_file、process group。
-
-EventParser
-  把 provider 原始输出解析成 AgentEvent，同时保留 raw provider event。
-
-PermissionPolicy / ToolInjectionPolicy
-  决定 allowed dirs、shell/file edit 权限、MCP/tool config 注入方式和是否允许 provider 的 bypass/trust/yolo 参数。
-```
-
-和 Task Graph 的边界保持不变：Open Design runtime 可以作为 Agent Runtime 的架构参考，但跨 task/phase 的 phase endpoint、dependency edge 和 blocker 仍属于 Task Graph / Scheduler。Agent Runtime 只执行一个已经被调度出来的 `AgentRunParams`，不负责持久工作关系的编排；MVP 由 Scheduler 直接选择可运行 endpoint。
+1. TeamHarness 的 project DAG/Loop 与 `ready_nodes` 不应作为 Coordination Graph。它是 Leader 维护的团队协作视图（`shared/projects/{id}/plan.md`），可被改写；Coordination Graph 的唯一写入口是 Task Manager。
+2. Leader/Manager 的房间状态记忆（"从 room 推断身份/项目"）不应作为权威编排状态；Leader prompt 本身就禁止从 session 猜状态。
+3. `message` MCP 工具不应成为 Agent mailbox。基座事实：worker/remote-member 的 `message` 工具被禁用（server.py `MESSAGE_TOOL_BLOCKED_ROLES = {"worker", "remote-member"}`）。Threadmill 不提供替代 mailbox；外部记忆只来自切片、探索、检索、订阅与自动 Delta。
+4. Matrix 房间线程不应作为过程上下文审计通道。运行过程上下文留在 Invocation 内（QwenPaw `sessions/` 私有、Threadmill 不读）。
+5. QwenPaw 原生 subagent（共享同一 workspace）不应承担需要隔离的 phase 执行；需要隔离时用 WorkerFlow 临时 agent 或独立 worker。
+6. `accept_task_result` 不应等于 done 或 merge（见 workspace-merge.md §4.2）。
+7. 不应把 `runtime.yaml` 或 TeamHarness meta.json 当作 Coordination/Context Graph 的存储：图状态只存在于 Threadmill 侧。
 
 ---
 
-### 2.2 Open Design 源码可借鉴点
+## 3. 组件映射（可执行）
 
-Open Design 的源码参考固定到以下 commit，避免后续 upstream 变更导致链接漂移：
+| Threadmill 职责 | AgentTeams 基座实现 | 路径 | 复用类型 |
+| --- | --- | --- | --- |
+| 创建/复用执行宿主 | Worker CR + Pod；`spec.state`、`containerManaged`、`backendRuntime`、`deployMode` | `agentteams-controller/api/v1beta1/types.go`；`agentteams-controller/internal/service/deployer.go` | 直接复用 |
+| 检测可用性与容量 | `Worker.Status.Phase / LastHeartbeat / LastActiveAt`；Team `readyWorkers / totalWorkers` | `api/v1beta1/types.go`（WorkerStatus、TeamStatus） | 直接复用 |
+| 启动 agent 进程 | QwenPaw app（`/api/version`=2.0.1 就绪）或 OpenClaw gateway（`openclaw gateway run`） | `qwenpaw/src/qwenpaw_worker/worker.py`；`worker/scripts/worker-entrypoint.sh` | 直接复用 |
+| 注入模型/MCP/ACL/skill | `desired.*` apply 循环（model、mcpServers、channelPolicy、agentPackage） | `qwenpaw/src/qwenpaw_worker/update.py` | 直接复用 |
+| 发起 phase invocation | `taskflow delegate_task`（含 spec）；`worker_agentflow workflow_run`（临时 agent） | `plugins/teamharness/mcp/server.py`；`plugins/workerflow/mcp/server.py` | 适配封装 |
+| 取消/替换 | `taskflow cancel_task(reason[, replacementTaskId])`；`delete_temp_agent`；Worker `spec.state=Stopped` | 同上；`agentteams-controller/api/v1beta1/types.go` | 直接复用 |
+| 输出确认 | `ack_task / submit_task / check_task`；TaskResult 状态机 | `plugins/teamharness/mcp/server.py`（`_task_result_from_meta`） | 直接复用 |
+| Context 读工具 | Threadmill 新建 `threadmill-ctx` MCP server，经 `desired.mcpServers` 注入 | 注入机制：`qwenpaw_worker/update.py`；工具：Threadmill 新建 | 工具新建、机制复用 |
+| 事件记录 | 无 Event Log；从 heartbeat / trace / meta.json / result.md / 委派事件投影 | `task_trace.py`；`heartbeat.py` | Threadmill 新建投影 |
+| Scheduler | AgentTeams 无 Scheduler；controller 只 reconcile Worker 生命周期，不调度 phase | — | Threadmill 新建 |
 
-```text
-repo: https://github.com/nexu-io/open-design
-commit: 02c68415e29dcab659f1835e8a41ec1a37fce303
-```
+### 3.1 三种执行形态
 
-注意边界：这些源码用于借鉴 **agent runtime / CLI wrapper / adapter**。Task Graph 的 task、phase endpoint、edge 和 blocker 不进入 Agent Runtime；它们仍由 Task Graph / Scheduler 管理，Runtime 只负责受控 invocation 的输入、输出、权限、事件和 artifact。
+1. **持久 worker 上的委派（默认）**：Scheduler 选择 runnable endpoint 与匹配的 Worker Capacity，Runtime 经 controller REST API 选择或创建执行宿主，再用 `taskflow delegate_task` 委派 phase；worker 常驻并可承载多次 Invocation，但不拥有 Task、Attempt 或持久 Agent 身份。适合 plan / execute / verify 的长任务与需要稳定工具环境的执行。
+2. **WorkerFlow 临时 agent（ephemeral）**：`workflow_run` 创建 `tmp-` agent（独立 workspace、自定义 AGENTS.md/skills 模板），bounded 任务结束 `workflow_finish/fail` 后 `delete_temp_agent` 清理。适合一次性探索、并行检查、隔离验证。这是《统一设计》“Agent Invocation 是可替换的临时计算资源”的现成形态。
+3. **直接执行**：Runtime 在已选执行宿主中启动当前 endpoint 的 bounded Invocation。适合不拆分的 phase，但仍须经过 Invocation 记录、Context Slice、权限、输出契约和事件投影。
 
-| Open Design 源码 | 可以借鉴的内容 | 本系统落点 |
-|---|---|---|
-| [`docs/agent-adapters.md`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/docs/agent-adapters.md) | 高层 adapter 设计：detect / capabilities / run / cancel / resume / event stream / fallback / authorization boundary。文档里的 `AgentAdapter` 是概念接口。 | 本文的边界说明和 `AgentAdapter` 概念接口。 |
-| [`apps/daemon/src/runtimes/types.ts#L95-L247`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/types.ts#L95-L247) | 源码里的真实 adapter 形态是声明式 `RuntimeAgentDef`，包含 `id/name/bin/versionArgs/buildArgs/streamFormat/promptViaStdin/eventParser/authProbe/capabilityFlags/resume` 等。它比每个 adapter 实现完整 `run()` 更薄。 | 可抽成 `AgentProviderSpec` / `AgentAdapterSpec`：provider 只声明如何发现、如何组 argv/env、如何解析流、如何 resume；统一 run loop 由 Agent Runtime 管。 |
-| [`apps/daemon/src/runtimes/registry.ts`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/registry.ts) | 将 Claude / Codex / Cursor / OpenCode / ACP runtimes 注册到一个 `AGENT_DEFS` 列表，并检查重复 id。 | 本系统保留 provider registry，但 registry 只暴露 adapter 能力，不暴露 provider-specific flags 给 Scheduler。 |
-| [`apps/daemon/src/runtimes/detection.ts#L171-L260`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/detection.ts#L171-L260) | detection 先解析真实可执行文件，再并行做 help capability、model list、auth probe；capability flags 通过 `--help` 探测后缓存，供 `buildArgs` 决定是否传新 flag。 | `AgentAdapter.detect()` 和 `AgentCapabilities` 不应只写死；要支持版本/能力探测，避免旧 CLI 因未知 flag 直接失败。 |
-| [`packages/contracts/src/api/registry.ts#L82-L125`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/packages/contracts/src/api/registry.ts#L82-L125) | 对外暴露的 `AgentInfo` 只包含 available/auth/path/version/diagnostics/models/reasoningOptions/docsUrl/externalMcpInjection 等稳定字段。 | Control Plane / UI 只消费稳定能力和诊断，不直接消费 adapter 内部实现。 |
-| [`apps/daemon/src/server.ts#L5412-L5427`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/server.ts#L5412-L5427) | 统一 runner 在 spawn 前调用 `def.buildArgs(composed, images, allowedDirs, options, runtimeContext)`，runtimeContext 包含 cwd、prompt file、resumeSessionId、newSessionId。 | `AgentRunParams` 里明确区分 task 输入、workspace/cwd、allowed dirs、model/reasoning、session handle；adapter 只把这些翻译成 CLI argv/env。 |
-| [`apps/daemon/src/server.ts#L5836-L5885`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/server.ts#L5836-L5885) | 统一 spawn：计算 stdin 模式、合并 agent env、构造 command invocation、设置 cwd、stdio、process group。 | Agent Runtime 统一管理进程生命周期、cwd、env、stdio 和 pid；provider adapter 不直接管理 task 状态。 |
-| [`apps/daemon/src/server.ts#L7309-L7342`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/server.ts#L7309-L7342) | prompt 默认走 stdin，避免 Windows argv 长度限制；Claude stream-json 模式把 prompt 包成 JSONL user message，并保持 stdin 打开。 | 本系统抽象 `PromptTransport`：`stdin_text` / `stdin_jsonl` / `prompt_file` / `argv_small_only`。大 prompt 不走 argv。 |
-| [`apps/daemon/src/runtimes/defs/claude.ts#L17-L97`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/defs/claude.ts#L17-L97) | Claude Code wrapper：`claude -p`、stream-json 输入输出、capability-gated `--include-partial-messages` / `--add-dir`、`--session-id` / `--resume`、permission mode、MCP 注入策略。 | Claude MVP adapter 的主要参考；但 permission mode 不能默认照抄 bypass，需要由本系统 `PermissionPolicy` 显式决定。 |
-| [`apps/daemon/src/runtimes/defs/codex.ts#L61-L206`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/defs/codex.ts#L61-L206) | Codex wrapper：`codex exec --json`、stdin prompt、sandbox 策略、create/resume 参数差异、`-C cwd` / `--add-dir` 只在 create 时传、从 stream 捕获 thread id。 | Codex 后续 adapter 可借鉴 session resume 和 sandbox 翻译方式；尤其要避免把 create-only flags 传给 resume。 |
-| [`apps/daemon/src/runtimes/defs/cursor-agent.ts#L31-L106`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/defs/cursor-agent.ts#L31-L106) | Cursor Agent wrapper：print/headless、stream-json、workspace 参数、`--trust` 通过 capability probe 决定、auth probe。 | 证明 adapter 需要“按版本探测再传 flag”，不能把所有 provider 统一成一套固定参数。 |
-| [`apps/daemon/src/runtimes/defs/opencode.ts#L8-L90`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/defs/opencode.ts#L8-L90) | OpenCode wrapper：`opencode run --format json`、capture-style session resume、skip permission flag 探测、MCP 通过 env content 注入。 | 可借鉴“external tool/MCP 注入策略是 adapter capability”的表达，不要让上层直接知道 provider 配置格式。 |
-| [`apps/daemon/src/runtimes/json-event-stream.ts`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/json-event-stream.ts) | 将 Codex / Cursor / Gemini / OpenCode 的 JSON stream 归一成 `status/text_delta/tool_use/tool_result/usage/error/raw`。 | `AgentEvent` parser 应保留 provider raw event，并只向上暴露稳定小 schema。 |
-| [`apps/daemon/src/runtimes/claude-stream.ts`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/claude-stream.ts) | Claude stream-json 专用 parser，处理 init/status、assistant text、tool use/result、usage、session id、raw line。 | Claude MVP parser 的直接参考；本系统事件命名仍以本文 `AgentEvent` 为准。 |
-| [`apps/daemon/src/runtimes/runs.ts#L28-L190`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/runs.ts#L28-L190) | run service 维护 run 状态、SSE clients、内存事件、per-run JSONL event log、child pid、process group、eventsLogPath。 | `AgentAttempt` 生命周期和 Event Log 写入可以借鉴；Threadmill 不需要照搬 SSE，但需要持久化事件 ref。 |
-| [`apps/daemon/src/runtimes/runs.ts#L274-L405`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/runtimes/runs.ts#L274-L405) | cancel 逻辑：close stdin、清理 pending retry、优先 RPC abort、再 SIGTERM、grace wait、最后 SIGKILL。 | `AgentRuntime.cancel()` 应有分层策略：adapter-level cancel / stdin close / process signal / force kill，并记录取消事件。 |
-| [`docs/new-agent-runtime-acp.md`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/docs/new-agent-runtime-acp.md) | 推荐新 runtime 暴露 ACP over stdio CLI；daemon spawn 子进程，通过 stdin/stdout 说 JSON-RPC，stderr 只放日志。 | 如果未来自研 agent runtime，可优先做 stdio JSON-RPC wrapper，而不是让主进程直接绑定某个 SDK。 |
-| [`apps/daemon/src/acp.ts#L1578-L1606`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/acp.ts#L1578-L1606) | ACP session create/load：有 `resumeSessionId` 时走 `session/load`，否则 `session/new`，并从结果里取 durable session handle。 | 本系统 session resume 要区分 daemon-minted、provider-captured、ACP-load 三类，不要只有一个 boolean。 |
-| [`apps/daemon/src/acp.ts#L1320-L1330`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/acp.ts#L1320-L1330) | ACP `session/request_permission` 的自动选择逻辑。 | 可以借鉴 permission request 的事件形态，但是否自动 approve 必须由 Threadmill 的 `PermissionPolicy` 控制。 |
-| [`apps/daemon/src/acp.ts#L1715-L1737`](https://github.com/nexu-io/open-design/blob/02c68415e29dcab659f1835e8a41ec1a37fce303/apps/daemon/src/acp.ts#L1715-L1737) | ACP cancel：有 session 时先发 `session/cancel`，无论如何关闭 stdin，让子 runtime 自己释放资源。 | adapter-level cancel 应优先给 provider 自清理机会，再走进程级 kill。 |
+### 3.2 持久 worker 与 ephemeral invocation 的适配
 
-可以直接“抄结构”的部分：
-
-```text
-1. RuntimeAgentDef 这种声明式 provider spec。
-2. detect/version/auth/capability/model probe 拆分。
-3. buildArgs 只做 CLI 参数翻译，不拥有 task 状态。
-4. prompt transport 默认 stdin / JSONL / file，避免 argv 大 prompt。
-5. stream parser -> 小而稳定的 AgentEvent，同时保留 raw provider event。
-6. session resume policy 区分 daemon-minted、provider-captured、ACP-load。
-7. run lifecycle / session / cancel / event log 由统一 runtime 管。
-8. external MCP / tool config 作为 adapter injection policy，而不是上层直接拼 provider config。
-```
-
-不能直接抄的部分：
-
-```text
-1. Open Design 的 artifact / preview / plugin marketplace 绑定。
-2. 面向 Web UI 的 SSE shape。
-3. 默认 bypass / trust / yolo 之类 provider 权限策略。
-4. 把 graph/node/edge/control-flow 放进 Agent Runtime。
-5. 让 agent 直接写 Task Graph、ctxlib 或 main branch。
-```
+- **持久 worker 不等于持久 Agent 身份**。worker 是执行宿主：无状态，任何 Pod 重建后从 MinIO 恢复（`worker/README.md`）。Task / Attempt 身份在 Threadmill 侧（Coordination Graph + Workspace Binding），worker 容器可替换。
+- **每次 phase invocation 在 worker 内是独立会话/委派轮次**。丢弃 Thread 不丢失 Task（见 docs/CONTEXT.md 的 Thread 语义）：QwenPaw 会话文件位于 `sessions/`，agent 被禁止读取（SESSION_FILE_PROMPT_POLICY），Threadmill 也不把它们当编排输入。
+- **临时 agent 的 run 级共享目录**（`<default-workspace>/shared/workerflow/<runId>/`，含 `inputs/`、`outputs/<agent-id>/`）可作为 Attempt 级临时 Workspace；`runId` 可关联 AttemptID（workspace-merge.md §3.2）。
+- **形态选择规则**：需要稳定工具环境或长时运行 → 复用持久 worker 作为执行宿主；需要隔离/并行/一次性检查 → 临时 agent；两者都不提供持久 Agent 身份，且都必须经过同一 Threadmill 适配层（Invocation 记录、Context Slice、权限、输出契约、事件投影）。
 
 ---
 
-## 3. 非目标
+## 4. 状态转换
 
-第一阶段不追求：
+### 4.1 Worker 生命周期（直接复用，只读）
 
 ```text
-1. 同时完整支持所有 CLI agent。
-2. 暴露每个 CLI 的所有命令行参数给上层。
-3. 自己重新实现一个独立于 CLI 的工具系统。
-4. 自己重新实现一个独立于 CLI 的 worktree 抽象。
-5. 让 executor 在没有 plan / requirement 的情况下扩大 scope。
-6. 让 verifier 自我批准自己或同一 active context 的执行结果。
-7. 让 agent 直接写 Task Graph、ctxlib 或 main branch。
+Worker CR 创建 -> controller reconcile -> Pod 启动
+  -> Pending -> Starting -> Running（/api/version 就绪后 POST ready）
+  -> Updating（desired-state apply）-> Stopping/Sleeping/Stopped（spec.state）
+  -> Failed（容器异常）-> 删除/重建（MinIO 恢复，无状态）
 ```
+
+Threadmill 侧只读 `phase / lastHeartbeat / lastActiveAt` 做容量与健康判断，不写入。
+
+### 4.2 Invocation 生命周期（适配封装）
+
+委派形态：
+
+```text
+Scheduler 选择 runnable endpoint 与匹配容量，Runtime 选择执行宿主
+  -> taskflow delegate_task(spec)            TaskMeta: assigned
+  -> worker ack_task                          in_progress（Invocation 开始，task 目录就绪）
+  -> worker 执行（受 phase lease 与工具策略约束）
+  -> submit_task(summary, deliverables)       submitted（result.md 已写）
+  -> check_task                               返回 effective + validationErrors
+  -> 验收决策（verify passed / revision / blocked）
+```
+
+- 取消路径：`cancel_task(reason[, replacementTaskId])`；worker 掉线 → `LastHeartbeat` 超时 → Threadmill 标记 invocation failed，Attempt 可重试（新委派轮次）。
+- `submit_task` 是终态动作：提交后 worker 不得继续编辑旧 task（task-execution SKILL.md）；修订必须由 Leader 重新委派。
+
+临时 agent 形态：
+
+```text
+workflow_run(subagents | nodes)
+  -> create_temp_agent(tmp-*) + 发送 submit prompt
+  -> 每完成一个 node：workflow_update(steps: done)
+       -> 返回 readyInstructions 时继续派发下游 node
+  -> workflow_finish / workflow_fail
+  -> delete_temp_agent + cleanup_shared（finally 语义）
+```
+
+- 失败补偿：`workflow_run` 创建失败会回滚调用 `workflow_fail` 并清理已建 agent（`plugins/workerflow/mcp/server.py` `_fail_workflow_run_spawn`）。
+- 临时 agent 状态记录在 `<default-workspace>/shared/workerflow/<runId>/workflow.json`（status: running/done/failed；subagents/nodes/steps 行；readyInstructions/waitingInstructions；Matrix card eventId）。
+
+### 4.3 Attempt / phase 状态（Threadmill 新建）
+
+记录在 Coordination Graph 与 WorkspaceBinding（Threadmill 侧），不在 AgentTeams meta.json 中扩展：
+
+```text
+prepared -> plan(invoked/running/passed)
+  -> execute(invoked/running/passed)
+  -> verify(invoked/running/passed)
+  -> done
+任意 phase failed -> 新 Attempt 或 OrchestrationProposal（Task Manager 裁决）
+```
+
+一次委派轮次（§4.2）承载一个 phase invocation；Attempt 生命周期跨多个轮次，由 Task Manager 编排（统一设计 §3.1、§3.2）。
 
 ---
 
-## 4. 总体结构
+## 5. 权限、事件与过程上下文隔离
+
+### 5.1 权限与 phase lease（安全边界）
+
+AgentTeams 直接复用的权限原语：
+
+- **角色工具可见性**：`MESSAGE_TOOL_BLOCKED_ROLES = {"worker", "remote-member"}`（server.py）——worker 无跨会话 `message` 工具，只能回复当前房间。Threadmill 依赖此事实实现"无 Agent mailbox"。
+- **通道 ACL**：`desired.channelPolicy`（group/dm allow/deny）apply 到 `agentteams_matrix` ACL 命名空间（`/api/access-control/agentteams_matrix`）。
+- **存储权限**：AccessEntries 默认 object-storage scoped `agents/<name>/*` 与 `shared/*`（types.go AccessEntry 注释）；CredentialBinding + ToolWhitelist 按工具白名单授权。
+- **凭据**：`runtime.yaml` credentials 段只写 env 名/文件路径，不写值；Matrix token、gateway key、storage key 经 env / SA token 注入。
+- **敏感输出**：artifact 发布前 SENSITIVE_ARTIFACT_NAME_RE/TEXT_RE 拦截；`AGENTTEAMS_OUTPUT_SANITIZE_KEYWORDS` 输出清洗；Credential Safety 规则在 TEAMS.md 中不可覆盖。
+- **会话隐私**：SESSION_FILE_PROMPT_POLICY 禁止 agent 读取 `sessions/`。
+
+Threadmill 新建的 phase lease（基座无此概念）——一次 Attempt 任一时刻只有一个有效写 lease，实现分三层：
 
 ```text
-┌──────────────────────────────────────────────┐
-│              Control Plane / Scheduler       │
-│  task phase / system role / budget / capacity│
-└───────────────────────┬──────────────────────┘
-                        │
-                        ▼
-┌──────────────────────────────────────────────┐
-│                 Agent Runtime                │
-│  prepare / invoke / observe / summarize      │
-└───────────┬──────────────────────┬───────────┘
-            │                      │
-            ▼                      ▼
-┌──────────────────────┐  ┌────────────────────┐
-│    Agent Adapter     │  │ Event / Artifact   │
-│ detect/run/parse     │  │ log refs / blobs   │
-└───────────┬──────────┘  └────────────────────┘
-            │
-            ▼
-┌──────────────────────────────────────────────┐
-│       Agent Invocation in controlled boundary│
-│ task_manager / ctx_manager / plan/exec/verify│
-│ Claude Code / Codex / Gemini / Custom        │
-└───────────────────────┬──────────────────────┘
-                        │
-                        ▼
-┌──────────────────────────────────────────────┐
-│      AgentResult + observed write set        │
-│  summary / status / artifacts / event refs   │
-└──────────────────────────────────────────────┘
+a) 委派轮次隔离（强）：每 phase 一次 taskflow 委派给不同 worker / 每 phase 一个 WorkerFlow 临时 agent
+   -> 容器或进程级隔离，天然满足"一个写 lease"；
+b) 工具级（中）：MCP allow policy（QwenPaw MCP Policy API）+ 目录 ACL（AccessEntries）
+   -> plan 只授只读工具与 plan 目录写权；execute 才授实现写权；verify 只授检查工具与 evidence 目录写权；
+c) 提示词级（弱，兜底）：worker.md + phase prompt 声明只读/只写边界。
 ```
 
-一句话概括：
+lease 记录在 `WorkspaceBinding.PhaseLeases`（phase → invocation id）。Task Manager 通过图激活或失效 endpoint；Runtime 在启动已调度 Invocation 前向 Workspace Service 取得并校验 lease，phase 结束后释放（统一设计 §3.3）。
 
-```text
-Agent Runtime 从 Control Plane / Scheduler 接收一个 AgentRunParams。这个 run 可以是普通 task phase attempt，也可以是 task_manager / ctx_manager 这类系统 agent invocation。Runtime 准备 context、workspace、权限和工具边界，选择合适 adapter 运行 agent，把输出解析成统一事件，观察实际写入和 diff，最后返回可验收的 AgentResult。
-```
+### 5.2 事件
+
+AgentTeams 原生事件面：
+
+- 心跳：本地 `heartbeat.json` + `POST /api/v1/workers/{name}/ready|heartbeat`（heartbeat.py）。
+- 运行关联 trace：`AgentTeamsTaskSpanProcessor` 给每轮 entry span 打 `agentteams.task.id` / `agentteams.project.id`（task_trace.py）。
+- 协作事实：Matrix 房间消息、`shared/tasks/*/meta.json`、`result.md`、`workflow.json`。
+
+Threadmill 新建 Event Log 投影：Runtime 把委派/ack/submit/取消、心跳超时、trace 关联与文件事实投影为统一 invocation 事件（invoked / acked / submitted / failed / cancelled + 证据 refs）。**AgentTeams 没有 Event Log**；投影器是 Threadmill 组件，消费上述原生事实流。
+
+### 5.3 过程上下文隔离
+
+- 运行过程上下文（中间推理、工具输出、探索轨迹、未提交文件状态）留在 Invocation 内：QwenPaw `sessions/` 私有；Matrix 线程对房间成员可见但不进入编排。
+- Task Manager 只能看到：它自己写的 spec、`result.md`、deliverables、`check_task` 返回、EvidenceRefs——即《统一设计》§5.5 的两个结构化边界：`PhaseOutput` 与 `OrchestrationProposal`。
+- worker 主动提交 `OrchestrationProposal`：在 result.md 内嵌块或独立 deliverable 中提交（Threadmill 扩展 result 契约），Runtime 只校验形状与必填引用并转交 Task Manager；Task Manager 审批后热修改 Coordination Graph（Coordination Graph 可热修改、Task Manager 唯一写）。
 
 ---
 
-## 5. 核心接口
+## 6. Context 读操作与结构化输出
 
-## 5.1 接口设计参考原则
+### 6.1 Context Graph 读操作（全部 Threadmill 新建）
 
-核心接口也参考 Open Design，但参考的不是“每个 provider 都实现一个很厚的 `run()` 类”，而是源码里更实际的形态：
+AgentTeams 没有 Context Graph。`ListSubgraphs / Explore / Retrieve / Subscribe` 由 Threadmill 新建的 `threadmill-ctx` MCP server 实现，并通过 `desired.mcpServers` 注入每个 worker（直接复用 QwenPaw 的 MCP 注入机制：`update.py` apply → `/api/mcp`）。所有角色（planner / executor / verifier / Task Manager）在 phase 委派中使用同一组 Context 读工具。
 
-```text
-RuntimeAgentDef / provider spec
-  + centralized AgentRunService / daemon runner
-  + provider-specific buildArgs / eventParser / probe / resume policy
+- Ctx Manager 只响应 `Retrieve` 检索与 MemoryCandidate 准入；不主动巡图，也不产生订阅外上下文。
+- 订阅只有两种来源：Context service 生成初始/检索切片时的自动订阅，或 Agent 从可见子图列表主动 `Subscribe`（统一设计 §14.1）。
+- 推送由 Threadmill 自动订阅执行器执行（增量、可合并、可重放），物理通道复用 Matrix/会话基础设施；对 worker 的 Delta 注入发生在委派轮次边界或 QwenPaw 会话内，不依赖 worker 的 `message` 工具（该工具对 worker 禁用，与"无订阅外旁路推送"的语义一致）。
+- `ContextSubscription`（consumer_invocation_id / subgraph_ids / source: initial_slice | retrieval | explicit / permission_snapshot / expires_at）是订阅语义的唯一运行关系，随 Invocation 结束过期，不引入 Notification 或 mailbox 实体（统一设计 §14.1）。
+- 初始 Context Slice：Context service 在 Task Manager 生成 phase spec 时组装，随 `spec.md` 与 prompt 注入（复用 spec 传输通道）；slice 内子图自动建立与 Invocation 同寿命的订阅。
+
+### 6.2 结构化输出
+
+直接复用 TaskResult 状态机作为 PhaseOutput 状态基线（server.py `ALLOWED_TASK_RESULT_STATUSES`）：
+
+| TaskResult（submit_task） | PhaseOutput 语义 |
+| --- | --- |
+| `SUCCESS` | passed |
+| `SUCCESS_WITH_NOTES` | passed + notes |
+| `REVISION_NEEDED` | failed（revision）→ 同一 Attempt 重试或新 Attempt |
+| `BLOCKED` | failed（blocked）+ 建议编排（OrchestrationProposal） |
+| `FAILED` / `PARTIAL` | failed + 原因 |
+
+result.md 内嵌结构化载荷（Threadmill 适配，不改 AgentTeams 协议，result.md 是 worker 拥有的自由 markdown）：
+
+```jsonc
+{
+  "phase_output": {           // PhaseOutput 形状（统一设计 §5.6）
+    "endpoint": {"task_id": "…", "attempt_id": "…", "phase": "execute"},
+    "delivery_refs": ["shared/tasks/<attempt_id>/workspace/…"],
+    "report_ref": "shared/tasks/<attempt_id>/result.md",
+    "evidence_refs": ["shared/tasks/<attempt_id>/evidence/…"],
+    "workspace_revision": "…",
+    "context_graph_revision": 0
+  },
+  "memory_candidates": [      // MemoryCandidate（统一设计 §12.1），Runtime 自动记录
+    {"client_ref": "…", "statement": "…", "kind": "fact", "why_reusable": "…"}
+  ],
+  "observed_write_set": {"files": ["shared/tasks/<attempt_id>/workspace/src/a.py"], "contracts": []},
+  "orchestration_proposal": null  // 可选，见 §5.3
+}
 ```
 
-也就是说：
+Runtime 校验输出形状与必填引用（统一设计 §5.6），不解释内容；`deliverables` 必须位于 `shared/tasks/{task_id}` 下（`_validate_task_deliverables` 强制）。
 
-```text
-- provider 侧接口尽量声明式，描述如何 detect、如何拼命令、如何解析流、如何恢复 session。
-- runtime 侧接口统一管理 run state、cwd/env/stdio、prompt transport、event log、cancel 和 result 汇总。
-- Control Plane / Scheduler 只看 AgentInfo / AgentCapabilities / AgentResult，不接触 provider-specific flags。
-```
+### 6.3 输出契约
 
-`AgentAdapter` 仍可作为概念 facade，但实现上优先落成 `AgentProviderSpec + AgentRunService`。
+DeliverySpec / ReportSpec 由 Task Manager 在委派时写入 `spec.md` 与 prompt；未规定二者的 endpoint 不可调度（统一设计 §5.6）。worker 按 spec 交付；`check_task` 的 result contract 校验（status + deliverable 前缀）复用为 VerifyResult 的机械部分，语义判断由 Threadmill verifier 完成（workspace-merge.md §4.2）。
 
 ---
 
-## 5.2 AgentProviderSpec
+## 7. 不变量
 
-`AgentProviderSpec` 对应 Open Design 源码里的 `RuntimeAgentDef` 思路，是 provider adapter 的主要实现单元。
-
-```go
-type AgentProviderSpec struct {
-	// ID 是 runtime 内部稳定标识，例如 "claude-code" 或 "codex"。
-	ID string `json:"id"`
-	// DisplayName 是 Electron/React UI 展示名称。
-	DisplayName string `json:"display_name"`
-	// Provider 标记底层 CLI / stdio runtime 类型。
-	Provider ProviderKind `json:"provider"`
-
-	// DocsURL 指向 provider 官方文档或本地说明。
-	DocsURL string `json:"docs_url,omitempty"`
-	// Executable 描述可执行文件查找方式；PATH 探测留在 adapter 内。
-	Executable ExecutableSpec `json:"executable"`
-	// VersionArgs 是版本探测参数，例如 ["--version"]。
-	VersionArgs []string `json:"version_args,omitempty"`
-
-	// Detect / Probe 是声明式探测配置，不拥有 task 状态。
-	Detect DetectionSpec `json:"detect"`
-	AuthProbe *AuthProbeSpec `json:"auth_probe,omitempty"`
-	CapabilityProbe *CapabilityProbeSpec `json:"capability_probe,omitempty"`
-	ModelProbe *ModelProbeSpec `json:"model_probe,omitempty"`
-
-	// PromptTransport 决定 prompt 通过 stdin、JSONL、文件还是 JSON-RPC 传入。
-	PromptTransport PromptTransport `json:"prompt_transport"`
-	// StreamFormat 决定 provider 原始输出格式，parser 据此转换成 AgentEvent。
-	StreamFormat StreamFormat `json:"stream_format"`
-
-	// BuildArgs 只把统一参数翻译成 argv/env/stdin，不直接调度 task。
-	BuildArgs func(input AgentCommandBuildInput) (AgentCommand, error) `json:"-"`
-	// ParseEvent 只做 raw provider event -> 统一 AgentEvent 的映射。
-	ParseEvent func(raw RawProviderEvent, ctx EventParseContext) ([]AgentEvent, error) `json:"-"`
-
-	// 生命周期、权限和工具注入策略都在 runtime 边界收口。
-	SessionPolicy SessionPolicy `json:"session_policy"`
-	CancelPolicy CancelPolicy `json:"cancel_policy"`
-	PermissionMapping PermissionMapping `json:"permission_mapping"`
-	ToolInjectionPolicy *ToolInjectionPolicy `json:"tool_injection_policy,omitempty"`
-}
-```
-
-关键约束：
-
-```text
-1. build_args 只把 AgentRunParams / RuntimeContext 翻译成 argv/env/stdin 策略，不拥有 task 状态。
-2. parse_event 只做 provider raw event -> AgentEvent 的映射，并保留 raw。
-3. detect / auth / capability / model probe 可以按版本和 --help 结果动态决定能力。
-4. session_policy 明确 create/resume/load 的差异，避免把 create-only flags 传给 resume。
-5. permission_mapping 只能表达 provider 参数映射，最终是否允许 bypass/trust/yolo 由 PermissionPolicy 决定。
-```
-
-命令构建输入：
-
-```go
-type AgentCommandBuildInput struct {
-	// Params 是 Control Plane 传入的稳定运行意图。
-	Params AgentRunParams `json:"params"`
-	// Detection 是 detect/version/auth 结果，供 build args 做兼容判断。
-	Detection AgentDetection `json:"detection"`
-	// Capabilities 是已探测出的 provider 能力。
-	Capabilities AgentCapabilities `json:"capabilities"`
-	// RuntimeContext 是本次运行的 cwd、权限目录和 session 上下文。
-	RuntimeContext AgentRuntimeContext `json:"runtime_context"`
-}
-
-type AgentRuntimeContext struct {
-	// CWD 是 agent 进程启动目录，通常是 attempt worktree。
-	CWD string `json:"cwd"`
-	// AllowedDirs 是 wrapper 允许 provider 读取/写入的目录边界。
-	AllowedDirs []string `json:"allowed_dirs"`
-	// PromptFile 是大 prompt 的临时文件路径，避免塞进 argv。
-	PromptFile string `json:"prompt_file,omitempty"`
-	// ResumeSessionID 是恢复已有 provider session 的句柄。
-	ResumeSessionID string `json:"resume_session_id,omitempty"`
-	// NewSessionID 是 runtime 生成的新 session 标识。
-	NewSessionID string `json:"new_session_id,omitempty"`
-	// EnvOverrides 是本次运行允许注入的环境变量白名单。
-	EnvOverrides map[string]string `json:"env_overrides,omitempty"`
-}
-
-type AgentCommand struct {
-	// ExecutablePath 是最终执行的 CLI 或 stdio runtime 路径。
-	ExecutablePath string `json:"executable_path"`
-	// Args 是 provider-specific 参数，只在 adapter 内生成。
-	Args []string `json:"args"`
-	// Env 是最小环境变量集合，不隐式泄漏全局环境。
-	Env map[string]string `json:"env,omitempty"`
-	// CWD 是进程工作目录。
-	CWD string `json:"cwd"`
-	// Stdin 描述 stdin_text / jsonl / json_rpc 等输入计划。
-	Stdin *StdinPlan `json:"stdin,omitempty"`
-}
-```
-
-Prompt transport 参考 Open Design 的 stdin / JSONL / prompt file 策略：
-
-```go
-type PromptTransportKind string
-
-const (
-	PromptTransportStdinText PromptTransportKind = "stdin_text"
-	PromptTransportStdinJSONL PromptTransportKind = "stdin_jsonl"
-	PromptTransportPromptFile PromptTransportKind = "prompt_file"
-	PromptTransportArgvSmallOnly PromptTransportKind = "argv_small_only"
-	PromptTransportJSONRPC PromptTransportKind = "json_rpc"
-)
-
-type PromptTransport struct {
-	// Kind 决定 prompt 的传输方式；大 prompt 优先走 stdin 或文件。
-	Kind PromptTransportKind `json:"kind"`
-	// MessageShape 只在 JSONL 模式下使用。
-	MessageShape string `json:"message_shape,omitempty"`
-	// MaxBytes 只在 argv_small_only 模式下使用，超过必须失败或切换策略。
-	MaxBytes int `json:"max_bytes,omitempty"`
-}
-```
-
-Session / cancel 也作为显式接口，而不是藏在 provider flags 里：
-
-```go
-type SessionPolicy struct {
-	// Mode 区分不支持 session、runtime 生成 session、provider 回传 session、ACP load 等模式。
-	Mode SessionMode `json:"mode"`
-	// CreateArg 是创建新 session 时使用的 provider 参数。
-	CreateArg string `json:"create_arg,omitempty"`
-	// ResumeArg 是恢复 session 时使用的 provider 参数。
-	ResumeArg string `json:"resume_arg,omitempty"`
-	// LoadMethod 是 JSON-RPC/ACP 类 runtime 的 session 加载方法名。
-	LoadMethod string `json:"load_method,omitempty"`
-	// CaptureFromEvent 表示 session id 需要从 provider event 中捕获。
-	CaptureFromEvent bool `json:"capture_from_event,omitempty"`
-}
-
-type CancelPolicy struct {
-	// PreferAdapterCancel 表示优先使用 provider 原生 cancel。
-	PreferAdapterCancel bool `json:"prefer_adapter_cancel"`
-	// CloseStdin 表示 cancel 时先关闭 stdin，让 provider 自行收尾。
-	CloseStdin bool `json:"close_stdin"`
-	// TerminateSignal 是平台相关的温和终止信号，例如 SIGTERM / CTRL_BREAK。
-	TerminateSignal string `json:"terminate_signal,omitempty"`
-	// GraceMS 是温和终止后的等待时间。
-	GraceMS int `json:"grace_ms"`
-	// ForceKill 表示超时后是否允许强杀进程树。
-	ForceKill bool `json:"force_kill"`
-}
-```
+1. 所有 Agent（含 Task Manager）都经 Runtime 边界执行：Task Manager 在 Manager/controller 侧，phase agent 在 worker/临时 agent 侧，两侧都经过同一适配层（Context 注入、输出契约、事件投影）。
+2. Runtime 不判断 Task 完成、不解释编排建议、不写 Coordination Graph / Context Graph、不合并 main。
+3. worker 无 `message` 工具；不存在 Agent mailbox；外部记忆只来自切片、图探索、检索、订阅与自动 Delta。
+4. 过程上下文留在 Invocation 内；Task Manager 只消费 `PhaseOutput` / `OrchestrationProposal` 与证据。
+5. 每次 invocation 有 workspace 边界、权限快照与输出契约；Observed Write Set 以 Runtime 观察为准，agent 自报只能作参考。
+6. 替换/取消不静默：worker 替换、临时 agent 失败清理、cancel 都必须产生显式事件。
+7. AgentTeams 的委派协议不承载 Threadmill 的图状态：TaskMeta / ProjectMeta 不写 Coordination/Context Graph 字段；图只存于 Threadmill 侧。
+8. 订阅推送必须由已存在订阅触发；不提供订阅之外的旁路推送。
 
 ---
 
-## 5.3 AgentRegistry / AgentRunService
-
-`AgentRegistry` 对应 Open Design 的 runtime registry：集中注册 provider，并只向上暴露稳定 `AgentInfo`。
-
-```go
-type AgentRegistry interface {
-	// List 返回 UI / Scheduler 可见的 agent 摘要，不暴露 provider flags。
-	List(ctx context.Context) ([]AgentInfo, error)
-	// Get 按 provider_id 取声明式 provider spec。
-	Get(ctx context.Context, providerID string) (*AgentProviderSpec, error)
-	// Resolve 根据角色、能力和策略返回候选 provider。
-	Resolve(ctx context.Context, requirement AgentRequirement) ([]AgentProviderSpec, error)
-}
-
-type AgentInfo struct {
-	// ID 是 runtime 层 provider 标识。
-	ID string `json:"id"`
-	// DisplayName 是 UI 展示名称。
-	DisplayName string `json:"display_name"`
-	// Provider 是底层 agent 类型。
-	Provider ProviderKind `json:"provider"`
-	// Available 表示本机是否探测到可用 executable 和基础配置。
-	Available bool `json:"available"`
-	// AuthState 表示认证是否可用；unknown 不应静默当作 ok。
-	AuthState AuthState `json:"auth_state"`
-	ExecutablePath string `json:"executable_path,omitempty"`
-	Version string `json:"version,omitempty"`
-	Diagnostics []string `json:"diagnostics,omitempty"`
-	Capabilities AgentCapabilities `json:"capabilities"`
-	Models []AgentModelInfo `json:"models,omitempty"`
-	DocsURL string `json:"docs_url,omitempty"`
-}
-```
-
-`AgentRunService` 对应 Open Design 的 centralized runner：它消费 `AgentProviderSpec`，而不是让每个 provider 自己管理完整 run lifecycle。
-
-```go
-type AgentRunService interface {
-	// Invoke 启动一次 agent run；事件通过只读 channel 流式返回。
-	Invoke(ctx context.Context, providerID string, params AgentRunParams) (<-chan AgentEvent, error)
-	// Resume 恢复已有 run/session；不支持时返回明确错误。
-	Resume(ctx context.Context, runID string, message string) (<-chan AgentEvent, error)
-	// Cancel 请求取消 run；实现必须记录 cancel 事件并清理进程资源。
-	Cancel(ctx context.Context, runID string, reason string) error
-	// GetRun 返回 runtime 维护的 run state 投影。
-	GetRun(ctx context.Context, runID string) (*AgentRunState, error)
-}
-
-type AgentRunState struct {
-	// RunID 是 runtime run 的唯一标识。
-	RunID string `json:"run_id"`
-	ProviderID string `json:"provider_id"`
-	// Status 是 run lifecycle 状态，不等于 task 状态。
-	Status AgentRunStatus `json:"status"`
-	PID int `json:"pid,omitempty"`
-	// SessionHandle 保存 provider session 的恢复信息。
-	SessionHandle *AgentSessionHandle `json:"session_handle,omitempty"`
-	CWD string `json:"cwd"`
-	EventLogRef string `json:"event_log_ref,omitempty"`
-	ArtifactRefs []string `json:"artifact_refs"`
-	StartedAt *time.Time `json:"started_at,omitempty"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
-}
-```
-
-`AgentRunService` 负责：
-
-```text
-- 根据 AgentProviderSpec.build_args 生成 AgentCommand。
-- 统一 spawn 进程或 stdio JSON-RPC 子 runtime。
-- 按 PromptTransport 写 stdin / JSONL / prompt file。
-- 调用 provider parser 生成 AgentEvent，并写入 Event Log。
-- 维护 session_handle、pid、process group 和 run state。
-- 按 CancelPolicy 做 adapter cancel -> close stdin -> terminate -> force kill。
-- 汇总 AgentResult，但不直接修改 Task Graph。
-```
-
----
-
-## 5.4 AgentAdapter
-
-`AgentAdapter` 是不同 CLI agent 的概念归一化边界。实际实现优先由 `AgentProviderSpec` 声明 provider 差异，再由统一 `AgentRunService` 执行。
-
-```go
-type AgentAdapter interface {
-	// ID 返回 adapter 稳定标识。
-	ID() string
-	// DisplayName 返回 UI 展示名称。
-	DisplayName() string
-	// Provider 返回底层 agent 类型。
-	Provider() ProviderKind
-
-	// Detect 探测 CLI 是否安装、版本和认证状态。
-	Detect(ctx context.Context) (*AgentDetection, error)
-	// Capabilities 返回 adapter 已知能力。
-	Capabilities(ctx context.Context) (AgentCapabilities, error)
-
-	// Run 启动 provider 并流式返回统一 AgentEvent。
-	Run(ctx context.Context, params AgentRunParams) (<-chan AgentEvent, error)
-	// Cancel 取消正在运行的 provider session / process。
-	Cancel(ctx context.Context, runID string) error
-	// Resume 可选；不支持时返回明确错误，而不是静默新开 session。
-	Resume(ctx context.Context, runID string, message string) (<-chan AgentEvent, error)
-}
-```
-
-adapter / provider spec 负责：
-
-```text
-- 找到 CLI executable。
-- 判断版本和认证状态。
-- 构造 provider-specific spawn 命令。
-- 决定 prompt 通过 argv、stdin、JSON-RPC 还是 HTTP 传递。
-- 设置 cwd、env、权限、工具和可读目录。
-- 解析 stdout / stderr / JSONL / JSON-RPC / SSE。
-- 把 provider 原始事件映射成统一 AgentEvent。
-```
-
----
-
-## 5.5 AgentDetection
-
-CLI 存在不代表可以无头运行，因此 detection 需要记录认证和配置状态。
-
-```go
-type AgentDetection struct {
-	// Provider 是被探测的底层 agent 类型。
-	Provider ProviderKind `json:"provider"`
-	// ExecutablePath 是实际命中的可执行文件路径。
-	ExecutablePath string `json:"executable_path"`
-	// Version 是 provider 版本文本或规范化版本号。
-	Version string `json:"version"`
-	// ConfigDir 是 provider 本地配置目录。
-	ConfigDir string `json:"config_dir,omitempty"`
-	// NativeSkillsDir 是 provider 原生 skill/prompt 目录。
-	NativeSkillsDir string `json:"native_skills_dir,omitempty"`
-	// AuthState 是认证状态。
-	AuthState AuthState `json:"auth_state"`
-	// InstallHint 是不可用时给 UI 展示的安装/修复提示。
-	InstallHint string `json:"install_hint,omitempty"`
-	// Error 是探测失败的诊断文本。
-	Error string `json:"error,omitempty"`
-}
-```
-
-检测结果用于：
-
-```text
-- 判断 adapter 是否可调度。
-- 在 UI 中提示缺少 CLI、缺少认证或版本不支持。
-- 决定是否允许 fallback 到其他 adapter。
-```
-
----
-
-## 5.6 AgentCapabilities
-
-Capability 不描述所有 CLI flags，只描述调度和上层产品需要知道的能力。
-
-```go
-type AgentCapabilities struct {
-	// SupportsHeadless 表示是否可无交互运行。
-	SupportsHeadless bool `json:"supports_headless"`
-	// SupportsStreaming 表示是否能实时输出事件。
-	SupportsStreaming bool `json:"supports_streaming"`
-	// SupportsStructuredOutput 表示是否能约束结构化输出。
-	SupportsStructuredOutput bool `json:"supports_structured_output"`
-	SupportsToolCalling bool `json:"supports_tool_calling"`
-	SupportsFileEdit bool `json:"supports_file_edit"`
-	SupportsShell bool `json:"supports_shell"`
-	SupportsMCP bool `json:"supports_mcp"`
-
-	// Worktree/CWD/Git 隔离优先使用 CLI 自身能力；不支持时由 wrapper 兜底。
-	SupportsGitWorktree bool `json:"supports_git_worktree"`
-	SupportsAdditionalDirectories bool `json:"supports_additional_directories"`
-
-	SupportsResume bool `json:"supports_resume"`
-	SupportsNativeSkillLoading bool `json:"supports_native_skill_loading"`
-	SupportsSurgicalEdit bool `json:"supports_surgical_edit"`
-
-	// PermissionMode 是 provider 原生权限能力，不代表 runtime 一定允许使用。
-	PermissionMode PermissionMode `json:"permission_mode"`
-	ContextWindowHint int `json:"context_window_hint,omitempty"`
-	CostModel *CostModel `json:"cost_model,omitempty"`
-	// DefaultRoles 表示该 provider 默认适合承担哪些 agent 角色。
-	DefaultRoles []AgentRole `json:"default_roles"`
-}
-```
-
-调度使用 capability 做硬约束：
-
-```text
-- 需要改文件的 execute task 不能调度到不支持 file_edit 的 adapter。
-- 需要运行测试的 verifier 不能调度到不支持 shell 的 adapter。
-- 需要实时 UI 的运行优先选择 supports_streaming 的 adapter。
-- skill 要求 native skill loading 时，不支持的 adapter 必须改用 prompt injection 或被排除。
-```
-
----
-
-## 5.7 AgentRunParams
-
-`AgentRunParams` 是 adapter 的稳定输入。它表达运行意图，不暴露 provider-specific flags。
-
-```go
-type AgentRunParams struct {
-	// RunID 是 runtime run id；InvocationID 是上层 task phase invocation id。
-	RunID string `json:"run_id"`
-	InvocationID string `json:"invocation_id"`
-
-	// CWD 是 agent 运行目录；WorktreeID 关联 Workspace/Merge 模块。
-	CWD string `json:"cwd"`
-	WorktreeID string `json:"worktree_id,omitempty"`
-
-	// Role / Phase 表达调度意图，不暴露 provider-specific flags。
-	Role AgentRole `json:"role"`
-	Phase AgentPhase `json:"phase"`
-
-	// SystemPrompt / UserPrompt 是 runtime 注入 provider 的最终提示词。
-	SystemPrompt string `json:"system_prompt"`
-	UserPrompt string `json:"user_prompt"`
-
-	// ContextPackDir 是 Ctx Agent 生成的只读上下文包目录。
-	ContextPackDir string `json:"context_pack_dir,omitempty"`
-	// SkillDir 是本次可注入 skill 的目录。
-	SkillDir string `json:"skill_dir,omitempty"`
-
-	AllowedTools []ToolCapability `json:"allowed_tools,omitempty"`
-	TimeoutMS int `json:"timeout_ms,omitempty"`
-	BudgetLimit *BudgetLimit `json:"budget_limit,omitempty"`
-	// OutputSchema 是 verifier/planner 等结构化输出的 JSON Schema。
-	OutputSchema *JSONSchema `json:"output_schema,omitempty"`
-	// Metadata 绑定 task graph provenance。
-	Metadata AgentRunMetadata `json:"metadata"`
-}
-
-type AgentRunMetadata struct {
-	TaskID string `json:"task_id"`
-	AttemptID string `json:"attempt_id"`
-	RequirementRefs []string `json:"requirement_refs"`
-}
-```
-
-provider-specific 设置留在 adapter 内部或 adapter config 中，例如 Claude Code adapter 可以内部选择：
-
-```text
-claude -p --output-format stream-json --verbose --permission-mode <mode>
-```
-
-而 Codex / Gemini adapter 可以选择自己的 headless 命令、stdin 策略和 stream parser。
-
----
-
-## 5.8 AgentEvent
-
-`AgentEvent` 是 Runtime 向 Event Log、UI 和 projection 暴露的统一流式事件。
-
-```go
-type AgentEventKind string
-
-const (
-	AgentEventThinking AgentEventKind = "thinking"
-	AgentEventTextDelta AgentEventKind = "text_delta"
-	AgentEventToolCall AgentEventKind = "tool_call"
-	AgentEventToolResult AgentEventKind = "tool_result"
-	AgentEventFileWrite AgentEventKind = "file_write"
-	AgentEventError AgentEventKind = "error"
-	AgentEventDone AgentEventKind = "done"
-)
-
-// AgentEvent 是 Go 后端持久化和推送给 Electron/React UI 的统一事件 envelope。
-type AgentEvent interface {
-	// Kind 返回事件类型，便于 Event Log、投影和前端渲染分发。
-	Kind() AgentEventKind
-	// RunID 返回所属 runtime run。
-	RunID() string
-}
-```
-
-### AgentThinkingEvent
-
-```go
-type AgentThinkingEvent struct {
-	// Type 固定为 "thinking"，表示模型思考或中间推理摘要。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	Text string `json:"text"`
-	// Raw 保留 provider 原始事件，便于审计和 parser 修正。
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-### AgentTextDeltaEvent
-
-```go
-type AgentTextDeltaEvent struct {
-	// Type 固定为 "text_delta"，表示可展示文本增量。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	Text string `json:"text"`
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-### AgentToolCallEvent
-
-```go
-type AgentToolCallEvent struct {
-	// Type 固定为 "tool_call"，表示 agent 请求调用工具。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	// ToolCallID 用于把 call 与 result 关联起来。
-	ToolCallID string `json:"tool_call_id,omitempty"`
-	Name string `json:"name"`
-	Input any `json:"input,omitempty"`
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-### AgentToolResultEvent
-
-```go
-type AgentToolResultEvent struct {
-	// Type 固定为 "tool_result"，表示工具调用结果。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	ToolCallID string `json:"tool_call_id,omitempty"`
-	Output any `json:"output,omitempty"`
-	// IsError 表示工具执行失败，但不一定代表整个 run 失败。
-	IsError bool `json:"is_error,omitempty"`
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-### AgentFileWriteEvent
-
-如果 provider 没有原生 file write event，Runtime 可以通过 write-set 观察合成该事件。
-
-```go
-type AgentFileWriteEvent struct {
-	// Type 固定为 "file_write"；provider 不支持时由 runtime write-set 观察合成。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	Path string `json:"path"`
-	Operation FileOperation `json:"operation,omitempty"`
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-### AgentErrorEvent
-
-```go
-type AgentErrorEvent struct {
-	// Type 固定为 "error"，表示 provider/runtime 层错误。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	Message string `json:"message"`
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-### AgentDoneEvent
-
-```go
-type AgentDoneEvent struct {
-	// Type 固定为 "done"，表示 run 事件流结束。
-	Type AgentEventKind `json:"type"`
-	RunIDValue string `json:"run_id"`
-	Reason AgentDoneReason `json:"reason"`
-	Raw any `json:"raw,omitempty"`
-}
-```
-
-原则：
-
-```text
-1. 上层只依赖统一 AgentEvent。
-2. provider 原始事件必须保留 raw，便于审计和后续 parser 修正。
-3. 大输出不直接塞进 event，进入 Artifact Store，用 ref 关联。
-4. Event Log 由 Runtime 自动记录，agent 不显式写日志。
-```
-
----
-
-## 5.9 AgentResult
-
-`AgentResult` 是一次 invocation 的最终汇总。
-
-```go
-type AgentResult struct {
-	// InvocationID / RunID 连接 task phase invocation 与 runtime run。
-	InvocationID string `json:"invocation_id"`
-	RunID string `json:"run_id"`
-	TaskID string `json:"task_id"`
-	AttemptID string `json:"attempt_id"`
-	Phase AgentPhase `json:"phase"`
-
-	// Status 是本次 invocation 的业务汇总状态。
-	Status AgentResultStatus `json:"status"`
-	Summary string `json:"summary"`
-	// StructuredOutput 保存通过 output schema 解析出的结构化结果。
-	StructuredOutput any `json:"structured_output,omitempty"`
-
-	// TouchedFilesDeclared 是 agent 自报的修改范围。
-	TouchedFilesDeclared []string `json:"touched_files_declared"`
-	// TouchedFilesObserved 是 Runtime 从 git/write-set 观察到的真实修改范围。
-	TouchedFilesObserved []string `json:"touched_files_observed"`
-
-	// SubmittedRequirementRefs 是 agent 提交给 Task Manager 的 requirement；agent 不直接写 task/edge。
-	SubmittedRequirementRefs []string `json:"submitted_requirement_refs"`
-	ContextQueries []string `json:"context_queries"`
-	ArtifactRefs []string `json:"artifact_refs"`
-	EventRefs []string `json:"event_refs"`
-	Usage *AgentUsage `json:"usage,omitempty"`
-}
-
-type AgentUsage struct {
-	DurationMS int `json:"duration_ms,omitempty"`
-	TokenUsage any `json:"token_usage,omitempty"`
-	CostUSD float64 `json:"cost_usd,omitempty"`
-}
-```
-
-`expanded_task_graph` 的含义不是 agent 直接写了 task graph，而是它提交了 requirement，Task Manager Agent 已经或将要把它编排成 task graph 变更。
-
----
-
-## 6. Runtime 执行流程
-
-一次 task phase attempt 的执行流程：
-
-```text
-1. Scheduler 选择可运行 task phase 和角色。
-2. Runtime 根据角色和 capability 选择 adapter。
-3. Runtime 准备 cwd/worktree、context pack、task contract 和 output schema。
-4. Runtime 生成 system prompt 与 user prompt。
-5. Runtime 调用 AgentRunService.invoke(provider_id, params)。
-6. AgentRunService 根据 AgentProviderSpec 启动 CLI/stdio runtime，并解析输出为 AgentEvent。
-7. Runtime 自动写入 Event Log，并把大对象写入 Artifact Store。
-8. Runtime 观察 worktree diff 和 touched files。
-9. Runtime 汇总 AgentResult。
-10. Control Plane 路由 AgentResult：Task Manager Agent 负责 Task Graph 写入，Verifier 负责验收，Merge Queue 负责合并。
-```
-
-流程示意：
-
-```text
-Task Contract
-  -> Context Pack
-  -> Workspace Binding
-  -> AgentRunParams
-  -> AgentRunService.invoke()
-  -> AgentEvent stream
-  -> Event Log / Artifact Store
-  -> Observed Write Set
-  -> AgentResult
-```
-
----
-
-## 7. Workspace / Worktree / Git
-
-第一阶段不单独实现一套与 agent 无关的 worktree 系统。worktree、git、cwd、可写范围和 tool 权限先作为 CLI wrapper 能力包装。
-
-基本原则：
-
-```text
-1. 每个 task attempt 在独立 cwd/worktree 中执行。
-2. 优先复用 CLI agent 自身的 worktree / cwd / git 能力。
-3. 如果 CLI 不支持 worktree，则由 Runtime 用 git worktree 或独立 clone 兜底。
-4. agent 不能直接修改 main branch。
-5. Runtime 观察实际 diff，并将结果交给 Verify / Merge Queue。
-6. Merge Queue 才能把 verify passed 的结果合入 main。
-```
-
-Workspace 绑定：
-
-```go
-type WorkspaceBinding struct {
-	// WorktreeID 关联 Workspace/Merge 模块中的隔离工作区。
-	WorktreeID string `json:"worktree_id"`
-	// CWD 是实际传给 CLI agent 的执行目录。
-	CWD string `json:"cwd"`
-	// BaseRef 是 attempt 起始 commit / ref。
-	BaseRef string `json:"base_ref"`
-	// BranchName 是可选的 git 分支名。
-	BranchName string `json:"branch_name,omitempty"`
-	// WritableRoots 是 agent 被允许写入的目录白名单。
-	WritableRoots []string `json:"writable_roots"`
-	// ReadableRoots 是 agent 被允许读取的目录白名单。
-	ReadableRoots []string `json:"readable_roots"`
-}
-```
-
-观察结果：
-
-```go
-type ObservedWriteSet struct {
-	// WorktreeID 标识被观察的隔离工作区。
-	WorktreeID string `json:"worktree_id"`
-	// ChangedFiles / CreatedFiles / DeletedFiles 来自 git diff 或文件系统观察。
-	ChangedFiles []string `json:"changed_files"`
-	CreatedFiles []string `json:"created_files"`
-	DeletedFiles []string `json:"deleted_files"`
-	// DiffArtifactRef 指向 Artifact Store 中的大 diff/patch。
-	DiffArtifactRef string `json:"diff_artifact_ref,omitempty"`
-}
-```
-
----
-
-## 8. Prompt / Context / Skill 注入
-
-Runtime 不依赖 agent session memory。每次 invocation 都显式注入必要上下文。
-
-上下文层次：
-
-```text
-1. Runtime policy / role boundary
-2. Task contract
-3. Context pack from Ctx Agent
-4. Approved plan 或 acceptance criteria
-5. Skill / workflow instruction（可选）
-6. User prompt / phase-specific instruction
-7. Output schema
-```
-
-Skill 注入支持多种模式：
-
-```go
-type SkillInjectionMode string
-
-const (
-	// SkillInjectionNative 表示安装或 symlink 到 agent 原生 skill 目录。
-	SkillInjectionNative SkillInjectionMode = "native"
-	// SkillInjectionPrompt 表示将 SKILL.md / references inline 到 prompt。
-	SkillInjectionPrompt SkillInjectionMode = "prompt"
-	// SkillInjectionProjectFile 表示写入 .cursorrules 等 agent-specific 项目文件。
-	SkillInjectionProjectFile SkillInjectionMode = "project_file"
-	// SkillInjectionUnsupported 表示该 provider 不支持 skill 注入。
-	SkillInjectionUnsupported SkillInjectionMode = "unsupported"
-)
-```
-
-选择规则：
-
-```text
-- adapter 支持 nativeSkillLoading 时，优先 native。
-- 不支持 native 时，使用 prompt injection。
-- 需要 agent-specific 规则文件时，使用 project_file。
-- skill 要求的 capability 不满足时，不能调度或必须降级为受限模式。
-```
-
----
-
-## 9. Tool / Permission Policy
-
-Runtime 用统一策略表达权限意图，adapter 负责翻译成具体 CLI flags。
-
-```go
-type ToolCapability struct {
-	// Name 是工具能力名，例如 shell、file_edit、mcp:server。
-	Name string `json:"name"`
-	// Matcher 是可选匹配规则，用于限制命令、路径或 MCP tool 名称。
-	Matcher string `json:"matcher,omitempty"`
-	// Mode 明确允许或拒绝；默认值不应被当作 allow。
-	Mode ToolCapabilityMode `json:"mode"`
-}
-```
-
-```go
-type PermissionPolicy struct {
-	// Mode 是 runtime 允许的权限等级；危险 provider flag 必须经过这里收口。
-	Mode PermissionMode `json:"mode"`
-	// RequireHumanApprovalForHighRisk 表示 shell、跨目录写入、credential 访问等高风险动作需要人工批准。
-	RequireHumanApprovalForHighRisk bool `json:"require_human_approval_for_high_risk"`
-}
-```
-
-原则：
-
-```text
-1. planner 默认不能改代码。
-2. executor 只能在 approved scope 内改代码。
-3. verifier 默认不修改实现，只运行检查和报告结果。
-4. 高风险操作必须显式人工批准。
-5. `dont_ask` / `bypass` 只允许在明确授权的本地调试或受控执行中使用，并且不能覆盖高风险人工批准要求。
-6. agent-generated edits 默认作为 pending changes / worktree diff，不直接进入 main。
-```
-
----
-
-## 10. Claude Code MVP Adapter
-
-第一阶段 Claude Code adapter 是 reference adapter。
-
-必须支持：
-
-```text
-- detect: claude 是否存在、版本、auth 状态。
-- capabilities: headless、streaming、tool calling、file edit、shell、MCP、worktree。
-- run: 使用 print/headless 模式启动。
-- parse: 将 stream-json / JSONL 转成统一 AgentEvent。
-- cancel: 终止进程。
-- result: 汇总 final result、usage、cost、session id 和 touched files。
-```
-
-建议内部命令形态：
-
-```text
-claude -p
-  --output-format stream-json
-  --verbose
-  --permission-mode <mode>
-  --allowedTools / --disallowedTools ...
-  --max-turns <n>
-```
-
-Claude Code 原始事件映射：
-
-```text
-system/init           -> Event Log 的 AgentStarted / metadata
-assistant text        -> text_delta
-assistant tool_use    -> tool_call
-user tool_result      -> tool_result
-result                -> done + AgentResult usage/status
-hook events           -> raw event 或后续扩展事件
-partial messages      -> text_delta 或 raw event
-```
-
-MVP 不要求完整支持 Claude Code 的全部 flags，但必须保留 raw 事件，避免后续无法补 schema。
-
----
-
-## 11. Fallback 策略
-
-Fallback 用于 adapter 不可用、认证失效、运行失败或 capability 不满足时。
-
-```go
-type FallbackPolicy struct {
-	// AllowFallback 表示当前 provider 不可用时是否允许切换候选 provider。
-	AllowFallback bool `json:"allow_fallback"`
-	// RequireExplicitSwitch 表示 fallback 必须产生显式事件，不能静默发生。
-	RequireExplicitSwitch bool `json:"require_explicit_switch"`
-	// Candidates 是按优先级排列的候选 provider id。
-	Candidates []string `json:"candidates"`
-}
-```
-
-原则：
-
-```text
-1. 不静默切换 provider。
-2. fallback 必须记录到 Event Log。
-3. 如果任务依赖某个 provider 的特定能力，不能 fallback 到不支持该能力的 provider。
-4. fallback 后的 result 必须标注实际执行 adapter。
-```
-
----
-
-## 12. 与其他模块关系
-
-### Task Graph
-
-```text
-Task Graph 提供 task contract、phase、role、acceptance criteria 和状态。
-Agent Runtime 返回 AgentResult 和 event refs。
-Control Plane 只能路由结果；Task Graph 的状态、edge、blocker 写入仍由经 Agent Runtime 启动并授予 graph_write tool 的 Task Manager Agent 负责。
-```
-
-### Ctx Agent / Context Lib
-
-```text
-Ctx Manager Agent / Ctx Agent 也通过 Agent Runtime 运行，为 invocation 选择 context pack。
-Agent Runtime 只消费 context pack，不直接读写 ctxlib。
-agent 运行中需要更多上下文时，通过受控 ctx query 进入经 Agent Runtime 授权的 Ctx Manager Agent。
-```
-
-### Event Log / Artifact Store
-
-```text
-Runtime 自动记录 AgentStarted、AgentEvent、AgentFinished、AgentFailed、WorktreeDiffObserved 等事件。
-transcript、stdout/stderr、大 tool output、diff patch、test output 进入 Artifact Store。
-```
-
-### Verify / Merge Queue
-
-```text
-Verifier 消费 AgentResult、ObservedWriteSet、test output 和 acceptance criteria。
-Merge Queue 只合并 verify passed 的 worktree diff；Agent Runtime 不执行 main branch merge。
-```
-
----
-
-## 13. 不变量
-
-```text
-1. Agent Runtime 是 CLI agent 的唯一启动入口。
-2. Scheduler / Task Graph 不依赖 provider-specific flags。
-3. 普通 worker agent 不直接写 Task Graph；只能提交 requirement。
-4. 只有经 Agent Runtime 授权的 Task Manager Agent 可以通过 graph_write service/tool 写 Task Graph。
-5. 普通 worker agent 不直接写 ctxlib；ctxlib 只从 Event Log / Artifact Store 提炼。
-6. 只有经 Agent Runtime 授权的 Ctx Manager Agent 可以通过 ctx service/tool 写 ctxlib。
-7. agent 不直接修改 main branch。
-8. 每次 invocation 必须有 workspace/cwd 边界、role 边界和 tool/permission 边界。
-9. 每次 invocation 必须自动进入 Event Log。
-10. 大对象必须进入 Artifact Store，Event Log 只保存 ref。
-11. observed write set 以 Runtime 观察为准，agent 声明只能作为参考。
-12. verifier 不能自我批准同一 active context 的执行结果。
-13. fallback 不能静默发生。
-14. 第一阶段以 Claude Code adapter 跑通最小闭环，再扩展 Codex / Gemini / custom。
-```
-
----
-
-## 14. MVP 范围
-
-MVP 需要完成：
-
-```text
-1. AgentAdapter 接口。
-2. Claude Code adapter detect / capabilities / run / cancel。
-3. AgentRunParams、AgentEvent、AgentResult 数据结构。
-4. stream-json 到 AgentEvent 的 parser。
-5. workspace/cwd 绑定和 observed write set。
-6. Event Log / Artifact Store 写入 refs。
-7. role-based tool / permission policy。
-8. plan / execute / verify 三类 role 的 prompt boundary。
-9. AgentResult 作为 Task Manager Agent 推进 Task Graph 状态的输入证据。
-```
-
-MVP 可以暂缓：
-
-```text
-1. 完整 Codex / Gemini adapter。
-2. 复杂 resume。
-3. 多 provider 自动 fallback。
-4. 完整 MCP server 编排。
-5. UI 级实时细节展示。
-6. 高级 skill/plugin marketplace。
-```
+## 8. 数据契约速查
+
+| 契约 | 位置 | 关键字段 |
+| --- | --- | --- |
+| runtime.yaml（期望状态） | `agents/{memberName}/runtime/runtime.yaml`（qwenpaw worker 默认从对象存储拉取；`docs/member-runtime-config-contract.md` 推荐 `shared/runtime/members/{memberName}/runtime.yaml`） | `metadata.generation`；`team.*`（name/teamRoomId/leaderName/admin）；`member.*`（name/runtimeName/role/runtime/matrixUserId/personalRoomId）；`desired.model / mcpServers / channelPolicy / agentPackage / state`；`storage.*`（endpoint/bucket/prefixes）；`credentials.*`（仅 env 名/路径） |
+| TaskMeta | `shared/tasks/{task_id}/meta.json` | `task_id`、`project_id`、`assigned_to`、`room_id`、`status`（assigned/in_progress/submitted）、`depends_on`、`spec_path`、`result_path` |
+| ProjectMeta | `shared/projects/{project_id}/meta.json` | `project_id`、`status`、`mode`（quick/project）、`plan_type`（dag/loop）、`reply_route`、`parent_task_id`、`requester_report` |
+| spec / result | `shared/tasks/{task_id}/spec.md`、`result.md` | Leader 拥有 meta.json/spec.md；worker 拥有 workspace/、progress/、result.md |
+| WorkerFlow 状态 | `<default-workspace>/shared/workerflow/<runId>/workflow.json` | `status`（running/done/failed）、`subagents`/`nodes`/`steps`、`readyInstructions`/`waitingInstructions`、`eventId` |
+| 心跳 | 本地 `heartbeat.json`；controller `POST /api/v1/workers/{name}/ready|heartbeat` | process/API 可达性、`lastActiveAt` |
+| Invocation 记录（Threadmill 新建） | Event Log + Artifact Store | invocation id、形态（delegate/workflow_run/direct）、phase、worker/temp agent id、事件流 refs、PhaseOutput refs |
