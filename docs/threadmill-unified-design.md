@@ -282,6 +282,25 @@ Task Manager 不旁观 phase agent 的中间推理、工具输出、探索轨迹
 2. 运行中主动提交的 `OrchestrationProposal`；
 3. 通过 Runtime 受控 join 的输入集合 `PhaseInputSet` 与等待结果 `InputWaitResult`。
 
+```go
+type OrchestrationProposal struct {
+    ProposalID               string           `json:"proposal_id"`
+    ClientRef                string           `json:"client_ref"`
+    FromEndpoint             PhaseEndpointRef `json:"from_endpoint"`
+    FromInvocationID         string           `json:"from_invocation_id"`
+    BasedOnGraphRevision     int64            `json:"based_on_graph_revision"`
+    BasedOnWorkspaceRevision string            `json:"based_on_workspace_revision"`
+    BasedOnInputRevision     string           `json:"based_on_input_revision"`
+    OrchestrationAdvice      string           `json:"orchestration_advice"` // split, dependency, serial/parallel, replan, retry...
+    DeliverySpecAdvice       string           `json:"delivery_spec_advice"`
+    ReportSpecAdvice         string           `json:"report_spec_advice"`
+    Rationale                string           `json:"rationale"`
+    EvidenceRefs             []string         `json:"evidence_refs"`
+}
+```
+
+planner、executor、verifier 三方都可提交建议，但情景不同：planner（契约歧义、方案不可行、依赖变化）→ replan/拆任务；executor（发现缺失前置、范围冲突）→ split/dependency；verifier（验收失败）→ retry，失效旧输出并重开 execute→verify。
+
 `PhaseInputSet` 是 endpoint 已声明入边的只读投影，至少包含：`inputRevision`、`required`、`delivered`、`pending`。`required` 定义 source endpoint、所需交付物与 `requiredBy`（start 或 completion）；`delivered` 只引用正式 `PhaseOutput` 与 artifact；`pending` 仅表示尚未到达的 completion 输入。
 
 Phase Agent 可以在本体工作做到当前信息不足时调用 `runtime.awaitInputs` 等待已知 completion 输入。Runtime 不保留长期占用 worker capacity 的挂起线程；它记录 waiting 语义、在输入到达或失效时更新 `inputRevision`，并可在恢复时重建受控执行调用。Agent 不直接持有 mailbox、不轮询消息，也不自己维护图状态。
