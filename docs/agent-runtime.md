@@ -9,7 +9,7 @@
 
 ## 1. 定位
 
-《统一设计》第 16 节：Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Ctx Manager、planner、executor 和 verifier。它负责 provider detect/auth/capability、按 role/purpose 组装 prompt、Context Slice 和输出契约、创建或复用 Attempt Workspace、施加 phase 权限与写 lease、运行/取消/恢复/替换 Agent、归一化事件、观察真实 write set、执行 Context 读请求并传递自动订阅的 Context Delta、把 `PhaseOutput` / `OrchestrationProposal` / Requirement / MemoryCandidate 交给相应唯一 owner。Runtime 不判断 Task 是否完成，不写 Coordination Graph，不替 Ctx Manager 检索或接受记忆，不合并 main。
+《统一设计》第 16 节：Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Ctx Manager、planner、executor 和 verifier。它负责 provider detect/auth/capability、按 role/purpose 组装 prompt、Context Slice 和输出契约、创建 Invocation 并从 Workspace Service 取得轮次 Workspace、施加 phase 权限与写 lease、运行/取消/恢复/替换 Agent、归一化事件、观察真实 write set、执行 Context 读请求并传递自动订阅的 Context Delta、把 `PhaseOutput` / `OrchestrationProposal` / Requirement / MemoryCandidate 交给相应唯一 owner。Runtime 不判断 Task 是否完成，不写 Coordination Graph，不替 Ctx Manager 检索或接受记忆，不合并 main，不创建任何业务对象。
 
 AgentTeams 基座提供的不是"与 CLI 无关的通用 adapter 层"，而是一套可部署、可观测的 agent 运行时与协作基座：
 
@@ -65,7 +65,7 @@ AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge
 | PhaseOutput ↔ submit_task + result.md | `submit_task(summary, deliverables, status)` 是现成载荷骨架；result.md 内嵌 Threadmill 结构化 JSON 块（PhaseOutput 形状），不改变 AgentTeams 协议 |
 | Agent Invocation（临时计算资源）↔ WorkerFlow 临时 agent | `workflow_run / create_temp_agent` 创建 `tmp-` 前缀 agent（独立 workspace、自定义 AGENTS.md/skills 模板），bounded 任务结束即删除 |
 | Context 读工具注入 ↔ QwenPaw MCP 机制 | 注入机制直接复用（`desired.mcpServers` → `/api/mcp`）；工具本身是 Threadmill 新建的 `threadmill-ctx` MCP server |
-| Workspace 目录语义 ↔ shared/tasks 布局 | `shared/tasks/{attempt_id}/`（含 workspace/、progress/、result.md）作为 Attempt 的目录落点；目录所有权规则直接复用 task-execution SKILL.md |
+| Workspace 目录语义 ↔ shared/tasks 布局 | `shared/tasks/{task_id}/{workspace_ref}/`（含 workspace/、progress/、result.md）作为轮次 Workspace 的目录落点；目录所有权规则直接复用 task-execution SKILL.md |
 | 输出状态映射 ↔ TaskResult 状态机 | `SUCCESS → passed`；`SUCCESS_WITH_NOTES → passed + notes`；`REVISION_NEEDED / BLOCKED / FAILED → failed`（见 §6.2） |
 | 验收机械部分 ↔ check_task | `check_task` 返回 `effective = status==submitted && 无 deliverable 校验错误`（deliverables 必须位于 `shared/tasks/{task_id}` 下）；语义验收由 Threadmill verifier 完成 |
 
@@ -108,15 +108,15 @@ AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge
 
 ### 3.1 三种执行形态
 
-1. **持久 worker 上的委派（默认）**：Scheduler 选择 runnable endpoint 与匹配的 Worker Capacity，Runtime 经 controller REST API 选择或创建执行宿主，再用 `taskflow delegate_task` 委派 phase；worker 常驻并可承载多次 Invocation，但不拥有 Task、Attempt 或持久 Agent 身份。适合 plan / execute / verify 的长任务与需要稳定工具环境的执行。
+1. **持久 worker 上的委派（默认）**：Scheduler 选择 runnable endpoint 与匹配的 Worker Capacity，Runtime 经 controller REST API 选择或创建执行宿主，再用 `taskflow delegate_task` 委派 phase；worker 常驻并可承载多次 Invocation，但不拥有 Task、轮次或持久 Agent 身份。适合 plan / execute / verify 的长任务与需要稳定工具环境的执行。
 2. **WorkerFlow 临时 agent（ephemeral）**：`workflow_run` 创建 `tmp-` agent（独立 workspace、自定义 AGENTS.md/skills 模板），bounded 任务结束 `workflow_finish/fail` 后 `delete_temp_agent` 清理。适合一次性探索、并行检查、隔离验证。这是《统一设计》“Agent Invocation 是可替换的临时计算资源”的现成形态。
 3. **直接执行**：Runtime 在已选执行宿主中启动当前 endpoint 的 bounded Invocation。适合不拆分的 phase，但仍须经过 Invocation 记录、Context Slice、权限、输出契约和事件投影。
 
 ### 3.2 持久 worker 与 ephemeral invocation 的适配
 
-- **持久 worker 不等于持久 Agent 身份**。worker 是执行宿主：无状态，任何 Pod 重建后从 MinIO 恢复（`worker/README.md`）。Task / Attempt 身份在 Threadmill 侧（Coordination Graph + Workspace Binding），worker 容器可替换。
+- **持久 worker 不等于持久 Agent 身份**。worker 是执行宿主：无状态，任何 Pod 重建后从 MinIO 恢复（`worker/README.md`）。Task / 轮次身份在 Threadmill 侧（Coordination Graph + Workspace Binding），worker 容器可替换。
 - **每次 phase invocation 在 worker 内是独立会话/委派轮次**。丢弃 Thread 不丢失 Task（见 docs/CONTEXT.md 的 Thread 语义）：QwenPaw 会话文件位于 `sessions/`，agent 被禁止读取（SESSION_FILE_PROMPT_POLICY），Threadmill 也不把它们当编排输入。
-- **临时 agent 的 run 级共享目录**（`<default-workspace>/shared/workerflow/<runId>/`，含 `inputs/`、`outputs/<agent-id>/`）可作为 Attempt 级临时 Workspace；`runId` 可关联 AttemptID（workspace-merge.md §3.2）。
+- **临时 agent 的 run 级共享目录**（`<default-workspace>/shared/workerflow/<runId>/`，含 `inputs/`、`outputs/<agent-id>/`）可作为轮次级临时 Workspace；`runId` 可关联 WorkspaceRef（workspace-merge.md §3.2）。
 - **形态选择规则**：需要稳定工具环境或长时运行 → 复用持久 worker 作为执行宿主；需要隔离/并行/一次性检查 → 临时 agent；两者都不提供持久 Agent 身份，且都必须经过同一 Threadmill 适配层（Invocation 记录、Context Slice、权限、输出契约、事件投影）。
 
 ---
@@ -148,7 +148,7 @@ Scheduler 选择 runnable endpoint 与匹配容量，Runtime 选择执行宿主
   -> 验收决策（verify passed / revision / blocked）
 ```
 
-- 取消路径：`cancel_task(reason[, replacementTaskId])`；worker 掉线 → `LastHeartbeat` 超时 → Threadmill 标记 invocation failed，Attempt 可重试（新委派轮次）。
+- 取消路径：`cancel_task(reason[, replacementTaskId])`；worker 掉线 → `LastHeartbeat` 超时 → Threadmill 标记 invocation failed，Task Manager 失效旧输出并重开 execute→verify 轮次（新委派轮次、新 Workspace）。
 - `submit_task` 是终态动作：提交后 worker 不得继续编辑旧 task（task-execution SKILL.md）；修订必须由 Leader 重新委派。
 
 临时 agent 形态：
@@ -165,7 +165,7 @@ workflow_run(subagents | nodes)
 - 失败补偿：`workflow_run` 创建失败会回滚调用 `workflow_fail` 并清理已建 agent（`plugins/workerflow/mcp/server.py` `_fail_workflow_run_spawn`）。
 - 临时 agent 状态记录在 `<default-workspace>/shared/workerflow/<runId>/workflow.json`（status: running/done/failed；subagents/nodes/steps 行；readyInstructions/waitingInstructions；Matrix card eventId）。
 
-### 4.3 Attempt / phase 状态（Threadmill 新建）
+### 4.3 轮次 / phase 状态（Threadmill 新建）
 
 记录在 Coordination Graph 与 WorkspaceBinding（Threadmill 侧），不在 AgentTeams meta.json 中扩展：
 
@@ -174,10 +174,10 @@ prepared -> plan(invoked/running/passed)
   -> execute(invoked/running/passed)
   -> verify(invoked/running/passed)
   -> done
-任意 phase failed -> 新 Attempt 或 OrchestrationProposal（Task Manager 裁决）
+任意 phase failed -> OrchestrationProposal（Task Manager 裁决：失效旧输出、重开轮次）
 ```
 
-一次委派轮次（§4.2）承载一个 phase invocation；Attempt 生命周期跨多个轮次，由 Task Manager 编排（统一设计 §3.1、§3.2）。
+一次委派轮次（§4.2）承载一个 phase invocation；Task 轮次生命周期跨多个委派轮次，由 Task Manager 编排（统一设计 §3.1、§3.2）。
 
 ---
 
@@ -194,7 +194,7 @@ AgentTeams 直接复用的权限原语：
 - **敏感输出**：artifact 发布前 SENSITIVE_ARTIFACT_NAME_RE/TEXT_RE 拦截；`AGENTTEAMS_OUTPUT_SANITIZE_KEYWORDS` 输出清洗；Credential Safety 规则在 TEAMS.md 中不可覆盖。
 - **会话隐私**：SESSION_FILE_PROMPT_POLICY 禁止 agent 读取 `sessions/`。
 
-Threadmill 新建的 phase lease（基座无此概念）——一次 Attempt 任一时刻只有一个有效写 lease，实现分三层：
+Threadmill 新建的 phase lease（基座无此概念）——一个轮次任一时刻只有一个有效写 lease，实现分三层：
 
 ```text
 a) 委派轮次隔离（强）：每 phase 一次 taskflow 委派给不同 worker / 每 phase 一个 WorkerFlow 临时 agent
@@ -204,7 +204,7 @@ b) 工具级（中）：MCP allow policy（QwenPaw MCP Policy API）+ 目录 ACL
 c) 提示词级（弱，兜底）：worker.md + phase prompt 声明只读/只写边界。
 ```
 
-lease 记录在 `WorkspaceBinding.PhaseLeases`（phase → invocation id）。Task Manager 通过图激活或失效 endpoint；Runtime 在启动已调度 Invocation 前向 Workspace Service 取得并校验 lease，phase 结束后释放（统一设计 §3.3）。
+lease 记录在 `WorkspaceBinding.PhaseLeases`（phase → invocation id）。Task Manager 通过图激活或失效 endpoint；Runtime 在启动已调度 Invocation 前向 Workspace Service 取得并校验 lease，phase 结束后释放（统一设计 §4.3）。
 
 ### 5.2 事件
 
@@ -244,7 +244,7 @@ AgentTeams 没有 Context Graph。`ListSubgraphs / Explore / Retrieve / Subscrib
 | --- | --- |
 | `SUCCESS` | passed |
 | `SUCCESS_WITH_NOTES` | passed + notes |
-| `REVISION_NEEDED` | failed（revision）→ 同一 Attempt 重试或新 Attempt |
+| `REVISION_NEEDED` | failed（revision）→ verifier 提交 retry 建议，Task Manager 重开轮次 |
 | `BLOCKED` | failed（blocked）+ 建议编排（OrchestrationProposal） |
 | `FAILED` / `PARTIAL` | failed + 原因 |
 
@@ -253,17 +253,21 @@ result.md 内嵌结构化载荷（Threadmill 适配，不改 AgentTeams 协议�
 ```jsonc
 {
   "phase_output": {           // PhaseOutput 形状（统一设计 §5.6）
-    "endpoint": {"task_id": "…", "attempt_id": "…", "phase": "execute"},
-    "delivery_refs": ["shared/tasks/<attempt_id>/workspace/…"],
-    "report_ref": "shared/tasks/<attempt_id>/result.md",
-    "evidence_refs": ["shared/tasks/<attempt_id>/evidence/…"],
-    "workspace_revision": "…",
-    "context_graph_revision": 0
+    "binding": {
+      "task_id": "…", "task_contract_ref": "…",
+      "workspace_ref": "…",  // 轮次标识
+      "phase": "execute",
+      "workspace_id": "…", "input_revision": "…",
+      "workspace_head": "…", "context_slice_ref": "…"
+    },
+    "delivery_refs": ["shared/tasks/<task_id>/<workspace_ref>/workspace/…"],
+    "report_ref": "shared/tasks/<task_id>/<workspace_ref>/result.md",
+    "evidence_refs": ["shared/tasks/<task_id>/<workspace_ref>/evidence/…"]
   },
   "memory_candidates": [      // MemoryCandidate（统一设计 §12.1），Runtime 自动记录
     {"client_ref": "…", "statement": "…", "kind": "fact", "why_reusable": "…"}
   ],
-  "observed_write_set": {"files": ["shared/tasks/<attempt_id>/workspace/src/a.py"], "contracts": []},
+  "observed_write_set": {"files": ["shared/tasks/<task_id>/<workspace_ref>/workspace/src/a.py"], "contracts": []},
   "orchestration_proposal": null  // 可选，见 §5.3
 }
 ```
