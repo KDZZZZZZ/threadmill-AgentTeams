@@ -301,6 +301,8 @@ type OrchestrationProposal struct {
 
 planner、executor、verifier 三方都可提交建议，但情景不同：planner（契约歧义、方案不可行、依赖变化）→ replan/拆任务；executor（发现缺失前置、范围冲突）→ split/dependency；verifier（验收失败）→ retry，失效旧输出并重开 execute→verify。
 
+拆分机会、缺少前置、执行失败、验证失败和计划失效都使用同一种建议协议。建议是自由文本意图、理由和对未来 endpoint 契约的建议，不是图命令；phase agent 不决定创建哪些 Task、如何连边或哪些 endpoint 失效。Runtime 只记录并转交，Task Manager 结合当前图和可见证据决定接受、改写或拒绝，并热修改 Coordination Graph。无需为不同原因新增 Split Request、Failure Request 或 Rework Task 等实体。
+
 `PhaseInputSet` 是 endpoint 已声明入边的只读投影，至少包含：`inputRevision`、`required`、`delivered`、`pending`。`required` 定义 source endpoint、所需交付物与 `requiredBy`（start 或 completion）；`delivered` 只引用正式 `PhaseOutput` 与 artifact；`pending` 仅表示尚未到达的 completion 输入。
 
 Phase Agent 可以在本体工作做到当前信息不足时调用 `runtime.awaitInputs` 等待已知 completion 输入。Runtime 不保留长期占用 worker capacity 的挂起线程；它记录 waiting 语义、在输入到达或失效时更新 `inputRevision`，并可在恢复时重建受控执行调用。Agent 不直接持有 mailbox、不轮询消息，也不自己维护图状态。
