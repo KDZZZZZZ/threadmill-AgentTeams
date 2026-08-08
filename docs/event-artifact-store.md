@@ -36,7 +36,7 @@ Event Log 不是由 agent 显式写日志，而是 Runtime 在以下边界自动
 | 捕获点 | 产生的事件 | 说明 |
 | --- | --- | --- |
 | Invocation 生命周期 | AgentInvocationStarted / Finished / Failed | Runtime 启动、取消、恢复、替换 Agent 时 |
-| Phase Endpoint 编排 | PhaseActivated | Scheduler 选中 runnable endpoint 并请求 Runtime 创建/复用 Task Attempt 的 Workspace Binding |
+| Phase Endpoint 编排 | PhaseActivated | Scheduler 选中 runnable endpoint 并请求 Workspace Service 创建/复用该轮次的 Workspace Binding |
 | 结构化边界输出 | PhaseOutputSubmitted | 每个 phase 按 DeliverySpec / ReportSpec 提交输出；Runtime 只校验形状与必填引用 |
 | 编排建议 | OrchestrationProposalSubmitted / OrchestrationProposalDecided | 运行中 Agent 主动提交建议；Task Manager 裁决（接受/改写/拒绝）并明确当前 Invocation 处置 |
 | MemoryCandidate | MemoryCandidateSubmitted / Admitted / Rejected | Runtime 自动记录候选；Ctx Manager 准入后记录裁决（含低价值候选的审计事件） |
@@ -72,7 +72,7 @@ type Event struct {
 
 	// 以下外键均可选，用于把事件关联到 task、agent run、workspace 或 context graph 对象。
 	TaskID string `json:"task_id,omitempty"`
-	AttemptID string `json:"attempt_id,omitempty"`
+	WorkspaceRef string `json:"workspace_ref,omitempty"` // 轮次标识
 	PhaseEndpoint string `json:"phase_endpoint,omitempty"`
 	AgentInvocationID string `json:"agent_invocation_id,omitempty"`
 	WorkspaceID string `json:"workspace_id,omitempty"`

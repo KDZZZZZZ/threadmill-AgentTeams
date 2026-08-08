@@ -15,7 +15,7 @@ Coordination Graph 是可热修改的**当前编排**，不是不可变的工作
 
 ```text
 Coordination Graph 保存什么：
-  - Task、Task Attempt、Phase Endpoint、Decision Endpoint
+  - Task、Phase Endpoint、Decision Endpoint
   - endpoint 之间的依赖/阻塞边（控制 + 数据 + 失败策略）
   - 每个 phase 的 DeliverySpec 与 ReportSpec（endpoint 契约）
   - 阶段完成信号（PhaseOutput）及其交付物/报告/证据引用
@@ -42,19 +42,17 @@ Task Contract
   稳定定义要交付什么、为什么、允许边界及怎样算完成；不包含实现步骤。
 
 Task
-  由 Task Contract 约束的持久工作身份；不区分 root/child，分解和依赖由边表达。
-
-Task Attempt
-  对同一 Task Contract 的一次有界尝试；拥有一份 Workspace Binding。
+  由 Task Contract 约束的持久工作身份；不区分 root/child，分解和依赖由边表达；
+  直接拥有一份或多份（按轮次）Workspace Binding。
 
 Phase Endpoint
-  Task Attempt 中可被依赖、阻塞、激活和产出信号的命名端点。
+  Task 中可被依赖、阻塞、激活和产出信号的命名端点。
 
 Agent Invocation
   在明确角色、阶段、工作区、上下文、权限和预算下对 Agent 的一次有界调用。
 ```
 
-每个 Task Attempt 只有三个工作阶段 `plan -> execute -> verify`，外加两个非工作端点：
+每个 Task 轮次只有三个工作阶段 `plan -> execute -> verify`，外加两个非工作端点：
 
 - `prepared`：Task Contract、输入 revision、Workspace Binding、权限和初始上下文已装配；是运行前置条件，不启动 Agent。
 - `done`：verify、依赖、人工决定和交付/合入条件全部成立后的图结论；不启动 Agent。
@@ -105,7 +103,7 @@ type CoordinationEdge struct {
 type PhaseResultBinding struct {
     TaskID          string `json:"task_id"`
     TaskContractRef string `json:"task_contract_ref"`
-    AttemptID       string `json:"attempt_id"`
+    WorkspaceRef    string `json:"workspace_ref"` // 轮次标识：Workspace Binding ID + generation
     Phase           string `json:"phase"` // plan | execute | verify
     WorkspaceID     string `json:"workspace_id"`
     InputRevision   string `json:"input_revision"`
@@ -195,7 +193,7 @@ type OrchestrationProposal struct {
 - 拆分机会 → `OrchestrationAdvice: split` + 对每个新 endpoint 的 DeliverySpec/ReportSpec 建议；
 - 缺少前置 → `OrchestrationAdvice: dependency` + 建议的依赖方向与消费 endpoint；
 - 串并调整 → `OrchestrationAdvice: serial/parallel` + 受影响 endpoint；
-- 执行/验证失败 → `OrchestrationAdvice: replan`（或指明应开新 Attempt 而非新 Task）+ 失败证据引用；
+- 执行/验证失败 → `OrchestrationAdvice: replan`（或指明应重开轮次而非新 Task）+ 失败证据引用；
 - 计划失效（输入 revision 变化）→ `OrchestrationAdvice: replan` + 过期证据引用。
 
 建议是**自由文本意图、理由和对未来 endpoint 契约的建议，不是图命令**。phase agent 不决定创建哪些 Task、如何连边或哪些 endpoint 失效。Runtime 只记录并转交（同一建议重复提交只转交一次），Task Manager 结合当前图和可见证据决定接受、改写或拒绝，并热修改 Coordination Graph。phase agent 可以在编排建议中提出新 endpoint 的要求，但正式契约只能由 Task Manager 写入图。
@@ -210,18 +208,18 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 
 Scheduler 不解释建议，只在图更新后重算 runnable endpoint。编排建议**不结束当前 phase**；Task Manager 的裁决必须明确当前 Invocation 是继续、阻塞还是取消；若允许继续，phase agent 最终仍须提交原 endpoint 的 `PhaseOutput`。
 
-### 5.2 失败后的 Attempt 语义
+### 5.2 失败后的轮次语义
 
 ```text
 Task Contract
-  -> Attempt N: plan -> execute -> verify
+  -> Round 1: plan -> execute -> verify
        -> passed + delivery conditions -> done
-       -> failed, contract still valid -> Attempt N+1
+       -> failed, contract still valid -> verifier 提交 Proposal，Task Manager 重开轮次
        -> independent prerequisite found -> new Task + endpoint edge
        -> contract ambiguous/invalid -> blocked + decision endpoint
 ```
 
-验证失败通常创建同一 Task 的新 Attempt，而不是新 Task。只有工作具有独立验收、独立失败/重试、不同权限或 Workspace、跨时间等待、被其他 Task 直接依赖等特征时，Task Manager 才创建新 Task。新 Attempt 默认从最新有效基线创建新的 Workspace；旧 Workspace 封存为 evidence。运行中的 Agent 若认为应局部修复、拆分任务或调整依赖，必须提交 `OrchestrationProposal`；Agent 和 Runtime 都不能自行跳转 phase。
+验证失败不创建新 Task，也不创建新 Attempt 实体：verifier 是唯一拥有失败证据的角色，由它提交 `OrchestrationProposal`（retry），Task Manager 裁决后失效旧输出、在图上重开 execute→verify 端点，并从最新有效基线新建 Workspace Binding（旧现场封存为 evidence）。只有工作具有独立验收、独立失败/重试、不同权限或 Workspace、跨时间等待、被其他 Task 直接依赖等特征时，Task Manager 才创建新 Task。运行中的 Agent 若认为应局部修复、拆分任务或调整依赖，必须提交 `OrchestrationProposal`；Agent 和 Runtime 都不能自行跳转 phase。
 
 ## 6. revision 与结果失效
 
@@ -262,7 +260,7 @@ flowchart LR
 4. phase agent 只提交 PhaseOutput 与 OrchestrationProposal，不直接创建 task 或 edge。
 5. 失败、拆分、前置、串并调整统一走 OrchestrationProposal，不新增其他建议协议或实体。
 6. 跨 Task 关系尽量落到具体 Phase Endpoint。
-7. 验证失败通常创建新 Attempt，不创建新 Task。
+7. 验证失败通常重开轮次，不创建新 Task。
 8. 每个 phase endpoint 必须有 DeliverySpec 与 ReportSpec，否则不可调度。
 9. 每个阶段结果绑定 PhaseResultBinding；相关 revision 变化后信号失效。
 10. done 只在验收和交付条件全部满足后成立。
@@ -295,23 +293,23 @@ AgentTeams 是归档基座，Threadmill 只复用其**已证实能力**：DAG/Lo
 | --- | --- | --- |
 | Task Contract | `shared/tasks/{task_id}/spec.md` + plan.md 节点条目（task_id / title / depends_on） | Adapter 在 spec.md 头部写入 Task Contract 与 DeliverySpec/ReportSpec（AgentTeams 原生只有自由文本 spec）。 |
 | Coordination Graph 投影 | `ProjectMeta` + `plan.md`（DAG/Loop 条目，marker `[ ] pending / [~] delegated / [x] completed / [!] blocked / [→] revision`）+ `TaskMeta` | AgentTeams 没有独立图存储；图状态是文件的可解析投影。Threadmill 侧保留自己的 Coordination Graph 语义，agentteams 投影由 adapter 维护。 |
-| Phase Endpoint | DAG/Loop plan 节点状态机 | AgentTeams 无 plan/execute/verify 三分段；节点级 `completed` ≈ Threadmill 的 verify passed + 接受。三阶段 Attempt 语义由 Threadmill Runtime 在 Task 目录现场（workspace/ + deliverables/）内实现。 |
+| Phase Endpoint | DAG/Loop plan 节点状态机 | AgentTeams 无 plan/execute/verify 三分段；节点级 `completed` ≈ Threadmill 的 verify passed + 接受。三阶段轮次语义由 Threadmill Runtime 在 Task 目录现场（workspace/ + deliverables/）内实现。 |
 | PhaseOutput | `TaskResult`（result.md：STATUS/SUMMARY/DELIVERABLES/NOTES）+ TaskMeta 状态 | Adapter 把 endpoint 的 PhaseOutput（DeliveryRefs/ReportRef/EvidenceRefs）序列化进 result 协议并保留引用。 |
 | 串行/阻塞 | `depends_on` + `ready_nodes` 的依赖已接受检查 | `delegate_task` 前置校验（`validate_delegate_task`：pending、依赖全部 completed）直接对应"阻塞未解除不得调度"。 |
-| 失败处理 | `REVISION_NEEDED` / `BLOCKED` / `INTERRUPTED` 结果状态 | 这些结果不自动推进图；adapter 把失败证据转成 `OrchestrationProposal` 语义并交 Task Manager 决定（重新 plan_dag、新 Attempt 或等待人工）。 |
+| 失败处理 | `REVISION_NEEDED` / `BLOCKED` / `INTERRUPTED` 结果状态 | 这些结果不自动推进图；adapter 把失败证据转成 `OrchestrationProposal` 语义并交 Task Manager 决定（重新 plan_dag、重开轮次或等待人工）。 |
 
 ### 9.3 Threadmill 新建
 
 AgentTeams 中不存在、必须由 Threadmill 新建的部分：
 
-- **Coordination Graph 本体**（Task/Attempt/Phase Endpoint/边/DeliverySpec/ReportSpec/PhaseOutput/OrchestrationProposal 的语义与存储）；
+- **Coordination Graph 本体**（Task/Phase Endpoint/边/DeliverySpec/ReportSpec/PhaseOutput/OrchestrationProposal 的语义与存储）；
 - **graph revision / input revision 维护**（agentteams 的 plan.md 是整体替换，无 revision 计数；由 adapter 层递增并绑定结果）；
 - **OrchestrationProposal 通道**（agentteams 无此协议；Runtime 记录转交、Task Manager 审批）；
 - **Event Log**（审计全部图变更；agentteams 只有 Matrix 消息与文件状态）；
 - **Context Graph / Ctx Manager / Context Slice / 订阅推送**（agentteams 用 shared/ 文件 + memory/ 笔记，无知识图）；
 - **Scheduler**（`ready_nodes` 只提供可运行节点计算，调度选择是 Threadmill 新建）；
 - **Merge Queue 与 git worktree 隔离**（agentteams 的 workspace/ 是共享目录，不是 git worktree，也没有 main 合并门）；
-- **Workspace Binding 的 Attempt 级生命周期**（创建/复用/封存、phase lease、write set 观察）。
+- **Workspace Binding 的轮次级生命周期**（创建/复用/封存、phase lease、write set 观察）。
 
 ### 9.4 不应复用
 

@@ -100,7 +100,7 @@ MVP 至少支持（同统一设计 §9.3）：
 type ContextSliceRequest struct {
 	TaskID          string   `json:"task_id,omitempty"`
 	TaskContractRef string   `json:"task_contract_ref,omitempty"`
-	AttemptID       string   `json:"attempt_id,omitempty"`
+	WorkspaceRef    string   `json:"workspace_ref,omitempty"` // 轮次标识
 	Phase           string   `json:"phase,omitempty"`
 	Role            string   `json:"role"`
 	Purpose         string   `json:"purpose"`

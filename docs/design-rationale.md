@@ -1,7 +1,7 @@
 # Threadmill 设计理由：为什么是两张持久图与一个执行边界
 
 状态：Draft
-定位：本文回答 Threadmill 架构中的“为什么”：为什么只保留两张持久图、为什么 Coordination Graph 可热修改、为什么 Manager 不看运行过程、为什么同一 Attempt 共享 Workspace、为什么 Context Graph 是所有 Agent 的通信面，以及为什么在 AgentTeams 基座上不直接复用 Matrix 房间编排、TeamHarness DAG 和私有记忆。它不列接口，不描述 UI。
+定位：本文回答 Threadmill 架构中的“为什么”：为什么只保留两张持久图、为什么 Coordination Graph 可热修改、为什么 Manager 不看运行过程、为什么同一轮次共享 Workspace、为什么 Context Graph 是所有 Agent 的通信面，以及为什么在 AgentTeams 基座上不直接复用 Matrix 房间编排、TeamHarness DAG 和私有记忆。它不列接口，不描述 UI。
 
 > **语义以 [threadmill-unified-design.md](./threadmill-unified-design.md) 为准**。本文解释统一设计的选择；模块文档可以演进，但不应悄悄改变这里定义的工作模型。
 
@@ -15,13 +15,13 @@ Threadmill 管理的三类对象必须分开持久化，因为它们回答不同
 | --- | --- | --- |
 | Coordination Graph | 哪个 Phase Endpoint 可以运行、被什么阻塞、阶段交付是否满足 | 未履行的因果义务；跨 Task、跨 Agent、跨时间 |
 | Context Graph | 哪些记忆可见、如何关联、如何检索、哪些订阅需要推送 | 已提炼的知识关系；供新 Invocation 复用 |
-| Agent Runtime / Workspace | 一次 Invocation 如何在权限、工作区和预算内执行 | 运行现场；随 Invocation/Attempt 消失或封存 |
+| Agent Runtime / Workspace | 一次 Invocation 如何在权限、工作区和预算内执行 | 运行现场；随 Invocation/轮次消失或封存 |
 
 **职责分离的判据是“谁需要看到什么”**，不是数据量的多少：
 
 - Coordination Graph 的消费者是 Task Manager 与 Scheduler，它们只关心阶段依赖、完成信号、交付物/报告要求与结果引用。它们不需要也不应看到一次运行的中间推理、工具输出或探索轨迹。
 - Context Graph 的消费者是所有 Agent（包括 Task Manager 自己），它们需要的是从运行证据中提炼出的、有出处的知识，而不是事件流水本身。因此 Context Graph 是 Event Log / Artifact Store 的可追溯投影，而不是第二个 Event Log。
-- Runtime/Workspace 的消费者只有当前 Invocation。运行现场默认留在 Invocation 内；Attempt 结束后 Workspace 封存为 evidence，按保留策略清理。
+- Runtime/Workspace 的消费者只有当前 Invocation。运行现场默认留在 Invocation 内；轮次结束后 Workspace 封存为 evidence，按保留策略清理。
 
 **为什么不建立 Execution Graph（phase 内持久执行图）**：phase 内的执行步骤、LLM 调用、工具链是 Runtime 的内部现场。把“这一次怎样运行”持久化成图，会引入第三个写入口、第三套失效语义，却不会让任何编排者变得更正确——编排者需要的全部信息已经由 `PhaseOutput`（阶段结束输出）与 `OrchestrationProposal`（运行中主动建议）承载。只有当内部工作获得独立生命周期（独立验收、独立重试、跨时间等待、单独授权、被其他 Task 直接依赖）时，Task Manager 才把它提升为新的 Task Contract 并写入 Coordination Graph。这是“执行结构可递归、持久图不膨胀”的准确含义。
 
@@ -68,22 +68,22 @@ Runtime 只校验输出形状与必填引用，不解释内容；Task Manager �
 
 ---
 
-## 4. 为什么同一 Attempt 的 plan、execute、verify 共享 Workspace
+## 4. 为什么同一轮次的 plan、execute、verify 共享 Workspace
 
-**同一个 Task Attempt 的 plan、execute、verify 默认共享同一个 Workspace Binding**——三个阶段可以由不同 Agent、不同 provider 或不同 Thread 执行，但它们看到的是同一份受控执行现场。
+**同一个 Task 轮次的 plan、execute、verify 默认共享同一个 Workspace Binding**——三个阶段可以由不同 Agent、不同 provider 或不同 Thread 执行，但它们看到的是同一份受控执行现场。
 
 这解决四个实际问题：
 
 1. **executor 直接消费 planner 的现场产物**：Approved Plan、Declared Write Set、基线信息就留在现场，不需要跨阶段转述。
 2. **verifier 检查真实候选现场**：它验证的是 execute 留下的真实 diff、未提交文件和工具状态，而不是重新拼装的近似副本。
 3. **阶段切换不丢状态**：未提交文件、生成物、工具状态在 plan → execute → verify 之间连续存在。
-4. **Agent 可替换，Attempt 身份不变**：executor 崩溃后新的 Invocation 从同一 Workspace 继续，证据链不因换 Agent 而断裂。
+4. **Agent 可替换，Task 身份不变**：executor 崩溃后新的 Invocation 从同一 Workspace 继续，证据链不因换 Agent 而断裂。
 
 **共享 Workspace 不等于共享权限**。权限随 phase lease 切换：plan 默认只读源码（可写结构化 plan artifact），execute 可写批准范围，verify 默认不可修改候选实现。任何阶段只能有一个有效写 lease；同一 Task 内需要并行时，只能并行只读准备，或由 Task Manager 拆为具有独立 Workspace 的 Task。
 
-**为什么验证失败要开新 Attempt 而不是在旧现场继续修**：旧现场是失败证据，新 Attempt 从最新有效基线创建新 Workspace，保证“验证结果绑定哪个 revision”永远可回答。若运行中的 Agent 认为应局部修复、拆分或调整依赖，走 OrchestrationProposal；Agent 和 Runtime 都不能自行跳转 phase 或在旧现场无审计地继续。
+**为什么验证失败要重开轮次而不是在旧现场继续修**：旧现场是失败证据，新轮次从最新有效基线创建新 Workspace，保证“验证结果绑定哪个 revision”永远可回答。若运行中的 Agent 认为应局部修复、拆分或调整依赖，走 OrchestrationProposal；Agent 和 Runtime 都不能自行跳转 phase 或在旧现场无审计地继续。
 
-**Workspace 为什么不是图节点**：Workspace 是 Attempt 的执行现场，不是协调义务。把 Workspace 放进 Coordination Graph 会让“谁阻塞谁”和“文件在哪个目录”两种问题混在一个模型里；它也不承担跨 Agent 通信，通信由 Context Graph 与 Coordination Graph 各司其职。
+**Workspace 为什么不是图节点**：Workspace 是轮次的执行现场，不是协调义务。把 Workspace 放进 Coordination Graph 会让“谁阻塞谁”和“文件在哪个目录”两种问题混在一个模型里；它也不承担跨 Agent 通信，通信由 Context Graph 与 Coordination Graph 各司其职。
 
 ---
 
@@ -170,12 +170,12 @@ AgentTeams 的协作模型是“Human + Manager + Worker 同在一个房间，�
 
 TeamHarness 的 projectflow/taskflow（`third_party/agentteams/copaw/src/copaw_worker/task.py`、`plugins/teamharness/mcp/server.py`）有可复用的状态机内核：DAG 环检测、`_ready_nodes` 就绪计算、`delegate → ack → submit → check` 原子流转、`shared/projects|tasks/{id}/meta.json` 文件存储。但它缺 Threadmill 编排的四个关键语义：
 
-1. **无 Attempt/Phase 维度**：TaskMeta 只有 `assigned → in_progress → submitted`，`REVISION_NEEDED` 回到同一目录继续修——没有“plan → execute → verify 共享现场、失败开新 Attempt”的模型。
+1. **无 Phase/轮次维度**：TaskMeta 只有 `assigned → in_progress → submitted`，`REVISION_NEEDED` 回到同一目录继续修——没有“plan → execute → verify 共享现场、失败重开轮次”的模型。
 2. **无 revision 与失效**：`meta.json` 是当前态快照，没有输入 revision、没有结果失效语义，无法回答“哪份验证结果仍有效”。
 3. **Leader 双写**：Leader 既编排又直接写 meta.json/plan.md/result.md 并自行验收（`accept_task_result`）——这违反“Task Manager 唯一写入口”与“verify 独立于产生者”两条不变量。
 4. **无 DeliverySpec/ReportSpec**：委派只传 spec.md，没有“该阶段必须交付什么、报告必须回答什么”的 endpoint 契约。
 
-因此复用方式是**适配封装**：把 FileSystemTaskStore 的存储协议与 `_ready_nodes` 内核当作 Coordination Graph 的物理底座，在其上加 Attempt/Phase 维度、revision、endpoint 契约与唯一写入口（见 architecture.md 6.2/6.3）。
+因此复用方式是**适配封装**：把 FileSystemTaskStore 的存储协议与 `_ready_nodes` 内核当作 Coordination Graph 的物理底座，在其上加 Phase/轮次维度、revision、endpoint 契约与唯一写入口（见 architecture.md 6.2/6.3）。
 
 ### 6.3 为什么不用 AgentTeams 的私有记忆
 
@@ -205,10 +205,10 @@ Threadmill 需要的是**共享的、可追溯的、有准入的 Context Graph**
 
 后续设计至少应能回答：
 
-1. 杀掉所有 Agent 进程后，Coordination Graph（Task/Attempt/Phase Endpoint/edge）、Workspace Binding 与 Event Log/Artifact Store 是否足以恢复未完成工作？
+1. 杀掉所有 Agent 进程后，Coordination Graph（Task/Phase Endpoint/edge）、Workspace Binding 与 Event Log/Artifact Store 是否足以恢复未完成工作？
 2. 某个结论来自 Task Contract、Agent 推断，还是已经验证的 evidence？
 3. 每条 Coordination Edge 阻止哪个 Phase Endpoint、携带什么数据、解除条件是什么、source 失败时怎么办？
-4. 失败是在重试同一 Task Contract（新 Attempt），还是暴露了需要独立 Task 的新工作？
+4. 失败是在重试同一 Task Contract（重开轮次），还是暴露了需要独立 Task 的新工作？
 5. 每个 ContextSlice 绑定哪个 Context Graph revision 与 input revision，过期后谁触发重选或重验？
 6. 每个 MemoryCandidate 是否有 SourceRefs、谁准入、准入后哪些订阅收到 Delta？
 7. 最终写入 main 的决定能否追溯到 Requirement、真实 diff 和仍有效的验证结果？
