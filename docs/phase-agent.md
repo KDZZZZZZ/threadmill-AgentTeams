@@ -280,7 +280,52 @@ Agent 在当前 Task 的受控目录产出文件，并在 `result.md` 或等价�
 
 最终 Artifact ID、哈希、去重和存储布局由人类设计。Agent 不创建 `ArtifactRef`，也不直接写对象存储。
 
-## 7. AgentTeams 适配与强制控制
+## 7. 不提供的 Interface
+
+Phase Agent 不提供：
+
+- Coordination Graph 或 Context Graph 的写 interface；
+- main 写入、合并、done 判定；
+- mailbox、Agent 间消息、订阅外推送；
+- phase 跳转、lease、Workspace 或 worker 生命周期管理；
+- 读取未提交的其他 Agent 过程上下文；
+- `Attempt`、`Split`、`Failure`、`Rework`、`Execution Graph` 等额外实体 interface。
+
+## 8. 人类待决项
+
+本文故意不冻结：
+
+- MCP、HTTP、gRPC 或本地进程等传输协议；
+- `requiredArtifacts`、检索请求/响应、`ContextDelta.changes` 的完整字段；
+- `InputWaitResult` 的持久化、恢复令牌、截止时间与错误码；
+- Artifact ID、内容哈希、存储与去重策略；
+- 预算、重试、超时和可观测性字段；
+- DeliverySpec、ReportSpec、WriteSet 的完整结构。
+
+### 8.1 Phase Agent 内部配置（待进一步研究）
+
+Phase Agent 的上下文管理与运行内部配置需要结合具体宿主能力进一步研究，本文不冻结：
+
+- **上下文装配**：ContextSlice 的构建、seed subgraph 选择、frontier 预算、按 role/purpose 的注入重排与正文注入量；
+- **订阅生命周期**：订阅绑定逻辑 Invocation、过期与清理时机、Delta 合并与重放策略；
+- **等待恢复**：`InputWaitResult` 的持久化、恢复令牌、截止时间与重试策略；
+- **预算与门控**：token/时间预算、工具白名单、重试与超时参数。
+
+### 8.2 AgentTeams 集成（待进一步研究）
+
+AgentTeams 承载的具体集成细节需要结合实际能力与部署形态调研后定案，本文不冻结：
+
+- taskflow worker 包装链的具体时序与状态映射（`delegate_task` / `ack_task` / `submit_task` / `check_task`）；
+- workerflow 临时 agent 的创建、上下文注入与清理时机；
+- MCP allow policy 的具体工具清单、AccessEntries / AllowedDirs 的映射规则；
+- `result.md` 载荷格式与 PhaseOutput / 报告引用的映射；
+- 角色门控的动作黑名单（`plan_dag`、`accept_task_result` 等）与 Matrix 人工通道的具体接入。
+
+这些主题不改变 interface 的三面边界与控制权，但实现前必须完成专项调研。
+
+### 8.3 AgentTeams 适配与强制控制（待定）
+
+AgentTeams 承载方式与控制保障同样未定案，本文不冻结：
 
 ```text
 # 图决定可运行性，Runtime 承载调用，Agent 只提交结构化结果
@@ -297,7 +342,7 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 - 持久 worker：`delegate_task -> ack_task -> submit_task -> check_task`。
 - 临时 agent：`workflow_run` 创建独立 agent，结束后清理。
 
-承载方式不改变 interface 或控制权：
+承载方式不改变 interface 或控制权；下表只是设计方向，具体落点与保证待研究：
 
 | 控制层 | AgentTeams 落点 | 保证 |
 | --- | --- | --- |
@@ -308,7 +353,9 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 | 输入门控 | `PhaseInputSet` + Runtime 校验 | 上游只以正式交付引用进入；未满足输入不可完成 |
 | 通信门控 | worker 默认禁用 message 工具 | 无 Agent mailbox；Matrix 只用于人工可见性和最终报告 |
 
-## 8. 阶段权限
+### 8.4 阶段权限（待定）
+
+阶段可写范围与产物基线待定，本文不冻结：
 
 | 阶段 | 可写 | 禁止 | 主要产物 |
 | --- | --- | --- | --- |
@@ -318,52 +365,9 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 
 同一轮次的三个阶段共享 Workspace Binding。`verify passed` 仅代表获得后续 Merge Queue 资格；`done` 仍由 Task Manager 和 DeliveryPolicy 决定。
 
-## 9. 不提供的 Interface
-
-Phase Agent 不提供：
-
-- Coordination Graph 或 Context Graph 的写 interface；
-- main 写入、合并、done 判定；
-- mailbox、Agent 间消息、订阅外推送；
-- phase 跳转、lease、Workspace 或 worker 生命周期管理；
-- 读取未提交的其他 Agent 过程上下文；
-- `Attempt`、`Split`、`Failure`、`Rework`、`Execution Graph` 等额外实体 interface。
-
-## 10. 人类待决项
-
-本文故意不冻结：
-
-- MCP、HTTP、gRPC 或本地进程等传输协议；
-- `requiredArtifacts`、检索请求/响应、`ContextDelta.changes` 的完整字段；
-- `InputWaitResult` 的持久化、恢复令牌、截止时间与错误码；
-- Artifact ID、内容哈希、存储与去重策略；
-- 预算、重试、超时和可观测性字段；
-- DeliverySpec、ReportSpec、WriteSet 的完整结构。
-
-### 10.1 Phase Agent 内部配置（待进一步研究）
-
-Phase Agent 的上下文管理与运行内部配置需要结合具体宿主能力进一步研究，本文不冻结：
-
-- **上下文装配**：ContextSlice 的构建、seed subgraph 选择、frontier 预算、按 role/purpose 的注入重排与正文注入量；
-- **订阅生命周期**：订阅绑定逻辑 Invocation、过期与清理时机、Delta 合并与重放策略；
-- **等待恢复**：`InputWaitResult` 的持久化、恢复令牌、截止时间与重试策略；
-- **预算与门控**：token/时间预算、工具白名单、重试与超时参数。
-
-### 10.2 AgentTeams 集成（待进一步研究）
-
-AgentTeams 承载的具体集成细节需要结合实际能力与部署形态调研后定案，本文不冻结：
-
-- taskflow worker 包装链的具体时序与状态映射（`delegate_task` / `ack_task` / `submit_task` / `check_task`）；
-- workerflow 临时 agent 的创建、上下文注入与清理时机；
-- MCP allow policy 的具体工具清单、AccessEntries / AllowedDirs 的映射规则；
-- `result.md` 载荷格式与 PhaseOutput / 报告引用的映射；
-- 角色门控的动作黑名单（`plan_dag`、`accept_task_result` 等）与 Matrix 人工通道的具体接入。
-
-这些主题不改变 interface 的三面边界与控制权，但实现前必须完成专项调研。
-
 这些实现选择不改变 interface 的核心不变量：输入由图声明、正式交付经 Runtime 注入、Agent 可以自主 join 已知输入、未知依赖只能提案、Task 完成不由 Agent 宣布。
 
-## 11. 参考文档
+## 9. 参考文档
 
 - [统一设计](./threadmill-unified-design.md)：两张图、输入边、三阶段、订阅与 Runtime 的语义权威。
 - [Agent Runtime](./agent-runtime.md)：AgentTeams 的 taskflow / workerflow 映射、lease、MCP 注入与 result.md 载体。
