@@ -65,3 +65,7 @@ htmlcov/
 *.lz
 *.lzo
 ```
+
+# Project-local agent skills
+.omc/skills/ponytail/
+.omc/skills/codebase-design/
