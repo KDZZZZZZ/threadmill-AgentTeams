@@ -226,10 +226,18 @@ func SubmitPhaseOutput(output PhaseOutput) Accepted
 ```go
 // agent.proposeOrchestration 提交的编排意图
 type OrchestrationProposal struct {
-    ProposalID  string   `json:"proposal_id"`  // 幂等转交和裁决的标识
-    Advice      string   `json:"advice"`       // split | dependency | replan | retry | serial_parallel
-    Rationale   string   `json:"rationale"`    // 为什么需要调整
-    EvidenceRefs []string `json:"evidence_refs"` // 已注册的支撑证据
+    ProposalID               string   `json:"proposal_id"`                 // 幂等转交和裁决的标识
+    ClientRef                string   `json:"client_ref"`                  // 提交方引用，用于去重
+    FromEndpoint             string   `json:"from_endpoint"`               // 来源 endpoint
+    FromInvocationID         string   `json:"from_invocation_id"`          // 来源 Invocation
+    BasedOnGraphRevision     int64    `json:"based_on_graph_revision"`     // 基于的图版本（过期校验）
+    BasedOnWorkspaceRevision string   `json:"based_on_workspace_revision"` // 基于的 Workspace 版本
+    BasedOnInputRevision     string   `json:"based_on_input_revision"`     // 基于的输入版本
+    OrchestrationAdvice      string   `json:"orchestration_advice"`        // split | dependency | replan | retry | serial_parallel
+    DeliverySpecAdvice       string   `json:"delivery_spec_advice"`        // 对未来 endpoint 交付的建议
+    ReportSpecAdvice         string   `json:"report_spec_advice"`          // 对未来 endpoint 报告的建议
+    Rationale                string   `json:"rationale"`                   // 为什么需要调整
+    EvidenceRefs             []string `json:"evidence_refs"`               // 已注册的支撑证据
 }
 
 // MCP 工具：agent.proposeOrchestration(proposal) -> Accepted；这是意图，不是 Coordination Graph 命令
