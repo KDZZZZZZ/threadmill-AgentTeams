@@ -279,7 +279,8 @@ human.approved(plan_revision, risk_scope) -> A.execute
 Task Manager 不旁观 phase agent 的中间推理、工具输出、探索轨迹或未提交上下文。运行过程默认留在 Invocation 内；只有以下结构化边界输出可以进入 Task Manager：
 
 1. 阶段结束时的 `PhaseOutput`；
-2. 运行中主动提交的 `OrchestrationProposal`。
+2. 运行中主动提交的 `OrchestrationProposal`；
+3. 通过 Runtime 受控 join 的输入集合 `PhaseInputSet` 与等待结果 `InputWaitResult`。
 
 ```go
 type OrchestrationProposal struct {
@@ -302,9 +303,15 @@ planner、executor、verifier 三方都可提交建议，但情景不同：plann
 
 拆分机会、缺少前置、执行失败、验证失败和计划失效都使用同一种建议协议。建议是自由文本意图、理由和对未来 endpoint 契约的建议，不是图命令；phase agent 不决定创建哪些 Task、如何连边或哪些 endpoint 失效。Runtime 只记录并转交，Task Manager 结合当前图和可见证据决定接受、改写或拒绝，并热修改 Coordination Graph。无需为不同原因新增 Split Request、Failure Request 或 Rework Task 等实体。
 
+`PhaseInputSet` 是 endpoint 已声明入边的只读投影，至少包含：`inputRevision`、`required`、`delivered`、`pending`。`required` 定义 source endpoint、所需交付物与 `requiredBy`（start 或 completion）；`delivered` 只引用正式 `PhaseOutput` 与 artifact；`pending` 仅表示尚未到达的 completion 输入。
+
+Phase Agent 可以在本体工作做到当前信息不足时调用 `runtime.awaitInputs` 等待已知 completion 输入。Runtime 不保留长期占用 worker capacity 的挂起线程；它记录 waiting 语义、在输入到达或失效时更新 `inputRevision`，并可在恢复时重建受控执行调用。Agent 不直接持有 mailbox、不轮询消息，也不自己维护图状态。
+
+若 Agent 发现的是启动契约中没有声明的新前置，而不是等待既有 `inputId`，必须提交 `OrchestrationProposal(advice: dependency)`；Task Manager 审批后才会更新 Coordination Graph 与目标 endpoint 输入契约。
+
 ### 5.6 Endpoint 契约与阶段交付
 
-Task Manager 编排每个 Phase Endpoint 时，必须同时规定 `DeliverySpec` 和 `ReportSpec`。前者定义该阶段必须交付什么，后者定义报告必须回答哪些问题；未规定二者的 endpoint 不可调度。phase agent 可以在编排建议中提出新 endpoint 的要求，但正式契约只能由 Task Manager 写入图。
+Task Manager 编排每个 Phase Endpoint 时，必须同时规定 `DeliverySpec` 和 `ReportSpec`，并把入边投影进 `PhaseInputSet`。前者定义该阶段必须交付什么，后者定义报告必须回答哪些问题；未规定二者的 endpoint 不可调度。phase agent 可以在编排建议中提出新 endpoint 的要求，但正式契约只能由 Task Manager 写入图。
 
 ```go
 type PhaseOutput struct {
@@ -317,17 +324,17 @@ type PhaseOutput struct {
 
 `PhaseOutput` 必须完整绑定 `PhaseResultBinding`（TaskID / TaskContractRef / WorkspaceRef / Phase / WorkspaceID / InputRevision / WorkspaceHead / ContextSliceRef），以证明输出属于哪个 Task Contract 版本、基于哪个 Input Revision、使用哪份 Context Slice、属于哪个轮次。不再复制残缺的 revision 字段（Workspace 状态走 Binding，图状态走 ContextSliceRef）。
 
-每个 phase 必须按 endpoint 的两项要求提交 `PhaseOutput`，否则不得进入 completed。Runtime 只校验输出形状和必填引用；Task Manager 能读取所有 completed endpoint 的报告、交付物和证据引用，并据此继续编排，但不能读取未提交的运行过程上下文。
+每个 phase 必须按 endpoint 的两项要求提交 `PhaseOutput`，否则不得进入 completed。Runtime 只校验输出形状和必填引用，以及 required completion input 是否已到齐；Task Manager 能读取所有 completed endpoint 的报告、交付物和证据引用，并据此继续编排，但不能读取未提交的运行过程上下文。
 
 | 阶段 | 默认交付物基线 | 默认报告基线 |
 | --- | --- | --- |
-| plan | Submitted Plan、Declared Write Set、验证计划 | 方案、假设、依赖、权限、风险和所需 Context Subgraph |
+| plan | Submitted Plan、Declared Write Set、验证计划、Requirement | 方案、假设、依赖、权限、风险和所需 Context Subgraph |
 | execute | diff/commit 或其他候选产物、Observed Write Set | 实际变更、偏差、新 Memory Candidate 和未解决问题 |
 | verify | Verify Result、测试和检查证据 | 契约判断、证据、Workspace/Input revision、失败原因或通过理由 |
 
 表中只是 Manager 编排时的默认基线，不替代每个 endpoint 的具体 `DeliverySpec` 和 `ReportSpec`。报告和交付物位于 Artifact Store；`PhaseOutput` 只是 endpoint 输出载荷，不新增 Delivery 实体。阶段结果跨 Task 使用时，由 Coordination Edge 引用对应 endpoint 输出。
 
-### 5.7 编排建议的运行时处理
+### 5.7 编排建议与等待结果的运行时处理
 
 Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理由和 evidence，再决定是否热修改图。接受拆分建议时，它创建必要 Task/endpoint、为每个新 phase 写交付物和报告要求并连接边；接受失败或重排建议时，它调整尚待执行的计划和受影响 endpoint。拒绝时只返回结构化理由。Scheduler 不解释建议，只在图更新后重算 runnable endpoint。
 
@@ -336,9 +343,9 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 1. **幂等**：Runtime 对重复 `ProposalID` 只转交一次；Task Manager 对已裁决的 `ProposalID` 不重复处理。
 2. **过期校验**：Task Manager 校验 `BasedOnGraphRevision`；若图已更新到更高 revision，拒绝该建议并要求基于新 revision 重提，或明确声明按当前图裁决。
 
-编排建议不结束当前 phase。Task Manager 的裁决必须明确当前 Invocation 是继续、阻塞还是取消；若允许继续，phase agent 最终仍须提交原 endpoint 的 `PhaseOutput`。图变更历史由 Event Log 审计，但审计机制不限制 Coordination Graph 的运行时热修改。
+`runtime.awaitInputs` 返回的 waiting 结果不结束当前 phase。它只是说明：本体工作已推进到当前已知输入允许的极限，接下来可以等待、继续、重提建议或结束为阻塞报告。若允许继续，phase agent 最终仍须提交原 endpoint 的 `PhaseOutput`。图变更历史由 Event Log 审计，但审计机制不限制 Coordination Graph 的运行时热修改。
 
-**Coordination Graph 原子审计**：图变更（mutation、graph revision、endpoint invalidation、Proposal 裁决、audit event）必须在同一事务或 transactional outbox 中完成，任一部分失败则整体回滚，避免"图已修改、Event Log 没记录"。
+**Coordination Graph 原子审计**：图变更（mutation、graph revision、endpoint invalidation、Proposal 裁决、audit event）必须在同一事务或 transactional outbox 中完成，任一部分失败则整体回滚，避免“图已修改、Event Log 没记录”。
 
 ---
 
@@ -351,12 +358,12 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 | Task Manager Agent | 默认编排 Coordination Graph；规定每个 endpoint 的 DeliverySpec/ReportSpec；审批编排建议并热修改图；接受 endpoint 输出 | Requirement、所有 completed PhaseOutput/report/evidence、自己的 Context Slice/Delta 和可见 Context Graph | 旁观 phase 运行过程、选实现方案、写 Context Graph、操作 Workspace |
 | Scheduler | 从可运行 endpoint 中选择下一次 Invocation | Coordination Graph、预算、容量、能力 | 创建/修改 task、edge、blocker，解释编排建议，选择记忆 |
 | Ctx Manager Agent | 响应检索请求并准入 Memory Candidate；维护 Context Graph | Event Log、Artifact Store、权限策略 | 主动巡图或提示、决定普通探索/切片、执行订阅或推送、改 Coordination Graph、批准阶段交付 |
-| Agent Runtime | 启动/取消 Invocation，施加 phase 权限，记录事件并校验输出形状 | Scheduler 的 run request、Context Slice、Workspace Binding | 判断业务完成、暴露未提交过程上下文、写任一图的业务状态 |
+| Agent Runtime | 启动/取消/恢复 Invocation，施加 phase 权限，记录事件并校验输入与输出形状 | Scheduler 的 run request、Context Slice、Workspace Binding、PhaseInputSet | 判断业务完成、暴露未提交过程上下文、写任一图的业务状态 |
 | Workspace Service | 为 Task 轮次创建/复用/封存执行现场，观察 write set | Runtime policy、轮次 revision | 调度 Agent、判断验收、写 main |
 | Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上机械检查并合入 | Task Contract、Approved Plan、Workspace、evidence | Verifier 修改实现；Merge Queue 修冲突或直接改 Coordination/Context Graph |
-| Phase Agent | 完成当前 phase；提交 PhaseOutput 或编排建议；使用可见 Context Graph | Task Contract、endpoint 契约、自己的 Context Slice/Delta、子图列表与描述 | 直接改图、直接通信、改 main、宣布 done |
+| Phase Agent | 完成当前 phase；在已知 completion 输入上自主等待或汇总；提交 PhaseOutput 或编排建议；使用可见 Context Graph | Task Contract、endpoint 契约、自己的 Context Slice/Delta、子图列表与描述、PhaseInputSet | 直接改图、直接通信、改 main、宣布 done |
 
-依赖约束：Task Manager 与 phase agent 都通过相同的 Context 读接口获取外部记忆；二者都不能写 Context Graph。Ctx Manager 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。跨模块数据只使用 Task Contract、PhaseOutput、OrchestrationProposal、ArtifactRef、ContextSlice 和受控 service request。
+依赖约束：Task Manager 与 phase agent 都通过相同的 Context 读接口获取外部记忆；二者都不能写 Context Graph。Ctx Manager 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。跨模块数据只使用 Task Contract、PhaseInputSet、PhaseOutput、OrchestrationProposal、ArtifactRef、ContextSlice 和受控 service request。
  
 
 ## 7. Scheduler 与 Manager
