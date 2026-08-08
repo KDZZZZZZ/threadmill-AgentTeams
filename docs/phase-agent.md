@@ -340,6 +340,27 @@ Phase Agent 不提供：
 - 预算、重试、超时和可观测性字段；
 - DeliverySpec、ReportSpec、WriteSet 的完整结构。
 
+### 10.1 Phase Agent 内部配置（待进一步研究）
+
+Phase Agent 的上下文管理与运行内部配置需要结合具体宿主能力进一步研究，本文不冻结：
+
+- **上下文装配**：ContextSlice 的构建、seed subgraph 选择、frontier 预算、按 role/purpose 的注入重排与正文注入量；
+- **订阅生命周期**：订阅绑定逻辑 Invocation、过期与清理时机、Delta 合并与重放策略；
+- **等待恢复**：`InputWaitResult` 的持久化、恢复令牌、截止时间与重试策略；
+- **预算与门控**：token/时间预算、工具白名单、重试与超时参数。
+
+### 10.2 AgentTeams 集成（待进一步研究）
+
+AgentTeams 承载的具体集成细节需要结合实际能力与部署形态调研后定案，本文不冻结：
+
+- taskflow worker 包装链的具体时序与状态映射（`delegate_task` / `ack_task` / `submit_task` / `check_task`）；
+- workerflow 临时 agent 的创建、上下文注入与清理时机；
+- MCP allow policy 的具体工具清单、AccessEntries / AllowedDirs 的映射规则；
+- `result.md` 载荷格式与 PhaseOutput / 报告引用的映射；
+- 角色门控的动作黑名单（`plan_dag`、`accept_task_result` 等）与 Matrix 人工通道的具体接入。
+
+这些主题不改变 interface 的三面边界与控制权，但实现前必须完成专项调研。
+
 这些实现选择不改变 interface 的核心不变量：输入由图声明、正式交付经 Runtime 注入、Agent 可以自主 join 已知输入、未知依赖只能提案、Task 完成不由 Agent 宣布。
 
 ## 11. 参考文档
