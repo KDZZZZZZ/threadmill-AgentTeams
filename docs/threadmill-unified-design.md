@@ -465,7 +465,7 @@ type ContextNode struct {
     ID             string         `json:"id"`
     Kind           string         `json:"kind"` // fact | decision | constraint | failure | pattern | preference | hypothesis
     Statement      string         `json:"statement"`
-    Status         string         `json:"status"` // candidate | accepted | disputed | superseded | outdated
+    Status         string         `json:"status"` // candidate（未验证，读取侧规则见 12.4）| accepted | disputed | superseded | outdated
     Scope          []string       `json:"scope"`
     SubgraphIDs    []string       `json:"subgraph_ids"`
     SourceRefs     []string       `json:"source_refs"`
@@ -622,7 +622,7 @@ type MemoryCandidate struct {
 }
 ```
 
-Runtime 自动记录 candidate。Ctx Manager 是唯一有权执行 `create / revise / supersede / dispute / reject` 的角色。
+Runtime 自动记录 candidate，随后由 Context service 在入口处执行硬门槛前置过滤（见 12.2）：未通过硬门槛的候选只保留审计事件、不进图；通过者带 `status=candidate` 写入 Context Graph，并以事件驱动方式立即触发 Ctx Manager 整理。Ctx Manager 是唯一有权执行 `create / revise / supersede / dispute / reject` 的角色。
 
 ### 12.2 准入规则
 
@@ -646,6 +646,8 @@ Runtime 自动记录 candidate。Ctx Manager 是唯一有权执行 `create / rev
 - 密钥、凭据和超出权限范围的信息；
 - 已由 Task Contract、代码或生成契约权威表达且不会因压缩丢失的全文复制。
 
+其中四项属于**硬门槛**——没有 SourceRefs 的主张、未区分事实与假设的推测、密钥/凭据/超出权限范围的信息：由 Context service 在入口处同步前置过滤（结构校验、权限集合求交、敏感模式匹配、kind 强制自标），不通过则不进入 Context Graph，无需 Ctx Manager 介入。其余各项属于**价值判断**，由 Ctx Manager 在异步整理中决定。
+
 ### 12.3 评分与决定
 
 Ctx Manager 使用可解释评分，不让 embedding 单独决定：
@@ -662,7 +664,16 @@ value = reuse_probability
       - sensitivity_risk
 ```
 
-硬门槛优先于分数：缺证据、越权、秘密信息、不可区分事实/猜测直接拒绝。低价值 candidate 保留审计事件，但不进入 Context Graph，从而减少 Memory Manager 的后续清理工作和知识库垃圾。
+硬门槛优先于分数，且在进图前执行：缺证据、越权、秘密信息、不可区分事实/猜测由 Context service 前置过滤直接拒绝，不进入 Context Graph。通过硬门槛的候选先以 candidate 状态进图（满足订阅推送的实时性），再由 Ctx Manager 事件驱动异步整理；整理判定为低价值或不合格的候选从图中移除或保留为仅审计可见，从而减少 Memory Manager 的后续清理工作和知识库垃圾。
+
+### 12.4 candidate 状态的读取侧规则
+
+候选进图不等于可信。candidate 状态节点（已过硬门槛、未经 Ctx Manager 价值整理）在读取侧必须遵守：
+
+1. 初始 Context Slice 不包含 candidate 节点；新 Agent 的第一包上下文只含 accepted 及以上状态的可信记忆；
+2. Explore / Retrieve 可以返回 candidate 节点，但必须降权排序并标注"未验证"；
+3. candidate 节点的新增/变化可以实时推送（满足订阅的实时联络），但 Context Delta 必须携带 `unverified` 标记；只有 accepted 及以上状态的变化才代表可信知识更新；
+4. 候选整理由事件驱动（提交即触发），并辅以低频兜底对账，防止事件丢失导致候选滞留。
 
 ---
 
@@ -753,7 +764,7 @@ Context Graph commits a node/edge/subgraph revision
   -> Runtime records whether the Agent consumed it
 ```
 
-推送是基础设施自动执行，不调用 Ctx Manager 做逐条判断。它必须由已存在的订阅触发，并且增量、可合并、可重放；系统不提供订阅之外的旁路推送。
+推送是基础设施自动执行，不调用 Ctx Manager 做逐条判断。它必须由已存在的订阅触发，并且增量、可合并、可重放；系统不提供订阅之外的旁路推送。candidate 状态节点的更新同样实时推送，但 Delta 携带 `unverified` 标记（见 12.4），接收方不得将其当作可信知识。
 
 ### 14.3 推送与协调边的边界
 
