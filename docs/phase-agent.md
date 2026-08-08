@@ -1,7 +1,7 @@
 # Phase Agent Interface
 
 > 状态：Draft
-> 定位：定义 planner、executor、verifier 在 AgentTeams 宿主中使用的 Agent-facing interface。它以 Runtime 注入的 MCP 工具与回调表达，不预设 HTTP、gRPC 或最终 Go 类型。
+> 定位：定义 planner、executor、verifier 在 AgentTeams 宿主中使用的 Agent-facing interface。它以 Runtime 注入的 MCP 工具与回调表达；结构体以 Go 表达，json tag 即 MCP/HTTP 的传输映射，不预设最终实现位置。
 > 语义权威：[统一设计](./threadmill-unified-design.md)。本文与统一设计冲突时，以统一设计为准。
 
 ## 1. 设计目标
@@ -26,7 +26,7 @@ Phase Agent 是一次受控 Invocation 内的计算者，不是编排者。它�
 
 | 决定 | Owner | Phase Agent 可见结果 |
 | --- | --- | --- |
-| endpoint 是否可启动、入边和交付规定 | Task Manager + Coordination Graph | `StartPhaseInput.inputs` |
+| endpoint 是否可启动、入边和交付规定 | Task Manager + Coordination Graph | `StartPhaseInput.Inputs` |
 | 何时派发和恢复 Invocation | Scheduler + Runtime | `runtime.startPhase`、`runtime.onInputsChanged` |
 | 输入已到达、失效或无法到达 | Runtime | `PhaseInputSet` 与 `runtime.awaitInputs` 结果 |
 | 当前工作如何完成、何时等待 | Phase Agent | 输出、等待调用或编排建议 |
@@ -41,44 +41,46 @@ Phase Agent 没有 Coordination Graph、Context Graph、main、mailbox 或 phase
 
 Scheduler 选中 runnable Phase Endpoint 后，Runtime 调用 Agent。Agent 不调用此接口。
 
-```ts
-interface StartPhaseInput {
-  invocationId: string; // 当前受控 Invocation 的唯一标识
-  endpointRef: string; // 被调度的 Phase Endpoint
-  taskId: string; // 持久 Task 身份
-  phase: "plan" | "execute" | "verify"; // 当前执行阶段
-  contractRef: string; // Task Contract、DeliverySpec 和 ReportSpec
-  workspaceRef: string; // 当前轮次共享的 Workspace Binding
-  contextSliceRef: string; // Runtime 装配的初始上下文切片
-  inputs: PhaseInputSet; // 入边交付的只读投影
+```go
+// runtime.startPhase 注入的启动输入
+type StartPhaseInput struct {
+    InvocationID    string        `json:"invocation_id"`     // 当前受控 Invocation 的唯一标识
+    EndpointRef     string        `json:"endpoint_ref"`      // 被调度的 Phase Endpoint
+    TaskID          string        `json:"task_id"`           // 持久 Task 身份
+    Phase           string        `json:"phase"`             // plan | execute | verify
+    ContractRef     string        `json:"contract_ref"`      // Task Contract、DeliverySpec 和 ReportSpec
+    WorkspaceRef    string        `json:"workspace_ref"`     // 当前轮次共享的 Workspace Binding
+    ContextSliceRef string        `json:"context_slice_ref"` // Runtime 装配的初始上下文切片
+    Inputs          PhaseInputSet `json:"inputs"`            // 入边交付的只读投影
 }
 
-interface PhaseInputSet {
-  inputRevision: string; // 输入集合和新鲜度的版本
-  required: InputRequirement[]; // 当前 endpoint 声明需要的全部输入
-  delivered: InputDelivery[]; // 已到达的正式交付
-  pending: PendingInput[]; // 尚未到达的 completion 输入
+// 当前 endpoint 已声明入边的只读投影
+type PhaseInputSet struct {
+    InputRevision string           `json:"input_revision"` // 输入集合和新鲜度的版本
+    Required      []InputRequirement `json:"required"`     // 当前 endpoint 声明需要的全部输入
+    Delivered     []InputDelivery  `json:"delivered"`      // 已到达的正式交付
+    Pending       []PendingInput   `json:"pending"`        // 尚未到达的 completion 输入
 }
 
-interface InputRequirement {
-  inputId: string; // 输入要求的稳定标识
-  fromEndpoint: string; // 负责交付的上游 endpoint
-  requiredArtifacts: string[]; // 该输入必须包含的 artifact 类型或引用
-  requiredBy: "start" | "completion"; // 启动前满足，或最终提交前满足
+type InputRequirement struct {
+    InputID          string   `json:"input_id"`           // 输入要求的稳定标识
+    FromEndpoint     string   `json:"from_endpoint"`      // 负责交付的上游 endpoint
+    RequiredArtifacts []string `json:"required_artifacts"` // 该输入必须包含的 artifact 类型或引用
+    RequiredBy       string   `json:"required_by"`        // start | completion
 }
 
-interface InputDelivery {
-  inputId: string; // 对应的输入要求
-  fromEndpoint: string; // 实际交付的上游 endpoint
-  phaseOutputRef: string; // 上游正式 PhaseOutput 引用
-  artifactRefs: string[]; // 可消费的正式 artifact 引用
-  sourceRevision: string; // 上游交付所基于的 revision
+type InputDelivery struct {
+    InputID       string   `json:"input_id"`        // 对应的输入要求
+    FromEndpoint  string   `json:"from_endpoint"`   // 实际交付的上游 endpoint
+    PhaseOutputRef string  `json:"phase_output_ref"` // 上游正式 PhaseOutput 引用
+    ArtifactRefs  []string `json:"artifact_refs"`   // 可消费的正式 artifact 引用
+    SourceRevision string  `json:"source_revision"` // 上游交付所基于的 revision
 }
 
-interface PendingInput {
-  inputId: string; // 尚未到达的输入要求
-  fromEndpoint: string; // 预计交付的上游 endpoint
-  requiredBy: "completion"; // 仅允许并行等待，不能缺失提交
+type PendingInput struct {
+    InputID      string `json:"input_id"`       // 尚未到达的输入要求
+    FromEndpoint string `json:"from_endpoint"`  // 预计交付的上游 endpoint
+    RequiredBy   string `json:"required_by"`    // 仅 completion：并行等待，不能缺失提交
 }
 ```
 
@@ -97,10 +99,11 @@ Runtime 还在宿主侧强制 token/时间预算、工具白名单、可写目�
 
 Runtime 可因取消、lease 失效、预算耗尽、输入终止或 Task Manager 裁决终止当前 Invocation。
 
-```ts
-interface StopPhaseInput {
-  invocationId: string; // 要终止的 Invocation
-  reason: string; // 取消、lease 失效或裁决原因
+```go
+// runtime.stopPhase 注入的终止输入
+type StopPhaseInput struct {
+    InvocationID string `json:"invocation_id"` // 要终止的 Invocation
+    Reason       string `json:"reason"`        // 取消、lease 失效或裁决原因
 }
 ```
 
@@ -112,17 +115,18 @@ Agent 收到后停止写入。已产生的受控产物仅能通过正常输出�
 
 Agent 完成当前可执行工作、且只缺少启动输入中已声明的 completion 输入时，调用：
 
-```ts
-// Agent 主动等待已经声明的 completion 输入
-runtime.awaitInputs({
-  inputIds?: string[]; // 省略表示等待全部 pending 输入
-}) -> InputWaitResult
+```go
+// runtime.awaitInputs 请求：Agent 主动等待已经声明的 completion 输入
+type AwaitInputsRequest struct {
+    InputIDs []string `json:"input_ids,omitempty"` // 省略表示等待全部 pending 输入
+}
 
-interface InputWaitResult {
-  inputRevision: string; // 恢复时使用的最新输入版本
-  delivered: InputDelivery[]; // 本次等待期间新增或确认的交付
-  pending: PendingInput[]; // 仍未到达的输入
-  terminalReason?: "source_failed" | "source_cancelled" | "input_stale" | "lease_expired" | "deadline_exceeded"; // 无法继续等待时的原因
+// runtime.awaitInputs 返回
+type InputWaitResult struct {
+    InputRevision  string          `json:"input_revision"`             // 恢复时使用的最新输入版本
+    Delivered      []InputDelivery `json:"delivered"`                  // 本次等待期间新增或确认的交付
+    Pending        []PendingInput  `json:"pending"`                    // 仍未到达的输入
+    TerminalReason string          `json:"terminal_reason,omitempty"`  // source_failed | source_cancelled | input_stale | lease_expired | deadline_exceeded
 }
 ```
 
@@ -164,12 +168,13 @@ Runtime 通过 `threadmill-ctx` MCP server 向 AgentTeams 宿主注入以下只�
 
 ### 5.1 `runtime.onContextDelta`（Runtime 回调）
 
-```ts
-interface ContextDelta {
-  subscriptionId: string; // 当前 Context 订阅
-  subgraphId: string; // 发生变化的子图
-  revision: number; // Context Graph revision
-  changes: unknown[]; // 可合并、可重放的增量内容
+```go
+// runtime.onContextDelta 推送的知识增量
+type ContextDelta struct {
+    SubscriptionID string `json:"subscription_id"` // 当前 Context 订阅
+    SubgraphID     string `json:"subgraph_id"`     // 发生变化的子图
+    Revision       int64  `json:"revision"`        // Context Graph revision
+    Changes        []any  `json:"changes"`         // 可合并、可重放的增量内容
 }
 ```
 
@@ -179,9 +184,10 @@ interface ContextDelta {
 
 Runtime 在 Agent 未调用 `runtime.awaitInputs` 的正常运行期间，也可以在已声明 completion 输入到达或失效时更新可见输入：
 
-```ts
-interface InputsChanged {
-  inputs: PhaseInputSet; // 正式输入交付变化后的完整投影
+```go
+// runtime.onInputsChanged 推送的输入投影变化
+type InputsChanged struct {
+    Inputs PhaseInputSet `json:"inputs"` // 正式输入交付变化后的完整投影
 }
 ```
 
@@ -195,16 +201,17 @@ interface InputsChanged {
 
 阶段完成且所有 completion 输入到达时调用。
 
-```ts
-interface PhaseOutput {
-  phase: "plan" | "execute" | "verify"; // 产生输出的阶段
-  deliveryRefs: string[]; // 满足 DeliverySpec 的交付物
-  reportRef: string; // 满足 ReportSpec 的报告
-  evidenceRefs: string[]; // 支撑交付和判断的证据
+```go
+// agent.submitPhaseOutput 提交的阶段输出
+type PhaseOutput struct {
+    Phase        string   `json:"phase"`         // plan | execute | verify
+    DeliveryRefs []string `json:"delivery_refs"` // 满足 DeliverySpec 的交付物
+    ReportRef    string   `json:"report_ref"`    // 满足 ReportSpec 的报告
+    EvidenceRefs []string `json:"evidence_refs"` // 支撑交付和判断的证据
 }
 
-// 提交不等于通过；后续状态由授权方判定
-agent.submitPhaseOutput(output: PhaseOutput) -> Accepted
+// MCP 工具：agent.submitPhaseOutput(output) -> Accepted；提交不等于通过，后续状态由授权方判定
+func SubmitPhaseOutput(output PhaseOutput) Accepted
 ```
 
 - Runtime 将输出绑定到当前 Task Contract、endpoint、Input Revision、Context Slice 和 Workspace 轮次；Agent 不填写或改写这些绑定字段。
@@ -216,16 +223,17 @@ agent.submitPhaseOutput(output: PhaseOutput) -> Accepted
 
 运行中发现新前置、需要拆分、重排、重试或计划失效时调用。
 
-```ts
-interface OrchestrationProposal {
-  proposalId: string; // 幂等转交和裁决的标识
-  advice: "split" | "dependency" | "replan" | "retry" | "serial_parallel"; // 编排意图
-  rationale: string; // 为什么需要调整
-  evidenceRefs: string[]; // 已注册的支撑证据
+```go
+// agent.proposeOrchestration 提交的编排意图
+type OrchestrationProposal struct {
+    ProposalID  string   `json:"proposal_id"`  // 幂等转交和裁决的标识
+    Advice      string   `json:"advice"`       // split | dependency | replan | retry | serial_parallel
+    Rationale   string   `json:"rationale"`    // 为什么需要调整
+    EvidenceRefs []string `json:"evidence_refs"` // 已注册的支撑证据
 }
 
-// 这是意图，不是 Coordination Graph 命令
-agent.proposeOrchestration(proposal: OrchestrationProposal) -> Accepted
+// MCP 工具：agent.proposeOrchestration(proposal) -> Accepted；这是意图，不是 Coordination Graph 命令
+func ProposeOrchestration(proposal OrchestrationProposal) Accepted
 ```
 
 Proposal 是意图，不是图命令。Runtime 对重复 `proposalId` 只转交一次；Task Manager 检查 graph revision、输入 revision 与证据后接受、改写或拒绝。Proposal 不结束当前 phase，除非裁决明确取消；已知输入等待仍由 `runtime.awaitInputs` 自主处理。
@@ -234,16 +242,17 @@ Proposal 是意图，不是图命令。Runtime 对重复 `proposalId` 只转交�
 
 发现具有独立交付与验收的新工作时调用：
 
-```ts
-interface Requirement {
-  text: string; // 新需求的原始描述
-  goal?: string; // 可选目标
-  constraints?: string[]; // 可选约束
-  evidenceRefs?: string[]; // 可选来源证据
+```go
+// agent.submitRequirement 提交的新需求
+type Requirement struct {
+    Text         string   `json:"text"`           // 新需求的原始描述
+    Goal         string   `json:"goal,omitempty"` // 可选目标
+    Constraints  []string `json:"constraints,omitempty"` // 可选约束
+    EvidenceRefs []string `json:"evidence_refs,omitempty"` // 可选来源证据
 }
 
-// Requirement 交给 Task Manager 规整，不能直接调度
-agent.submitRequirement(requirement: Requirement) -> Accepted
+// MCP 工具：agent.submitRequirement(requirement) -> Accepted；交给 Task Manager 规整，不能直接调度
+func SubmitRequirement(requirement Requirement) Accepted
 ```
 
 Runtime 记录来源为当前 phase，Task Manager 将其规整为 Task Contract。Requirement 本身不可调度，不能用于修改当前 endpoint 的既有验收或输入契约。
@@ -252,16 +261,17 @@ Runtime 记录来源为当前 phase，Task Manager 将其规整为 Task Contract
 
 标注可复用知识时调用：
 
-```ts
-interface MemoryCandidate {
-  statement: string; // 一句话知识陈述
-  kind: string; // fact、decision、constraint 等候选类型
-  sourceRefs: string[]; // 必须能追溯到证据
-  whyReusable: string; // 为什么值得跨 Invocation 复用
+```go
+// agent.submitMemoryCandidate 提交的记忆候选
+type MemoryCandidate struct {
+    Statement   string   `json:"statement"`             // 一句话知识陈述
+    Kind        string   `json:"kind"`                  // fact | decision | constraint | ...
+    SourceRefs  []string `json:"source_refs"`           // 必须能追溯到证据
+    WhyReusable string   `json:"why_reusable"`          // 为什么值得跨 Invocation 复用
 }
 
-// 这是记忆候选，不是 Context Node
-agent.submitMemoryCandidate(candidate: MemoryCandidate) -> Accepted
+// MCP 工具：agent.submitMemoryCandidate(candidate) -> Accepted；这是记忆候选，不是 Context Node
+func SubmitMemoryCandidate(candidate MemoryCandidate) Accepted
 ```
 
 这是候选，不是 Context Node。Runtime 记录候选；Ctx Manager 负责 evidence、权限与价值判断，以及 create/revise/supersede/dispute/reject。`sourceRefs` 缺失时默认拒绝。
