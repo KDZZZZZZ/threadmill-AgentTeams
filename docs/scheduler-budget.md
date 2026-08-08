@@ -12,7 +12,7 @@ Scheduler 是 Coordination Graph 的只读消费者。它读取图，选择当�
 
 Scheduler 不做：
 
-- 不创建、修改或删除 Task、Task Attempt、Phase Endpoint、edge、blocker；
+- 不创建、修改或删除 Task、Phase Endpoint、edge、blocker；
 - 不解释 OrchestrationProposal，不决定 replan、拆分或失败处置；这些由 Task Manager 裁决；
 - 不启动 Ctx Manager 做普通探索或提示；初始 Context Slice 与自动订阅由 Context service 在 Invocation 创建时完成，Ctx Manager 只响应 Agent 的 Retrieve 请求与准入 MemoryCandidate；
 - 不把 Agent 与 Task 永久绑定；不操作 Workspace；不合并 main。
@@ -103,7 +103,7 @@ Scheduler 依默认优先级选择下一个 runnable endpoint，请求 Runtime �
 ```text
 登记 Requirement。
 Runtime(role=task_manager) 启动 Task Manager Invocation；
-Task Manager 将 Requirement 规整为 Task Contract，创建 Task / Attempt /
+Task Manager 将 Requirement 规整为 Task Contract，创建 Task / 轮次 /
 Phase Endpoint / edge / blocker，并为每个 endpoint 写入 DeliverySpec 与 ReportSpec；
 图更新后 Scheduler 重算 runnable endpoint。
 不一定立刻启动 agent。
@@ -163,7 +163,7 @@ scheduler_policy = maximize_verified_tasks
 Scheduler 不主动 replan。以下事件由 Task Manager 处理后产生图更新；Scheduler 在每次图 revision 更新后重算 runnable endpoint 与优先级：
 
 ```text
-1. PhaseOutput 提交：Manager 决定继续、创建新 Attempt 或新 Task。
+1. PhaseOutput 提交：Manager 决定继续、重开轮次或创建新 Task。
 2. OrchestrationProposal：execute 发现 approved plan 依赖的事实错误、
    verify 失败且非局部修复可解决、冲突影响当前 Task 的 write set、
    预算不足需要缩小目标等，由运行中的 phase agent 提交；

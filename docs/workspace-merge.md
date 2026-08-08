@@ -2,7 +2,7 @@
 
 版本：v0.4（重写）
 状态：Draft
-定位：本文说明《统一设计》的 Workspace 与 Merge Queue 语义如何在 third_party/agentteams（AgentTeams v1.2.x 归档基座）上实现：一 Attempt 一 Workspace、三 phase 共享、phase lease、四种 Workspace 实现形态、write set、Merge Queue。
+定位：本文说明《统一设计》的 Workspace 与 Merge Queue 语义如何在 third_party/agentteams（AgentTeams v1.2.x 归档基座）上实现：一轮次一 Workspace、三 phase 共享、phase lease、四种 Workspace 实现形态、write set、Merge Queue。
 > 语义以 docs/threadmill-unified-design.md 为准（下称《统一设计》，见其第 4、8 节），本文只补充实现映射；术语冲突时以《统一设计》为准。
 
 ---
@@ -11,8 +11,8 @@
 
 《统一设计》的核心规则：
 
-1. 同一 Task Attempt 的 plan、execute、verify 默认共享同一个 Workspace Binding（§4.1）。
-2. Workspace 实现形式可替换：Git 仓库（`git worktree + branch`，默认）、独立 clone/目录、容器加持久 volume、远程 sandbox；上层契约相同（稳定 Workspace ID、固定基线、允许写范围、可观测变更、阶段间持久、Attempt 间隔离）（§4.1）。
+1. 同一 Task 轮次的 plan、execute、verify 默认共享同一个 Workspace Binding（§4.1）。
+2. Workspace 实现形式可替换：Git 仓库（`git worktree + branch`，默认）、独立 clone/目录、容器加持久 volume、远程 sandbox；上层契约相同（稳定 Workspace ID、固定基线、允许写范围、可观测变更、阶段间持久、轮次间隔离）（§4.1）。
 3. 权限随 phase lease 切换：plan 默认只读源码，execute 可写批准范围，verify 默认不可修改候选实现；任何阶段只有一个有效写 lease（§4.3）。
 4. `verify passed` 只获得进入 Merge Queue 的资格；Merge Queue 是 main 的唯一写入口，在 latest main 上机械检查、targeted verify、串行合并（§8.2）。
 5. 冲突或复验失败产生 evidence，由 Task Manager 将受影响阶段编排回 plan/execute/verify 或 waiting_human（§8.2、§8.3）。
@@ -51,7 +51,7 @@
 type WorkspaceBinding struct {
     ID              string            `json:"id"`
     TaskID          string            `json:"task_id"`
-    AttemptID       string            `json:"attempt_id"`
+    Generation      int               `json:"generation"` // 轮次序号：1 起递增
     Kind            string            `json:"kind"` // git_worktree | clone | container | remote
     Root            string            `json:"root"`
     BranchName      string            `json:"branch_name,omitempty"`
@@ -76,14 +76,14 @@ Kind 与基座实现映射：
 | `container` | 容器 + 持久 volume | 复用 QwenPaw/OpenClaw worker 镜像与启动机制（`qwenpaw/Dockerfile`、`worker/Dockerfile`）；per-attempt 容器生命周期由 Threadmill 新建调用层（或复用 Worker CR 的 state 状态机管理执行宿主） | 镜像/启动复用，生命周期新建 |
 | `remote` | 远程 sandbox | 复用 controller `deployMode=Edge` 的远程宿主通道（types.go DeployMode 注释）；sandbox 语义 Threadmill 新建 | 通道复用，语义新建 |
 
-### 3.2 一 Attempt 一 Workspace 的落点
+### 3.2 一轮次一 Workspace 的落点
 
-- **Attempt 创建**：Task Manager 在 Coordination Graph 中创建 Attempt；Scheduler 选择 runnable endpoint 后，Runtime 向 Workspace Service 请求创建 Binding，并经 controller 选择或创建执行宿主。默认逻辑落点为 `shared/tasks/{attempt_id}/`，复用 TeamHarness 存储布局与 MinIO 物理同步，但 Workspace 身份、基线和 revision 由 Threadmill 记录。
-- **三 phase 共享**：plan / execute / verify 的委派都绑定同一 Workspace ID。Workspace Service 在每个 phase 启动前物化并校验该 Binding 的指定 revision；MinIO 只承担物理传输与恢复，不作为并发合并或 revision 权威。Pod 重建或更换 worker 后，Runtime 仍从同一 Binding 恢复 Attempt 现场。
+- **轮次创建**：Task Manager 在 Coordination Graph 中决定新轮次；Scheduler 选择 runnable endpoint 后，Workspace Service 创建 Binding，Runtime 创建 Invocation 并经 controller 选择或创建执行宿主。默认逻辑落点为 `shared/tasks/{task_id}/{workspace_ref}/`，复用 TeamHarness 存储布局与 MinIO 物理同步，但 Workspace 身份、基线和 revision 由 Threadmill 记录。
+- **三 phase 共享**：plan / execute / verify 的委派都绑定同一 Workspace ID。Workspace Service 在每个 phase 启动前物化并校验该 Binding 的指定 revision；MinIO 只承担物理传输与恢复，不作为并发合并或 revision 权威。Pod 重建或更换 worker 后，Runtime 仍从同一 Binding 恢复轮次现场。
 - **目录内阶段约定**（Threadmill 约定，避免与 TeamHarness 的 spec/result 冲突）：
 
 ```text
-shared/tasks/{attempt_id}/
+shared/tasks/{task_id}/{workspace_ref}/
   meta.json          # TeamHarness 委派状态（直接复用，不写 Threadmill 图状态）
   spec.md            # Task Contract + DeliverySpec/ReportSpec + phase lease 声明（适配封装）
   plan/              # plan 产物：Approved Plan、Declared Write Set、验证计划
@@ -92,12 +92,12 @@ shared/tasks/{attempt_id}/
   result.md          # PhaseOutput 载荷
 ```
 
-- **Attempt 隔离**：新 Attempt 一律新目录（`{attempt_id+1}`），不能在验证失败的旧现场上无审计地继续修改（统一设计 §4.4）；旧目录封存为 evidence，按保留策略清理（复用 MinIO 生命周期管理）。
-- **临时 Attempt**：WorkerFlow run 级共享目录（`<default-workspace>/shared/workerflow/<runId>/`）可作为一次性 Attempt 的 Workspace；`runId` 关联 AttemptID，结束后 `cleanup_shared` 清理（agent-runtime.md §3.2）。
+- **轮次隔离**：新轮次一律新目录（新 workspace_ref），不能在验证失败的旧现场上无审计地继续修改（统一设计 §4.4）；旧目录封存为 evidence，按保留策略清理（复用 MinIO 生命周期管理）。
+- **临时轮次**：WorkerFlow run 级共享目录（`<default-workspace>/shared/workerflow/<runId>/`）可作为一次性轮次的 Workspace；`runId` 关联 WorkspaceRef，结束后 `cleanup_shared` 清理（agent-runtime.md §3.2）。
 
 ### 3.3 phase lease
 
-语义：任一时刻一个 Attempt 只有一个有效写 lease；plan 默认只读源码（可写 `plan/` 产物），execute 可写批准范围（`workspace/`），verify 默认只读实现（可写 `evidence/`）。**AgentTeams 没有 phase lease 概念**，Threadmill 用三层 enforcement：
+语义：任一时刻一个轮次只有一个有效写 lease；plan 默认只读源码（可写 `plan/` 产物），execute 可写批准范围（`workspace/`），verify 默认只读实现（可写 `evidence/`）。**AgentTeams 没有 phase lease 概念**，Threadmill 用三层 enforcement：
 
 ```text
 a) 委派轮次隔离（强）：每 phase 一次 taskflow 委派给不同 worker / 每 phase 一个 WorkerFlow 临时 agent
@@ -114,7 +114,7 @@ prepared
   -> plan_leased -> plan_done        （plan 通过后冻结 Approved Plan 与 Declared Write Set）
   -> execute_leased -> execute_done  （复用同一 Workspace；观察 diff 与 Observed Write Set）
   -> verify_leased -> verify_passed  （→ Merge Queue 资格，§4）
-                   -> verify_failed  （→ 新 Attempt 或 OrchestrationProposal）
+                   -> verify_failed  （→ OrchestrationProposal，重开轮次）
 ```
 
 lease 记录在 `WorkspaceBinding.PhaseLeases`；Task Manager 通过图激活或失效 endpoint，Runtime 在启动已调度 Invocation 前向 Workspace Service 取得并校验 lease，phase 结束后释放。Task Contract / 依赖结果 / 代码基线 / Workspace Head / 高影响上下文变化后，Task Manager 使相关 phase 失效（统一设计 §3.3），Scheduler 只执行该决定。
@@ -147,7 +147,7 @@ lease 记录在 `WorkspaceBinding.PhaseLeases`；Task Manager 通过图激活或
 流程（统一设计 §8.2）：
 
 ```text
-Verify passed on Attempt Workspace
+Verify passed on round Workspace
   -> MergeCandidate
   -> 临时 merge-check workspace（Threadmill git worktree / clone 新建）
   -> latest main 上机械应用检查（文件冲突 / 权限边界 / 写集合重叠 / main drift）
@@ -197,7 +197,7 @@ MergeCandidate: queued
 2. 普通 agent 不写 Coordination Graph / Context Graph；只提交 `PhaseOutput` / `OrchestrationProposal` / MemoryCandidate。
 3. Observed Write Set 以 Runtime 观察为准；agent 自报（submit_task deliverables）只能作参考。
 4. 隔离叠加：Pod 隔离（每 worker 一 Pod）+ 存储 ACL（AccessEntries scoped `agents/<name>/*`、`shared/*`）+ AllowedDirs + MCP allow policy + phase lease。
-5. worker 无状态：任何 Pod 重建后从 MinIO 恢复 Attempt 现场；Attempt 身份与 Workspace 记录在 Threadmill 侧，不随容器丢失。
+5. worker 无状态：任何 Pod 重建后从 MinIO 恢复轮次现场；轮次身份与 Workspace 记录在 Threadmill 侧，不随容器丢失。
 6. 敏感路径（credentials/、sessions/、logs/、tool results/）在任何同步、观察与合并检查中排除（sync.py / worker-file-sync.sh 排除清单直接复用）。
 7. 冲突视为 verify gate 不通过，必须回到 plan → execute → verify 或等待人工决定；Merge Queue 不修冲突。
 8. 所有 merge、冲突、失败、权限违规都必须有事件记录与 evidence refs（Threadmill Event Log 投影 + Artifact Store）。
@@ -215,5 +215,5 @@ MergeCandidate: queued
 | ProjectMeta | `shared/projects/{project_id}/meta.json` | `status`、`plan_type`、`reply_route`、`requester_report`（pending/reason/report_path/sent_at） |
 | spec / result | `shared/tasks/{task_id}/spec.md`、`result.md` | Leader 拥有 spec；worker 拥有 result；目录所有权见 §3.2 |
 | WorkerFlow 状态 | `<default-workspace>/shared/workerflow/<runId>/workflow.json` | `status`、`subagents`/`nodes`/`steps`、`readyInstructions` |
-| MergeCandidate（Threadmill 新建） | Threadmill 侧存储 | attempt_id、verify_result_ref、diff_artifact_ref、base/main revision、status（queued/merge_check/targeted_verify/merged/failed）、evidence_refs |
+| MergeCandidate（Threadmill 新建） | Threadmill 侧存储 | workspace_ref、verify_result_ref、diff_artifact_ref、base/main revision、status（queued/merge_check/targeted_verify/merged/failed）、evidence_refs |
 | 心跳/就绪 | 本地 `heartbeat.json`；`POST /api/v1/workers/{name}/ready|heartbeat` | Pod 健康与 `lastActiveAt`（容量判断输入） |

@@ -22,7 +22,7 @@ Task Manager Agent 是 **Coordination Graph 的唯一写入口**，也是**默�
 ```text
 Requirement（人类或 agent 提交，保存来源）
   -> Task Manager 规整为 Task Contract（what / why / done / 边界）
-  -> 创建 Task、Task Attempt、Phase/Decision Endpoint、edge 和 blocker
+  -> 创建 Task、Phase/Decision Endpoint、edge 和 blocker，并创建轮次（Round）
   -> 为每个 phase endpoint 写入 DeliverySpec 与 ReportSpec
   -> 读取所有 completed endpoint 的 PhaseOutput / 报告 / 证据，决定后续编排
   -> 审批 OrchestrationProposal，接受后热修改图并明确当前 Invocation 处置
@@ -170,7 +170,7 @@ B.verify -> A.verify   A 可以先实施，但最终验收必须包含 B
 ### 8.3 如何处理失败和过期结果
 
 ```text
-- 局部实现或验证失败：为同一 Task Contract 创建新 Attempt。
+- 局部实现或验证失败：失效旧输出并为同一 Task Contract 重开轮次。
 - Task Contract 不完整或自相矛盾：阻塞受影响 endpoint，请求澄清或重新立约。
 - verify 暴露出独立工作：接受 OrchestrationProposal(split)，登记新 Task 并连接到消费其结果的 endpoint。
 - candidate 相对新 revision 已过期：使旧验证失效，重新 verify 或重新 plan。

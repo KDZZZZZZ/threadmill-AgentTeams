@@ -16,9 +16,9 @@ _Avoid_: Task prompt、plan
 由一个 Task Contract 约束、通过 phase endpoint 协调的持久工作单元。Task 的寿命长于任何参与执行的 agent。
 _Avoid_: Agent、session、thread
 
-**Task Attempt（任务尝试）**:
-对同一个 Task Contract 的一次有界尝试；拥有一份 Workspace Binding。验证失败后通常开始新的 attempt，而不是创建新的 task。
-_Avoid_: Retry task
+**轮次（Round）**:
+对同一个 Task Contract 的一次有界尝试，由该轮次的 Workspace Binding 标识，不创建独立持久实体。验证失败后由 Task Manager 失效旧输出、重开 execute→verify 轮次，而不是创建新的 task。
+_Avoid_: Retry task、Task Attempt
 
 **Phase Endpoint（阶段端点）**:
 Task 生命周期中的命名协调点，其他工作可以向它提供输入或依赖它产生的结果；需要人工或外部决定的端点即 Decision Endpoint。
@@ -65,7 +65,7 @@ _Avoid_: Agent assignment
 _Avoid_: Orchestrator、Task runner
 
 **Workspace Binding（工作区绑定）**:
-一次 Task Attempt 的可变执行现场（git worktree、独立目录、容器等实现形式可替换）；同一 Attempt 的 plan/execute/verify 共享，Attempt 间隔离。
+一个 Task 轮次的可变执行现场（git worktree、独立目录、容器等实现形式可替换）；同一轮次的 plan/execute/verify 共享，轮次间隔离。
 _Avoid_: Sandbox、checkout
 
 **Merge Queue（合并队列）**:
