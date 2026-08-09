@@ -103,15 +103,15 @@ _Avoid_: Note、memory write
 _Avoid_: Style note、requirement
 
 **ContextNode 节点 Kind（directive / fact / hypothesis）**:
-所有 ContextNode 全局统一使用这三类 Kind，与 Subgraph.Kind（`general` | `task`）正交；候选只建议 `general` 子图、`TaskContextWriter` 定向投影只写 `task` 子图，两条写路径目标不相交，不发生类型冲突。`directive`：规范性陈述，定义必须/应当/期望做什么，包括用户 Requirement、稳定偏好，以及 Task Manager 已写入 Coordination Graph 的 Task Contract 与 endpoint DeliverySpec/ReportSpec 的上下文投影（权威在 Coordination Graph/Requirement 原件，节点必须引用来源，不复制易变 runnable/blocked 状态；硬约束、软偏好与任务契约通过字段或来源引用区分）。`fact`：已经成立、发生或经相应验收边界接受/验证的描述性陈述，包括 completed/accepted PhaseOutput、交付物、报告和证据的上下文投影（权威载荷仍在 Artifact Store/PhaseOutput，节点必须带权威来源引用）。`hypothesis`：尚待证据验证的描述性推测，不得承载任务或用户要求。task 子图是便于检索/订阅的投影，不替代 Coordination Graph、Requirement 原件、PhaseOutput 或 Artifact Store。
+所有 ContextNode 全局统一使用这三类 Kind，与 Subgraph.Kind（`general` | `task`）正交。Context Agent 可经 Context Service CRUD general 节点和 general 子图；`TaskContextWriter` 定向投影只写 `task` 子图，两条写路径目标不相交。`directive`：规范性陈述，定义必须/应当/期望做什么，包括用户 Requirement、稳定偏好，以及 Task Manager 已写入 Coordination Graph 的 Task Contract 与 endpoint DeliverySpec/ReportSpec 的上下文投影（权威在 Coordination Graph/Requirement 原件，节点必须引用来源）。`fact`：已经成立、发生或经相应验收边界接受/验证的描述性陈述。`hypothesis`：尚待证据验证的描述性推测，不得承载任务或用户要求。
 _Avoid_: task fact、phase fact、hypothesis task
 
 **Context Graph（上下文图）**:
-从运行证据中提炼出的知识节点及其逻辑关系的持久图。所有 Agent 可列表、探索和订阅；列表/探索不足时经独立接口 `contextAgent.retrieve` 调用 Context Agent 自然语言检索（Context Agent 内部使用仅注入自身的 `ContextGraphSearcher.Search`）；general 写入只经候选缓冲：候选入 Task 级缓冲，Task done 后冻结、Context Agent 批量裁决、Context Service 落图；Task Manager 的定向投影经 `TaskContextWriter` 写入，仅限 task 子图。
+从运行证据中提炼出的知识节点及其逻辑关系的持久图。所有 Agent 可列表、探索和订阅；Context Agent 额外持有机械 Search，并可经 Context Service CRUD general 节点和 general 子图、审查 done 后冻结候选。task 子图及其节点只接受 Task Manager 经 `TaskContextWriter` 定向投影；任何持久化 mutation 均由 Context Service 执行。
 _Avoid_: Memory store、KB dump
 
 **Context Node / Context Edge（上下文节点/边）**:
-图中的知识陈述与逻辑关系（logical_adjacent、derives_from_subgraph、supports、contradicts、supersedes 等）。创建时自动边只有两类：同创建者最近节点的 `logical_adjacent` 与订阅子图的 `derives_from_subgraph`（见 context-graph.md §4）。所有节点统一使用 `directive` | `fact` | `hypothesis` 三类 Kind，与所属子图无关；同一节点可同时属于多个子图。Agent 只能通过 MemoryCandidate 间接影响它们；embedding 相似不能单独建立语义边。
+图中的知识陈述与逻辑关系（logical_adjacent、derives_from_subgraph、supports、contradicts、supersedes 等）。所有节点统一使用 `directive | fact | hypothesis`；同一 general 节点可属于多个 general 子图。普通 Agent 只能通过 MemoryCandidate 间接影响节点；Context Agent 可经受控 CRUD 管理 general 节点，不能操作 task 子图节点。
 _Avoid_: Chat excerpt、snippet
 
 **Context Subgraph（上下文子图）**:

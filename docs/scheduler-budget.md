@@ -14,7 +14,7 @@ Scheduler 不做：
 
 - 不创建、修改或删除 Task、Phase Endpoint、edge、blocker；
 - 不解释 OrchestrationProposal，不决定 replan、拆分或失败处置；这些由 Task Manager 裁决；
-- 不启动 Context Agent（即此前 Ctx Manager Agent / 图中 ctx agent）做普通探索或提示；初始 Context Slice 与自动订阅由 Context service 在 Invocation 创建时完成，Context Agent 只响应独立检索接口（`contextAgent.retrieve`，内部经仅注入 Context Agent 的 `ContextGraphSearcher.Search` 完成机械匹配）与对 Task done 后冻结候选批次的 general 语义裁决（`ListSubgraphs` / `Explore` / `Subscribe` 由 Context Service / Graph 操作面直接处理，不调用 Context Agent；普通 worker / Task Manager 不持有 Search）；
+- 不启动 Context Agent 做无触发的普通探索或提示；Context Agent 只在自然语言检索、done 后候选审查或显式 general 图管理 Invocation 中工作，并受权限、revision 和预算约束。
 - 不把 Agent 与 Task 永久绑定；不操作 Workspace；不合并 main。
 
 Scheduler 与 Task Manager 的唯一协调媒介是 Coordination Graph：Task Manager 写图（含审批 OrchestrationProposal 后的热修改），Scheduler 在图 revision 更新后重算 runnable endpoint。循环为：
@@ -48,7 +48,7 @@ Budget Model 约束系统可投入的 token、时间、并发、retry 和 verify
 - start planner / start executor / start verifier
     -> 统一为"启动 endpoint Invocation"，role 由 endpoint 决定；
 - start context_agent to create context pack
-    -> Context Agent 只在被独立检索接口（`contextAgent.retrieve`）调用或审查 Task done 后冻结的候选批次时工作；
+    -> Context Agent 可由独立检索、冻结候选审查或显式 general 图管理请求启动；
        初始切片/订阅由 Context service 在 Invocation 创建时完成；
 - create worktree
     -> Runtime / Workspace Service 在 Invocation 启动时创建或复用 Workspace Binding；
@@ -196,7 +196,7 @@ Scheduler 不主动 replan。以下事件由 Task Manager 处理后产生图更�
    Task Manager 的依赖编排权。
 6. 不直接启动任何 agent；只向 Agent Runtime 提交 run request。
 7. budget 不足时优先保护 verify 和 merge，而不是继续开新探索。
-8. 不解释 OrchestrationProposal、不改图、不启动 Context Agent 做普通探索。
+8. 不解释 OrchestrationProposal、不改 Coordination Graph、不启动 Context Agent 做无触发探索。
 ```
 
 ## 10. AgentTeams 实现映射

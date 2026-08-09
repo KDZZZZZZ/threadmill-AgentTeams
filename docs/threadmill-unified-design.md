@@ -57,14 +57,14 @@ Threadmill 只保留两张持久图。Agent Runtime 和 Workspace 是执行边�
 | 对象 | 生命周期 | 负责的问题 | 唯一写入口 |
 | --- | --- | --- | --- |
 | Coordination Graph | 持久 | 哪个 Phase Endpoint 可以运行、被什么阻塞、阶段交付是否满足 | Task Manager Agent |
-| Context Graph | 持久 | 哪些记忆可见、如何关联、如何检索、哪些订阅需要推送 | Context Service（Phase Agent 候选先入 Task 级缓冲，Task 达成权威 done 后由 Task Manager 冻结、经 Context Agent 批量语义裁决后落图；task 子图只接受 Task Manager 经 TaskContextWriter 的定向投影） |
+| Context Graph | 持久 | 哪些记忆可见、如何关联、如何检索、哪些订阅需要推送 | Context Service（Context Agent 可经受控工具 CRUD general 节点和 general 子图；候选终审也由 Context Service 原子落图；task 子图只接受 Task Manager 经 TaskContextWriter 的定向投影） |
 | Agent Runtime / Workspace | 一次 Invocation / 一个轮次 | 如何在权限、工作区和预算内执行并记录证据 | Runtime / Workspace service |
 
 三者边界必须保持：
 
 - Coordination Graph 是可热修改的当前编排，但只有 Task Manager 能写。运行中的 Agent 如需拆分、增加前置、调整串并关系或失败后重排，只能提交结构化编排建议。
 - Coordination Graph 不保存 Agent 的运行过程上下文；只保存阶段依赖、完成信号、交付物/报告要求及其结果引用。
-- Context Graph 是所有 Agent 的外部记忆通信面。Agent 可探索可见图、订阅子图并接收自动增量推送；列表/探索不足时经独立接口 `contextAgent.retrieve` 请求 Context Agent 语义检索（机械 Search 经仅注入 Context Agent 的 `ContextGraphSearcher` 完成），但不能直接写图。图的持久化 mutation 唯一执行者是 Context Service：Phase Agent 候选只入 Task 级候选缓冲（仅建议 general 子图），Task 达成权威 done 后由 Task Manager 调用 `TaskMemoryFinalizer` 冻结缓冲，Context Agent 对冻结批次批量裁决，Context Service 落图；task 子图只接受 Task Manager 经 `TaskContextWriter` 的定向投影。
+- Context Graph 是所有 Agent 的外部记忆通信面。普通 Agent 可探索、订阅和接收 Delta，但不能写图；Context Agent 可经 Context Service 的权限/revision/审计边界 CRUD general 节点和 general 子图，并审查 done 后冻结候选；task 子图及其节点只接受 Task Manager 经 `TaskContextWriter` 的定向投影。所有持久化 mutation 均由 Context Service 执行，没有 Agent 直连图存储。
 - Runtime 只负责启动、权限、Workspace、事件、输出契约和受控请求转交；不拥有业务编排或知识判断。
 - Workspace 不是图节点，也不承担跨 Agent 通信。
 
@@ -357,7 +357,7 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 | --- | --- | --- | --- |
 | Task Manager Agent | 默认编排 Coordination Graph；规定 endpoint 契约；审批编排建议；向 `task` 子图投影上下文节点（`directive` 承载 Task Contract、DeliverySpec/ReportSpec 与 Requirement 投影，`fact` 承载已接受的 PhaseOutput、交付物、报告和证据投影；权威来源仍是 Coordination Graph、PhaseOutput/Artifact Store、Requirement provenance） | Requirement、completed PhaseOutput/report/evidence、自己的 Context Slice/Delta 和可见 Context Graph | 旁观 phase 过程、选实现方案、任意写 Context Graph、操作 Workspace |
 | Scheduler | 从可运行 endpoint 中选择下一次 Invocation | Coordination Graph、预算、容量、能力 | 创建/修改 task、edge、blocker，解释编排建议，选择记忆 |
-| Context Agent | 响应独立检索接口（`contextAgent.retrieve`）：内部将自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 并调用仅注入 Context Agent 的 `ContextGraphSearcher.Search`（字段由 Graph 定义）；对 Task done 后冻结的候选批次做 general 语义裁决（create / revise / supersede / dispute / reject） | Event Log、Artifact Store、权限策略 | 主动巡图或提示、审查 `task` 写入、执行任何图写入、改 Coordination Graph、批准阶段交付 |
+| Context Agent | 响应 `contextAgent.retrieve`；受控探索；经 Context Service CRUD general 节点和 general 子图；审查 done 后冻结候选 | 可见 Context Graph、Event Log、Artifact Store、权限策略 | 主动无界巡图、操作 task 子图或其节点、直连图存储、改 Coordination Graph、批准阶段交付 |
 | Agent Runtime | 启动/取消/恢复 Invocation，施加 phase 权限，记录事件并校验输入与输出形状 | Scheduler 的 run request、Context Slice、Workspace Binding、PhaseInputSet | 判断业务完成、暴露未提交过程上下文、写任一图的业务状态 |
 | Workspace Service | 为 Task 轮次创建/复用/封存执行现场，观察 write set | Runtime policy、轮次 revision | 调度 Agent、判断验收、写 main |
 | Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上机械检查并合入 | Task Contract、Approved Plan、Workspace、evidence | Verifier 修改实现；Merge Queue 修冲突或直接改 Coordination/Context Graph |
@@ -466,16 +466,15 @@ Context Graph 解决的不是“保存更多聊天”，而是：
 - 如何在切片和候选准入时整理图，提高后续子图选择的缓存命中率；
 - Agent 订阅的 Context Subgraph 更新后，如何安全推送。
 
-Context Graph 是 Event Log / Artifact Store 的可追溯投影。普通 Agent **不能直接创建、修改或删除 Context Node**；任何候选的最终落图都由 Context Service 在事务中执行。
+Context Graph 是 Event Log / Artifact Store 的可追溯投影。普通 Agent 不能直接创建、修改或删除 Context Node；Context Agent 可以经 Context Service 的受控 CRUD 管理 general 节点和 general 子图。
 
-**两条不相交的写路径**：Context Graph 的写入只有两条路径，目标集合不相交：
+**三条受控写路径**：
 
-1. **候选缓冲（general）**：Phase Agent 的 `MemoryCandidate` 只建议 `general` 子图，经硬门槛进入 Task 级候选缓冲，返回 `CandidateBufferedReceipt{CandidateID}`。Task Manager 先持久化权威 `done`，再调用 `FinalizeTaskMemory`：首次冻结为 `frozen-unreviewed`，失败重试同一批次且不改变 `done`；Context Agent 批量裁决，Context Service 原子落图并保存 `TaskMemoryReviewReceipt{AuditRef}` 后标记 `reviewed`。
-2. **TaskContextWriter（task）**：Task Manager 的定向投影只写 `task` 子图（§9.2；CONTEXT.md 的 Task-directed Projection），经 Context Service 硬门槛与 Recipient 校验后写入，不经过 Context Agent，也不进入候选缓冲。
+1. **Context Agent CRUD（general）**：Context Agent 可创建、读取、更新和删除 general 节点与 general 子图；Context Service 校验权限、SourceRefs 和 revision，原子提交并审计。
+2. **候选缓冲终审（general）**：Phase Agent 的 `MemoryCandidate` 进入 Task 缓冲；Task done 后冻结，由 Context Agent 批量裁决，Context Service 原子落图。
+3. **TaskContextWriter（task）**：Task Manager 的定向投影只写 `task` 子图，经 Context Service 硬门槛与 Recipient 校验，不经过 Context Agent。
 
-推论：Context Agent 只裁决冻结批次中的 general 候选；Task Manager 的定向投影只写 task 子图；普通 Agent 的候选不能声明 task 目标。不存在混合 general/task 候选的逐目标鉴权。
-
-`Subgraph.Kind`（`general | task`）只决定写路径，不决定 Node `Kind`：全部节点统一使用 `directive | fact | hypothesis`——任务契约与用户 Requirement 投影为 `directive`，已接受的 PhaseOutput、交付物、报告和证据投影为 `fact`，任务与要求绝不写为 `hypothesis`。所有写入都必须经过 Runtime、证据与敏感信息校验、revision 和审计事务；Context Agent 是冻结批次中 general 候选语义裁决的唯一入口；Task Manager 的定向投影被限制在 `task` 子图，不能访问图存储。
+三条路径均由 Context Service 执行持久化 mutation。Context Agent 的 CRUD 与候选裁决只覆盖 general 对象；任何属于 task 子图的节点以及 task 子图本身都由 `TaskContextWriter` 路径独占。
 
 ### 9.2 核心对象
 
@@ -513,7 +512,7 @@ type ContextSubgraph struct {
 
 Context Subgraph 是可重叠的逻辑视图，不复制节点。一个节点可以同时属于 API、模块、架构决定等多个 `general` 子图。
 
-`Subgraph.Kind` 只有两种：`general` 是普通子图，写入只经候选缓冲（Phase Agent 候选建议、Task done 后冻结、Context Agent 批量裁决、Context Service 落图）；`task` 是 Task 专用子图，写入只经 Task Manager 的 `TaskContextWriter` 定向投影。候选与定向投影的目标集合不相交：候选只声明 `general` 子图，`TaskContextWriter` 只写 `task` 子图，不存在混合 general/task 归属的逐目标鉴权路径。`Subgraph.Kind` 只决定写路径，不决定 Node `Kind`。Task 子图是便于检索/订阅的投影：其中节点使用全图统一的 `directive | fact | hypothesis`（`directive` 以 Coordination Graph、Requirement provenance 为权威来源，`fact` 以 Artifact Store/PhaseOutput 为权威来源，`hypothesis` 不承载任务或用户要求），不替代这些来源，也不复制易变 runnable/blocked 状态或临时计划。
+`Subgraph.Kind` 只有两种：`general` 由 Context Agent 经 Context Service CRUD，也可由冻结候选审查产生或更新；`task` 只经 Task Manager 的 `TaskContextWriter` 定向投影。Context Agent 的 CRUD 必须拒绝 task 子图及任何属于 task 子图的节点。`Subgraph.Kind` 只决定写权限，不决定 Node `Kind`。
 
 `ContextNode.Kind` 全图统一为 `directive | fact | hypothesis`，与节点属于哪个子图无关：
 
@@ -590,9 +589,9 @@ type ContextSlice struct {
 
 子图列表只返回调用者可见的 ID、名称、摘要（Summary）、Kind 和 revision。`Explore` 沿当前 Slice 的 node/frontier 或已选子图展开，默认一跳并受 token/depth 限制；权限隐藏内容只返回数量，不泄露摘要。列表和探索是受权限约束的普通读操作，不需要 Context Agent 逐次推理或批准。
 
-### 11.2 机械检索 `Search`（仅 Context Agent）
+### 11.2 Context Agent 检索、探索与 general 图管理
 
-机械检索从共享 Reader 拆出：`ContextGraphSearcher.Search(SearchRequest) -> ContextSearchResult` 是 Context Agent 访问 Graph 的底层 seam，**只注入 Context Agent**，不注入普通 worker / Task Manager（它们不持有机械检索工具）。普通 Agent 列表/探索不足时调用独立接口 `contextAgent.retrieve`；Context Agent 内部把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs`，再调用 `ContextGraphSearcher.Search`。Graph 按这些显式字段做确定性机械匹配，不做 LLM 语义判断；结果以 `ContextSearchResult`（匹配切片 + 实际命中关键词 + 自动订阅 ID）返回，请求/响应字段由 Graph 定义。搜索命中的子图自动订阅，**订阅绑定原请求方 Invocation**（不是 Context Agent 自己）：可信 consumer binding 由 Runtime 在 Context Agent 调用 Search 时附加，不放入 `SearchRequest`；搜索失败不创建订阅。
+普通 Agent 不持有机械 Search；列表/探索不足时调用 `contextAgent.retrieve`。Context Agent 可组合读接口调查，并经 Context Service 对 general 节点和 general 子图执行 CRUD。每次 mutation 都校验权限与 revision、原子提交、记录审计并在成功后触发订阅推送；task 子图及其节点一律拒绝。接口和字段以 [context-graph.md](./context-graph.md) §6 为权威，MCP 工具映射见 [context-agent.md](./context-agent.md)。
 
 ### 11.3 主动订阅 `Subscribe`
 

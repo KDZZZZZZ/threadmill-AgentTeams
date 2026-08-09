@@ -101,14 +101,11 @@ Runtime 只校验输出形状与必填引用，不解释内容；Task Manager �
 
 Task Manager、planner、executor、verifier 共享同一 Context 读接口（列表、探索、订阅）。如果 Manager 与 phase agent 各有一套上下文机制，就会出现“Manager 依据的记忆”与“执行者依据的记忆”不一致——这正是统一设计要消灭的分叉。探索（`Explore`）与列表（`ListSubgraphs`）是受权限约束的普通读操作，不需要 Context Agent（即此前 Ctx Manager Agent / 图中 ctx agent）逐次推理或批准，否则每次探索都是一次语义裁决，Context Agent 会成为吞吐瓶颈。机械检索（`ContextGraphSearcher.Search`）从共享 Reader 拆出、只注入 Context Agent：普通 Agent 列表/探索不足时统一走 `contextAgent.retrieve`，由 Context Agent 把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 后调用 Search；Search 命中子图的自动订阅绑定**原请求方** Invocation，而不是执行检索的 Context Agent 自己（可信 consumer binding 由 Runtime 附加，不放入 SearchRequest）。
 
-### 5.3 为什么 Context Agent 只响应检索与裁决 general 候选
+### 5.3 为什么只有 Context Agent 管理 general 图
 
-Context Agent 是 Task done 后冻结批次中 `general` 候选语义裁决的唯一入口；图的持久化 mutation 一律由 Context Service 执行（Task Manager 的 task 定向投影也经 Context Service，不直接访问图存储）。它的语义判断只出现在两个边界：
+普通 Agent 负责完成 Task，不应同时决定共享知识库结构。Context Agent 在显式 Invocation、权限快照、graph revision 与预算内执行语义检索、general 节点 CRUD、general 子图 CRUD 和冻结候选审查；服务接口与字段以 [context-graph.md](./context-graph.md) §6 为准，Agent 工具包装以 [context-agent.md](./context-agent.md) 为准。
 
-1. **响应自然语言检索请求（独立接口 `contextAgent.retrieve`）**：Agent 在列表与探索不足时提交意图与检索条件，Context Agent 把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs`，调用仅注入 Context Agent 的底层机械检索 seam `ContextGraphSearcher.Search`（请求/响应字段由 Graph 定义），做多路召回并返回带 path explanation 的记忆子图切片。该接口独立于普通 Agent 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe）——普通 Agent 不再直接持有 `Search`，机械匹配发生在 Context Agent 内部；检索接口的请求/响应字段由 Context Agent 文档定义。
-2. **裁决 general MemoryCandidate**：Agent 候选先入 Task 级缓冲；Task Manager 先持久化权威 done，再调用 `FinalizeTaskMemory` 冻结为 `frozen-unreviewed`。Context Agent 批量裁决 general 候选，Context Service 原子落图并保存审查回执后标记 `reviewed`；失败重试同一批次且不改变 done。`task` 子图只接受 `TaskContextWriter` 定向投影。
-
-它不主动巡图、不主动提示、不决定普通探索与切片、不执行订阅或推送。原因：主动提示是“系统认为自己知道 Agent 需要什么”，它把知识判断从 Agent 的明确请求变成系统的隐式猜测，且无法审计。切片的生成是 Context service 按 role/purpose/权限的受控响应，不是 Context Agent 的观察行为。
+Context Agent 发起 mutation，但不直连存储。Context Service 机械校验权限与 revision，原子提交节点/子图/成员关系/审计，并在成功后触发订阅执行器。task 子图及其节点仍由 Task Manager 经 `TaskContextWriter` 独占，避免知识策展改写任务权威投影。
 
 ### 5.4 为什么订阅只有两种来源，推送自动执行
 

@@ -44,11 +44,11 @@
 | 创建者近期节点索引 | Context Graph Store | 按稳定 Agent identity 查询最近创建的可见节点 |
 | 候选入口机械校验（Hard Gate） | Context Service | 同步、无 LLM：字段结构合法；`Statement` 非空；`Kind` 只能是 directive/fact/hypothesis；`SourceRefs` 非空且调用者可读；不含密钥或越权内容；`SubgraphIDs` 只含调用者可写的 general 子图。失败返回 error、记录 `MemoryCandidateRejected`，不进入缓冲 |
 | 缓冲冻结与审查触发 | Task Manager | 按 DeliveryPolicy 得出权威 `done` 后经 `TaskMemoryFinalizer.FinalizeTaskMemory` 冻结 Task 缓冲并触发审查；canceled/failed/reopened 不触发 |
-| `general` 语义/归属裁决 | Context Agent | 只裁决冻结批次中 general 候选的 create/revise/supersede/dispute/reject；落图由 Context Service 执行 |
-| Search 检索 | Context Service（Graph 操作面） | `ContextGraphSearcher.Search` 是按 `Keywords` / `Scope` / `AnchorRefs` 显式字段的机械确定性匹配，不调用 Context Agent、不用 LLM 语义判断；唯一调用方是 Context Agent（§6.1） |
-| 列表 / 探索 / 订阅 | Context Service（Graph 操作面） | `ListSubgraphs` / `Explore` / `Subscribe` 由 Context Service 直接处理，不调用 Context Agent；普通 Agent 的 `ContextGraphReader` 不含 Search |
-| Context Agent 自然语言检索 | 独立模块接口（本文不定义） | Phase Agent 如需自然语言检索，经独立工具 `contextAgent.retrieve(...)` 呈现，不属于 `ContextGraphReader`；Context Agent 内部把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 后经 `ContextGraphSearcher.Search` 机械查图。其请求/响应字段不由本文定义 |
-| 持久化 mutation | Context Service | 唯一执行节点/边/子图写入的落点；Context Agent、Task Manager 都不直接写图 |
+| `general` 节点与子图语义管理 | Context Agent 经 Context Service | `ContextGraphCurator`（§6.1.3）定义 CRUD 接口与字段；Context Agent 只持有对应工具包装 |
+| Search 检索 | Context Service（Graph 操作面） | 按 `Keywords / Scope / AnchorRefs` 机械匹配；只向 Context Agent 暴露 |
+| 普通列表 / 探索 / 订阅 | Context Service（Graph 操作面） | 所有普通 Agent 可用，不调用 Context Agent |
+| Context Agent 自然语言检索 | [context-agent.md](./context-agent.md) 定义 | Context Agent 将 Query 转换为 SearchRequest；结果只能来自可见图 |
+| 持久化 mutation | Context Service | 唯一执行节点/边/子图 mutation；Context Agent 不直连存储 |
 | 自动边生成 | 写入事务 | 根据受信创建快照生成；与节点原子提交 |
 | 主动推送 | Context Graph 内部订阅执行器 | 节点/边事务提交并递增受影响 subgraph revision 后，由 Context Graph 主动触发自身订阅执行器，匹配已存在订阅并生成 ContextDelta；Runtime 只负责送达活动 Invocation；不是 Context Agent 推送，也不是 Agent 拉取；主动仅限已订阅子图，订阅之外无旁路；候选缓冲不触发推送 |
 
@@ -150,10 +150,10 @@ type ContextSubgraph struct {
 
 `Kind` 把子图分为两类：
 
-- `general`：普通子图。所有 Agent 都可提交 `MemoryCandidate`（只建议 general 目标，经硬门槛进入 Task 缓冲）；Task 权威 `done` 后由 Context Agent 对冻结批次批量审查、Context Service 落图。
-- `task`：Task 专用子图。只经 `TaskContextWriter`（§6.5）由 Task Manager 投影写入，不经过候选缓冲与 Context Agent 审查。
+- `general`：普通子图。Context Agent 可经 Context Service CRUD；所有 Agent 也可提交 `MemoryCandidate`，Task done 后由 Context Agent 批量审查、Context Service 落图。
+- `task`：Task 专用子图。只经 `TaskContextWriter` 由 Task Manager 投影写入；Context Agent CRUD 必须拒绝 task 子图和任何属于 task 子图的节点。
 
-Task 专用写入仍经过 Runtime/Context Service 的身份、证据、敏感信息、去重、revision 和审计校验；它只跳过 Context Agent 审查。Task 专用子图中的节点仍用统一三类 Kind（`directive` | `fact` | `hypothesis`，见 §8.1），不保存 runnable/blocked 或临时计划；它是便于检索/订阅的投影，不替代 Coordination Graph、Requirement 原件、PhaseOutput 或 Artifact Store。Context Agent 的裁决权限只覆盖冻结批次中 general 候选的语义与归属，不审查 task 投影。
+所有路径仍经过 Runtime/Context Service 的身份、证据、敏感信息、revision 和审计校验。Context Agent 发起 general mutation 但不直连存储；task 投影不经过 Context Agent。
 
 子图不保存 `NodeIDs` 或 `EdgeIDs`：正式归属由 `ContextNode.SubgraphIDs` 表达，推导关系按 `ContextEdge.FromRef = "subgraph:<id>"` 查询，避免双写。
 
@@ -219,6 +219,14 @@ flowchart TD
 - 推送：上述事务成功后，Context Graph 才触发订阅执行器推送 `ContextDelta`。
 - 决策与落图分离：Context Agent 的 create/revise/supersede/dispute/reject 是冻结批次 general 候选的语义裁决，持久化 mutation 一律由 Context Service 执行；Task Manager 也不直接访问图存储。
 
+Context Agent general CRUD 事务必须遵守：
+
+- create/update/delete 只操作 `general` 子图和不属于任何 task 子图的节点；
+- 节点、子图、成员归属、关联边、graph/subgraph/node revision 与审计事件原子提交；
+- node delete 同事务移除 general 归属与关联边；subgraph delete 只移除该子图及成员归属，不删除节点；
+- update/delete 使用调用方读取的 revision 做乐观并发校验；权限、来源或 revision 任一失败则整体回滚；
+- 事务成功后才对受影响的已订阅子图触发 `ContextDelta`。
+
 审查落图事务必须原子包含：
 
 - ContextNode create/revision；
@@ -238,20 +246,22 @@ Task 定向投影（§8.2）在同一事务原子规则上追加：
 
 ## 6. 对外 Interface（外部接口）
 
-本节是 Context Graph 与 Task 工作记忆的对外接口定义权威：六个外部 seam 覆盖 Phase Agent、Task Manager 与架构文档要求的全部 Context 调用；请求/响应最小字段以本节为权威，其他文档只引用，不重复定义同名接口或第二套字段。
+本节是 Context Graph 与 Task 工作记忆全部服务接口、请求和响应字段的唯一权威。Context Agent 文档只定义语义职责和 MCP 工具到本节 seam 的包装映射，不重复声明接口或字段。
 
 每个 seam 调用都带 Runtime 附加的可信调用上下文。`TaskMemoryBufferReader` 从调用上下文取得 TaskID，不接受调用方指定其他 Task；其余身份、权限、预算与 revision 规则同样由 Runtime 注入。
 
 | Seam | 调用方 | 方向 | 方法 |
 | --- | --- | --- | --- |
-| `ContextGraphReader`（§6.1） | 所有 Agent | 图读 | `ListSubgraphs` / `Explore` / `Subscribe` |
-| `ContextGraphSearcher`（§6.1） | 仅 Context Agent | 图读（机械检索） | `Search` → `ContextSearchResult` |
-| `TaskMemoryBufferReader`（§6.2） | 同一 Task 的 plan/execute/verify | 工作记忆读 | `ListTaskCandidates` → `TaskMemoryBufferView` |
-| `CandidateSubmitter`（§6.3） | 所有 Phase Agent | 工作记忆写 | `SubmitCandidate` → `CandidateBufferedReceipt` |
-| `TaskMemoryFinalizer`（§6.4） | 仅 Task Manager | 审查触发 | `FinalizeTaskMemory` → `TaskMemoryReviewReceipt` |
-| `TaskContextWriter`（§6.5） | Task Manager | 图写（task 投影） | `RegisterTaskSubgraph` / `ProjectTaskContext` |
+| `ContextGraphReader`（§6.1.1） | 所有 Agent | 图读/订阅 | `ListSubgraphs` / `Explore` / `Subscribe` |
+| `ContextGraphSearcher`（§6.1.2） | 仅 Context Agent | 机械检索 | `Search` |
+| `ContextGraphCurator`（§6.1.3） | 仅 Context Agent | general 图读写 | `GetSubgraph` / `GetNode` / `CreateNode` / `UpdateNode` / `DeleteNode` / `CreateSubgraph` / `UpdateSubgraph` / `DeleteSubgraph` |
+| `ContextCandidateReviewer`（§6.1.4） | 仅 Context Agent | 冻结候选审查 | `SubmitReview` |
+| `TaskMemoryBufferReader`（§6.2） | 同一 Task 的 plan/execute/verify | 工作记忆读 | `ListTaskCandidates` |
+| `CandidateSubmitter`（§6.3） | 所有 Phase Agent | 工作记忆写 | `SubmitCandidate` |
+| `TaskMemoryFinalizer`（§6.4） | 仅 Task Manager | 审查触发 | `FinalizeTaskMemory` |
+| `TaskContextWriter`（§6.5） | Task Manager | task 图写 | `RegisterTaskSubgraph` / `ProjectTaskContext` |
 
-seam 路由：`ListSubgraphs` / `Explore` / `Subscribe` 由 Context Service（Graph 操作面）直接处理，不调用 Context Agent；`Search` 同样由 Context Service（Graph 操作面）直接处理、按 `Keywords` / `Scope` / `AnchorRefs` 显式字段机械确定性匹配（§6.1），但经 `ContextGraphSearcher` 只向 Context Agent 暴露，普通 Agent 的 `ContextGraphReader` 不含 Search。Context Agent 的自然语言检索属独立模块接口（如独立工具 `contextAgent.retrieve(...)`），不属于 `ContextGraphReader`，其请求/响应字段不在本文定义。
+seam 路由：所有方法由 Context Service 执行。普通 Agent 只获得 Reader；Context Agent 额外获得 Searcher、Curator 和 CandidateReviewer；Task Manager 只获得其授权 seams。MCP 工具包装见 [context-agent.md](./context-agent.md)。
 
 ### 6.1 读 seams：ContextGraphReader 与 ContextGraphSearcher
 
@@ -267,7 +277,7 @@ type ContextGraphReader interface {
 }
 ```
 
-- 这是统一设计 §11 与 task-manager-agent §7 的同一读 surface；方法与请求/响应最小字段在本节定义，其他文档不再重复接口或字段定义。调用者：所有 Agent 使用同一读接口（Task Manager 与 Phase Agent 无差异），只含列表、探索与订阅，不含 Search。调用身份、role/purpose、权限、预算与 graph revision 由 Runtime 调用上下文附加。
+- 这是统一设计 §11 与 phase-agent §5 引用的同一读 surface；方法与字段只在本节定义。所有普通 Agent 使用相同的列表、探索和订阅接口，不含 Search。
 - 列表、探索与订阅都是权限约束的读/订阅操作，由 Context Service（Graph 操作面）直接处理，不需要 Context Agent 参与。
 - 订阅结果 `ContextSubscription` 的字段集以本节为权威；订阅绑定当前 Invocation，随其结束过期，无显式退订接口（§6.6）。
 - **主动推送**：节点/边事务提交并递增受影响 subgraph revision 后，Context Graph 主动触发其内部订阅执行器，匹配已存在订阅的子图、事件类型、权限与新鲜度，按 subgraph revision 合并生成 `ContextDelta`；Runtime 只负责把它送达活动 Invocation（`runtime.onContextDelta`，统一设计 §14.2；结构以 phase-agent §5.1 为权威）。`ContextDelta` 是**输出事件**，不是本 seam 的方法；推送不是 Context Agent 行为，也不是 `ContextGraphReader` / `ContextGraphSearcher` 方法，不需要 Agent 轮询拉取；主动仅限已订阅子图，订阅之外无旁路推送。
@@ -327,7 +337,7 @@ type ContextGraphSearcher interface {
 }
 ```
 
-- **唯一调用方是 Context Agent**：Phase Agent、Task Manager 等普通 Agent 的 `ContextGraphReader` 不含 Search，不能直接调用；列表/探索不足时只能经独立工具 `contextAgent.retrieve(...)` 请求 Context Agent。Context Agent 在响应自然语言检索请求时，内部把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs`，再经 `ContextGraphSearcher.Search` 机械查图；它是 Context Agent 访问 Graph 的底层机械检索 seam，不是普通 Agent 工具。
+- **唯一调用方是 Context Agent**：普通 Agent 列表/探索不足时调用 `context-agent.md` 定义的 `contextAgent.retrieve`。Context Agent 将 `Query` 转换为 `Keywords / Scope / AnchorRefs` 后调用本 seam。
 - `Search` 是**机械确定性匹配**：只按 `Keywords` / `Scope` / `AnchorRefs` 显式字段匹配可见图（不接受 Intent、ReasoningAnchor 或自然语言意图，不用 LLM 语义判断，不调用 Context Agent），由 Context Service（Graph 操作面）直接处理，返回命中切片与 `MatchedKeywords`。
 - **自动订阅绑定原始请求方**：Search 命中子图后建立的自动订阅（`SubscriptionIDs`）绑定发起检索的原始请求方 Invocation（即经 `contextAgent.retrieve(...)` 提出检索请求的那个 Agent 的 Invocation），而不是 Context Agent 自己的 Invocation。可信 consumer binding 由 Runtime 在 Context Agent 调用 `Search` 时附加（调用上下文），不放入 `SearchRequest`，也不接受调用方自报。Search 失败不创建订阅。
 
@@ -349,6 +359,110 @@ type ContextSearchResult struct {
 ```
 
 错误/拒绝语义：权限隐藏内容只返回数量与可见部分，不泄露摘要、路径或存在性（§9）；调用方基于响应中的 `GraphRevision` 与自身切片修订对齐，过期后应基于新 revision 重新切片（统一设计 §10）。
+
+#### 6.1.3 ContextGraphCurator：general 节点与子图管理 seam（仅 Context Agent）
+
+```go
+type ContextGraphCurator interface {
+    GetSubgraph(ctx context.Context, req GetSubgraphRequest) (ContextSubgraph, error)
+    GetNode(ctx context.Context, req GetNodeRequest) (ContextNode, error)
+    CreateNode(ctx context.Context, req CreateGeneralNodeRequest) (ContextNodeRef, error)
+    UpdateNode(ctx context.Context, req UpdateGeneralNodeRequest) (ContextNodeRef, error)
+    DeleteNode(ctx context.Context, req DeleteGeneralNodeRequest) error
+    CreateSubgraph(ctx context.Context, req CreateGeneralSubgraphRequest) (ContextSubgraph, error)
+    UpdateSubgraph(ctx context.Context, req UpdateGeneralSubgraphRequest) (ContextSubgraph, error)
+    DeleteSubgraph(ctx context.Context, req DeleteGeneralSubgraphRequest) error
+}
+
+type GetSubgraphRequest struct {
+    SubgraphID string `json:"subgraph_id"`
+}
+
+type GetNodeRequest struct {
+    NodeID string `json:"node_id"`
+}
+
+type CreateGeneralNodeRequest struct {
+    Statement   string   `json:"statement"`
+    Kind        string   `json:"kind"`
+    SourceRefs  []string `json:"source_refs"`
+    SubgraphIDs []string `json:"subgraph_ids"`
+}
+
+type UpdateGeneralNodeRequest struct {
+    NodeID         string   `json:"node_id"`
+    SourceRevision string   `json:"source_revision"`
+    Statement      string   `json:"statement"`
+    Kind           string   `json:"kind"`
+    SourceRefs     []string `json:"source_refs"`
+    SubgraphIDs    []string `json:"subgraph_ids"`
+    Status         string   `json:"status"`
+}
+
+type DeleteGeneralNodeRequest struct {
+    NodeID         string `json:"node_id"`
+    SourceRevision string `json:"source_revision"`
+    Reason         string `json:"reason"`
+}
+
+type CreateGeneralSubgraphRequest struct {
+    Name    string   `json:"name"`
+    Summary string   `json:"summary"`
+    NodeIDs []string `json:"node_ids"`
+}
+
+type UpdateGeneralSubgraphRequest struct {
+    SubgraphID string   `json:"subgraph_id"`
+    Revision   int64    `json:"revision"`
+    Name       string   `json:"name"`
+    Summary    string   `json:"summary"`
+    NodeIDs    []string `json:"node_ids"`
+}
+
+type DeleteGeneralSubgraphRequest struct {
+    SubgraphID string `json:"subgraph_id"`
+    Revision   int64  `json:"revision"`
+    Reason     string `json:"reason"`
+}
+```
+
+字段与约束：
+
+- 所有节点操作只允许目标不属于任何 `task` 子图；所有 `SubgraphIDs` 和 `NodeIDs` 只能引用调用者可写的 general 对象。
+- Node `Kind` 只能是 `directive | fact | hypothesis`；create/update 的 `SourceRefs` 必须非空、可读且支持陈述。
+- update/delete 必须匹配当前 revision；过期、越权或引用无效时整体拒绝。
+- node delete 原子移除 general 归属和所有关联边；subgraph delete 原子移除成员归属及以该子图为端点的 `derives_from_subgraph` 边，但不删除成员节点。
+- `UpdateGeneralSubgraphRequest.NodeIDs` 是更新后的完整成员集合；create 允许空集合。
+- 原子事务和推送规则以 §5 为准。
+
+#### 6.1.4 ContextCandidateReviewer：冻结候选审查 seam（仅 Context Agent）
+
+```go
+type FrozenCandidateBatch struct {
+    TaskID     string                    `json:"task_id"`
+    Candidates []TaskMemoryCandidateView `json:"candidates"`
+}
+
+type CandidateReviewDecision struct {
+    CandidateID  string   `json:"candidate_id"`
+    Action       string   `json:"action"`
+    Statement    string   `json:"statement"`
+    Kind         string   `json:"kind"`
+    SubgraphIDs  []string `json:"subgraph_ids"`
+    TargetNodeID string   `json:"target_node_id"`
+    Reason       string   `json:"reason"`
+}
+
+type CandidateReviewSubmission struct {
+    Decisions []CandidateReviewDecision `json:"decisions"`
+}
+
+type ContextCandidateReviewer interface {
+    SubmitReview(ctx context.Context, submission CandidateReviewSubmission) (TaskMemoryReviewReceipt, error)
+}
+```
+
+`FrozenCandidateBatch.Candidates` 复用 §6.2 的 `TaskMemoryCandidateView`。`Action` 只能是 `create | revise | supersede | dispute | reject`；`SubgraphIDs` 只能引用可写 general 子图；revise/supersede/dispute 必须填写 `TargetNodeID`。提交必须对冻结批次的 CandidateID 恰好覆盖一次。Context Service 重验权限、SourceRefs、目标节点和 revision，并按 §5 原子提交；失败时批次保持 `frozen-unreviewed`。
 
 ### 6.2 TaskMemoryBufferReader：Task 内工作记忆读 seam
 
@@ -423,10 +537,10 @@ type TaskContextWriter interface {
 
 明确不提供以下接口与机制：
 
-- **管理型 CRUD**：不提供 `GetNode` / `CreateNode` / `UpdateNode` / `DeleteNode` / `ListNodes`、子图管理 CRUD、`Unsubscribe`、`Push`、`QueryRawGraph`、SearchJob、mailbox / Notification 等接口。
+- **CRUD 只向 Context Agent 受控开放**：`ContextGraphCurator`（§6.1.3）定义 general 节点与 general 子图 CRUD；Context Service 必须拒绝任何涉及 task 子图或属于 task 子图节点的 CRUD。普通 Agent 不持有对应工具，也不提供原始 Store/QueryRawGraph 访问。
 - **无公开启动装配 seam**：初始 Context Slice 由 Context Service 在 Runtime 启动 endpoint 时作为内部启动步骤装配（§8.3），不提供 `StartContextAssembler` / `AssembleInitialSlice` 等公开接口或 request 类型。
 - **Search 不可见于普通 Agent**：`Search` 不属于 `ContextGraphReader`，Phase Agent、Task Manager 等普通 Agent 的读 surface 只含 `ListSubgraphs` / `Explore` / `Subscribe`；`ContextGraphSearcher` 仅向 Context Agent 暴露，普通 Agent 不能直接查图，列表/探索不足时只能经独立工具 `contextAgent.retrieve(...)` 请求 Context Agent（§6.1.2）。
-- 节点与边只能经两条写路径产生：`general` 候选在 Task 权威 `done` 后终审落图，`task` 投影经 Task Manager 授权路径写入。`TaskMemoryBufferReader` 只读取当前 Task 的工作记忆，不创建节点或边，也不把候选接入 ListSubgraphs/Explore/Search/Subscribe。
+- 节点与子图有三条受控写路径：Context Agent 经 Context Service CRUD general 对象；general 候选在 Task 权威 `done` 后终审落图；task 投影经 Task Manager 授权路径写入。`TaskMemoryBufferReader` 只读取当前 Task 工作记忆，不创建节点或边。
 - 无订阅外旁路推送：`ContextDelta` 只能由已存在的订阅触发（§6.1）；订阅随 Invocation 结束过期，无显式退订接口。
 - **分页、排序 DSL、缓存控制**：不设计分页游标、排序表达式或缓存控制字段；响应按 token 预算与可见性裁剪，`Frontier` 表达继续探索方向。
 - **物理存储**：节点、边、Recipient bindings、候选缓冲记录、订阅与审计的物理存储方式不在本节设计（§11 待定项）。
@@ -437,7 +551,7 @@ type TaskContextWriter interface {
 - **Task 工作记忆**：`TaskMemoryBufferReader` 返回当前 Task 缓冲的 append-only 快照；不走图查询，不建立订阅。每次 Phase Invocation 启动时，Context Service 把当前快照引用写入 `StartPhaseInput.TaskMemoryBufferRef`；运行中追加候选后可再次读取。
 - **按创建者召回**：创建者链只召回已落图节点；缓冲候选不参与。
 - **按子图推导召回**：Explore/Search 只召回已落图节点；缓冲候选不参与。
-- **主动推送**：缓冲追加不改变 graph revision，也不产生 ContextDelta；只有审查落图或 task 投影提交后才触发子图订阅推送。
+- **主动推送**：缓冲追加不改变 graph revision，也不产生 ContextDelta；Context Agent general CRUD、审查落图或 task 投影事务成功并递增受影响子图 revision 后才触发订阅推送。
 - **孤立节点治理**：没有 `SubgraphIDs` 且没有订阅来源的已落图节点仍可通过创建者链和 Search 找到。
 
 ## 8. Task 启动信息与 Manager 决定的归属
@@ -600,7 +714,7 @@ match(node, E) =
 6. 候选只能建议 general 目标；task 子图写入只有 `TaskContextWriter` 一条路径。
 7. Task Manager 必须先按 DeliveryPolicy 持久化权威 `done`，再调用 `FinalizeTaskMemory`；该 hook 失败不改变 `done`。canceled/failed/reopened 不触发。
 8. `FinalizeTaskMemory` 首次调用原子冻结为 `frozen-unreviewed`；失败重试同一批次，成功后保存回执并标记 `reviewed`；同一 TaskID 不重复审查或落图。
-9. Context Agent 只裁决冻结批次中 general 候选的 create/revise/supersede/dispute/reject；持久化 mutation 只由 Context Service 执行；Task Manager 不直接访问图存储。
+9. Context Agent 可经 Context Service CRUD general 节点和 general 子图，并裁决冻结批次中的 general 候选；Context Service 是唯一持久化 mutation 执行者。任何涉及 task 子图或属于 task 子图的节点必须拒绝。
 10. 自动边、节点、Recipient bindings、归属、graph/subgraph revision 递增、逐候选审计事件、审查回执与 `reviewed` 状态在同一事务原子提交；事务成功后才推送已订阅子图。
 11. 普通读操作不能创建节点或语义边。
 12. 节点 Kind 与子图正交：general 与 task 子图中的节点都使用 `directive` | `fact` | `hypothesis`，同一节点可属于多个子图，不发生类型冲突。
@@ -611,6 +725,7 @@ match(node, E) =
 17. `ProjectionID` 是幂等/修订键：同键同 SourceRevision 幂等返回，较新 SourceRevision 修订，较旧或不可比较拒绝并审计。
 18. `Search` 只经 `ContextGraphSearcher` 暴露给 Context Agent；Phase Agent、Task Manager 等普通 Agent 的 `ContextGraphReader` 不含 Search，列表/探索不足时只能经独立工具 `contextAgent.retrieve(...)` 请求 Context Agent。
 19. Search 自动订阅绑定原始请求方 Invocation（由 Runtime 在 Context Agent 调用 `Search` 时附加 consumer binding），不绑定 Context Agent 自己的 Invocation。
+20. Context Agent 可用 ListSubgraphs / GetSubgraph / GetNode / Explore / Search 探索，并经 Context Service 对 general 节点和 general 子图执行受控 CRUD；任何涉及 task 子图或属于 task 子图的节点必须拒绝。
 
 ## 11. 待定项
 

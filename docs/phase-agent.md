@@ -322,7 +322,7 @@ Phase Agent 不提供：
 本文故意不冻结：
 
 - MCP、HTTP、gRPC 或本地进程等传输协议；
-- `requiredArtifacts`、`ContextDelta.changes` 的完整字段；`contextAgent.retrieve` 自然语言检索请求/响应的完整字段（属独立 Context Agent 接口，字段由 Context Agent 文档定义，本文与 context-graph.md 均不引用）；
+- `requiredArtifacts`、`ContextDelta.changes` 的完整字段；`contextAgent.retrieve` 请求/响应以 [context-agent.md](./context-agent.md) 为权威，本文不重复定义；
 - `InputWaitResult` 的持久化、恢复令牌、截止时间与错误码；
 - Artifact ID、内容哈希、存储与去重策略；
 - 预算、重试、超时和可观测性字段；
@@ -397,6 +397,7 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 
 - [统一设计](./threadmill-unified-design.md)：两张图、输入边、三阶段、订阅与 Runtime 的语义权威。
 - [Agent Runtime](./agent-runtime.md)：AgentTeams 的 taskflow / workerflow 映射、lease、MCP 注入与 result.md 载体。
+- [Context Agent 定义与工具](./context-agent.md)：自然语言检索接口与 Context Agent 最小工具集。
 - [Workspace 与 Merge Queue](./workspace-merge.md)：Workspace Binding、路径和 WriteSet 边界。
 - [Event Log 与 Artifact Store](./event-artifact-store.md)：artifact 注册与证据链。
 - [总体架构](./architecture.md)：五节点与控制链。

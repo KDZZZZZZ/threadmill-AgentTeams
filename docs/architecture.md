@@ -78,7 +78,7 @@ Requirement -> Task Contract -> Task -> 轮次(Round) -> Agent Invocation
 | 节点 | 职责 | 边界 |
 | --- | --- | --- |
 | Phase Agent | 完成 plan/execute/verify 当前阶段；读取 `ContextSliceRef` 与同 Task 的 `TaskMemoryBufferRef`；可刷新缓冲并提交 MemoryCandidate / PhaseOutput / OrchestrationProposal | 不直接写图、不跨 Task 读缓冲、不宣布 done |
-| Context Agent | 响应自然语言检索；Task done 后批量裁决冻结的 general 候选 | 不写图、不审查 task 投影、不执行推送 |
+| Context Agent | 响应自然语言检索；探索已落图知识；经 Context Service 对 general 节点和 general 子图执行 CRUD；Task done 后批量裁决冻结候选 | 不操作 task 子图或其节点、不直连图存储、不执行推送 |
 | Context Graph / Task Memory Buffer | Graph 保存已落图知识并提供探索/订阅；每 Task 缓冲保存三阶段共享的未终审工作记忆 | 缓冲不是 Graph，不参与 Graph revision、Search 或订阅 |
 | Task Manager Agent | 编排固定三阶段，维护契约/边/blocker；投影 task 节点；done 后触发候选终审 | 不创建第四阶段；不跨 Task 暴露候选 |
 | Coordination Graph | 记录依赖、阻塞、阶段契约和结果引用 | 只有 Task Manager 能写；Scheduler 只读 |
@@ -117,7 +117,7 @@ Phase Agent 同时读取两块记忆：已落图 Context Slice 与当前 Task �
   -> 图变得更丰富，后续 Context Slice/Search 质量提高
 ```
 
-Context Agent 只出现在两个语义边界：响应自然语言检索请求（独立模块接口，不属于 `ContextGraphReader`）、裁决 Task 权威 `done` 后冻结批次中 general 候选的语义/归属（落图由 Context Service 执行）；不主动巡图、不提示、不执行推送、不轮询拉取。
+Context Agent 的受控语义边界包括自然语言检索、冻结候选审查，以及 general 节点和 general 子图 CRUD。它可以在显式 Invocation、权限和预算内探索并调用 Context Service mutation 工具；不主动无界巡图、不提示、不操作 task 子图、不直连图存储、不执行推送。
 
 ### 3.3 两条链的交汇
 
@@ -130,12 +130,12 @@ Context Agent 只出现在两个语义边界：响应自然语言检索请求（
 
 ## 4. 边界与间接语义
 
-1. **Agent 不直接写任一图。** 图中的"积累记忆"（phase agent → ctx graph）是间接语义：Agent 只提交 MemoryCandidate 到 Task-scoped 缓冲（不落图、不推送），Task 权威 `done` 后经 `TaskMemoryFinalizer` 冻结、Context Agent 对冻结批次批量裁决、Context Service 原子落图；运行中的 phase agent 需要调整编排时只能提交 `OrchestrationProposal`（自由文本意图 + 理由 + evidence 引用，不是图命令），由 Task Manager 裁决后热修改 Coordination Graph。
+1. **图 mutation 只能经权威服务。** Phase Agent 只能提交 MemoryCandidate；Task Manager 只能写 Coordination Graph，并经 `TaskContextWriter` 投影 task 子图；Context Agent 可经 Context Service 的受控工具 CRUD general 节点和 general 子图。没有 Agent 能绕过服务直连图存储。
 2. **"主动推送"由 Context Graph 触发其内部订阅执行器执行。** Context Graph 提交节点/边/子图 revision 并递增受影响 subgraph revision 后，主动触发内部订阅执行器按子图、事件类型、权限与新鲜度匹配已存在订阅，合并更新生成增量、可合并、可重放的 Context Delta；Runtime 只负责把它送达活动 Invocation。订阅只有两种来源：切片/Search 结果自动订阅与 Agent 主动订阅（Search 的自动订阅绑定发起检索的原始请求方 Invocation，而非 Context Agent 自己）；不存在订阅之外的旁路推送；推送不是 Context Agent 行为，也不是 Agent 轮询拉取。
 3. **"控制"经 Scheduler/Runtime 落地。** Coordination Graph 是被读的编排状态，不主动执行；控制 = Scheduler 选择 runnable endpoint + Runtime 启动/约束/结束 Invocation。Scheduler 不创建/修改 task、edge、blocker。
 4. **不存在 Agent mailbox。** Agent 之间没有消息队列式直接通信；外部记忆只来自 Context Slice、图探索、检索、订阅与自动 Delta。
 5. **不存在持久 Agent 身份。** Agent 是临时计算资源：订阅绑定 Invocation 并随其过期，后续 Invocation 重新经切片自动订阅或主动订阅；Task、轮次与图的身份独立于任何 Agent。
-6. **Context Agent 不主动。** 不巡图、不提示、不决定普通探索/切片、不执行订阅/推送；只响应自然语言检索（独立模块接口，不属于 `ContextGraphReader`）与 Task 权威 `done` 后冻结批次中 general 候选的批量语义/归属裁决。列表、探索、订阅由 Context Service 直接处理，不调用 Context Agent；`Search` 同样由 Context Service 直接处理，但经 `ContextGraphSearcher` 仅向 Context Agent 暴露，普通 Agent 的 `ContextGraphReader` 不含 Search；Task Manager 与 phase agent 使用同一 `ContextGraphReader`，同一权限与准入语义。
+6. **Context Agent 只做受控工作。** 可使用 ListSubgraphs/GetSubgraph/GetNode/Explore/Search，并经 Context Service CRUD general 节点和 general 子图；不操作 task 子图或其节点，不主动提示，不执行订阅/推送，不直连图存储。
 7. **Coordination Graph 只保存编排义务**（依赖、阻塞、完成信号、结果引用），不保存 Agent 运行过程上下文；运行过程是 Agent Runtime 的内部现场。
 
 ---
@@ -224,7 +224,7 @@ AgentTeams（`third_party/agentteams`）是归档基座：只复用已证实能�
 | Verify gate 与 Merge Queue | latest-main 机械检查、临时 merge-check workspace、targeted verify、串行合入 |
 | Event Log + Artifact Store 注册表 | append-only 事件流、ContentHash 索引、审计 |
 | Context Graph 全套 | Context Node/Edge/Subgraph、ContextSlice、ContextSubscription、Task-scoped 候选缓冲与 TaskMemoryFinalizer 批量审查、订阅执行器与 Context Delta |
-| Context Agent 角色 | 自然语言检索响应（独立模块接口，不属于 `ContextGraphReader`；经 `ContextGraphSearcher.Search` 机械检索 Context Graph）+ Task 权威 `done` 后冻结批次 general 候选的批量语义/归属裁决（非写入口）；Context Service 落图 |
+| Context Agent 角色 | 自然语言检索 + 受控探索 + general 节点/子图 CRUD + done 后冻结候选批量审查；所有 mutation 由 Context Service 执行，task 对象拒绝 |
 
 ### 6.4 不应复用（语义冲突，必须新建或改写）
 
@@ -265,11 +265,11 @@ verify 失败（契约不满足、计划过时、缺前置）→ verifier 提交
 ## 8. 架构不变量（总览级）
 
 1. 所有 Agent Invocation 都经 Agent Runtime。
-2. Coordination Graph 只有 Task Manager 能写；Context Graph 的候选只入 Task 缓冲，Task 权威 `done` 后由 Context Agent 批量裁决、Context Service 落图（general），`task` 子图只接受 Task Manager 经 `TaskContextWriter` 受控投影；main 只有 Merge Queue 能写。
-3. Phase Agent 不直接写任一图；Task 工作期候选只停留缓冲、不落图不推送；Task Manager 不能任意写 Context Graph 或绕过 general 裁决。
+2. Coordination Graph 只有 Task Manager 能写；Context Graph 持久化 mutation 只有 Context Service 能执行。Context Agent 可经 Context Service CRUD general 节点和 general 子图；`task` 子图只接受 Task Manager 经 `TaskContextWriter` 的受控投影；main 只有 Merge Queue 能写。
+3. Phase Agent 不直接写任一图；Task 工作期候选只停留缓冲、不落图不推送；Task Manager 不能绕过 `TaskContextWriter`，Context Agent 不能操作 task 子图或直连图存储。
 4. 不存在 Agent mailbox；外部记忆只来自 Context Slice、图探索、检索、订阅与自动 Context Delta。
 5. 不存在持久 Agent 身份：Agent 是临时计算资源，订阅随 Invocation 过期。
-6. Context Agent 不主动巡图、不提示、不执行订阅/推送；主动推送由 Context Graph 在 revision 提交后触发其内部订阅执行器执行（仅限已订阅子图），Runtime 只送达，Delta 增量、可合并、可重放。
+6. Context Agent 只在检索、候选审查或显式图管理 Invocation 中受控探索和 CRUD；不主动提示、不操作 task 子图、不直连图存储、不执行订阅/推送。
 7. Coordination Graph 不主动执行："控制"经 Scheduler 选择与 Runtime 启动落地；Scheduler 只读图。
 8. 同一 Task 同一轮次内 plan、execute、verify 共享同一 Workspace Binding；任何阶段只有一个有效写 lease。
 9. Task 未通过 verify 不得进入 Merge Queue；verify passed 不等于 done（done 由 DeliveryPolicy 决定）。
@@ -283,6 +283,7 @@ verify 失败（契约不满足、计划过时、缺前置）→ verifier 提交
 
 - [统一设计（语义权威）](./threadmill-unified-design.md)
 - [Phase Agent 接口与数据结构契约](./phase-agent.md)
+- [Context Agent 定义与工具](./context-agent.md)
 - [Coordination Graph 详细设计](./task-graph.md)
 - [Agent Runtime 详细设计](./agent-runtime.md)
 - [Context Graph 节点与子图设计](./context-graph.md)
