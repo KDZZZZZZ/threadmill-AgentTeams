@@ -41,6 +41,8 @@ Phase Agent 没有 Coordination Graph、Context Graph、main、mailbox 或 phase
 
 Scheduler 选中 runnable Phase Endpoint 后，Runtime 调用 Agent。Agent 不调用此接口。
 
+任务要求来自 Coordination Graph 的权威投影。每个 Task 固定由 `plan / execute / verify` 三阶段组成；Runtime 启动当前阶段时同时提供两块上下文：`ContextSliceRef` 指向已落图、可探索/订阅的记忆切片，`TaskMemoryBufferRef` 指向该 Task 三阶段共享的候选缓冲快照。候选缓冲只在本 Task 内可见，不是 ContextNode，不参与图检索或订阅；两者都不能覆盖 `ContractRef` 或 `Inputs`。
+
 ```go
 // runtime.startPhase 注入的启动输入
 type StartPhaseInput struct {
@@ -50,7 +52,8 @@ type StartPhaseInput struct {
     Phase           string        `json:"phase"`             // plan | execute | verify
     ContractRef     string        `json:"contract_ref"`      // Task Contract、DeliverySpec 和 ReportSpec
     WorkspaceRef    string        `json:"workspace_ref"`     // 当前轮次共享的 Workspace Binding
-    ContextSliceRef string        `json:"context_slice_ref"` // Runtime 装配的初始上下文切片
+    ContextSliceRef     string        `json:"context_slice_ref"`      // 已落图、可检索/订阅的 Context 快照
+    TaskMemoryBufferRef string        `json:"task_memory_buffer_ref"` // 当前 Task 候选缓冲的只读快照
     Inputs          PhaseInputSet `json:"inputs"`            // 入边交付的只读投影
 }
 
@@ -63,28 +66,28 @@ type PhaseInputSet struct {
 }
 
 type InputRequirement struct {
-    InputID          string   `json:"input_id"`           // 输入要求的稳定标识
-    FromEndpoint     string   `json:"from_endpoint"`      // 负责交付的上游 endpoint
-    RequiredArtifacts []string `json:"required_artifacts"` // 该输入必须包含的 artifact 类型或引用
-    RequiredBy       string   `json:"required_by"`        // start | completion
+    InputID          string           `json:"input_id"`           // 输入要求的稳定标识
+    FromEndpoint     PhaseEndpointRef `json:"from_endpoint"`      // 负责交付的上游 endpoint（PhaseEndpointRef 权威定义见 task-graph.md §3.1）
+    RequiredArtifacts []string        `json:"required_artifacts"` // 该输入必须包含的 artifact 类型或引用
+    RequiredBy       string           `json:"required_by"`        // start | completion
 }
 
 type InputDelivery struct {
-    InputID       string   `json:"input_id"`        // 对应的输入要求
-    FromEndpoint  string   `json:"from_endpoint"`   // 实际交付的上游 endpoint
-    PhaseOutputRef string  `json:"phase_output_ref"` // 上游正式 PhaseOutput 引用
-    ArtifactRefs  []string `json:"artifact_refs"`   // 可消费的正式 artifact 引用
-    SourceRevision string  `json:"source_revision"` // 上游交付所基于的 revision
+    InputID       string           `json:"input_id"`        // 对应的输入要求
+    FromEndpoint  PhaseEndpointRef `json:"from_endpoint"`   // 实际交付的上游 endpoint（PhaseEndpointRef 权威定义见 task-graph.md §3.1）
+    PhaseOutputRef string          `json:"phase_output_ref"` // 上游正式 PhaseOutput 引用
+    ArtifactRefs  []string         `json:"artifact_refs"`   // 可消费的正式 artifact 引用
+    SourceRevision string          `json:"source_revision"` // 上游交付所基于的 revision
 }
 
 type PendingInput struct {
-    InputID      string `json:"input_id"`       // 尚未到达的输入要求
-    FromEndpoint string `json:"from_endpoint"`  // 预计交付的上游 endpoint
-    RequiredBy   string `json:"required_by"`    // 仅 completion：并行等待，不能缺失提交
+    InputID      string           `json:"input_id"`       // 尚未到达的输入要求
+    FromEndpoint PhaseEndpointRef `json:"from_endpoint"`  // 预计交付的上游 endpoint（PhaseEndpointRef 权威定义见 task-graph.md §3.1）
+    RequiredBy   string           `json:"required_by"`    // 仅 completion：并行等待，不能缺失提交
 }
 ```
 
-`inputs` 是当前 endpoint 已声明入边的只读投影：它明确告诉 Agent 谁应交付什么、哪些正式交付已经到达、哪些并行输入仍待到达。Agent 不读取或推断 Coordination Graph。
+`inputs` 是当前 endpoint 已声明入边的只读投影：它明确告诉 Agent 谁应交付什么、哪些正式交付已经到达、哪些并行输入仍待到达。所有入边相连的 Agent 都通过相同的 `ContractRef + PhaseInputSet` 获得任务要求；Agent 不读取或推断 Coordination Graph。
 
 - `requiredBy: "start"`：所有此类输入到达后，endpoint 才 runnable；它们不会出现在已启动 Invocation 的 `pending` 中。
 - `requiredBy: "completion"`：source 和 target 可以并行启动；target 的最终 PhaseOutput 提交前必须取得对应交付。
@@ -155,16 +158,15 @@ type InputWaitResult struct {
 
 ## 5. Context Interface
 
-Runtime 通过 `threadmill-ctx` MCP server 向 AgentTeams 宿主注入以下只读工具。它们共享当前 Invocation、角色、权限快照、预算与 Context Graph revision，不改变 `PhaseInputSet`。
+Runtime 通过 `threadmill-ctx` MCP server 向 AgentTeams 宿主注入以下只读工具。`context.listSubgraphs`、`context.explore`、`context.subscribe` 是 [context-graph.md](./context-graph.md) §6.1 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe）的 MCP adapter，工具名与行为不变。Phase Agent 不持有机械检索工具：`ContextGraphSearcher.Search` 只注入 Context Agent，是 Context Agent 访问 Graph 的底层检索 seam；Phase Agent 列表/探索不足时调用独立接口 `contextAgent.retrieve(...)`，由 Context Agent 内部转换为 Keywords / Scope / AnchorRefs 后调用 Search，**不属于 Graph reader**。调用身份、角色、权限快照、预算与 Context Graph revision 由 Runtime 调用上下文附加，不进入每个 request；Graph 读工具的请求/响应结构与 `ContextGraphReader` 定义以 context-graph.md §6.1 为权威。它们共享当前 Invocation，不改变 `PhaseInputSet`。
 
 | 工具 | 用途 | 结果 |
 | --- | --- | --- |
-| `context.listSubgraphs(filter?)` | 列出可见 Context Subgraph | `SubgraphSummary[]` |
-| `context.explore({ anchor, depth?, tokenBudget? })` | 从当前切片、frontier 或子图渐进展开 | `ContextSliceDelta` |
-| `context.retrieve({ intent, scope, reasoningAnchor })` | 请求 Ctx Manager 语义检索 | `RetrieveResult` |
-| `context.subscribe({ subgraphIds, eventKinds? })` | 订阅可见子图后续更新 | `Subscription` |
+| `context.listSubgraphs(filter?)` | 列出可见 Context Subgraph（权限过滤后的返回集合） | `ContextSubgraph[]` |
+| `context.explore({ anchor, depth? })` | 从当前切片、frontier 或子图渐进展开 | `ContextSliceDelta` |
+| `context.subscribe({ subgraphIds, eventKinds? })` | 订阅可见子图后续更新 | `ContextSubscription` |
 
-`context.retrieve` 是唯一需要 Ctx Manager 判断的读调用。成功检索的子图自动订阅；订阅绑定当前逻辑 Invocation，并在其结束时过期。普通探索、检索和 Delta 不是 Task 依赖交付，不能替代 `PhaseInputSet`。
+本节涉及的语义裁决方正式名为 **Context Agent**（即此前 Ctx Manager Agent / 图中 ctx agent）。`context.listSubgraphs`、`context.explore`、`context.subscribe` 由 Context Service / Graph 操作面直接处理，不调用 Context Agent，也不做 LLM 语义判断。Search 命中子图的自动订阅绑定**原请求方** Invocation（不是 Context Agent 自己）：可信 consumer binding 由 Runtime 在 Context Agent 调用 Search 时附加，不放入 SearchRequest；订阅在 Invocation 结束时过期。普通探索和 Delta 不是 Task 依赖交付，不能替代 `PhaseInputSet`。
 
 ### 5.1 `runtime.onContextDelta`（Runtime 回调）
 
@@ -178,7 +180,7 @@ type ContextDelta struct {
 }
 ```
 
-订阅执行器在 Context Graph revision 提交后匹配订阅，再由 Runtime 推送 Delta。Delta 必须可合并、可重放，且没有订阅外旁路推送。若 Delta 证明计划或编排失效，Agent 使用 `agent.proposeOrchestration`，不直接改图。
+`ContextDelta` 是订阅输出事件，不是接口方法：`ContextGraphReader` 不提供 Delta 读取或拉取方法，`Subscribe` 的结果是 `ContextSubscription`。推送由 Context Graph 主动触发：节点/边事务提交并递增受影响 subgraph revision 后，Context Graph 的内部订阅执行器匹配已存在订阅并生成 ContextDelta，Runtime 只负责送达活动 Invocation；Context Agent 不推送，也不需要 Agent 轮询。Delta 必须可合并、可重放，且没有订阅外旁路推送。若 Delta 证明计划或编排失效，Agent 使用 `agent.proposeOrchestration`，不直接改图。Task 工作期间的 `agent.submitMemoryCandidate` 只写候选缓冲，不产生节点提交，因此不触发推送；候选审查落图（Task done 后）才产生 Delta（见 §6.4）。
 
 ### 5.2 `runtime.onInputsChanged`（Runtime 回调）
 
@@ -195,7 +197,7 @@ type InputsChanged struct {
 
 ## 6. 出站 Interface
 
-所有出站调用都经 Runtime 校验、记录并路由。Agent 不直接访问 Task Manager、Ctx Manager 或 Artifact Store 的内部写 interface。
+所有出站调用都经 Runtime 校验、记录并路由。Agent 不直接访问 Task Manager、Context Agent 或 Artifact Store 的内部写 interface。
 
 ### 6.1 `agent.submitPhaseOutput`
 
@@ -214,7 +216,7 @@ type PhaseOutput struct {
 func SubmitPhaseOutput(output PhaseOutput) Accepted
 ```
 
-- Runtime 将输出绑定到当前 Task Contract、endpoint、Input Revision、Context Slice 和 Workspace 轮次；Agent 不填写或改写这些绑定字段。
+- Runtime 将输出绑定到当前 Task Contract、endpoint/phase、Input Revision、Workspace Binding/Head、`ContextSliceRef` 与 `TaskMemoryBufferRef`；Agent 不填写或改写这些绑定字段。
 - `deliveryRefs`、`reportRef`、`evidenceRefs` 必须满足当前 endpoint 的 DeliverySpec 和 ReportSpec。
 - Runtime 校验所有 required completion input 已交付且 source revision 仍满足约束。
 - 接受提交不等于通过；批准、拒绝、失效和 Task done 仍由授权方决定。
@@ -225,19 +227,21 @@ func SubmitPhaseOutput(output PhaseOutput) Accepted
 
 ```go
 // agent.proposeOrchestration 提交的编排意图
+// 结构与字段以 task-graph.md §5 的 OrchestrationProposal 为权威；此处为逐字段一致的引用摘录，
+// 不是独立定义，字段集变更只能发生在 task-graph.md。
 type OrchestrationProposal struct {
-    ProposalID               string   `json:"proposal_id"`                 // 幂等转交和裁决的标识
-    ClientRef                string   `json:"client_ref"`                  // 提交方引用，用于去重
-    FromEndpoint             string   `json:"from_endpoint"`               // 来源 endpoint
-    FromInvocationID         string   `json:"from_invocation_id"`          // 来源 Invocation
-    BasedOnGraphRevision     int64    `json:"based_on_graph_revision"`     // 基于的图版本（过期校验）
-    BasedOnWorkspaceRevision string   `json:"based_on_workspace_revision"` // 基于的 Workspace 版本
-    BasedOnInputRevision     string   `json:"based_on_input_revision"`     // 基于的输入版本
-    OrchestrationAdvice      string   `json:"orchestration_advice"`        // split | dependency | replan | retry | serial_parallel
-    DeliverySpecAdvice       string   `json:"delivery_spec_advice"`        // 对未来 endpoint 交付的建议
-    ReportSpecAdvice         string   `json:"report_spec_advice"`          // 对未来 endpoint 报告的建议
-    Rationale                string   `json:"rationale"`                   // 为什么需要调整
-    EvidenceRefs             []string `json:"evidence_refs"`               // 已注册的支撑证据
+    ProposalID               string           `json:"proposal_id"`                 // 幂等转交和裁决的标识
+    ClientRef                string           `json:"client_ref"`                  // 提交方引用，用于去重
+    FromEndpoint             PhaseEndpointRef `json:"from_endpoint"`               // 来源 endpoint
+    FromInvocationID         string           `json:"from_invocation_id"`          // 来源 Invocation
+    BasedOnGraphRevision     int64            `json:"based_on_graph_revision"`     // 基于的图版本（过期校验）
+    BasedOnWorkspaceRevision string           `json:"based_on_workspace_revision"` // 基于的 Workspace 版本
+    BasedOnInputRevision     string           `json:"based_on_input_revision"`     // 基于的输入版本
+    OrchestrationAdvice      string           `json:"orchestration_advice"`        // split | dependency | replan | retry | serial_parallel
+    DeliverySpecAdvice       string           `json:"delivery_spec_advice"`        // 对未来 endpoint 交付的建议
+    ReportSpecAdvice         string           `json:"report_spec_advice"`          // 对未来 endpoint 报告的建议
+    Rationale                string           `json:"rationale"`                   // 为什么需要调整
+    EvidenceRefs             []string         `json:"evidence_refs"`               // 已注册的支撑证据
 }
 
 // MCP 工具：agent.proposeOrchestration(proposal) -> Accepted；这是意图，不是 Coordination Graph 命令
@@ -265,26 +269,30 @@ func SubmitRequirement(requirement Requirement) Accepted
 
 Runtime 记录来源为当前 phase，Task Manager 将其规整为 Task Contract。Requirement 本身不可调度，不能用于修改当前 endpoint 的既有验收或输入契约。
 
-### 6.4 `agent.submitMemoryCandidate`
+### 6.4 `agent.listTaskMemoryCandidates`
+
+同一 Task 的 `plan / execute / verify` 可读取共享候选缓冲：
+
+```go
+// 返回结构以 context-graph.md §6.2 的 TaskMemoryBufferView 为权威。
+func ListTaskMemoryCandidates() TaskMemoryBufferView
+```
+
+TaskID 由 Runtime 调用上下文绑定，Agent 不能指定其他 Task。调用不经过 Context Graph，不建立订阅，也不触发 ContextDelta；本阶段提交新候选后可重新读取最新快照。
+
+### 6.5 `agent.submitMemoryCandidate`
 
 标注可复用知识时调用：
 
 ```go
-// agent.submitMemoryCandidate 提交的记忆候选
-type MemoryCandidate struct {
-    Statement   string   `json:"statement"`             // 一句话知识陈述
-    Kind        string   `json:"kind"`                  // fact | decision | constraint | ...
-    SourceRefs  []string `json:"source_refs"`           // 必须能追溯到证据
-    WhyReusable string   `json:"why_reusable"`          // 为什么值得跨 Invocation 复用
-}
-
-// MCP 工具：agent.submitMemoryCandidate(candidate) -> Accepted；这是记忆候选，不是 Context Node
-func SubmitMemoryCandidate(candidate MemoryCandidate) Accepted
+// 请求结构以 context-graph.md §3.3 的 MemoryCandidate 为权威。
+// 返回结构以 context-graph.md §6.3 的 CandidateBufferedReceipt 为权威。
+func SubmitMemoryCandidate(candidate MemoryCandidate) CandidateBufferedReceipt
 ```
 
-这是候选，不是 Context Node。Runtime 记录候选；Ctx Manager 负责 evidence、权限与价值判断，以及 create/revise/supersede/dispute/reject。`sourceRefs` 缺失时默认拒绝。
+这是候选，不是 Context Node。`agent.submitMemoryCandidate` 是 [context-graph.md](./context-graph.md) §6.3 `CandidateSubmitter.SubmitCandidate` 的 adapter：Runtime 注入可信 TaskID / InvocationID / CreatorAgentID，通过硬门槛后追加到当前 Task 缓冲并返回 `CandidateBufferedReceipt{CandidateID}`。同 Task 三阶段读取以 §6.2 为权威，done 后终审以 §6.4 为权威。
 
-### 6.5 Artifact / Evidence 引用
+### 6.6 Artifact / Evidence 引用
 
 Agent 在当前 Task 的受控目录产出文件，并在 `result.md` 或等价载体中填写路径引用。Runtime 做以下转换：
 
@@ -314,7 +322,7 @@ Phase Agent 不提供：
 本文故意不冻结：
 
 - MCP、HTTP、gRPC 或本地进程等传输协议；
-- `requiredArtifacts`、检索请求/响应、`ContextDelta.changes` 的完整字段；
+- `requiredArtifacts`、`ContextDelta.changes` 的完整字段；`contextAgent.retrieve` 请求/响应以 [context-agent.md](./context-agent.md) 为权威，本文不重复定义；
 - `InputWaitResult` 的持久化、恢复令牌、截止时间与错误码；
 - Artifact ID、内容哈希、存储与去重策略；
 - 预算、重试、超时和可观测性字段；
@@ -389,7 +397,7 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 
 - [统一设计](./threadmill-unified-design.md)：两张图、输入边、三阶段、订阅与 Runtime 的语义权威。
 - [Agent Runtime](./agent-runtime.md)：AgentTeams 的 taskflow / workerflow 映射、lease、MCP 注入与 result.md 载体。
-- [Task Manager Agent](./task-manager-agent.md)：唯一写图、Requirement 与 Proposal 裁决。
+- [Context Agent 定义与工具](./context-agent.md)：自然语言检索接口与 Context Agent 最小工具集。
 - [Workspace 与 Merge Queue](./workspace-merge.md)：Workspace Binding、路径和 WriteSet 边界。
 - [Event Log 与 Artifact Store](./event-artifact-store.md)：artifact 注册与证据链。
 - [总体架构](./architecture.md)：五节点与控制链。

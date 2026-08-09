@@ -15,7 +15,7 @@ Coordination Graph 是可热修改的**当前编排**，不是不可变的工作
 
 ```text
 Coordination Graph 保存什么：
-  - Task、Phase Endpoint、Decision Endpoint
+  - Task，以及每个 Task 固定的 plan / execute / verify Phase Endpoint
   - endpoint 之间的依赖/阻塞边（控制 + 数据 + 失败策略）
   - 每个 phase 的 DeliverySpec 与 ReportSpec（endpoint 契约）
   - 阶段完成信号（PhaseOutput）及其交付物/报告/证据引用
@@ -52,16 +52,24 @@ Agent Invocation
   在明确角色、阶段、工作区、上下文、权限和预算下对 Agent 的一次有界调用。
 ```
 
-每个 Task 轮次只有三个工作阶段 `plan -> execute -> verify`，外加两个非工作端点：
+每个 Task 固定由三个工作阶段组成：`plan -> execute -> verify`。`prepared` 与 `done` 是 Task 的派生门控状态，不是 endpoint，也不创建额外阶段。人工或外部决定作为 blocker/decision 条件挂在三阶段 endpoint 或 Task 上，不属于 Task 的第四种 endpoint。
 
-- `prepared`：Task Contract、输入 revision、Workspace Binding、权限和初始上下文已装配；是运行前置条件，不启动 Agent。
-- `done`：verify、依赖、人工决定和交付/合入条件全部成立后的图结论；不启动 Agent。
-
-`done` 不是 phase agent 宣布的结果，而是 Task Manager 在图上的结论。
+`done` 不是 phase agent 宣布的结果，而是 Task Manager 在图上的结论。Task Manager 先持久化权威 `done`，再调用 `TaskMemoryFinalizer.FinalizeTaskMemory`；审查失败重试同一冻结批次且不改变 `done`（见 [context-graph.md](./context-graph.md) §6.4）。canceled / failed / reopened 不触发。
 
 ## 3. 图结构
 
 ### 3.1 节点：Phase Endpoint + 契约
+
+Phase Endpoint 的稳定引用唯一定义在本节；其他文档只引用本类型，不得另立同名结构：
+
+```go
+type PhaseEndpointRef struct {
+    TaskID     string `json:"task_id"`     // 稳定 Task 身份
+    EndpointID string `json:"endpoint_id"` // Task 内固定命名端点：plan | execute | verify
+}
+```
+
+`TaskID` 与 `EndpointID` 是必填最小字段；扩展字段（如端点阶段快照）由统一设计补充，不在本文重复。
 
 每个可调度 phase 的 endpoint 必须同时规定 **DeliverySpec**（该阶段必须交付什么）和 **ReportSpec**（报告必须回答哪些问题）；未规定二者的 endpoint 不可调度。这是 Task Manager 编排每个 endpoint 时的强制动作。
 
@@ -108,7 +116,8 @@ type PhaseResultBinding struct {
     WorkspaceID     string `json:"workspace_id"`
     InputRevision   string `json:"input_revision"`
     WorkspaceHead   string `json:"workspace_head"`
-    ContextSliceRef string `json:"context_slice_ref"`
+    ContextSliceRef     string `json:"context_slice_ref"`
+    TaskMemoryBufferRef string `json:"task_memory_buffer_ref"`
 }
 ```
 
@@ -118,12 +127,10 @@ Task Contract、依赖结果、代码基线、Workspace Head 或高影响上下�
 
 ```go
 type PhaseOutput struct {
-    Endpoint             PhaseEndpointRef `json:"endpoint"`
-    DeliveryRefs         []string         `json:"delivery_refs"`
-    ReportRef            string           `json:"report_ref"`
-    EvidenceRefs         []string         `json:"evidence_refs"`
-    WorkspaceRevision    string           `json:"workspace_revision"`
-    ContextGraphRevision int64            `json:"context_graph_revision"`
+    Binding      PhaseResultBinding `json:"binding"`
+    DeliveryRefs []string           `json:"delivery_refs"`
+    ReportRef    string             `json:"report_ref"`
+    EvidenceRefs []string           `json:"evidence_refs"`
 }
 ```
 
@@ -166,7 +173,7 @@ on false: replan A
 human.approved(plan_revision, risk_scope) -> A.execute
 ```
 
-需要人工授权时，图中出现 decision endpoint（如 `human.approved(...)`），而不是由 agent 推断批准。
+需要人工授权时，图中记录 decision/blocker 条件（如 `human.approved(...)`）并阻塞相应 plan/execute/verify endpoint，而不是在 Task 内增加第四种 endpoint，也不是由 Agent 推断批准。
 
 ## 5. 失败、拆分、前置的统一协议：OrchestrationProposal
 
@@ -178,13 +185,20 @@ Task Manager 不旁观 phase agent 的中间推理、工具输出、探索轨迹
 2. 运行中主动提交的 `OrchestrationProposal`。
 
 ```go
+// OrchestrationProposal 唯一权威定义；其他文档只引用，不得另立第二套字段。
 type OrchestrationProposal struct {
-    FromEndpoint         PhaseEndpointRef `json:"from_endpoint"`
-    OrchestrationAdvice  string           `json:"orchestration_advice"` // split, dependency, serial/parallel, replan...
-    DeliverySpecAdvice   string           `json:"delivery_spec_advice"`
-    ReportSpecAdvice     string           `json:"report_spec_advice"`
-    Rationale            string           `json:"rationale"`
-    EvidenceRefs         []string         `json:"evidence_refs"`
+    ProposalID               string           `json:"proposal_id"`                 // 幂等转交和裁决的标识
+    ClientRef                string           `json:"client_ref"`                  // 提交方引用，用于去重
+    FromEndpoint             PhaseEndpointRef `json:"from_endpoint"`               // 来源 endpoint
+    FromInvocationID         string           `json:"from_invocation_id"`          // 来源 Invocation
+    BasedOnGraphRevision     int64            `json:"based_on_graph_revision"`     // 基于的图版本（过期校验）
+    BasedOnWorkspaceRevision string           `json:"based_on_workspace_revision"` // 基于的 Workspace 版本
+    BasedOnInputRevision     string           `json:"based_on_input_revision"`     // 基于的输入版本
+    OrchestrationAdvice      string           `json:"orchestration_advice"`        // split | dependency | replan | retry | serial_parallel
+    DeliverySpecAdvice       string           `json:"delivery_spec_advice"`        // 对未来 endpoint 交付的建议
+    ReportSpecAdvice         string           `json:"report_spec_advice"`          // 对未来 endpoint 报告的建议
+    Rationale                string           `json:"rationale"`                   // 为什么需要调整
+    EvidenceRefs             []string         `json:"evidence_refs"`               // 已注册的支撑证据
 }
 ```
 
@@ -216,14 +230,14 @@ Task Contract
        -> passed + delivery conditions -> done
        -> failed, contract still valid -> verifier 提交 Proposal，Task Manager 重开轮次
        -> independent prerequisite found -> new Task + endpoint edge
-       -> contract ambiguous/invalid -> blocked + decision endpoint
+       -> contract ambiguous/invalid -> blocked + decision condition
 ```
 
 验证失败不创建新 Task，也不创建新 Attempt 实体：verifier 是唯一拥有失败证据的角色，由它提交 `OrchestrationProposal`（retry），Task Manager 裁决后失效旧输出、在图上重开 execute→verify 端点，并从最新有效基线新建 Workspace Binding（旧现场封存为 evidence）。只有工作具有独立验收、独立失败/重试、不同权限或 Workspace、跨时间等待、被其他 Task 直接依赖等特征时，Task Manager 才创建新 Task。运行中的 Agent 若认为应局部修复、拆分任务或调整依赖，必须提交 `OrchestrationProposal`；Agent 和 Runtime 都不能自行跳转 phase。
 
 ## 6. revision 与结果失效
 
-- 每个阶段结果绑定 `PhaseResultBinding`（input revision、Workspace Head、Context Slice）。
+- 每个阶段结果绑定完整 `PhaseResultBinding`：Task Contract、phase、Input Revision、Workspace Binding/Head、`ContextSliceRef` 与 `TaskMemoryBufferRef`。
 - verify passed 必须绑定输入 revision 和 evidence；相关输入变化后信号失效，Scheduler 不得让 Merge Queue 静默复用绑定在旧 revision 上的验证结果。
 - Task Contract、依赖结果、代码基线、Workspace Head 或高影响上下文变化后，Task Manager 按影响范围使 plan、execute 或 verify 失效；Scheduler 只执行该决定。
 - 热修改图的每次变更由 Event Log 审计；审计机制不限制 Coordination Graph 的运行时热修改。
@@ -266,6 +280,7 @@ flowchart LR
 10. done 只在验收和交付条件全部满足后成立。
 11. 冲突、失败和人工决定必须保留可追溯证据。
 12. 杀掉所有 agent 进程不能抹掉任何未完成义务。
+13. Task Manager 先持久化权威 done，再调用 FinalizeTaskMemory；审查失败重试同一冻结批次且不改变 done，canceled / failed / reopened 不触发。
 ```
 
 ## 9. AgentTeams 实现映射
@@ -306,7 +321,7 @@ AgentTeams 中不存在、必须由 Threadmill 新建的部分：
 - **graph revision / input revision 维护**（agentteams 的 plan.md 是整体替换，无 revision 计数；由 adapter 层递增并绑定结果）；
 - **OrchestrationProposal 通道**（agentteams 无此协议；Runtime 记录转交、Task Manager 审批）；
 - **Event Log**（审计全部图变更；agentteams 只有 Matrix 消息与文件状态）；
-- **Context Graph / Ctx Manager / Context Slice / 订阅推送**（agentteams 用 shared/ 文件 + memory/ 笔记，无知识图）；
+- **Context Graph / Context Agent / Context Slice / 订阅推送**（agentteams 用 shared/ 文件 + memory/ 笔记，无知识图）；
 - **Scheduler**（`ready_nodes` 只提供可运行节点计算，调度选择是 Threadmill 新建）；
 - **Merge Queue 与 git worktree 隔离**（agentteams 的 workspace/ 是共享目录，不是 git worktree，也没有 main 合并门）；
 - **Workspace Binding 的轮次级生命周期**（创建/复用/封存、phase lease、write set 观察）。

@@ -8,7 +8,7 @@
 
 ## 1. 定位
 
-Event Log 是系统事实来源，由 Agent Runtime **自动记录**所有 agent 活动和状态变化——agent 不显式"写日志"，它们的 Invocation 生命周期、结构化边界输出、提交的 MemoryCandidate 和状态变更被自动捕获。这里的所有 Agent 包括 Task Manager Agent、Ctx Manager Agent、planner、executor 和 verifier。
+Event Log 是系统事实来源，由 Agent Runtime **自动记录**所有 agent 活动和状态变化——agent 不显式“写日志”，它们的 Invocation 生命周期、结构化边界输出、提交的 MemoryCandidate 和状态变更被自动捕获。这里的所有 Agent 包括 Task Manager Agent、Context Agent、planner、executor 和 verifier。
 
 Artifact Store 保存大对象：transcript、tool output、test output、diff patch、screenshots、PhaseOutput 引用的交付物/报告/证据。Event Log 只保存引用（ArtifactRef），不内嵌大对象。
 
@@ -21,7 +21,7 @@ Agent Runtime 归一化 Agent Event，保存 transcript、tool output、diff 和
 Event Log 的语义边界（同统一设计）：
 
 - **自动捕获**：Runtime 记录的是 Agent 的边界活动与结构化输出，不记录也不暴露未提交的 phase 过程上下文（中间推理、工具输出、探索轨迹）；
-- **审计**：Coordination Graph 的热修改历史、MemoryCandidate 的提交与裁决、Context Graph 的写入事务都由 Event Log 审计；审计机制不限制 Coordination Graph 的运行时热修改（§5.7）；
+- **审计**：Coordination Graph 的热修改历史、MemoryCandidate 的缓冲与审查、Context Graph 的写入事务都由 Event Log 审计；审计机制不限制 Coordination Graph 的运行时热修改（§5.7）；
 - **证据链**：verify、merge、human decision、Context Node 的 SourceRefs 都回溯到事件与 artifact；
 - **回放**：系统状态应尽可能能从 Event Log 重放。
 
@@ -39,8 +39,8 @@ Event Log 不是由 agent 显式写日志，而是 Runtime 在以下边界自动
 | Phase Endpoint 编排 | PhaseActivated | Scheduler 选中 runnable endpoint 并请求 Workspace Service 创建/复用该轮次的 Workspace Binding |
 | 结构化边界输出 | PhaseOutputSubmitted | 每个 phase 按 DeliverySpec / ReportSpec 提交输出；Runtime 只校验形状与必填引用 |
 | 编排建议 | OrchestrationProposalSubmitted / OrchestrationProposalDecided | 运行中 Agent 主动提交建议；Task Manager 裁决（接受/改写/拒绝）并明确当前 Invocation 处置 |
-| MemoryCandidate | MemoryCandidateSubmitted / Admitted / Rejected | Runtime 自动记录候选；Ctx Manager 准入后记录裁决（含低价值候选的审计事件） |
-| Context Graph 写入 | ContextGraphCommitted | 节点/边/子图 revision 的原子提交 |
+| MemoryCandidate | `MemoryCandidateBuffered` / `MemoryCandidateRejected`、`CandidateBufferFrozen`、`CandidateReviewAccepted` / `CandidateReviewRejected` | 入缓冲后对同 Task plan/execute/verify 可读，跨 Task 不可见；不代表 ContextNode。done 后冻结、终审并原子落图 |
+| Context Graph 写入 | ContextGraphCommitted | 节点/边变更与 graph/subgraph revision 的原子提交 |
 | 订阅与推送 | ContextSubscriptionCreated / Expired、ContextDeltaDelivered / Consumed | Runtime 记录订阅关系与 Delta 是否被 Agent 消费 |
 | 验证与合并 | VerifyPassed / VerifyFailed、MergeCandidateQueued / Merged | merge event 附 commit/diff/test evidence |
 | 人工决定 | HumanDecisionRequested / HumanDecisionRecorded | 显式记录，含理由与 revision |
@@ -128,7 +128,7 @@ ArtifactRef 出现在统一设计的各处引用点上：
 
 - `PhaseOutput`：DeliveryRefs / ReportRef / EvidenceRefs（endpoint 输出的交付物、报告、证据）；
 - `CoordinationEdge.Data`：沿边传递的交付物/报告/证据；
-- `MemoryCandidate.SourceRefs` 与 `ContextNode/ContextEdge.SourceRefs`：Context Graph 的证据溯源；
+- `MemoryCandidate.SourceRefs` 与 `ContextNode.SourceRefs`：Context Graph 的证据溯源（`ContextEdge` 不含 `SourceRefs`，边来源由创建事件与订阅记录重建，见 [context-graph.md](./context-graph.md) §3.4）；
 - `Event.ArtifactRefs`：事件载荷的大对象引用。
 
 **ContentHash 注册表是 Threadmill 新建语义**：AgentTeams 的 MinIO 是路径寻址对象存储，没有内容哈希注册、没有 ArtifactType 索引、没有"同内容只存一份"的引用语义。Threadmill 在 MinIO 之上登记 `Artifact{ID, Type, ContentHash, PathOrBlobRef}`，实现：
@@ -157,7 +157,7 @@ Runtime 保存 transcript、tool output、diff 和测试证据，**但不向 Tas
 
 1. 阶段结束时的 `PhaseOutput`；
 2. 运行中主动提交的 `OrchestrationProposal`；
-3. 显式标注的 `MemoryCandidate`（由 Runtime 记录进 Event Log，交 Ctx Manager 准入，不经 Task Manager 语义读取）。
+3. 显式 `MemoryCandidate`：进入该 Task 三阶段共享缓冲，可由同 Task Phase Agent 读取，但 Task Manager 不读取其语义内容；done 后冻结终审。
 
 ### 5.2 AgentTeams 的现成隔离策略（直接复用语义）
 
@@ -170,14 +170,14 @@ Session files are runtime-private state and may contain private conversation his
 
 ——third_party/agentteams/qwenpaw/src/qwenpaw_worker/worker.py（SESSION_FILE_PROMPT_POLICY，注入 AGENTS.md / SOUL.md）
 
-AgentTeams 中 session 文件（`workspace_dir/sessions/<channel>/`，含外发消息记录）是**运行时私有**的；Threadmill 沿用这一隔离：transcript 作为 Artifact 保存（类型 `agent_transcript`），但**只有审计/重放侧可读，不进入 Task Manager 的编排输入，也不进入 Context Graph**（Context Graph 只吃 MemoryCandidate 准入后的节点，见 docs/ctxlib.md）。
+AgentTeams 中 session 文件（`workspace_dir/sessions/<channel>/`，含外发消息记录）是**运行时私有**的；Threadmill 沿用这一隔离：transcript 作为 Artifact 保存（类型 `agent_transcript`），但**只有审计/重放侧可读，不进入 Task Manager 的编排输入，也不直接进入 Context Graph**（Context Graph 只接受受控 MemoryCandidate，见 [context-graph.md](./context-graph.md)）。
 
 ### 5.3 哪些事件可被 Manager 看
 
 | 可见性 | 事件/内容 | 依据 |
 | --- | --- | --- |
 | Task Manager 可读 | 所有 completed PhaseOutput 及其 DeliveryRefs/ReportRef/EvidenceRefs；OrchestrationProposalSubmitted / Decided；VerifyPassed/Failed；MergeCandidateQueued/Merged；HumanDecisionRequested/Recorded；自己的 Context Slice/Delta 与可见 Context Graph | 统一设计 §6、§7.1 |
-| Ctx Manager 可读 | Event Log、Artifact Store、权限策略（MemoryCandidateSubmitted / Admitted / Rejected、ContextGraphCommitted） | 统一设计 §6 |
+| Context Agent 可读 | Event Log、Artifact Store、权限策略（MemoryCandidateBuffered / CandidateBufferFrozen / CandidateReviewAccepted / CandidateReviewRejected、ContextGraphCommitted） | 统一设计 §6 |
 | 任何人不可读（运行时私有） | 未提交的 phase 过程上下文：中间推理、单步工具输出、探索轨迹、sessions/ transcript 内容 | 统一设计 §5.5、§16；worker.py SESSION_FILE_PROMPT_POLICY |
 | 仅审计侧 | 全部事件（含被拒绝的 MemoryCandidate、订阅关系、Delta 消费记录） | 统一设计 §5.7、§14.2 |
 
@@ -210,7 +210,7 @@ AgentProjection:
   当前 active Invocations、历史 Invocation 和结果。
 
 ContextProjection:
-  当前 Context Graph revision、节点/子图索引；MemoryCandidate 裁决记录。
+  当前 Context Graph revision、节点/子图索引；MemoryCandidate 缓冲与审查记录。
 
 MergeProjection:
   当前 Merge Queue、已合入 candidate 与冲突关系。
@@ -224,12 +224,13 @@ UIPanelProjection:
 ## 8. 不变量
 
 1. 关键状态变化必须进入 Event Log（由 Agent Runtime 自动记录，非 agent 显式写）；AgentTeams 无此机制，EventLogAdapter 为新建服务。
-2. Task Manager Agent 和 Ctx Manager Agent 也必须经 Agent Runtime 运行，它们不是日志旁路。
+2. Task Manager Agent 和 Context Agent 也必须经 Agent Runtime 运行，它们不是日志旁路。
 3. 大对象必须进 Artifact Store，并用 ArtifactRef 引用；Event Log 不内嵌大对象。
 4. Verify failure 必须可追溯到测试输出或人工判断；Merge 必须可追溯到 verify result、diff 和 commit。
 5. Human decision 必须显式记录。
 6. Process transcript 是 Artifact（`agent_transcript`），但运行时私有：Task Manager 只读结构化边界输出（PhaseOutput / OrchestrationProposal / 已完成 endpoint 的 report、delivery、evidence），不读未提交过程上下文。
-7. Context Graph 的高影响节点必须有 Event 或 Artifact 证据（SourceRefs），只经 MemoryCandidate 准入落图。
+7. Context Graph 的高影响节点必须有 Event 或 Artifact 证据（SourceRefs），只经候选缓冲准入后落图。
 8. 订阅与 Delta 的记录（创建、过期、投递、消费）必须进入 Event Log；Delta 增量、可合并、可重放。
 9. 图变更历史由 Event Log 审计，但审计机制不限制 Coordination Graph 的运行时热修改。
 10. 系统状态应尽可能能从 Event Log 重放；事件顺序由 EventLogAdapter 保证，不复用 filesync 水位或 Matrix 时间线作游标。
+11. 每 Task 一份候选缓冲，固定的 plan/execute/verify 三阶段共享，跨 Task 隔离；缓冲不属于 Context Graph。done 后冻结终审，成功落图后才触发图 revision 与推送。
