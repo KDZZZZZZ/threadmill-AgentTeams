@@ -57,14 +57,14 @@ Threadmill 只保留两张持久图。Agent Runtime 和 Workspace 是执行边�
 | 对象 | 生命周期 | 负责的问题 | 唯一写入口 |
 | --- | --- | --- | --- |
 | Coordination Graph | 持久 | 哪个 Phase Endpoint 可以运行、被什么阻塞、阶段交付是否满足 | Task Manager Agent |
-| Context Graph | 持久 | 哪些记忆可见、如何关联、如何检索、哪些订阅需要推送 | Ctx Manager Agent |
+| Context Graph | 持久 | 哪些记忆可见、如何关联、如何检索、哪些订阅需要推送 | Context Service（Phase Agent 候选先入 Task 级缓冲，Task 达成权威 done 后由 Task Manager 冻结、经 Context Agent 批量语义裁决后落图；task 子图只接受 Task Manager 经 TaskContextWriter 的定向投影） |
 | Agent Runtime / Workspace | 一次 Invocation / 一个轮次 | 如何在权限、工作区和预算内执行并记录证据 | Runtime / Workspace service |
 
 三者边界必须保持：
 
 - Coordination Graph 是可热修改的当前编排，但只有 Task Manager 能写。运行中的 Agent 如需拆分、增加前置、调整串并关系或失败后重排，只能提交结构化编排建议。
 - Coordination Graph 不保存 Agent 的运行过程上下文；只保存阶段依赖、完成信号、交付物/报告要求及其结果引用。
-- Context Graph 是所有 Agent 的外部记忆通信面。Agent 可探索可见图、请求检索、订阅子图并接收自动增量推送，但不能直接写图。
+- Context Graph 是所有 Agent 的外部记忆通信面。Agent 可探索可见图、订阅子图并接收自动增量推送；列表/探索不足时经独立接口 `contextAgent.retrieve` 请求 Context Agent 语义检索（机械 Search 经仅注入 Context Agent 的 `ContextGraphSearcher` 完成），但不能直接写图。图的持久化 mutation 唯一执行者是 Context Service：Phase Agent 候选只入 Task 级候选缓冲（仅建议 general 子图），Task 达成权威 done 后由 Task Manager 调用 `TaskMemoryFinalizer` 冻结缓冲，Context Agent 对冻结批次批量裁决，Context Service 落图；task 子图只接受 Task Manager 经 `TaskContextWriter` 的定向投影。
 - Runtime 只负责启动、权限、Workspace、事件、输出契约和受控请求转交；不拥有业务编排或知识判断。
 - Workspace 不是图节点，也不承担跨 Agent 通信。
 
@@ -79,16 +79,13 @@ Threadmill 只保留两张持久图。Agent Runtime 和 Workspace 是执行边�
 
 ### 3.1 固定工作阶段
 
-每个 Task 轮次只有三个工作阶段：
+每个 Task 固定由三个工作阶段组成：
 
 ```text
 plan -> execute -> verify
 ```
 
-系统还可以维护两个非工作端点：
-
-- `prepared`：Task Contract、输入 revision、Workspace Binding、权限和初始上下文已装配；它是运行前置条件，不创建第四个工作阶段。
-- `done`：verify、依赖、人工决定和交付/合入条件全部成立后的图结论；它不启动 Agent。
+`prepared` 与 `done` 是 Task 的派生门控状态，不是 endpoint，也不启动 Agent。人工或外部决定表示为 blocker/decision 条件并约束上述三阶段，不在 Task 内增加 decision endpoint 或第四阶段。
 
 | 阶段 | 责任 | 主要产物 | 禁止事项 |
 | --- | --- | --- | --- |
@@ -108,7 +105,7 @@ Task Contract
        -> passed + delivery conditions -> done
        -> failed, contract still valid -> verifier 提交 Proposal，Task Manager 重开轮次
        -> independent prerequisite found -> new Task + endpoint edge
-       -> contract ambiguous/invalid -> blocked + decision endpoint
+       -> contract ambiguous/invalid -> blocked + decision condition
 ```
 
 验证失败不创建新 Task，也不创建新 Attempt 实体：verifier 是唯一拥有失败证据的角色，由它提交 `OrchestrationProposal`（retry），Task Manager 裁决后失效旧输出、在图上重开 execute→verify 端点，并从最新有效基线新建 Workspace Binding（旧现场封存为 evidence）。只有工作具有独立验收、独立失败/重试、不同权限或 Workspace、跨时间等待、被其他 Task 直接依赖等特征时，Task Manager 才创建新 Task。
@@ -135,7 +132,8 @@ type PhaseResultBinding struct {
     WorkspaceID     string `json:"workspace_id"`
     InputRevision   string `json:"input_revision"`
     WorkspaceHead   string `json:"workspace_head"`
-    ContextSliceRef string `json:"context_slice_ref"`
+    ContextSliceRef     string `json:"context_slice_ref"`
+    TaskMemoryBufferRef string `json:"task_memory_buffer_ref"`
 }
 ```
 
@@ -274,7 +272,7 @@ human.approved(plan_revision, risk_scope) -> A.execute
 
 ### 5.5 阶段 Agent 的通信边界
 
-运行中的 phase agent 不直接向其他 Agent、Runtime mailbox 或 Coordination Graph 写消息。它可以像其他 Agent 一样探索、检索和订阅 Context Graph；也可以在发现当前编排不再合适时，主动向 Task Manager 提交编排建议。
+运行中的 phase agent 不直接向其他 Agent、Runtime mailbox 或 Coordination Graph 写消息。它可以像其他 Agent 一样探索和订阅 Context Graph；列表/探索不足时经独立接口 `contextAgent.retrieve` 请求 Context Agent 语义检索（phase agent 不持有机械检索工具）。它也可以在发现当前编排不再合适时，主动向 Task Manager 提交编排建议。
 
 Task Manager 不旁观 phase agent 的中间推理、工具输出、探索轨迹或未提交上下文。运行过程默认留在 Invocation 内；只有以下结构化边界输出可以进入 Task Manager：
 
@@ -313,6 +311,8 @@ Phase Agent 可以在本体工作做到当前信息不足时调用 `runtime.awai
 
 Task Manager 编排每个 Phase Endpoint 时，必须同时规定 `DeliverySpec` 和 `ReportSpec`，并把入边投影进 `PhaseInputSet`。前者定义该阶段必须交付什么，后者定义报告必须回答哪些问题；未规定二者的 endpoint 不可调度。phase agent 可以在编排建议中提出新 endpoint 的要求，但正式契约只能由 Task Manager 写入图。
 
+Phase Agent 的任务要求完全来自 Coordination Graph 的权威投影：Task Manager 先写 Task Contract、DeliverySpec、ReportSpec 与入边，Runtime 再装配 `ContractRef + PhaseInputSet` 启动 Agent。Context Slice 只提供可检索/订阅的上下文投影，不能定义或覆盖当前 endpoint 的任务要求：`ContextNode.Kind` 全图统一为 `directive | fact | hypothesis`，与节点属于 `general` 还是 `task` 子图无关——任务契约、DeliverySpec/ReportSpec 与用户 Requirement 投影为 `directive`，已接受的 PhaseOutput、交付物、报告和验证证据投影为 `fact`，任务和要求绝不写为 `hypothesis`。所有入边相连的 Agent 使用同一投影规则，不接收 Task Manager 的旁路自由文本任务。
+
 ```go
 type PhaseOutput struct {
     Binding      PhaseResultBinding `json:"binding"`
@@ -322,7 +322,7 @@ type PhaseOutput struct {
 }
 ```
 
-`PhaseOutput` 必须完整绑定 `PhaseResultBinding`（TaskID / TaskContractRef / WorkspaceRef / Phase / WorkspaceID / InputRevision / WorkspaceHead / ContextSliceRef），以证明输出属于哪个 Task Contract 版本、基于哪个 Input Revision、使用哪份 Context Slice、属于哪个轮次。不再复制残缺的 revision 字段（Workspace 状态走 Binding，图状态走 ContextSliceRef）。
+`PhaseOutput` 必须完整绑定 `PhaseResultBinding`（TaskID / TaskContractRef / WorkspaceRef / Phase / WorkspaceID / InputRevision / WorkspaceHead / ContextSliceRef / TaskMemoryBufferRef），以证明输出属于哪个契约版本、正式输入、已落图 Context 快照和 Task 候选缓冲快照。
 
 每个 phase 必须按 endpoint 的两项要求提交 `PhaseOutput`，否则不得进入 completed。Runtime 只校验输出形状和必填引用，以及 required completion input 是否已到齐；Task Manager 能读取所有 completed endpoint 的报告、交付物和证据引用，并据此继续编排，但不能读取未提交的运行过程上下文。
 
@@ -355,15 +355,15 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 
 | 模块 | 唯一职责/决定 | 可以读取 | 不可以做 |
 | --- | --- | --- | --- |
-| Task Manager Agent | 默认编排 Coordination Graph；规定每个 endpoint 的 DeliverySpec/ReportSpec；审批编排建议并热修改图；接受 endpoint 输出 | Requirement、所有 completed PhaseOutput/report/evidence、自己的 Context Slice/Delta 和可见 Context Graph | 旁观 phase 运行过程、选实现方案、写 Context Graph、操作 Workspace |
+| Task Manager Agent | 默认编排 Coordination Graph；规定 endpoint 契约；审批编排建议；向 `task` 子图投影上下文节点（`directive` 承载 Task Contract、DeliverySpec/ReportSpec 与 Requirement 投影，`fact` 承载已接受的 PhaseOutput、交付物、报告和证据投影；权威来源仍是 Coordination Graph、PhaseOutput/Artifact Store、Requirement provenance） | Requirement、completed PhaseOutput/report/evidence、自己的 Context Slice/Delta 和可见 Context Graph | 旁观 phase 过程、选实现方案、任意写 Context Graph、操作 Workspace |
 | Scheduler | 从可运行 endpoint 中选择下一次 Invocation | Coordination Graph、预算、容量、能力 | 创建/修改 task、edge、blocker，解释编排建议，选择记忆 |
-| Ctx Manager Agent | 响应检索请求并准入 Memory Candidate；维护 Context Graph | Event Log、Artifact Store、权限策略 | 主动巡图或提示、决定普通探索/切片、执行订阅或推送、改 Coordination Graph、批准阶段交付 |
+| Context Agent | 响应独立检索接口（`contextAgent.retrieve`）：内部将自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 并调用仅注入 Context Agent 的 `ContextGraphSearcher.Search`（字段由 Graph 定义）；对 Task done 后冻结的候选批次做 general 语义裁决（create / revise / supersede / dispute / reject） | Event Log、Artifact Store、权限策略 | 主动巡图或提示、审查 `task` 写入、执行任何图写入、改 Coordination Graph、批准阶段交付 |
 | Agent Runtime | 启动/取消/恢复 Invocation，施加 phase 权限，记录事件并校验输入与输出形状 | Scheduler 的 run request、Context Slice、Workspace Binding、PhaseInputSet | 判断业务完成、暴露未提交过程上下文、写任一图的业务状态 |
 | Workspace Service | 为 Task 轮次创建/复用/封存执行现场，观察 write set | Runtime policy、轮次 revision | 调度 Agent、判断验收、写 main |
 | Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上机械检查并合入 | Task Contract、Approved Plan、Workspace、evidence | Verifier 修改实现；Merge Queue 修冲突或直接改 Coordination/Context Graph |
 | Phase Agent | 完成当前 phase；在已知 completion 输入上自主等待或汇总；提交 PhaseOutput 或编排建议；使用可见 Context Graph | Task Contract、endpoint 契约、自己的 Context Slice/Delta、子图列表与描述、PhaseInputSet | 直接改图、直接通信、改 main、宣布 done |
 
-依赖约束：Task Manager 与 phase agent 都通过相同的 Context 读接口获取外部记忆；二者都不能写 Context Graph。Ctx Manager 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。跨模块数据只使用 Task Contract、PhaseInputSet、PhaseOutput、OrchestrationProposal、ArtifactRef、ContextSlice 和受控 service request。
+依赖约束：Task Manager 与 phase agent 使用相同 Context 读接口（`ContextGraphReader`：ListSubgraphs / Explore / Subscribe；机械检索 `ContextGraphSearcher.Search` 只注入 Context Agent）。phase agent 不能直接写 Context Graph；Task Manager 只能经 Context Service 向 `task` 子图投影上下文节点——`directive`（Task Contract 与 endpoint DeliverySpec/ReportSpec、用户 Requirement 的上下文投影，权威来源是 Coordination Graph 与 Requirement provenance）、`fact`（已接受/验证的 PhaseOutput、交付物、报告和证据的上下文投影，权威载荷在 Artifact Store/PhaseOutput）——`hypothesis` 不得承载任务或用户要求。节点引用权威来源、不复制易变 runnable/blocked 状态，不能访问图存储；Task Manager 的定向投影只写 `task` 子图，Phase Agent 候选只建议 `general` 子图，两条路径目标不相交，不存在逐目标混合鉴权。Context Agent 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。
  
 
 ## 7. Scheduler 与 Manager
@@ -372,10 +372,10 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 Task Manager 是 Coordination Graph 唯一写入口，也是默认编排者：
 
 - 将 Human Requirement 规整为 Task Contract；
-- 创建 Task、Phase/Decision Endpoint、edge 和 blocker，并为每个 phase 写入 DeliverySpec 与 ReportSpec；创建轮次（Round）时由 Workspace Service 配套创建 Workspace Binding；
+- 创建 Task 固定的 plan / execute / verify Phase Endpoint、edge、blocker 与 decision 条件，并为三个 phase 写入 DeliverySpec / ReportSpec；创建轮次时配套 Workspace Binding；
 - 读取所有 completed endpoint 的报告、交付物和证据，决定后续编排；
 - 审批运行中的 Agent 提交的 `OrchestrationProposal`，接受后热修改图并明确当前 Invocation 的处置；
-- 与 phase agent 一样使用 Context Slice、图探索、检索、订阅和自动 Delta，但不读取其未提交过程上下文；
+- 与 phase agent 一样使用 Context Slice、图探索、订阅和自动 Delta；列表/探索不足时经 `contextAgent.retrieve` 请求 Context Agent 语义检索，但不读取其未提交过程上下文；
 - 不选择实现方案，不直接操作 Workspace，不写 Context Graph。
 
 ### 7.2 Scheduler
@@ -406,7 +406,12 @@ flowchart TD
   PEV --> EL[Event Log + Artifact Store]
   PEV --> OUT[PhaseOutput or OrchestrationProposal]
   OUT --> TM
-  EL --> CM2[Ctx Manager admits submitted Memory Candidates]
+  PEV --> CB[Candidate Buffer: Task-scoped, hard gate only]
+  CB --> DONE[Task Manager persists done per DeliveryPolicy]
+  DONE --> FIN[FinalizeTaskMemory: freeze as frozen-unreviewed]
+  FIN --> CM2[Context Agent batch-reviews general candidates]
+  CM2 --> CSW[Context Service atomically lands nodes, revision, audit and review receipt; mark reviewed]
+  CSW --> PUSH[Subscription executor pushes after commit]
 ```
 
 ---
@@ -461,53 +466,62 @@ Context Graph 解决的不是“保存更多聊天”，而是：
 - 如何在切片和候选准入时整理图，提高后续子图选择的缓存命中率；
 - Agent 订阅的 Context Subgraph 更新后，如何安全推送。
 
-Context Graph 是 Event Log / Artifact Store 的可追溯投影。普通 Agent **不能直接创建、修改或删除 Context Node**。Agent 只能在工作中提交结构化 Memory Candidate；Runtime 自动将其及证据写入 Event Log；Ctx Manager 校验、去重、连边和落图。
+Context Graph 是 Event Log / Artifact Store 的可追溯投影。普通 Agent **不能直接创建、修改或删除 Context Node**；任何候选的最终落图都由 Context Service 在事务中执行。
 
-这既保留 Agent 对“什么值得记住”的一线判断，也保留 Ctx Manager 的唯一写入口和垃圾控制责任。
+**两条不相交的写路径**：Context Graph 的写入只有两条路径，目标集合不相交：
+
+1. **候选缓冲（general）**：Phase Agent 的 `MemoryCandidate` 只建议 `general` 子图，经硬门槛进入 Task 级候选缓冲，返回 `CandidateBufferedReceipt{CandidateID}`。Task Manager 先持久化权威 `done`，再调用 `FinalizeTaskMemory`：首次冻结为 `frozen-unreviewed`，失败重试同一批次且不改变 `done`；Context Agent 批量裁决，Context Service 原子落图并保存 `TaskMemoryReviewReceipt{AuditRef}` 后标记 `reviewed`。
+2. **TaskContextWriter（task）**：Task Manager 的定向投影只写 `task` 子图（§9.2；CONTEXT.md 的 Task-directed Projection），经 Context Service 硬门槛与 Recipient 校验后写入，不经过 Context Agent，也不进入候选缓冲。
+
+推论：Context Agent 只裁决冻结批次中的 general 候选；Task Manager 的定向投影只写 task 子图；普通 Agent 的候选不能声明 task 目标。不存在混合 general/task 候选的逐目标鉴权。
+
+`Subgraph.Kind`（`general | task`）只决定写路径，不决定 Node `Kind`：全部节点统一使用 `directive | fact | hypothesis`——任务契约与用户 Requirement 投影为 `directive`，已接受的 PhaseOutput、交付物、报告和证据投影为 `fact`，任务与要求绝不写为 `hypothesis`。所有写入都必须经过 Runtime、证据与敏感信息校验、revision 和审计事务；Context Agent 是冻结批次中 general 候选语义裁决的唯一入口；Task Manager 的定向投影被限制在 `task` 子图，不能访问图存储。
 
 ### 9.2 核心对象
 
 ```go
 type ContextNode struct {
-    ID             string         `json:"id"`
-    Kind           string         `json:"kind"` // fact | decision | constraint | failure | pattern | preference | hypothesis
-    Statement      string         `json:"statement"`
-    Status         string         `json:"status"` // candidate（未验证，读取侧规则见 12.4）| accepted | disputed | superseded | outdated
-    Scope          []string       `json:"scope"`
-    SubgraphIDs    []string       `json:"subgraph_ids"`
-    SourceRefs     []string       `json:"source_refs"`
-    Revision       int64          `json:"revision"`
-    ValidFrom      string         `json:"valid_from,omitempty"`
-    ValidUntil     string         `json:"valid_until,omitempty"`
-    Confidence     float64        `json:"confidence"`
-    Importance     float64        `json:"importance"`
-    Sensitivity    string         `json:"sensitivity"`
-    CreatedAt      time.Time      `json:"created_at"`
-    UpdatedAt      time.Time      `json:"updated_at"`
+    ID             string   `json:"id"`
+    Kind           string   `json:"kind"` // directive | fact | hypothesis（全图统一，与所属子图无关）
+    Statement      string   `json:"statement"`
+    Status         string   `json:"status"` // accepted | disputed | superseded | outdated；candidate 不落图，仅 Event Log 审计（见 12.4）
+    SubgraphIDs    []string `json:"subgraph_ids"`
+    SourceRefs     []string `json:"source_refs"`
+    CreatorAgentID string   `json:"creator_agent_id"` // 创建者：稳定 Agent identity，跨 Invocation 可识别；由 Runtime 授权身份写入，Agent 不可自报
 }
+
+> 字段集与命名以 [context-graph.md](./context-graph.md) §3.1 为权威，本结构与其逐字段一致：`ID / Kind / Statement / Status / SubgraphIDs / SourceRefs / CreatorAgentID`。持久层/审计元数据（版本、时间戳、置信度、重要性、敏感性、有效期、scope 等）属于独立记录，不进入 `ContextNode` 字段。其中 `CreatorAgentID` 是节点语义字段，保证每个节点可追溯到创建者。
 
 type ContextEdge struct {
-    ID          string   `json:"id"`
-    From        string   `json:"from"`
-    To          string   `json:"to"`
-    Kind        string   `json:"kind"`
-    Weight      float64  `json:"weight"`
-    SourceRefs  []string `json:"source_refs"`
-    CreatedBy   string   `json:"created_by"` // rule | model | human
-    ValidAtRev  string   `json:"valid_at_rev,omitempty"`
+    FromRef  string `json:"from_ref"`  // 端点：如 node:n1、subgraph:s1
+    ToNodeID string `json:"to_node_id"` // 目标节点
+    Kind     string `json:"kind"`      // 全集见 §9.3；自动边仅为子集：logical_adjacent | derives_from_subgraph
 }
+
+> 字段集与命名以 [context-graph.md](./context-graph.md) §3.4 为权威，本结构与其逐字段一致：`FromRef / ToNodeID / Kind`；不另设 `ID / Weight / SourceRefs / CreatedBy / ValidAtRev` 等扩展字段，边的来源由创建事件与订阅记录重建（见 context-graph.md §3.4）。自动连边生成的 Kind 只有 `logical_adjacent | derives_from_subgraph`（创建时自动生成，见 context-graph.md §4），是 §9.3 全集 Kinds 的子集。
 
 type ContextSubgraph struct {
-    ID          string   `json:"id"`
-    Name        string   `json:"name"`
-    Summary     string   `json:"summary"`
-    Scope       []string `json:"scope"`
-    AnchorNodes []string `json:"anchor_nodes"`
-    Revision    int64    `json:"revision"`
+    ID       string `json:"id"`
+    Name     string `json:"name"`
+    Summary  string `json:"summary"`
+    Revision int64  `json:"revision"`
+    Kind     string `json:"kind"` // general | task
 }
+
+> 字段集与命名以 [context-graph.md](./context-graph.md) §3.5 为权威，本结构与其逐字段一致：`ID / Name / Summary / Revision / Kind`；不另设 `Scope / AnchorNodes` 等扩展字段，策展锚点等如需保留属于独立记录。正式成员关系由 `ContextNode.SubgraphIDs` 表达，推导关系按 `ContextEdge.FromRef = "subgraph:<id>"` 查询，子图不保存成员 NodeIDs。
 ```
 
-Context Subgraph 是可重叠的逻辑视图，不复制节点。一个节点可以同时属于 API、模块、架构决定、某 Task 系列等多个子图。
+Context Subgraph 是可重叠的逻辑视图，不复制节点。一个节点可以同时属于 API、模块、架构决定等多个 `general` 子图。
+
+`Subgraph.Kind` 只有两种：`general` 是普通子图，写入只经候选缓冲（Phase Agent 候选建议、Task done 后冻结、Context Agent 批量裁决、Context Service 落图）；`task` 是 Task 专用子图，写入只经 Task Manager 的 `TaskContextWriter` 定向投影。候选与定向投影的目标集合不相交：候选只声明 `general` 子图，`TaskContextWriter` 只写 `task` 子图，不存在混合 general/task 归属的逐目标鉴权路径。`Subgraph.Kind` 只决定写路径，不决定 Node `Kind`。Task 子图是便于检索/订阅的投影：其中节点使用全图统一的 `directive | fact | hypothesis`（`directive` 以 Coordination Graph、Requirement provenance 为权威来源，`fact` 以 Artifact Store/PhaseOutput 为权威来源，`hypothesis` 不承载任务或用户要求），不替代这些来源，也不复制易变 runnable/blocked 状态或临时计划。
+
+`ContextNode.Kind` 全图统一为 `directive | fact | hypothesis`，与节点属于哪个子图无关：
+
+- `directive`：规范性陈述，定义必须/应当/期望做什么。包括用户 Requirement、稳定偏好，以及 Task Manager 已写入 Coordination Graph 的 Task Contract、DeliverySpec、ReportSpec 的上下文投影。硬约束、软偏好与任务契约通过字段/来源引用区分，不再用 Kind 区分。
+- `fact`：已经成立、发生或经相应验收边界接受的描述性陈述。包括 completed 且已被接受/验证的 PhaseOutput、交付物、报告和验证证据的投影；必须带权威来源引用。
+- `hypothesis`：尚待证据验证的描述性推测；不得承载任务或用户要求，任务契约与 Requirement 绝不写为 `hypothesis`。
+
+不保存“正在做什么”或当前任务状态；它们由 Coordination Graph、Workspace 和 Runtime 持有。
 
 ### 9.3 边类型
 
@@ -519,50 +533,42 @@ MVP 至少支持：
 | `supports` | source evidence/结论支持 target |
 | `contradicts` | 两节点不能同时作为当前事实使用 |
 | `supersedes` | 新 revision 替代旧节点，但保留历史 |
-| `derived_from` | 节点由另一节点或证据推导 |
+| `derived_from` | 节点由另一节点或证据推导（手动语义边） |
+| `derives_from_subgraph` | 自动边（创建时生成）：节点在订阅该子图的上下文中创建，可认为由该子图推出或受其启发；不表示节点属于该子图（见 context-graph.md §4.2） |
 | `belongs_to_subgraph` | 节点归属某逻辑子图 |
 | `depends_on_fact` | 一个结论成立需要另一个事实 |
 | `example_of` | 具体案例说明抽象规则 |
 
-边必须有来源和置信度。Embedding 相似只用于召回候选，不能单独建立 `supports`、`contradicts` 或 `supersedes` 等语义边。
+边的来源可重建：自动边由创建事件与订阅记录重建（见 context-graph.md §3.4、§4）；语义边由 Context Agent 在裁决 `general` 候选/更新节点时写入并随写入事务审计。`ContextEdge` 不承载来源与置信度字段，关联强度等如需保留属于独立记录。Embedding 相似只用于召回候选，不能单独建立 `supports`、`contradicts` 或 `supersedes` 等语义边。
 
 ---
 
 ## 10. Agent 创建时的 Context Subgraph 切片
 
-每个 Agent Invocation 创建前，Context service 都按调用者的 role、purpose 和权限生成初始切片；phase agent、Task Manager、verifier 等使用同一机制。Ctx Manager 不需要理解调用者的业务决定，只按请求绑定执行选择和权限策略：
+每个 Agent Invocation 创建前，Context service 都按调用者的 role、purpose 和权限生成初始切片；phase agent、Task Manager、verifier 等使用同一机制。装配是 Context Service 在 Runtime 启动 endpoint 时的内部启动步骤：按 Runtime 已有 start binding（InvocationID、TaskID、EndpointRef 与调用上下文）装配 Context Slice、建立自动订阅并返回 `ContextSliceRef`，不是外部接口；Context Agent 不需要理解调用者的业务决定，只按调用绑定执行选择和权限策略。
+
+选择输入不来自 Agent 侧的第二套请求：Context Service 从 `EndpointRef` 解析 Coordination Graph / Runtime 的权威绑定（Task Contract、`WorkspaceRef`、`InputRevision` 等从 endpoint 当前权威绑定读取，不重复进装配输入）；role / purpose / 权限快照 / 预算 / graph revision 由 Runtime 调用上下文附加，不进入装配输入；`TaskID + EndpointRef` 是唯一匹配键，`InvocationID` 不参与匹配。
+
+Context Slice 是绑定一次 Invocation 的只读快照：
 
 ```go
-type ContextSliceRequest struct {
-    TaskID          string   `json:"task_id,omitempty"`
-    TaskContractRef string   `json:"task_contract_ref,omitempty"`
-    WorkspaceRef    string   `json:"workspace_ref,omitempty"` // 轮次标识
-    Phase           string   `json:"phase,omitempty"`
-    Role            string   `json:"role"`
-    Purpose         string   `json:"purpose"`
-    InputRevision   string   `json:"input_revision"`
-    WorkspaceID     string   `json:"workspace_id,omitempty"`
-    PermissionScope []string `json:"permission_scope"`
-    SeedSubgraphs   []string `json:"seed_subgraphs,omitempty"`
-    TokenBudget     int      `json:"token_budget"`
-}
-
 type ContextSlice struct {
-    ID              string            `json:"id"`
-    Binding         ContextSliceRequest `json:"binding"`
-    SubgraphSummary []SubgraphSummary `json:"subgraph_summary"`
-    Nodes           []ContextNode     `json:"nodes"`
-    Frontier        []ContextFrontier `json:"frontier"`
-    Omitted         []string          `json:"omitted"`
-    Conflicts       []ContextConflict `json:"conflicts"`
-    GraphRevision   int64             `json:"graph_revision"`
+    ID            string            `json:"id"`
+    Subgraphs     []ContextSubgraph `json:"subgraphs"`
+    Nodes         []ContextNode     `json:"nodes"`
+    Frontier      []ContextFrontier `json:"frontier"`
+    Omitted       []string          `json:"omitted"`
+    Conflicts     []ContextConflict `json:"conflicts"`
+    GraphRevision int64             `json:"graph_revision"`
 }
 ```
 
+`ContextSlice` 只包含已落图知识。每个 Task 另有一份由 plan/execute/verify 共享的 append-only 候选缓冲；启动时通过 `TaskMemoryBufferRef` 提供当前只读快照，运行中通过 `TaskMemoryBufferReader` 刷新。候选不伪装成 ContextNode，不参与图探索、检索、订阅或 revision。
+
 选择顺序：
 
-1. 在任何相关性计算前应用权限和敏感性过滤；
-2. 以调用目的、Task Contract、phase、Workspace revision、owner/module/symbol 和已有 subgraph 为 seed；
+1. 在任何相关性计算前应用权限与敏感信息过滤；
+2. 以 Context Service 从 `EndpointRef` 解析的 Coordination Graph / Runtime 权威绑定（Task Contract、phase、Workspace revision）与调用目的、owner/module/symbol、已有 subgraph 为 seed；
 3. 召回 seed 节点及一跳强语义邻居；
 4. 按 role/purpose 重排：编排偏契约、依赖和历史报告，plan 偏约束/决策/失败模式，execute 偏接口/实现事实，verify 偏契约/风险/历史缺陷；
 5. 显式保留矛盾候选；
@@ -570,40 +576,31 @@ type ContextSlice struct {
 7. 把未注入但可能有用的邻接方向放入 `Frontier`，供渐进探索；
 8. 对切片实际包含的子图自动建立与 Invocation 同寿命的订阅。
 
-切片不是复制出来的新知识库，而是绑定一次 Invocation 的只读快照。Graph revision、input revision 或权限变化后必须重新选择。初始切片及其自动订阅属于 Context service 的受控响应，不代表 Ctx Manager 主动观察或提示 Agent。
+切片不是复制出来的新知识库，而是绑定一次 Invocation 的只读快照。Graph revision、input revision 或权限变化后必须重新选择。初始切片及其自动订阅属于 Context service 的受控响应，不代表 Context Agent 主动观察或提示 Agent。
 
 ---
 
 ## 11. 所有 Agent 的 Context Graph 使用方式
 
-所有 Agent——包括 Task Manager、planner、executor 和 verifier——使用相同的 Context 接口。它们都能查看权限内的 Context Subgraph 列表和描述、直接探索可见图、请求 Ctx Manager 检索，以及订阅子图：
+所有 Agent——包括 Task Manager、planner、executor 和 verifier——使用相同的 Context 读接口：[context-graph.md](./context-graph.md) §6.1 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe），本文不重复定义方法签名或请求/响应结构。它们都能查看权限内的 Context Subgraph 列表和描述、直接探索可见图，以及订阅子图；三个方法都由 Context Service / Graph 操作面直接处理，不调用 Context Agent，也不做 LLM 语义判断。**普通 Agent 不持有机械检索（`ContextGraphSearcher.Search`）**：列表/探索不足时经独立接口 `contextAgent.retrieve` 请求语义检索（转换与 Search 调用见 §11.2）。`Subscribe` 的结果是 `ContextSubscription`，修订提交后由订阅执行器经 Runtime 输出 `ContextDelta` 事件，不新增方法。
 
-```go
-type ContextService interface {
-    ListSubgraphs(ctx context.Context, req ListSubgraphsRequest) ([]SubgraphSummary, error)
-    Explore(ctx context.Context, req ExploreRequest) (ContextSliceDelta, error)
-    Retrieve(ctx context.Context, req RetrieveRequest) (ContextRetrieveResult, error)
-    Subscribe(ctx context.Context, req SubscribeRequest) (ContextSubscription, error)
-}
-```
-
-四项操作共享 Invocation、role/purpose、权限快照、Graph revision 和预算绑定，不为调用创建持久 SearchJob。请求、结果、所消费节点和订阅关系由 Runtime/Context Graph 记录。
+三项读操作共享 Invocation、role/purpose、权限快照、Graph revision 和预算绑定（由 Runtime 调用上下文附加，不进入每个 request），不为调用创建持久 SearchJob。请求、结果、所消费节点和订阅关系由 Runtime/Context Graph 记录。
 
 ### 11.1 列表与探索 `ListSubgraphs / Explore`
 
-子图列表只返回调用者可见的 ID、名称、描述、scope 和 revision。`Explore` 沿当前 Slice 的 node/frontier 或已选子图展开，默认一跳并受 token/depth 限制；权限隐藏内容只返回数量，不泄露摘要。列表和探索是受权限约束的普通读操作，不需要 Ctx Manager 逐次推理或批准。
+子图列表只返回调用者可见的 ID、名称、摘要（Summary）、Kind 和 revision。`Explore` 沿当前 Slice 的 node/frontier 或已选子图展开，默认一跳并受 token/depth 限制；权限隐藏内容只返回数量，不泄露摘要。列表和探索是受权限约束的普通读操作，不需要 Context Agent 逐次推理或批准。
 
-### 11.2 检索 `Retrieve`
+### 11.2 机械检索 `Search`（仅 Context Agent）
 
-Agent 在现有列表和探索不足时提交 intent、scope 和当前推理锚点。此时才调用 Ctx Manager，以结构化 scope、关键词和 embedding 多路召回并返回带 path explanation 的记忆子图切片。检索结果所含子图自动订阅；检索失败不创建订阅。
+机械检索从共享 Reader 拆出：`ContextGraphSearcher.Search(SearchRequest) -> ContextSearchResult` 是 Context Agent 访问 Graph 的底层 seam，**只注入 Context Agent**，不注入普通 worker / Task Manager（它们不持有机械检索工具）。普通 Agent 列表/探索不足时调用独立接口 `contextAgent.retrieve`；Context Agent 内部把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs`，再调用 `ContextGraphSearcher.Search`。Graph 按这些显式字段做确定性机械匹配，不做 LLM 语义判断；结果以 `ContextSearchResult`（匹配切片 + 实际命中关键词 + 自动订阅 ID）返回，请求/响应字段由 Graph 定义。搜索命中的子图自动订阅，**订阅绑定原请求方 Invocation**（不是 Context Agent 自己）：可信 consumer binding 由 Runtime 在 Context Agent 调用 Search 时附加，不放入 `SearchRequest`；搜索失败不创建订阅。
 
 ### 11.3 主动订阅 `Subscribe`
 
-Agent 可从可见子图列表中主动选择子图订阅。Context service 按权限、有效期和当前 Invocation 绑定校验后持久化订阅关系；无需 Ctx Manager 对每次订阅做语义决策。此后匹配更新由自动化订阅执行器产生 Context Delta，不建立 Agent mailbox。
+Agent 可从可见子图列表主动订阅。Context Service 校验当前 Invocation 与权限后持久化最小订阅关系；生命周期严格绑定 ConsumerInvocationID 指向的 Invocation，不另设到期时钟。此后仅成功图事务触发 Context Delta，Runtime 负责送达活动 Invocation。
 
-订阅关系属于操作层元数据（Operational Context Metadata，owner：Context Service），不是语义图（Semantic Context Graph）的一部分；语义图的节点、强语义边、子图定义只有 Ctx Manager 能写，读路径（切片、探索、检索、订阅、缓存）不得修改语义图。
+订阅关系属于操作层元数据（Operational Context Metadata，owner：Context Service），不是语义图（Semantic Context Graph）的一部分。读路径（切片、探索、检索、订阅、缓存）不得修改语义图。
 
-读取、探索、检索和订阅行为本身不能创建知识节点或强语义边。只有显式 `MemoryCandidate` 经 Ctx Manager 准入后才能更新 Context Graph。由此，Ctx Manager 只在需要语义判断的两个边界工作：响应检索需求，以及准入 Memory Candidate；它不主动巡图、主动提示或执行推送。
+Context Graph 读路径不创建节点或边。Task 工作记忆走独立的 `TaskMemoryBufferReader`：每个 Task 一份缓冲，由固定的 plan/execute/verify 三阶段共享，跨 Task 不可见；它不属于 Graph 读路径。Graph 写入仍只有 general 候选终审落图与 task 定向投影两条路径。
 
 ---
 
@@ -611,25 +608,9 @@ Agent 可从可见子图列表中主动选择子图订阅。Context service 按�
 
 ### 12.1 Agent 标注协议
 
-Agent 在 plan、execute、verify 工作时可以标注值得持久化的记忆，但它提交的是候选，不是最终节点：
+Agent 在固定的 plan/execute/verify 三阶段均可提交候选。Context Service 通过硬门槛后追加到该 Task 唯一缓冲，返回 `CandidateBufferedReceipt{CandidateID}`；后续阶段经 `TaskMemoryBufferReader` 可立即读取。候选只建议 general 子图，且在终审前不是 ContextNode。
 
-```go
-type MemoryCandidate struct {
-    ClientRef       string   `json:"client_ref"`
-    Statement       string   `json:"statement"`
-    Kind            string   `json:"kind"`
-    WhyReusable     string   `json:"why_reusable"`
-    Scope           []string `json:"scope"`
-    SubgraphIDs     []string `json:"subgraph_ids"`
-    RelatedNodeIDs  []string `json:"related_node_ids,omitempty"`
-    ProposedEdges   []string `json:"proposed_edges,omitempty"`
-    SourceRefs      []string `json:"source_refs"`
-    ValidityScope   string   `json:"validity_scope"`
-    Confidence      float64  `json:"confidence"`
-}
-```
-
-Runtime 自动记录 candidate，随后由 Context service 在入口处执行硬门槛前置过滤（见 12.2）：未通过硬门槛的候选只保留审计事件、不进图；通过者带 `status=candidate` 写入 Context Graph，并以事件驱动方式立即触发 Ctx Manager 整理。Ctx Manager 是唯一有权执行 `create / revise / supersede / dispute / reject` 的角色。
+Task Manager 先持久化权威 `done`，再调用 `FinalizeTaskMemory`。首次冻结为 `frozen-unreviewed`；失败重试同一批次且不改变 done。Context Agent 批量裁决，Context Service 原子落图并保存审查回执后标记 `reviewed`。
 
 ### 12.2 准入规则
 
@@ -648,16 +629,16 @@ Runtime 自动记录 candidate，随后由 Context service 在入口处执行硬
 - 临时进度、寒暄、单次命令输出和可从当前代码廉价恢复的细节；
 - 没有 SourceRefs 的主张；
 - 只有“可能有用”但没有复用场景的摘要；
-- 与已有节点近重复却不增加新证据、适用范围或 revision 的表述；
+- 与已有节点近重复却不增加新证据、新归属或语义修正的表述；
 - 未区分事实与假设的推测；
 - 密钥、凭据和超出权限范围的信息；
 - 已由 Task Contract、代码或生成契约权威表达且不会因压缩丢失的全文复制。
 
-其中四项属于**硬门槛**——没有 SourceRefs 的主张、未区分事实与假设的推测、密钥/凭据/超出权限范围的信息：由 Context service 在入口处同步前置过滤（结构校验、权限集合求交、敏感模式匹配、kind 强制自标），不通过则不进入 Context Graph，无需 Ctx Manager 介入。其余各项属于**价值判断**，由 Ctx Manager 在异步整理中决定。
+入口机械校验（Hard Gate）由 Context Service 同步执行，不调用 LLM：校验字段结构、Statement、Kind、SourceRefs 的存在性与可读权限、敏感信息，以及目标只含可写 general 子图。失败返回 error、记录 `MemoryCandidateRejected` 且不入缓冲。临时性、重复度、复用价值等语义判断不属于入口校验，由 Context Agent 在 Task done 后审查冻结批次。
 
 ### 12.3 评分与决定
 
-Ctx Manager 使用可解释评分，不让 embedding 单独决定：
+Context Agent 使用可解释评分，不让 embedding 单独决定：
 
 ```text
 value = reuse_probability
@@ -671,24 +652,24 @@ value = reuse_probability
       - sensitivity_risk
 ```
 
-硬门槛优先于分数，且在进图前执行：缺证据、越权、秘密信息、不可区分事实/猜测由 Context service 前置过滤直接拒绝，不进入 Context Graph。通过硬门槛的候选先以 candidate 状态进图（满足订阅推送的实时性），再由 Ctx Manager 事件驱动异步整理；整理判定为低价值或不合格的候选从图中移除或保留为仅审计可见，从而减少 Memory Manager 的后续清理工作和知识库垃圾。
+硬门槛优先于分数并在入缓冲前执行；价值判断由 Context Agent 对 `frozen-unreviewed` 批次执行。完整冻结、重试、落图和审计协议以 §12.1 与 context-graph.md §6.4 为准。图内不存在未经裁决的候选节点。
 
-### 12.4 candidate 状态的读取侧规则
+### 12.4 候选：Task 内可见，跨 Task 隔离，done 后批量审查
 
-候选进图不等于可信。candidate 状态节点（已过硬门槛、未经 Ctx Manager 价值整理）在读取侧必须遵守：
+每个 Task 的工作记忆由两部分组成：`ContextSliceRef` 指向已落图 Context Graph 快照；`TaskMemoryBufferRef` 指向该 Task append-only 候选缓冲快照。读取规则：
 
-1. 初始 Context Slice 不包含 candidate 节点；新 Agent 的第一包上下文只含 accepted 及以上状态的可信记忆；
-2. Explore / Retrieve 可以返回 candidate 节点，但必须降权排序并标注"未验证"；
-3. candidate 节点的新增/变化可以实时推送（满足订阅的实时联络），但 Context Delta 必须携带 `unverified` 标记；只有 accepted 及以上状态的变化才代表可信知识更新；
-4. 候选整理由事件驱动（提交即触发），并辅以低频兜底对账，防止事件丢失导致候选滞留。
+1. plan/execute/verify 共享同一候选缓冲，后阶段可见前阶段候选；跨 Task 读取拒绝；
+2. 候选只经 `TaskMemoryBufferReader` 读取，不参与 Explore/Search/Context Slice/订阅，也不改变 graph revision；
+3. 只有 done 后终审落图的节点进入 Context Graph；拒绝结论只在 Event Log 保存；
+4. 缓冲追加不推送，成功图事务才触发 ContextDelta。
 
 ---
 
 ## 13. 图整理与缓存命中
 
-> **本节暂不实现（设计决策，2026-08-07）**：MVP 不做读侧整理（切片时调整边权重）与缓存层次；语义图边权重只由 Ctx Manager 在准入/更新节点时写入。以下内容为设计意图，供 MVP 后实现时参考。
+> **本节暂不实现（设计决策，2026-08-07）**：MVP 不做读侧整理与缓存层次；语义边只由 Context Agent 在裁决 `general` 候选/更新节点时写入（`ContextEdge` 不含权重字段，关联强度如需保留属于独立记录）。以下内容为设计意图，供 MVP 后实现时参考。
 
-Context Graph 不运行独立的周期性“整理 Agent”。图整理只发生在系统已经必须读取或写入相关子图的两个时点：Context service 生成初始/检索切片时执行读侧整理，Ctx Manager 准入 Memory Candidate 时执行写侧整理。两者复用已有候选集，避免额外全图扫描并提高后续 Context Slice 的缓存命中率。
+Context Graph 不运行独立的周期性“整理 Agent”。图整理只发生在系统已经必须读取或写入相关子图的两个时点：Context service 生成初始/检索切片时执行读侧整理，Context Agent 裁决 `general` 候选时执行写侧整理。两者复用已有候选集，避免额外全图扫描并提高后续 Context Slice 的缓存命中率。
 
 ### 13.1 生成 Context Slice 时：读侧整理
 
@@ -696,8 +677,8 @@ Context service 为任意 Agent 选择记忆子图时，已经拥有 role/purpos
 
 1. 规范化 scope、实体键和子图归属，合并等价查询 seed；
 2. 排除 superseded/outdated 节点，同时保留影响当前任务的 conflict；
-3. 根据实际共同召回和共同消费记录，调整已有弱 `logical_adjacent` 边的权重，但不自动创建强语义边；
-4. 生成稳定的 `SliceCacheKey`，缓存已排序的 Node ID、Edge ID、子图概要和 frontier；
+3. 根据实际共同召回和共同消费记录，调整已有弱 `logical_adjacent` 边的检索关联强度（作为读侧独立记录，不进入 `ContextEdge` 字段），但不自动创建强语义边；
+4. 生成稳定的 `SliceCacheKey`，缓存已排序的 Node ID、边引用（FromRef/ToNodeID）、子图概要和 frontier；
 5. 将相同 role/purpose、可选 Task Contract、scope、权限和相关子图 revision 的后续请求命中同一切片缓存。
 
 ```text
@@ -716,17 +697,17 @@ SliceCacheKey = hash(
 
 ### 13.2 Memory Candidate 准入时：写侧整理
 
-Ctx Manager 判断候选记忆是否准入时，已经召回相似节点和候选所属子图。此时执行写侧整理：
+Context Agent 判断 `general` 候选语义是否准入时，已经召回相似节点和候选所属子图。此时执行写侧整理：
 
-1. 比较主张、适用范围、来源、revision 和时态；
+1. 比较主张、证据（SourceRefs）、归属（SubgraphIDs）与语义差异；
 2. 同一主张且无新价值时 `reject_duplicate`；
 3. 同一主张但增加证据或精确范围时修订现有节点；
 4. 新事实替代旧事实时保留 `supersedes` 历史；冲突时保留双方并建立 `contradicts`；
-5. 基于候选显式 `RelatedNodeIDs`、本次 Slice 实际消费节点和同一 Invocation 的因果连续性，建立有解释的 `logical_adjacent`；
-6. 原子增加受影响 node/subgraph revision，并只失效引用这些 revision 的 Slice Cache；
+5. 基于本次 Slice 实际消费节点和同一 Invocation 的因果连续性，建立有解释的 `logical_adjacent`；
+6. 原子提交节点/边变更并增加受影响 subgraph revision，只失效引用这些 revision 的 Slice Cache；
 7. 事务提交后由自动化订阅执行器匹配受影响子图并推送 Context Delta。
 
-Embedding 相似只用于召回候选，不能单独建立 `supports`、`contradicts`、`supersedes` 或高权重 `logical_adjacent`。图整理的产物仍然是已有 Context Node、Context Edge、Context Subgraph revision 和缓存索引，不新增 GraphCleanupJob 或整理结果实体。
+Embedding 相似只用于召回候选，不能单独建立 `supports`、`contradicts`、`supersedes` 等语义边。图整理的产物仍然是已有 Context Node、Context Edge、Context Subgraph revision 和缓存索引，不新增 GraphCleanupJob 或整理结果实体。
 
 ### 13.3 缓存层次与观测
 
@@ -743,42 +724,26 @@ MVP 只保留两级缓存：
 
 ### 14.1 自动订阅与主动订阅
 
-订阅只有两种来源：Context service 生成初始或检索切片时，自动订阅切片包含的子图；Agent 从权限内的子图列表和描述中主动选择订阅。两者都绑定当前 Invocation、权限快照和有效期，并作为 Context Graph 上的受控关系持久化。
-
-```go
-type ContextSubscription struct {
-    ID                   string    `json:"id"`
-    ConsumerInvocationID string    `json:"consumer_invocation_id"`
-    Role                 string    `json:"role"`
-    Purpose              string    `json:"purpose"`
-    SubgraphIDs          []string  `json:"subgraph_ids"`
-    Source               string    `json:"source"` // initial_slice | retrieval | explicit
-    EventKinds           []string  `json:"event_kinds"`
-    PermissionSnapshot   string    `json:"permission_snapshot"`
-    ExpiresAt            time.Time `json:"expires_at"`
-}
-```
-
-`ContextSubscription` 是订阅语义所需的唯一运行关系，不引入 Notification、SearchJob 或 Delivery。Agent 退出或 Invocation 结束后订阅过期；后续 Invocation 重新由切片自动订阅或由 Agent 主动选择，避免形成永久 Agent 身份。
+订阅入口只有两类：初始/检索切片自动订阅，以及 Agent 主动订阅。最小持久对象只保存 `ID / ConsumerInvocationID / SubgraphIDs / EventKinds / PermissionSnapshot`；role、purpose 从 Invocation 重建，来源写入 `ContextSubscriptionCreated` 审计事件，生命周期随 Invocation 结束。检索自动订阅绑定原请求方 Invocation，不绑定 Context Agent。
 
 ### 14.2 自动推送流程
 
 ```text
-Context Graph commits a node/edge/subgraph revision
+Context Graph 提交节点/边变更并递增 subgraph revision
   -> automated subscription executor matches subgraph, event kind, permission and freshness
   -> executor coalesces updates by subgraph revision
   -> Runtime emits Context Delta to each subscribed Agent Invocation
   -> Runtime records whether the Agent consumed it
 ```
 
-推送是基础设施自动执行，不调用 Ctx Manager 做逐条判断。它必须由已存在的订阅触发，并且增量、可合并、可重放；系统不提供订阅之外的旁路推送。candidate 状态节点的更新同样实时推送，但 Delta 携带 `unverified` 标记（见 12.4），接收方不得将其当作可信知识。
+推送是基础设施自动执行，不调用 Context Agent 做逐条判断。它必须由已存在的订阅触发，并且增量、可合并、可重放；系统不提供订阅之外的旁路推送。Task 工作期间的候选只入缓冲，不落图、不产生订阅推送；只有 Task done 后审查落图的节点变更才被推送（见 12.4）。
 
 ### 14.3 推送与协调边的边界
 
 - 已订阅子图发生匹配更新：自动 Context Delta push，Task Manager 与 phase agent 语义相同。
 - target phase 必须等待 source 结果：Coordination Edge，只引用 source endpoint 的 `PhaseOutput`。
 - Delta 证明当前编排或计划失效：收到 Delta 的 Agent 提交 `OrchestrationProposal`，由 Task Manager 裁决并热修改图。
-- Agent 没有一次性问答、mailbox 或订阅外推送通道；外部记忆只来自切片、图探索、检索、订阅和自动 Delta。
+- Agent 没有一次性问答、mailbox 或订阅外推送通道；外部记忆只来自切片、图探索、订阅、自动 Delta，以及列表/探索不足时经 `contextAgent.retrieve` 请求的语义检索。
 
 ## 15. Context Graph 写入流水线
 
@@ -787,39 +752,32 @@ flowchart TD
   A[Agent Invocation consumes Context Slice] --> E[Runtime captures events and artifacts]
   A --> MC[Agent emits Memory Candidate]
   MC --> E
-  E --> EX[Ctx Manager receives submitted candidates]
-  EX --> GATE[Evidence / permission / value gate]
-  GATE -->|reject| AUDIT[Audit event only]
-  GATE -->|accept| RET[Retrieve similar nodes]
-  RET --> DEC{Semantic decision}
-  DEC -->|new| N[Create node]
-  DEC -->|same + value| U[Revise existing node]
-  DEC -->|replacement| S[Supersede with history]
-  DEC -->|conflict| C[Keep both + contradicts]
-  N --> LINK[Link logical neighbors and subgraphs]
-  U --> LINK
-  S --> LINK
-  C --> LINK
-  LINK --> REV[Increment graph/subgraph revision]
-  REV --> PUSH[Automated subscription executor pushes Context Delta]
+  MC --> GATE[Hard gate: structure / SourceRefs / permission / sensitivity]
+  GATE -->|fail| AUDIT[MemoryCandidateRejected audit event]
+  GATE -->|pass| BUF[Task-scoped Candidate Buffer<br/>CandidateBufferedReceipt, no review / no push]
+  BUF --> DONE[Task Manager persists done per DeliveryPolicy]
+  DONE --> FIN[FinalizeTaskMemory: freeze as frozen-unreviewed]
+  FIN --> CM[Context Agent batch-reviews general candidates<br/>create / revise / supersede / dispute / reject]
+  CM -->|decision| COMMIT[Context Service atomically commits nodes, edges, SubgraphIDs, graph/subgraph revision, audit and review receipt; mark reviewed]
+  COMMIT --> PUSH[Automated subscription executor pushes Context Delta after commit]
 ```
 
-写入事务必须原子地产生：节点 revision、边变更、子图 revision、来源引用和审计事件。任一部分失败不得出现“节点已更新但订阅看不到 revision”之类半状态。
+写入事务必须原子地产生：节点创建/修订、边变更、子图归属、graph/subgraph revision 递增、来源引用、逐候选审计事件、审查回执与 `reviewed` 状态；事务成功后才推送。候选只建议 `general` 子图，定向投影只写 `task` 子图，不存在混合候选。
 
 ---
 
 ## 16. Agent Runtime
 
-Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Ctx Manager、planner、executor 和 verifier。它负责：
+Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Context Agent、planner、executor 和 verifier。它负责：
 
 - provider detect/auth/capability；
-- 按 role/purpose 或 endpoint 组装 prompt、Context Slice 和输出契约；
-- 创建 Invocation，从 Workspace Service 取得该轮次的 Workspace Binding；不创建任何业务对象（Task、轮次、端点由 Task Manager 在图上决定）；
+- 按 endpoint 组装 prompt、`ContextSliceRef`、`TaskMemoryBufferRef` 和输出契约；
+- 创建 Invocation 并取得 Workspace Binding；不创建 Task 或额外阶段；
 - 施加 phase-specific 工具、路径和写 lease；
 - 运行、取消、恢复和替换 Agent；
-- 归一化 Agent Event，保存 transcript、tool output、diff 和测试证据，但不向 Task Manager 暴露未提交的 phase 过程上下文；
-- 观察真实 write set；
-- 执行图探索等普通 Context 读请求，并传递自动订阅产生的 Context Delta；
-- 将 `PhaseOutput`、`OrchestrationProposal`、Requirement、MemoryCandidate 和 evidence 交给相应唯一 owner。
+- 记录 Event/Artifact，但不泄露未提交过程上下文；
+- 执行 Context Graph 读请求，并为同 Task 三阶段提供 `TaskMemoryBufferReader`；
+- 把 MemoryCandidate 追加到 Runtime 绑定 TaskID 的缓冲；跨 Task 访问拒绝；
+- 转交 PhaseOutput、OrchestrationProposal、Requirement 和 evidence 给唯一 owner。
 
-Runtime 不判断 Task 是否完成，不解释编排建议，不写 Coordination Graph，不替 Ctx Manager 检索或接受记忆，不合并 main。
+Runtime 不判断 Task 是否完成，不解释编排建议，不写 Coordination Graph，不替 Context Agent 检索或接受记忆，不合并 main。

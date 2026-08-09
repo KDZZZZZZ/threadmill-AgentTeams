@@ -9,7 +9,7 @@
 
 ## 1. 定位
 
-《统一设计》第 16 节：Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Ctx Manager、planner、executor 和 verifier。它负责 provider detect/auth/capability、按 role/purpose 组装 prompt、Context Slice 和输出契约、创建 Invocation 并从 Workspace Service 取得轮次 Workspace、施加 phase 权限与写 lease、运行/取消/恢复/替换 Agent、归一化事件、观察真实 write set、执行 Context 读请求并传递自动订阅的 Context Delta、把 `PhaseOutput` / `OrchestrationProposal` / Requirement / MemoryCandidate 交给相应唯一 owner。Runtime 不判断 Task 是否完成，不写 Coordination Graph，不替 Ctx Manager 检索或接受记忆，不合并 main，不创建任何业务对象。
+《统一设计》第 16 节：Runtime 是所有 Agent Invocation 的统一边界，包括 Task Manager、Context Agent（即此前 Ctx Manager Agent / 图中 ctx agent）、planner、executor 和 verifier。它负责 provider detect/auth/capability、按 role/purpose 组装 prompt、Context Slice 和输出契约、创建 Invocation 并从 Workspace Service 取得轮次 Workspace、施加 phase 权限与写 lease、运行/取消/恢复/替换 Agent、归一化事件、观察真实 write set、执行 Context 读请求并传递自动订阅的 Context Delta、把 `PhaseOutput` / `OrchestrationProposal` / Requirement 交给相应唯一 owner、把 MemoryCandidate 写入 Task 级候选缓冲（硬门槛后返回 `CandidateBufferedReceipt`，Task 工作期间不审查、不落图、不推送）。Runtime 不判断 Task 是否完成，不写 Coordination Graph，不替 Context Agent 检索或接受记忆，不合并 main，不创建任何业务对象。
 
 AgentTeams 基座提供的不是"与 CLI 无关的通用 adapter 层"，而是一套可部署、可观测的 agent 运行时与协作基座：
 
@@ -73,8 +73,8 @@ AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge
 
 - AgentInvocation 记录与 run 生命周期投影（AgentTeams 无此实体）。
 - phase lease 的声明与强制（AgentTeams 无 phase 概念，见 §5.1）。
-- Context Slice 组装、Context Graph 读接口（ListSubgraphs / Explore / Retrieve / Subscribe）与自动订阅执行器（AgentTeams 无 Context Graph）。
-- PhaseOutput / OrchestrationProposal / MemoryCandidate 的形状校验与路由。
+- Context Slice 组装、Context Graph 读接口与自动订阅，以及同 Task 三阶段共享的 `TaskMemoryBufferReader` / `TaskMemoryBufferRef` 装配。
+- PhaseOutput / OrchestrationProposal / Requirement 路由；MemoryCandidate 硬门槛、Task 级 append-only 缓冲读写与 done 后冻结终审转交。
 - Event Log 投影（AgentTeams 没有 Event Log；从 heartbeat、trace、meta.json/result.md、委派事件投影）。
 - Observed Write Set 观察器（目录快照对比 / git diff / deliverables 交叉核对）。
 - 输出 JSON Schema 校验（针对 result.md 内嵌载荷）。
@@ -83,7 +83,7 @@ AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge
 
 1. TeamHarness 的 project DAG/Loop 与 `ready_nodes` 不应作为 Coordination Graph。它是 Leader 维护的团队协作视图（`shared/projects/{id}/plan.md`），可被改写；Coordination Graph 的唯一写入口是 Task Manager。
 2. Leader/Manager 的房间状态记忆（"从 room 推断身份/项目"）不应作为权威编排状态；Leader prompt 本身就禁止从 session 猜状态。
-3. `message` MCP 工具不应成为 Agent mailbox。基座事实：worker/remote-member 的 `message` 工具被禁用（server.py `MESSAGE_TOOL_BLOCKED_ROLES = {"worker", "remote-member"}`）。Threadmill 不提供替代 mailbox；外部记忆只来自切片、探索、检索、订阅与自动 Delta。
+3. `message` MCP 工具不应成为 Agent mailbox。基座事实：worker/remote-member 的 `message` 工具被禁用（server.py `MESSAGE_TOOL_BLOCKED_ROLES = {"worker", "remote-member"}`）。Threadmill 不提供替代 mailbox；外部记忆只来自切片、探索、订阅、自动 Delta，以及列表/探索不足时经 `contextAgent.retrieve` 请求的语义检索。
 4. Matrix 房间线程不应作为过程上下文审计通道。运行过程上下文留在 Invocation 内（QwenPaw `sessions/` 私有、Threadmill 不读）。
 5. QwenPaw 原生 subagent（共享同一 workspace）不应承担需要隔离的 phase 执行；需要隔离时用 WorkerFlow 临时 agent 或独立 worker。
 6. `accept_task_result` 不应等于 done 或 merge（见 workspace-merge.md §4.2）。
@@ -102,7 +102,7 @@ AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge
 | 发起 phase invocation | `taskflow delegate_task`（含 spec）；`worker_agentflow workflow_run`（临时 agent） | `plugins/teamharness/mcp/server.py`；`plugins/workerflow/mcp/server.py` | 适配封装 |
 | 取消/替换 | `taskflow cancel_task(reason[, replacementTaskId])`；`delete_temp_agent`；Worker `spec.state=Stopped` | 同上；`agentteams-controller/api/v1beta1/types.go` | 直接复用 |
 | 输出确认 | `ack_task / submit_task / check_task`；TaskResult 状态机 | `plugins/teamharness/mcp/server.py`（`_task_result_from_meta`） | 直接复用 |
-| Context 读工具 | Threadmill 新建 `threadmill-ctx` MCP server，经 `desired.mcpServers` 注入 | 注入机制：`qwenpaw_worker/update.py`；工具：Threadmill 新建 | 工具新建、机制复用 |
+| Context 读工具 | Threadmill 新建 `threadmill-ctx` MCP server，经 `desired.mcpServers` 注入；`ContextGraphSearcher.Search` 仅注入 Context Agent，不注入普通 worker / Task Manager | 注入机制：`qwenpaw_worker/update.py`；工具：Threadmill 新建 | 工具新建、机制复用 |
 | 事件记录 | 无 Event Log；从 heartbeat / trace / meta.json / result.md / 委派事件投影 | `task_trace.py`；`heartbeat.py` | Threadmill 新建投影 |
 | Scheduler | AgentTeams 无 Scheduler；controller 只 reconcile Worker 生命周期，不调度 phase | — | Threadmill 新建 |
 
@@ -226,15 +226,15 @@ Threadmill 新建 Event Log 投影：Runtime 把委派/ack/submit/取消、心�
 
 ## 6. Context 读操作与结构化输出
 
-### 6.1 Context Graph 读操作（全部 Threadmill 新建）
+### 6.1 Context Graph 与 Task 工作记忆读操作
 
-AgentTeams 没有 Context Graph。`ListSubgraphs / Explore / Retrieve / Subscribe` 由 Threadmill 新建的 `threadmill-ctx` MCP server 实现，并通过 `desired.mcpServers` 注入每个 worker（直接复用 QwenPaw 的 MCP 注入机制：`update.py` apply → `/api/mcp`）。所有角色（planner / executor / verifier / Task Manager）在 phase 委派中使用同一组 Context 读工具。
+AgentTeams 没有这两块能力。Runtime 为每个 `plan / execute / verify` Invocation 注入：
 
-- Ctx Manager 只响应 `Retrieve` 检索与 MemoryCandidate 准入；不主动巡图，也不产生订阅外上下文。
-- 订阅只有两种来源：Context service 生成初始/检索切片时的自动订阅，或 Agent 从可见子图列表主动 `Subscribe`（统一设计 §14.1）。
-- 推送由 Threadmill 自动订阅执行器执行（增量、可合并、可重放），物理通道复用 Matrix/会话基础设施；对 worker 的 Delta 注入发生在委派轮次边界或 QwenPaw 会话内，不依赖 worker 的 `message` 工具（该工具对 worker 禁用，与"无订阅外旁路推送"的语义一致）。
-- `ContextSubscription`（consumer_invocation_id / subgraph_ids / source: initial_slice | retrieval | explicit / permission_snapshot / expires_at）是订阅语义的唯一运行关系，随 Invocation 结束过期，不引入 Notification 或 mailbox 实体（统一设计 §14.1）。
-- 初始 Context Slice：Context service 在 Task Manager 生成 phase spec 时组装，随 `spec.md` 与 prompt 注入（复用 spec 传输通道）；slice 内子图自动建立与 Invocation 同寿命的订阅。
+- `ContextGraphReader`：读取已落图的 ListSubgraphs / Explore / Subscribe；Search 仍只注入 Context Agent；
+- `TaskMemoryBufferReader`：只读取 Runtime 绑定 TaskID 对应的候选缓冲，不接受调用方指定 TaskID；
+- 启动时分别装配 `ContextSliceRef` 与 `TaskMemoryBufferRef`。前者建立子图订阅，后者只是 append-only 缓冲快照。
+
+候选追加不改变 graph revision、不触发 ContextDelta；同 Task 后续阶段可见，跨 Task 不可见。
 
 ### 6.2 结构化输出
 
@@ -258,14 +258,14 @@ result.md 内嵌结构化载荷（Threadmill 适配，不改 AgentTeams 协议�
       "workspace_ref": "…",  // 轮次标识
       "phase": "execute",
       "workspace_id": "…", "input_revision": "…",
-      "workspace_head": "…", "context_slice_ref": "…"
+      "workspace_head": "…", "context_slice_ref": "…", "task_memory_buffer_ref": "…"
     },
     "delivery_refs": ["shared/tasks/<task_id>/<workspace_ref>/workspace/…"],
     "report_ref": "shared/tasks/<task_id>/<workspace_ref>/result.md",
     "evidence_refs": ["shared/tasks/<task_id>/<workspace_ref>/evidence/…"]
   },
-  "memory_candidates": [      // MemoryCandidate（统一设计 §12.1），Runtime 自动记录
-    {"client_ref": "…", "statement": "…", "kind": "fact", "why_reusable": "…"}
+  "memory_candidates": [      // MemoryCandidate 引用摘录，四字段以 context-graph.md §3.3 为权威（逐字段一致，无扩展字段）；Runtime 自动记录并入 Task 级候选缓冲（Task done 前不审查、不落图、不推送）
+    {"statement": "…", "kind": "fact", "source_refs": ["…"], "subgraph_ids": ["…"]}
   ],
   "observed_write_set": {"files": ["shared/tasks/<task_id>/<workspace_ref>/workspace/src/a.py"], "contracts": []},
   "orchestration_proposal": null  // 可选，见 §5.3
@@ -284,12 +284,13 @@ DeliverySpec / ReportSpec 由 Task Manager 在委派时写入 `spec.md` 与 prom
 
 1. 所有 Agent（含 Task Manager）都经 Runtime 边界执行：Task Manager 在 Manager/controller 侧，phase agent 在 worker/临时 agent 侧，两侧都经过同一适配层（Context 注入、输出契约、事件投影）。
 2. Runtime 不判断 Task 完成、不解释编排建议、不写 Coordination Graph / Context Graph、不合并 main。
-3. worker 无 `message` 工具；不存在 Agent mailbox；外部记忆只来自切片、图探索、检索、订阅与自动 Delta。
-4. 过程上下文留在 Invocation 内；Task Manager 只消费 `PhaseOutput` / `OrchestrationProposal` 与证据。
-5. 每次 invocation 有 workspace 边界、权限快照与输出契约；Observed Write Set 以 Runtime 观察为准，agent 自报只能作参考。
-6. 替换/取消不静默：worker 替换、临时 agent 失败清理、cancel 都必须产生显式事件。
-7. AgentTeams 的委派协议不承载 Threadmill 的图状态：TaskMeta / ProjectMeta 不写 Coordination/Context Graph 字段；图只存于 Threadmill 侧。
-8. 订阅推送必须由已存在订阅触发；不提供订阅之外的旁路推送。
+3. worker 无 mailbox；外部知识来自 Context Graph，Task 内工作记忆来自当前 Task 候选缓冲，两者不混用。
+4. 每个 Task 固定 `plan / execute / verify` 三阶段；Runtime 不创建第四阶段。
+5. 同 Task 三阶段可经 `TaskMemoryBufferReader` 读取共享候选缓冲；TaskID 由 Runtime 绑定，跨 Task 读取必须拒绝。
+6. 候选追加不改变 Context Graph revision、不触发订阅 Delta；done 后冻结终审才可能落图。
+7. 每次 Invocation 有 workspace、权限与输出契约边界；Observed Write Set 以 Runtime 观察为准。
+8. AgentTeams 委派协议不承载 Threadmill 的图或 Task 缓冲状态。
+9. 订阅只保存最小路由/过滤/权限字段并随 ConsumerInvocationID 指向的 Invocation 结束；推送必须由已存在订阅与成功图事务触发。
 
 ---
 

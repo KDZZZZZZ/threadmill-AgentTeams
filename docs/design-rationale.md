@@ -25,7 +25,7 @@ Threadmill 管理的三类对象必须分开持久化，因为它们回答不同
 
 **为什么不建立 Execution Graph（phase 内持久执行图）**：phase 内的执行步骤、LLM 调用、工具链是 Runtime 的内部现场。把“这一次怎样运行”持久化成图，会引入第三个写入口、第三套失效语义，却不会让任何编排者变得更正确——编排者需要的全部信息已经由 `PhaseOutput`（阶段结束输出）与 `OrchestrationProposal`（运行中主动建议）承载。只有当内部工作获得独立生命周期（独立验收、独立重试、跨时间等待、单独授权、被其他 Task 直接依赖）时，Task Manager 才把它提升为新的 Task Contract 并写入 Coordination Graph。这是“执行结构可递归、持久图不膨胀”的准确含义。
 
-同理，**不引入 Agent mailbox**：Agent 之间的一次性问答、通知通道会把协调义务从 Coordination Graph 泄漏到运行时消息里，制造第二个无法审计的“谁等谁”来源。外部记忆只来自切片、探索、检索、订阅与自动 Context Delta；协调义务只存在于 Coordination Graph 的边。
+同理，**不引入 Agent mailbox**：Agent 之间的一次性问答、通知通道会把协调义务从 Coordination Graph 泄漏到运行时消息里，制造第二个无法审计的“谁等谁”来源。外部记忆只来自切片、探索、订阅与自动 Context Delta，以及列表/探索不足时经独立 `contextAgent.retrieve` 请求的语义检索；协调义务只存在于 Coordination Graph 的边。
 
 ---
 
@@ -59,8 +59,7 @@ Task Manager 的职责是编排，不是旁观。允许它读取 phase agent 的
 因此只有两类结构化边界输出可以进入 Task Manager 的视野：
 
 ```text
-1. 阶段结束时的 PhaseOutput（DeliveryRefs / ReportRef / EvidenceRefs /
-   WorkspaceRevision / ContextGraphRevision）
+1. 阶段结束时的 PhaseOutput（完整 `PhaseResultBinding`，含 Task Contract、Input/Workspace revision、`ContextSliceRef`、`TaskMemoryBufferRef`，以及 DeliveryRefs / ReportRef / EvidenceRefs）
 2. 运行中主动提交的 OrchestrationProposal
 ```
 
@@ -100,22 +99,22 @@ Runtime 只校验输出形状与必填引用，不解释内容；Task Manager �
 
 ### 5.2 为什么所有 Agent 使用同一接口，且都能探索
 
-Task Manager、planner、executor、verifier 共享同一 Context 读接口（列表、探索、检索、订阅）。如果 Manager 与 phase agent 各有一套上下文机制，就会出现“Manager 依据的记忆”与“执行者依据的记忆”不一致——这正是统一设计要消灭的分叉。探索（`Explore`）与列表（`ListSubgraphs`）是受权限约束的普通读操作，不需要 Ctx Manager 逐次推理或批准，否则每次探索都是一次语义裁决，Ctx Manager 会成为吞吐瓶颈。
+Task Manager、planner、executor、verifier 共享同一 Context 读接口（列表、探索、订阅）。如果 Manager 与 phase agent 各有一套上下文机制，就会出现“Manager 依据的记忆”与“执行者依据的记忆”不一致——这正是统一设计要消灭的分叉。探索（`Explore`）与列表（`ListSubgraphs`）是受权限约束的普通读操作，不需要 Context Agent（即此前 Ctx Manager Agent / 图中 ctx agent）逐次推理或批准，否则每次探索都是一次语义裁决，Context Agent 会成为吞吐瓶颈。机械检索（`ContextGraphSearcher.Search`）从共享 Reader 拆出、只注入 Context Agent：普通 Agent 列表/探索不足时统一走 `contextAgent.retrieve`，由 Context Agent 把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 后调用 Search；Search 命中子图的自动订阅绑定**原请求方** Invocation，而不是执行检索的 Context Agent 自己（可信 consumer binding 由 Runtime 附加，不放入 SearchRequest）。
 
-### 5.3 为什么 Ctx Manager 只响应检索与准入 MemoryCandidate
+### 5.3 为什么 Context Agent 只响应检索与裁决 general 候选
 
-Ctx Manager 是 Context Graph 的唯一写入口，但它的语义判断只出现在两个边界：
+Context Agent 是 Task done 后冻结批次中 `general` 候选语义裁决的唯一入口；图的持久化 mutation 一律由 Context Service 执行（Task Manager 的 task 定向投影也经 Context Service，不直接访问图存储）。它的语义判断只出现在两个边界：
 
-1. **响应检索请求（Retrieve）**：Agent 在列表与探索不足时提交 intent、scope 与推理锚点，Ctx Manager 做多路召回并返回带 path explanation 的记忆子图切片。
-2. **准入 MemoryCandidate**：Agent 标注“值得记住的东西”提交候选，Ctx Manager 校验证据、权限、价值，决定 create / revise / supersede / dispute / reject。
+1. **响应自然语言检索请求（独立接口 `contextAgent.retrieve`）**：Agent 在列表与探索不足时提交意图与检索条件，Context Agent 把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs`，调用仅注入 Context Agent 的底层机械检索 seam `ContextGraphSearcher.Search`（请求/响应字段由 Graph 定义），做多路召回并返回带 path explanation 的记忆子图切片。该接口独立于普通 Agent 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe）——普通 Agent 不再直接持有 `Search`，机械匹配发生在 Context Agent 内部；检索接口的请求/响应字段由 Context Agent 文档定义。
+2. **裁决 general MemoryCandidate**：Agent 候选先入 Task 级缓冲；Task Manager 先持久化权威 done，再调用 `FinalizeTaskMemory` 冻结为 `frozen-unreviewed`。Context Agent 批量裁决 general 候选，Context Service 原子落图并保存审查回执后标记 `reviewed`；失败重试同一批次且不改变 done。`task` 子图只接受 `TaskContextWriter` 定向投影。
 
-它不主动巡图、不主动提示、不决定普通探索与切片、不执行订阅或推送。原因：主动提示是“系统认为自己知道 Agent 需要什么”，它把知识判断从 Agent 的明确请求变成系统的隐式猜测，且无法审计。切片的生成是 Context service 按 role/purpose/权限的受控响应，不是 Ctx Manager 的观察行为。
+它不主动巡图、不主动提示、不决定普通探索与切片、不执行订阅或推送。原因：主动提示是“系统认为自己知道 Agent 需要什么”，它把知识判断从 Agent 的明确请求变成系统的隐式猜测，且无法审计。切片的生成是 Context service 按 role/purpose/权限的受控响应，不是 Context Agent 的观察行为。
 
 ### 5.4 为什么订阅只有两种来源，推送自动执行
 
-`ContextSubscription` 只有两种来源：**切片自动订阅**（生成初始/检索切片时自动订阅所含子图）与 **Agent 主动订阅**（从可见子图列表中选择）。推送由自动化订阅执行器触发：图提交 revision → 执行器匹配子图、事件类型、权限与新鲜度 → 按 subgraph revision 合并 → Runtime 发出 Context Delta → 记录是否消费。
+`ContextSubscription` 只有两种来源：**切片自动订阅**（生成初始/检索切片时自动订阅所含子图；经 `contextAgent.retrieve` 的检索路径中，Search 命中子图的自动订阅绑定原请求方 Invocation，由 Runtime 附加可信 consumer binding，不放入 SearchRequest）与 **Agent 主动订阅**（从可见子图列表中选择）。推送由自动化订阅执行器触发：Context Graph 提交节点/边变更并递增 subgraph revision → 执行器匹配子图、事件类型、权限与新鲜度 → 按 subgraph revision 合并 → Runtime 发出 Context Delta → 记录是否消费。
 
-为什么不允许其他订阅/推送路径：订阅之外的旁路推送（一次性问答、mailbox、Ctx Manager 主动推送）会制造“Agent 收到但不知道来自哪个订阅”的不可追溯上下文，也会让 Ctx Manager 重新承担它不该承担的主动观察职责。自动推送是基础设施行为，不调用 Ctx Manager 做逐条判断；Delta 必须由已存在的订阅触发，增量、可合并、可重放。
+为什么不允许其他订阅/推送路径：订阅之外的旁路推送（一次性问答、mailbox、Context Agent 主动推送）会制造“Agent 收到但不知道来自哪个订阅”的不可追溯上下文，也会让 Context Agent 重新承担它不该承担的主动观察职责。自动推送是基础设施行为，不调用 Context Agent 做逐条判断；Delta 必须由已存在的订阅触发，增量、可合并、可重放。
 
 ### 5.5 推送与协调边的边界
 
@@ -141,9 +140,15 @@ Context Graph 用**多重聚类**把前两项移出 Agent：一条记忆在写�
 C_graph ≈ K + F
 ```
 
-其中 F 是为防止初始切片漏召回而给出的少量"未展开候选子图/边界摘要"，Agent 只在需要时继续展开。本质上，图把"运行时的 Q×H 导航"换成了"写入时的归属打标"，由 Ctx Manager 的准入与连边质量承担后者。
+其中 F 是为防止初始切片漏召回而给出的少量"未展开候选子图/边界摘要"，Agent 只在需要时继续展开。本质上，图把"运行时的 Q×H 导航"换成了"写入时的归属打标"，由准入质量（候选入 Task 级缓冲、Task done 后冻结并经 Context Agent 批量语义裁决落图；task 定向投影经 `TaskContextWriter` 与 Context Service 硬门槛）与归属打标质量承担后者。
 
-需要收紧三点：其一，**归属质量决定成本优势是否兑现**——归属打错比目录翻层更糟，这正是 MemoryCandidate 需要明确准入规则、相似不等于直接更新、Agent 不能自封可信记忆的原因；其二，公平的对比对象不是裸文件，而是"文件 + 向量检索"，图真正不可替代的是结构化关系（supports / contradicts / supersedes / derived_from）、可追溯来源（SourceRefs）与渐进披露（初始切片 + Frontier），而不是聚类本身；其三，上述公式只算了读取侧成本，图的建设成本（候选准入、去重、连边、版本与 supersede 链维护）是持续的写入侧投入，只有在记忆被反复复用时才回本——这正是 Threadmill"同一批项目知识被多个 Agent、多个 Task 反复消费"这一前提成立时，Context Graph 才值得做的原因。
+需要收紧三点：其一，**归属质量决定成本优势是否兑现**——归属打错比目录翻层更糟，这正是 MemoryCandidate 需要明确准入规则、相似不等于直接更新、Agent 不能自封可信记忆的原因；其二，公平的对比对象不是裸文件，而是"文件 + 向量检索"，图真正不可替代的是结构化关系（supports / contradicts / supersedes / logical_adjacent / derives_from_subgraph）、可追溯来源（SourceRefs）与渐进披露（初始切片 + Frontier），而不是聚类本身；其三，上述公式只算了读取侧成本，图的建设成本（候选准入、去重、连边、版本与 supersede 链维护）是持续的写入侧投入，只有在记忆被反复复用时才回本——这正是 Threadmill"同一批项目知识被多个 Agent、多个 Task 反复消费"这一前提成立时，Context Graph 才值得做的原因。
+
+### 5.7 为什么 Task 定向投影要显式声明接收者
+
+Task Manager 写 `task` 子图时不写"给某个 Agent"的消息——Agent Invocation 是临时计算资源，按 Agent、worker、session 或 Invocation 匹配会在替换、恢复和重试时失效。因此投影必须携带 **Recipient Binding**（`TaskContextRecipient{TaskID, EndpointRefs}`，EndpointRefs 为空表示该 Task 的全部 endpoint）：它声明"这条上下文写给哪些稳定编排端点"，由 Context Service 按 `TaskID + EndpointRef` 确定性装配进初始 Context Slice，不要求 Agent 主动检索、订阅或声明自己需要什么（结构与规则见 [context-graph.md](./context-graph.md) 的 Task 定向投影章节，术语见 [CONTEXT.md](./CONTEXT.md)）。
+
+**Task-directed Projection** 就是携带该绑定的定向写入，经 `TaskContextWriter.ProjectTaskContext` 进入 `task` 子图，只作补充上下文并引用权威来源；它不替代 ContractRef / Inputs 的权威输入，也不是给 Agent 的私信。它与候选缓冲是两条目标不相交的写路径：定向投影不进候选缓冲，候选也不声明 task 子图。
 
 ---
 
@@ -181,7 +186,7 @@ TeamHarness 的 projectflow/taskflow（`third_party/agentteams/copaw/src/copaw_w
 
 AgentTeams 的记忆全部是单 Agent 私有：OpenClaw 式 `MEMORY.md`/`memory/` 目录（`docs/declarative-resource-management.md`）、CoPaw 的 remelight 记忆后端（`copaw/src/matrix/config.py`）、Hermes 的 `memory_enabled`（`hermes/src/hermes_worker/bridge.py`）。它们随各自 worker 的 MinIO 前缀同步，没有共享视图、没有准入、没有子图、没有订阅。
 
-Threadmill 需要的是**共享的、可追溯的、有准入的 Context Graph**：所有 Agent 经同一接口读取，知识从 Event Log/Artifact Store 提炼，MemoryCandidate 由 Ctx Manager 准入，订阅与 Delta 自动推送。私有记忆的直接复用会制造 N 个互不可见的“项目真相”，且无法回答“这条知识基于什么证据、什么时候失效”。`docs/k8s-native-agent-orch.md` 预留的 `shared/knowledge/` 前缀没有实现，只能作为 Context Graph 的物理落点，不能当作现成记忆服务。
+Threadmill 需要的是**共享的、可追溯的、有准入的 Context Graph**：所有 Agent 经同一接口读取，知识从 Event Log/Artifact Store 提炼，MemoryCandidate 先入 Task 级候选缓冲、Task done 后冻结并经 Context Agent 批量裁决落图（task 子图只经 `TaskContextWriter` 定向投影），订阅与 Delta 自动推送。私有记忆的直接复用会制造 N 个互不可见的“项目真相”，且无法回答“这条知识基于什么证据、什么时候失效”。`docs/k8s-native-agent-orch.md` 预留的 `shared/knowledge/` 前缀没有实现，只能作为 Context Graph 的物理落点，不能当作现成记忆服务。
 
 ### 6.4 复用边界的总原则
 
@@ -213,6 +218,6 @@ Threadmill 需要的是**共享的、可追溯的、有准入的 Context Graph**
 6. 每个 MemoryCandidate 是否有 SourceRefs、谁准入、准入后哪些订阅收到 Delta？
 7. 最终写入 main 的决定能否追溯到 Requirement、真实 diff 和仍有效的验证结果？
 8. Task Manager 是否只看 PhaseOutput 与 OrchestrationProposal，没有读取任何未提交过程上下文？
-9. 是否还存在任何 Agent 直接写图、直接通信、或 Ctx Manager 主动提示的路径？
+9. 是否还存在任何 Agent 直接写图、直接通信、或 Context Agent 主动提示的路径？
 
 答不清这些问题时，不应该继续增加状态、Agent 角色或记忆策略；应先修正工作模型。

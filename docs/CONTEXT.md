@@ -5,7 +5,7 @@ Threadmill 协调软件工作，但不把工作绑定在执行它的 agent sessi
 ## 工作
 
 **Requirement（需求）**:
-对目标、动机和约束的原始表达。Requirement 用来保留来源，不是可直接调度的工作。
+对目标、动机和约束的原始表达。Requirement 用来保留来源，不是可直接调度的工作。Requirement 是要求，不等于 preference：原始目标、约束与验收意图映射为 `directive`（投影时引用 Requirement 原件）；其中稳定风格取舍属于 `directive` 的软约束，通过来源/字段区分，不是独立 Kind。
 _Avoid_: Request、prompt、ticket
 
 **Task Contract（任务契约）**:
@@ -13,7 +13,7 @@ _Avoid_: Request、prompt、ticket
 _Avoid_: Task prompt、plan
 
 **Task（任务）**:
-由一个 Task Contract 约束、通过 phase endpoint 协调的持久工作单元。Task 的寿命长于任何参与执行的 agent。
+由一个 Task Contract 约束、固定包含 `plan / execute / verify` 三个工作阶段的持久工作单元。`prepared / done` 是派生门控状态；人工或外部决定是 blocker/decision 条件，不增加第四阶段。Task 的寿命长于任何 Agent Invocation。
 _Avoid_: Agent、session、thread
 
 **轮次（Round）**:
@@ -21,7 +21,7 @@ _Avoid_: Agent、session、thread
 _Avoid_: Retry task、Task Attempt
 
 **Phase Endpoint（阶段端点）**:
-Task 生命周期中的命名协调点，其他工作可以向它提供输入或依赖它产生的结果；需要人工或外部决定的端点即 Decision Endpoint。
+Task 内固定的 `plan / execute / verify` 三个命名协调端点；其他工作可向它们提供输入或依赖其结果。人工或外部决定表示为 blocker/decision 条件，不是 Phase Endpoint。
 _Avoid_: Status flag、agent state
 
 **Coordination Graph（协调图）**:
@@ -31,7 +31,7 @@ _Avoid_: Workflow diagram、agent chat graph
 ## 编排协议
 
 **PhaseOutput（阶段输出）**:
-阶段结束时 endpoint 提交的结构化输出载荷，含交付物/报告/证据引用、Workspace revision 与 Context Graph revision；是进入 Task Manager 视野的两类结构化输出之一。
+阶段结束时提交的结构化输出载荷，含交付物/报告/证据引用，并由 Runtime 绑定完整 `PhaseResultBinding`：Task Contract、phase、Input Revision、Workspace Binding/Head、`ContextSliceRef` 与 `TaskMemoryBufferRef`。
 _Avoid_: Agent summary、task result dump
 
 **OrchestrationProposal（编排建议）**:
@@ -90,32 +90,56 @@ _Avoid_: Chat history
 交付物、报告与证据引用的存放处；PhaseOutput 与 Coordination Edge 只携带引用。
 _Avoid_: File dump、shared folder
 
+**Hard Gate（候选入口机械校验）**:
+Context Service 在 MemoryCandidate 入 Task 缓冲前执行的同步确定性校验：字段结构、Statement、Kind、SourceRefs、权限、敏感信息和 general-only 目标。不调用 LLM，不判断长期价值；失败只返回 error、记审计且不入缓冲。
+_Avoid_: Memory review、semantic scoring
+
 **MemoryCandidate（记忆候选）**:
-Agent 在工作中标注的、值得持久化的结构化候选（陈述、理由、scope、子图归属、来源引用、置信度）。只有 Ctx Manager 有权准入为 Context Node；其余一律只留审计事件。
+Agent 提交的结构化记忆主张；通过硬门槛后进入当前 Task 的 append-only 候选缓冲，返回 `CandidateBufferedReceipt{CandidateID}`。该 Task 固定的 plan/execute/verify 三阶段可经 `TaskMemoryBufferReader` 只读，跨 Task 不可见；候选不落图、不参与订阅或推送。Task done 后冻结终审，接受者由 Context Service 原子落图。
 _Avoid_: Note、memory write
 
+**Preference（偏好）**:
+用户明确且稳定的风格取舍，表示为 `directive` 的软约束（通过来源/字段与硬约束、任务契约区分），不是独立 Kind。preference 不等于 requirement：原始目标、约束与验收意图不因“用户偏好某风格”而变成 preference；只有稳定风格取舍本身才记作 preference。
+_Avoid_: Style note、requirement
+
+**ContextNode 节点 Kind（directive / fact / hypothesis）**:
+所有 ContextNode 全局统一使用这三类 Kind，与 Subgraph.Kind（`general` | `task`）正交；候选只建议 `general` 子图、`TaskContextWriter` 定向投影只写 `task` 子图，两条写路径目标不相交，不发生类型冲突。`directive`：规范性陈述，定义必须/应当/期望做什么，包括用户 Requirement、稳定偏好，以及 Task Manager 已写入 Coordination Graph 的 Task Contract 与 endpoint DeliverySpec/ReportSpec 的上下文投影（权威在 Coordination Graph/Requirement 原件，节点必须引用来源，不复制易变 runnable/blocked 状态；硬约束、软偏好与任务契约通过字段或来源引用区分）。`fact`：已经成立、发生或经相应验收边界接受/验证的描述性陈述，包括 completed/accepted PhaseOutput、交付物、报告和证据的上下文投影（权威载荷仍在 Artifact Store/PhaseOutput，节点必须带权威来源引用）。`hypothesis`：尚待证据验证的描述性推测，不得承载任务或用户要求。task 子图是便于检索/订阅的投影，不替代 Coordination Graph、Requirement 原件、PhaseOutput 或 Artifact Store。
+_Avoid_: task fact、phase fact、hypothesis task
+
 **Context Graph（上下文图）**:
-从运行证据中提炼出的知识节点及其逻辑关系的持久图。Ctx Manager Agent 是唯一写入口；所有 Agent 可列表、探索、检索和订阅，但不可直接写。
+从运行证据中提炼出的知识节点及其逻辑关系的持久图。所有 Agent 可列表、探索和订阅；列表/探索不足时经独立接口 `contextAgent.retrieve` 调用 Context Agent 自然语言检索（Context Agent 内部使用仅注入自身的 `ContextGraphSearcher.Search`）；general 写入只经候选缓冲：候选入 Task 级缓冲，Task done 后冻结、Context Agent 批量裁决、Context Service 落图；Task Manager 的定向投影经 `TaskContextWriter` 写入，仅限 task 子图。
 _Avoid_: Memory store、KB dump
 
 **Context Node / Context Edge（上下文节点/边）**:
-图中的知识陈述与逻辑关系（logical_adjacent、supports、contradicts、supersedes、derived_from 等）。Agent 只能通过 MemoryCandidate 间接影响它们；embedding 相似不能单独建立语义边。
+图中的知识陈述与逻辑关系（logical_adjacent、derives_from_subgraph、supports、contradicts、supersedes 等）。创建时自动边只有两类：同创建者最近节点的 `logical_adjacent` 与订阅子图的 `derives_from_subgraph`（见 context-graph.md §4）。所有节点统一使用 `directive` | `fact` | `hypothesis` 三类 Kind，与所属子图无关；同一节点可同时属于多个子图。Agent 只能通过 MemoryCandidate 间接影响它们；embedding 相似不能单独建立语义边。
 _Avoid_: Chat excerpt、snippet
 
 **Context Subgraph（上下文子图）**:
 可重叠的逻辑视图，不复制节点；是切片、检索与订阅的操作单位。
 _Avoid_: Folder、tag collection
 
+**Recipient Binding（接收者绑定）**:
+Task Manager 写 `task` 子图时声明的稳定编排接收者，即 `TaskContextRecipient{TaskID, EndpointRefs}`（`EndpointRefs` 为空表示该 Task 的全部 endpoint）；每个 Task 创建时由 Context Service 注册唯一 `TaskContextSubgraphBinding{TaskID, SubgraphID}`。接收者只引用稳定 Task / Phase Endpoint，不引用 Agent、worker、session 或 Invocation。结构与规则见 [context-graph.md](./context-graph.md) 的 Task 定向投影章节。
+_Avoid_: recipient agent、assignee、mention
+
+**Task-directed Projection（Task 定向投影）**:
+Task Manager 经受控写接口（`TaskContextWriter.ProjectTaskContext`）写给指定 Task / endpoint 的 `task` 子图节点写入；Context Service 按 `TaskID + EndpointRef` 确定性匹配，把命中的定向节点并入初始 Context Slice（`ContextSliceRef`），不依赖 Agent 行为或 embedding。投影必须引用权威来源，不替代 Coordination Graph、Requirement 原件或 PhaseOutput。该路径不经过候选缓冲，也不经过 Context Agent；候选缓冲与定向投影是两条目标不相交的写路径。
+_Avoid_: context push、memory injection、prompt injection
+
+**Task Memory Buffer（Task 候选记忆缓冲）**:
+每个 Task 一份 append-only 工作记忆，由该 Task 固定的 `plan / execute / verify` 三阶段共享。通过硬门槛的 MemoryCandidate 在 Task done 前可经 `TaskMemoryBufferReader` 只读；跨 Task 不可见。它不是 Context Graph，不参与图检索、revision、订阅或 ContextDelta；done 后冻结并批量终审。
+_Avoid_: Context Subgraph、candidate graph、Agent private memory
+
 **Context Slice（上下文切片）**:
-Context service 为一次 Agent Invocation 按 role/purpose/权限生成的只读快照（节点、子图概要、Frontier、冲突、graph revision）；`Explore` 沿 slice 或子图展开并返回 ContextSliceDelta。切片不是复制出来的新知识库。
+Context service 为一次 Agent Invocation 按 role/purpose/权限生成的已落图只读快照（节点、子图概要、Frontier、冲突、graph revision）。它与同 Task 的 `TaskMemoryBufferRef` 分离：前者可探索/订阅，后者只读未终审候选；两者都不能覆盖 ContractRef/Inputs。
 _Avoid_: Prompt dump、full project history
 
 **ContextSubscription（上下文订阅）**:
-绑定 Invocation 与权限快照的受控订阅关系。来源只有两种：切片/检索时自动订阅，或 Agent 主动选择；匹配更新由自动化订阅执行器推送 Context Delta，不建立 Agent mailbox。
+绑定 Invocation 与权限快照的受控订阅关系。来源只有两种：切片/检索时自动订阅（经 `contextAgent.retrieve` 的检索路径中，Search 命中子图的自动订阅绑定原请求方 Invocation，不是 Context Agent 自己；可信 consumer binding 由 Runtime 在 Context Agent 调用 Search 时附加，不放入 SearchRequest），或 Agent 主动选择；Context Graph 在节点/边事务提交并递增受影响 subgraph revision 后主动触发内部订阅执行器匹配已存在订阅并生成 Context Delta，Runtime 只负责送达活动 Invocation，不建立 Agent mailbox。
 _Avoid_: Notification、SearchJob、Delivery
 
 **Context Delta（上下文增量）**:
-已订阅子图发生匹配更新后推送给活动 Invocation 的增量载荷；增量、可合并、可重放。系统不提供订阅之外的旁路推送。
+已订阅子图发生匹配更新后，由 Context Graph 主动触发内部订阅执行器生成、经 Runtime 送达活动 Invocation 的增量载荷；增量、可合并、可重放；Context Agent 不推送。系统不提供订阅之外的旁路推送。Task 工作期间的候选只入缓冲，不产生 Delta；只有 Task done 后审查落图的节点变更触发推送。
 _Avoid_: Message、push notification
 
 ## 已删除术语
