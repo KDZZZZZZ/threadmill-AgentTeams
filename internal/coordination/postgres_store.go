@@ -692,20 +692,31 @@ func writeGraphTables(ctx context.Context, q postgresDBTX, projectID kernel.Proj
 		`DELETE FROM coordination_edges WHERE project_id = $1`,
 		`DELETE FROM coordination_blockers WHERE project_id = $1`,
 		`DELETE FROM coordination_phase_results WHERE project_id = $1`,
-		`DELETE FROM coordination_endpoints WHERE project_id = $1`,
-		`DELETE FROM coordination_tasks WHERE project_id = $1`,
 	} {
 		if _, err := q.ExecContext(ctx, stmt, projectID); err != nil {
 			return mapPostgresError(err)
 		}
 	}
 	for _, task := range snapshot.Tasks {
-		if _, err := q.ExecContext(ctx, `INSERT INTO coordination_tasks(project_id, task_id, contract_ref, outcome) VALUES ($1, $2, $3, $4)`, projectID, task.ID, task.ContractRef, task.Outcome); err != nil {
+		if _, err := q.ExecContext(ctx, `INSERT INTO coordination_tasks(project_id, task_id, contract_ref, outcome)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (project_id, task_id) DO UPDATE SET
+	contract_ref = EXCLUDED.contract_ref,
+	outcome = EXCLUDED.outcome,
+	updated_at = now()`, projectID, task.ID, task.ContractRef, task.Outcome); err != nil {
 			return mapPostgresError(err)
 		}
 	}
 	for _, endpoint := range snapshot.Endpoints {
-		if _, err := q.ExecContext(ctx, `INSERT INTO coordination_endpoints(project_id, task_id, endpoint_id, spec_ref, binding_ref, generation, state, run_policy) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, projectID, endpoint.Ref.TaskID, endpoint.Ref.EndpointID, endpoint.SpecRef, endpoint.BindingRef, endpoint.Generation, endpoint.State, endpoint.RunPolicy); err != nil {
+		if _, err := q.ExecContext(ctx, `INSERT INTO coordination_endpoints(project_id, task_id, endpoint_id, spec_ref, binding_ref, generation, state, run_policy)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (project_id, task_id, endpoint_id) DO UPDATE SET
+	spec_ref = EXCLUDED.spec_ref,
+	binding_ref = EXCLUDED.binding_ref,
+	generation = EXCLUDED.generation,
+	state = EXCLUDED.state,
+	run_policy = EXCLUDED.run_policy,
+	updated_at = now()`, projectID, endpoint.Ref.TaskID, endpoint.Ref.EndpointID, endpoint.SpecRef, endpoint.BindingRef, endpoint.Generation, endpoint.State, endpoint.RunPolicy); err != nil {
 			return mapPostgresError(err)
 		}
 	}

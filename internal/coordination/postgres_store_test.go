@@ -4,11 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
 	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func TestPostgresWriteGraphTablesUsesAuthoritativeSnapshotShape(t *testing.T) {
@@ -52,14 +60,14 @@ func TestPostgresWriteGraphTablesUsesAuthoritativeSnapshotShape(t *testing.T) {
 	if err := writeGraphTables(context.Background(), rec, "project-a", snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec.execs) != 5+len(snapshot.Tasks)+len(snapshot.Endpoints)+len(snapshot.Edges)+len(snapshot.Blockers)+len(snapshot.Results) {
+	if len(rec.execs) != 3+len(snapshot.Tasks)+len(snapshot.Endpoints)+len(snapshot.Edges)+len(snapshot.Blockers)+len(snapshot.Results) {
 		t.Fatalf("exec count = %d, want deletes plus all snapshot rows; execs=%#v", len(rec.execs), rec.execs)
 	}
 	if !strings.Contains(rec.execs[0].query, "DELETE FROM coordination_edges") ||
-		!strings.Contains(rec.execs[4].query, "DELETE FROM coordination_tasks") {
-		t.Fatalf("delete order = %#v, want relation tables cleared before tasks", rec.execs[:5])
+		!strings.Contains(rec.execs[2].query, "DELETE FROM coordination_phase_results") {
+		t.Fatalf("delete order = %#v, want relation tables cleared without deleting task or endpoint rows", rec.execs[:3])
 	}
-	edgeExec := rec.execs[5+len(snapshot.Tasks)+len(snapshot.Endpoints)]
+	edgeExec := rec.execs[3+len(snapshot.Tasks)+len(snapshot.Endpoints)]
 	if got := edgeExec.args[7]; got != `{"quote\"kind","path\\kind"}` {
 		t.Fatalf("artifact array literal = %v, want escaped text[] literal", got)
 	}
@@ -101,6 +109,101 @@ func TestPostgresErrorMapping(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
+	dsn := os.Getenv("THREADMILL_PG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("THREADMILL_PG_TEST_DSN is not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("coordination_it_%d", time.Now().UnixNano())
+	baseDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseDB.Close()
+	if _, err := baseDB.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer baseDB.ExecContext(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
+
+	db, err := sql.Open("pgx", dsnWithSearchPath(t, dsn, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewMigrator(db).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	graph := NewTaskManagerGraph(taskManagerPrincipal(), store, store, kernel.NewMemoryIdempotencyStore())
+	revision := createPostgresTask(t, graph, store, "pg-task-a")
+	if revision != 2 {
+		t.Fatalf("initial revision = %d, want 2", revision)
+	}
+	if _, err := graph.ReplacePending(ctx, basicSubgraph("pg-task-b", "stale-decision", 1)); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("unauthorized stale replace = %v, want forbidden before graph write", err)
+	}
+	if err := store.RegisterReplacePending(ctx, projectID, "stale-decision"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.ReplacePending(ctx, basicSubgraph("pg-task-b", "stale-decision", 1)); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("stale replace = %v, want revision_conflict", err)
+	}
+
+	controller := &recordingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+	const workers = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- runtime.reconcile(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent reconcile failed: %v", err)
+		}
+	}
+	if commands := store.runtimeCommands(ctx, projectID); len(commands) != 1 || commands[0].Action != CommandStart {
+		t.Fatalf("commands after concurrent reconcile = %#v, want one start", commands)
+	}
+	if active := countPostgresActiveLeases(ctx, store, projectID); active != 1 {
+		t.Fatalf("active leases = %d, want 1", active)
+	}
+
+	if err := store.RegisterTransition(ctx, projectID, "pg-hold-after-restart", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("pg-task-a", EndpointPlan),
+		Action:     "held",
+		Generation: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	revision = mustTransition(t, graph, revision, "pg-hold-after-restart")
+	restartedController := &recordingController{}
+	restarted := newGraphRuntime(projectID, NewPostgresStore(db), restartedController)
+	if err := restarted.reconcile(ctx); err != nil {
+		t.Fatalf("restarted reconcile: %v", err)
+	}
+	if got := restartedController.lastAction(); got != CommandStop {
+		t.Fatalf("restart action = %s, want stop", got)
+	}
+	stop := restartedController.lastCommand()
+	if stop.LeaseRef == "" || stop.Endpoint != ref("pg-task-a", EndpointPlan) {
+		t.Fatalf("stop command = %#v, want persisted active lease stop", stop)
+	}
+}
+
 type recordingDBTX struct {
 	execs []recordedExec
 }
@@ -127,3 +230,39 @@ type recordingResult int64
 
 func (r recordingResult) LastInsertId() (int64, error) { return 0, nil }
 func (r recordingResult) RowsAffected() (int64, error) { return int64(r), nil }
+
+func dsnWithSearchPath(t *testing.T, dsn, schema string) string {
+	t.Helper()
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("options", "-c search_path="+schema)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func createPostgresTask(t *testing.T, graph *Service, decisions *PostgresStore, taskID kernel.TaskID) kernel.Revision {
+	t.Helper()
+	requestID := kernel.IdempotencyKey("decision-create-" + string(taskID))
+	base := latestRevision(t, graph)
+	if err := decisions.RegisterReplacePending(context.Background(), projectID, requestID); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := graph.ReplacePending(context.Background(), basicSubgraph(taskID, requestID, base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
+}
+
+func countPostgresActiveLeases(ctx context.Context, store *PostgresStore, projectID kernel.ProjectID) int {
+	active := 0
+	for _, lease := range store.runtimeLeases(ctx, projectID) {
+		if lease.State == "active" {
+			active++
+		}
+	}
+	return active
+}
