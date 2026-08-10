@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -16,6 +17,7 @@ const (
 	envHTTPAddr             = "THREADMILL_HTTP_ADDR"
 	envProjectID            = "THREADMILL_PROJECT_ID"
 	envWebDistDir           = "THREADMILL_WEB_DIST_DIR"
+	envAllowedOrigins       = "THREADMILL_ALLOWED_ORIGINS"
 )
 
 type Config struct {
@@ -28,6 +30,7 @@ type Config struct {
 	HTTPAddr             string
 	ProjectID            string
 	WebDistDir           string
+	AllowedOrigins       []string
 }
 
 type Environment map[string]string
@@ -71,6 +74,11 @@ func Load(env Environment) (Config, error) {
 		ProjectID:            lookup(env, envProjectID),
 		WebDistDir:           lookup(env, envWebDistDir),
 	}
+	allowedOrigins, err := parseAllowedOrigins(lookup(env, envAllowedOrigins))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AllowedOrigins = allowedOrigins
 	if cfg.HTTPAddr == "" {
 		cfg.HTTPAddr = ":8080"
 	}
@@ -112,6 +120,9 @@ func Load(env Environment) (Config, error) {
 	if cfg.ObjectStoreBucket == "" {
 		missing = append(missing, envObjectStoreBucket)
 	}
+	if len(cfg.AllowedOrigins) == 0 {
+		missing = append(missing, envAllowedOrigins)
+	}
 	if len(missing) > 0 {
 		return Config{}, DiagnosticError{Diagnostic: Diagnostic{
 			OK:          false,
@@ -138,7 +149,43 @@ func Check(cfg Config) Diagnostic {
 	return Diagnostic{
 		OK:          true,
 		Code:        "ok",
-		Message:     fmt.Sprintf("configuration valid; http address %s; project %s; web dist %s; object store endpoint %s bucket %s secure %t", cfg.HTTPAddr, cfg.ProjectID, cfg.WebDistDir, cfg.ObjectStoreEndpoint, cfg.ObjectStoreBucket, cfg.ObjectStoreSecure),
+		Message:     fmt.Sprintf("configuration valid; http address %s; project %s; web dist %s; object store endpoint %s bucket %s secure %t; allowed origins %d", cfg.HTTPAddr, cfg.ProjectID, cfg.WebDistDir, cfg.ObjectStoreEndpoint, cfg.ObjectStoreBucket, cfg.ObjectStoreSecure, len(cfg.AllowedOrigins)),
 		Recoverable: true,
 	}
+}
+
+func parseAllowedOrigins(raw string) ([]string, error) {
+	seen := make(map[string]struct{})
+	origins := make([]string, 0)
+	for _, candidate := range strings.Split(raw, ",") {
+		origin := strings.TrimSpace(candidate)
+		if origin == "" {
+			continue
+		}
+		if !validOrigin(origin) {
+			return nil, DiagnosticError{Diagnostic: Diagnostic{
+				OK:          false,
+				Code:        "configuration_invalid",
+				Message:     fmt.Sprintf("invalid origin configuration: %s", envAllowedOrigins),
+				Recoverable: true,
+			}}
+		}
+		if _, exists := seen[origin]; exists {
+			continue
+		}
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+	return origins, nil
+}
+
+func validOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	return parsed.Opaque == "" && parsed.Path == "" && parsed.RawPath == "" && parsed.RawQuery == "" && parsed.Fragment == "" && parsed.User == nil
 }

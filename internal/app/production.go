@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +21,6 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/objectstore"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
-	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/scheduler"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/taskmanager"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/httpapi"
@@ -30,17 +30,39 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/workspace"
 )
 
-const productionOperatorID kernel.ActorPrincipalID = "operator://local"
-
 type productionHost struct {
-	db     *postgres.DB
-	api    http.Handler
-	mcp    http.Handler
-	web    http.Handler
-	secret string
+	db  *postgres.DB
+	api http.Handler
+	mcp http.Handler
+	web http.Handler
+}
+
+// productionRuntimeDependencies is the explicit seam between the production
+// HTTP/MCP host and the real runtime wiring. An empty dependency set is never
+// replaced with disabled ports: production startup fails closed until the
+// AgentTeams-backed runtime supplies every authoritative command path.
+type productionRuntimeDependencies struct {
+	requirements  httpapi.RequirementCommandPort
+	human         httpapi.HumanDecisionPort
+	manager       httpapi.ManagerPort
+	phase         mcpapi.PhaseRuntime
+	requirement   mcpapi.RequirementSubmitter
+	orchestration mcpapi.OrchestrationProposalRuntime
+	taskManager   mcpapi.TaskManagerAgentRuntime
+	workspace     workspace.AgentToolPort
+	objectStore   productionReadinessProbe
+	agentTeams    productionReadinessProbe
+	runtime       productionReadinessProbe
 }
 
 func newProductionHost(ctx context.Context, cfg config.Config) (*productionHost, error) {
+	return newProductionHostWithDependencies(ctx, cfg, productionRuntimeDependencies{})
+}
+
+func newProductionHostWithDependencies(ctx context.Context, cfg config.Config, deps productionRuntimeDependencies) (*productionHost, error) {
+	if err := validateProductionRuntimeDependencies(deps); err != nil {
+		return nil, err
+	}
 	if err := runMigrations(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -48,7 +70,7 @@ func newProductionHost(ctx context.Context, cfg config.Config) (*productionHost,
 	if err != nil {
 		return nil, err
 	}
-	host, err := buildProductionHost(ctx, cfg, db)
+	host, err := buildProductionHostWithDependencies(ctx, cfg, db, deps)
 	if err != nil {
 		_ = db.Close(context.Background())
 		return nil, err
@@ -57,16 +79,19 @@ func newProductionHost(ctx context.Context, cfg config.Config) (*productionHost,
 }
 
 func buildProductionHost(ctx context.Context, cfg config.Config, db *postgres.DB) (*productionHost, error) {
+	return buildProductionHostWithDependencies(ctx, cfg, db, productionRuntimeDependencies{})
+}
+
+func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config, db *postgres.DB, deps productionRuntimeDependencies) (*productionHost, error) {
+	if err := validateProductionRuntimeDependencies(deps); err != nil {
+		return nil, err
+	}
 	projectID := kernel.ProjectID(cfg.ProjectID)
 	if err := kernel.RequireID("project_id", projectID); err != nil {
 		return nil, err
 	}
 	sqlDB := db.SQL()
 	authenticator := auth.NewAuthenticator(auth.NewPostgresStore(sqlDB), time.Now)
-	sessionSecret, _, err := authenticator.IssueOperatorSession(ctx, productionOperatorID, []kernel.ProjectID{projectID}, 24*time.Hour)
-	if err != nil {
-		return nil, fmt.Errorf("issue local operator session: %w", err)
-	}
 	if _, err := scheduler.NewPostgresCapacityLedger(sqlDB, projectID).Ensure(ctx, 1, 1); err != nil {
 		return nil, err
 	}
@@ -94,18 +119,21 @@ func buildProductionHost(ctx context.Context, cfg config.Config, db *postgres.DB
 	capacity := productionCapacity{projectID: projectID, ledger: scheduler.NewPostgresCapacityLedger(sqlDB, projectID), db: sqlDB}
 	ui := uiprojection.NewService(capacity, coordStore, productionInvocations{db: sqlDB}, productionContextInspector{db: sqlDB, contexts: contextStore}, events, permissions)
 	query := productionQuery{projectID: projectID, graph: coordStore, ui: ui, invocations: productionInvocations{db: sqlDB}, contracts: taskmanager.NewPostgresStore(sqlDB, projectID, coordStore)}
-	manager := disabledManagerPort{projectID: projectID}
-	api := httpapi.New(httpapi.Options{
+	api := newProductionAPIHandler(cfg, httpapi.Options{
 		Authenticator: authenticator,
-		CSRFGuard:     noopStateGuard{},
-		Requirements:  disabledRequirementPort{},
+		Requirements:  deps.requirements,
 		Capacity:      capacity,
-		Human:         disabledHumanPort{},
-		Manager:       manager,
+		Human:         deps.human,
+		Manager:       deps.manager,
 		Query:         query,
-		Readiness:     productionReadiness{db: db},
-		Events:        events,
-	}).Handler()
+		Readiness: productionReadiness{
+			db:          db,
+			objectStore: deps.objectStore,
+			agentTeams:  deps.agentTeams,
+			runtime:     deps.runtime,
+		},
+		Events: events,
+	})
 	registry, err := mcpapi.NewRegistry(mcpapi.AllRuntimeToolSpecs(mcpapi.RuntimeToolDependencies{
 		ContextReader:      contextStore,
 		ContextRetrieve:    productionContextRetrieve{agent: contextagent.Agent{Searcher: contextStore}},
@@ -116,11 +144,11 @@ func buildProductionHost(ctx context.Context, cfg config.Config, db *postgres.DB
 		CandidateSubmitter: contextStore,
 		TaskContextWriter:  contextStore,
 		MemoryFinalizer:    contextStore,
-		Phase:              disabledPhaseRuntime{},
-		Requirement:        disabledRequirementRuntime{},
-		Orchestration:      disabledOrchestrationRuntime{},
-		TaskManager:        disabledTaskManagerRuntime{},
-		Workspace:          disabledWorkspacePort{},
+		Phase:              deps.phase,
+		Requirement:        deps.requirement,
+		Orchestration:      deps.orchestration,
+		TaskManager:        deps.taskManager,
+		Workspace:          deps.workspace,
 		Evidence:           artifactRegistry,
 	})...)
 	if err != nil {
@@ -135,11 +163,11 @@ func buildProductionHost(ctx context.Context, cfg config.Config, db *postgres.DB
 		return nil, err
 	}
 	_ = invocations
-	return &productionHost{db: db, api: api, mcp: mcp, web: web.Handler(), secret: sessionSecret}, nil
+	return &productionHost{db: db, api: api, mcp: mcp, web: web.Handler()}, nil
 }
 
 func (h *productionHost) Handler() http.Handler {
-	return productionCookieMiddleware(h.secret, routeProductionHTTP(h.api, h.mcp, h.web))
+	return routeProductionHTTP(h.api, h.mcp, h.web)
 }
 
 func (h *productionHost) Close(ctx context.Context) error {
@@ -163,14 +191,9 @@ func routeProductionHTTP(api, mcp, web http.Handler) http.Handler {
 	})
 }
 
-func productionCookieMiddleware(secret string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: auth.SessionCookieName, Value: secret, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
-		if _, err := r.Cookie(auth.SessionCookieName); err != nil {
-			r.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: secret})
-		}
-		next.ServeHTTP(w, r)
-	})
+func newProductionAPIHandler(cfg config.Config, options httpapi.Options) http.Handler {
+	options.CSRFGuard = auth.NewStateChangeGuard(cfg.AllowedOrigins)
+	return httpapi.New(options).Handler()
 }
 
 type allowProjectPermission struct{ projectID kernel.ProjectID }
@@ -386,42 +409,104 @@ func (q productionQuery) Task(ctx context.Context, principal auth.Principal, tas
 	return httpapi.TaskProjection{TaskID: taskID, ProjectID: q.projectID, Status: status, GraphRevision: graph.Revision, ContractRef: task.ContractRef, DeliveryPolicy: policy, Endpoints: endpoints}, nil
 }
 
-type productionReadiness struct{ db *postgres.DB }
+type productionDatabasePinger interface {
+	Ping(context.Context) error
+}
+
+type productionReadinessProbe interface {
+	Check(context.Context) error
+}
+
+type productionReadiness struct {
+	db          productionDatabasePinger
+	objectStore productionReadinessProbe
+	agentTeams  productionReadinessProbe
+	runtime     productionReadinessProbe
+}
 
 func (p productionReadiness) Readiness(ctx context.Context) httpapi.ReadinessStatus {
-	status := httpapi.ReadinessStatus{Status: "ready", Dependencies: []httpapi.DependencyReadiness{{Name: "postgres", Status: "ready"}}}
-	if err := p.db.Ping(ctx); err != nil {
-		status.Status = "not_ready"
-		status.Dependencies[0].Status = "not_ready"
-		status.Dependencies[0].Message = err.Error()
+	status := httpapi.ReadinessStatus{
+		Status: "ready",
+		Dependencies: []httpapi.DependencyReadiness{
+			productionDependencyReadiness(ctx, "postgres", p.db),
+			productionDependencyReadiness(ctx, "object_store", p.objectStore),
+			productionDependencyReadiness(ctx, "agentteams", p.agentTeams),
+			productionDependencyReadiness(ctx, "runtime", p.runtime),
+		},
+	}
+	for _, dependency := range status.Dependencies {
+		if dependency.Status != "ready" {
+			status.Status = "not_ready"
+			break
+		}
 	}
 	return status
 }
 
-type noopStateGuard struct{}
-
-func (noopStateGuard) Check(*http.Request, auth.SessionRecord) error { return nil }
-
-type disabledRequirementPort struct{}
-
-func (disabledRequirementPort) SubmitRequirement(context.Context, auth.Principal, httpapi.RequirementCreateRequest) (httpapi.RequirementCreateResponse, error) {
-	return httpapi.RequirementCreateResponse{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "requirement runtime is not configured", Recoverable: true}
+func productionDependencyReadiness(ctx context.Context, name string, dependency any) httpapi.DependencyReadiness {
+	status := httpapi.DependencyReadiness{Name: name, Status: "not_ready"}
+	if nilDependency(dependency) {
+		status.Message = "not configured"
+		return status
+	}
+	var err error
+	switch typed := dependency.(type) {
+	case productionDatabasePinger:
+		err = typed.Ping(ctx)
+	case productionReadinessProbe:
+		err = typed.Check(ctx)
+	default:
+		status.Message = "invalid readiness dependency"
+		return status
+	}
+	if err != nil {
+		status.Message = err.Error()
+		return status
+	}
+	status.Status = "ready"
+	return status
 }
 
-type disabledHumanPort struct{}
-
-func (disabledHumanPort) SubmitHumanDecision(context.Context, auth.Principal, httpapi.HumanDecisionRequest) (httpapi.HumanDecisionResponse, error) {
-	return httpapi.HumanDecisionResponse{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "human decision runtime is not configured", Recoverable: true}
+func validateProductionRuntimeDependencies(deps productionRuntimeDependencies) error {
+	required := []struct {
+		name  string
+		value any
+	}{
+		{name: "requirements", value: deps.requirements},
+		{name: "human_decisions", value: deps.human},
+		{name: "manager", value: deps.manager},
+		{name: "phase_runtime", value: deps.phase},
+		{name: "requirement_runtime", value: deps.requirement},
+		{name: "orchestration_runtime", value: deps.orchestration},
+		{name: "task_manager_runtime", value: deps.taskManager},
+		{name: "workspace", value: deps.workspace},
+		{name: "object_store_readiness", value: deps.objectStore},
+		{name: "agentteams_readiness", value: deps.agentTeams},
+		{name: "runtime_readiness", value: deps.runtime},
+	}
+	missing := make([]string, 0)
+	for _, dependency := range required {
+		if nilDependency(dependency.value) {
+			missing = append(missing, dependency.name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("production runtime dependencies are not configured: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
-type disabledManagerPort struct{ projectID kernel.ProjectID }
-
-func (p disabledManagerPort) SubmitManagerMessage(context.Context, auth.Principal, httpapi.ManagerMessageRequest) (httpapi.ManagerMessageResponse, error) {
-	return httpapi.ManagerMessageResponse{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "task manager agent runtime is not configured", Recoverable: true}
-}
-
-func (p disabledManagerPort) Conversation(context.Context, auth.Principal, string, string) (httpapi.ManagerConversation, error) {
-	return httpapi.ManagerConversation{ProjectID: p.projectID, Messages: []httpapi.ManagerConversationEntry{}}, nil
+func nilDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func latestProductionInvocation(invocations []runtime.Invocation, ref coordination.PhaseEndpointRef, generation int) kernel.InvocationID {
@@ -452,70 +537,6 @@ func scanProductionInvocation(row interface{ Scan(...any) error }) (runtime.Invo
 		_ = json.Unmarshal(effectiveTools, &invocation.EffectiveTools)
 	}
 	return invocation, nil
-}
-
-type disabledPhaseRuntime struct{}
-type disabledRequirementRuntime struct{}
-type disabledOrchestrationRuntime struct{}
-type disabledTaskManagerRuntime struct{}
-type disabledWorkspacePort struct{}
-
-var errRuntimeNotConfigured = kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "runtime port is not configured", Recoverable: true}
-
-func (disabledPhaseRuntime) AwaitInputs(context.Context, kernel.InvocationID, phase.AwaitInputsRequest) (phase.InputWaitResult, error) {
-	return phase.InputWaitResult{}, errRuntimeNotConfigured
-}
-
-func (disabledPhaseRuntime) SubmitPhaseOutput(context.Context, kernel.InvocationID, phase.PhaseOutput) (phase.OutputReceipt, error) {
-	return phase.OutputReceipt{}, errRuntimeNotConfigured
-}
-
-func (disabledRequirementRuntime) SubmitRequirement(context.Context, auth.Principal, taskmanager.Requirement) (any, error) {
-	return nil, errRuntimeNotConfigured
-}
-
-func (disabledOrchestrationRuntime) SubmitOrchestrationIntent(context.Context, auth.Principal, auth.BoundScope, phase.OrchestrationIntent) (phase.OrchestrationProposal, error) {
-	return phase.OrchestrationProposal{}, errRuntimeNotConfigured
-}
-
-func (disabledTaskManagerRuntime) Snapshot(context.Context, auth.Principal, auth.BoundScope, kernel.Revision) (coordination.GraphSnapshot, error) {
-	return coordination.GraphSnapshot{}, errRuntimeNotConfigured
-}
-
-func (disabledTaskManagerRuntime) SubmitTaskManagerDecision(context.Context, auth.Principal, auth.BoundScope, taskmanager.TaskManagerDecision) (string, error) {
-	return "", errRuntimeNotConfigured
-}
-
-func (disabledTaskManagerRuntime) ReplacePending(context.Context, auth.Principal, auth.BoundScope, mcpapi.PendingSubgraphIntent) (kernel.Revision, error) {
-	return 0, errRuntimeNotConfigured
-}
-
-func (disabledTaskManagerRuntime) Transition(context.Context, auth.Principal, auth.BoundScope) (kernel.Revision, error) {
-	return 0, errRuntimeNotConfigured
-}
-
-func (disabledWorkspacePort) List(context.Context, kernel.InvocationID, workspace.PathRequest) (workspace.ListResult, error) {
-	return workspace.ListResult{}, errRuntimeNotConfigured
-}
-
-func (disabledWorkspacePort) Read(context.Context, kernel.InvocationID, workspace.PathRequest) (workspace.ReadResult, error) {
-	return workspace.ReadResult{}, errRuntimeNotConfigured
-}
-
-func (disabledWorkspacePort) WritePlan(context.Context, kernel.InvocationID, workspace.WriteRequest) (workspace.WriteResult, error) {
-	return workspace.WriteResult{}, errRuntimeNotConfigured
-}
-
-func (disabledWorkspacePort) Write(context.Context, kernel.InvocationID, workspace.WriteRequest) (workspace.WriteResult, error) {
-	return workspace.WriteResult{}, errRuntimeNotConfigured
-}
-
-func (disabledWorkspacePort) Run(context.Context, kernel.InvocationID, workspace.RunRequest) (workspace.RunResult, error) {
-	return workspace.RunResult{}, errRuntimeNotConfigured
-}
-
-func (disabledWorkspacePort) Diff(context.Context, kernel.InvocationID, workspace.PathRequest) (workspace.DiffResult, error) {
-	return workspace.DiffResult{}, errRuntimeNotConfigured
 }
 
 type productionContextRetrieve struct{ agent contextagent.Agent }
