@@ -24,6 +24,7 @@ func TestPostgresExecutionStoreReserveCreatesReleaseWaitAttempt(t *testing.T) {
 	ref := "execution://wait/1"
 	db := openScriptDB(t, []sqlStep{
 		beginStep(false),
+		execStep("pg_advisory_xact_lock", []driver.Value{ref}, 1),
 		queryStep("FOR UPDATE", []driver.Value{ref}, [][]driver.Value{{
 			ref, int64(1), "inv-wait", "threadmill-first", "worker-a", "fp-a", "terminated", "release_wait",
 		}}),
@@ -51,6 +52,7 @@ func TestPostgresExecutionStoreReserveDetectsFingerprintConflict(t *testing.T) {
 	ref := "execution://conflict/1"
 	db := openScriptDB(t, []sqlStep{
 		beginStep(false),
+		execStep("pg_advisory_xact_lock", []driver.Value{ref}, 1),
 		queryStep("FOR UPDATE", []driver.Value{ref}, [][]driver.Value{{
 			ref, int64(1), "inv-a", "threadmill-first", "worker-a", "fp-old", "reserved", "",
 		}}),
@@ -143,6 +145,7 @@ func TestPostgresExecutionStoreRealPostgresLifecycle(t *testing.T) {
 	}
 
 	store := adapter.NewPostgresExecutionStore(db.SQL())
+	assertConcurrentRealPostgresReservation(t, ctx, store)
 	ref := "execution://real-postgres/1"
 	first, created, err := store.Reserve(ctx, ref, "fp-a", adapter.AgentTeamsExecutionRef{
 		InvocationID: "inv-real",
@@ -176,6 +179,59 @@ func TestPostgresExecutionStoreRealPostgresLifecycle(t *testing.T) {
 	}
 	if err := store.MarkDispatched(ctx, first.Execution.AgentTeamsTaskID); !kernel.IsCode(err, kernel.CodeStaleCommand) {
 		t.Fatalf("MarkDispatched(old terminated) = %v, want stale_command", err)
+	}
+}
+
+func assertConcurrentRealPostgresReservation(t *testing.T, ctx context.Context, store *adapter.PostgresExecutionStore) {
+	t.Helper()
+	const workers = 16
+	ref := "execution://real-postgres/concurrent"
+	// The production record is intentionally package-private. Capture only the
+	// externally meaningful fields through the helper accessor below.
+	type reservation struct {
+		taskID  string
+		attempt int
+		created bool
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan reservation, workers)
+	var ready sync.WaitGroup
+	ready.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(worker int) {
+			ready.Done()
+			<-start
+			record, created, err := store.Reserve(ctx, ref, "fp-concurrent", adapter.AgentTeamsExecutionRef{
+				InvocationID: "inv-real-concurrent",
+				HostRef:      fmt.Sprintf("worker-%d", worker),
+			})
+			results <- reservation{taskID: record.Execution.AgentTeamsTaskID, attempt: record.Attempt, created: created, err: err}
+		}(i)
+	}
+	ready.Wait()
+	close(start)
+	createdCount := 0
+	var taskID string
+	for i := 0; i < workers; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent Reserve: %v", result.err)
+		}
+		if result.created {
+			createdCount++
+		}
+		if result.attempt != 1 || result.taskID == "" {
+			t.Fatalf("concurrent reservation = %#v, want attempt 1", result)
+		}
+		if taskID == "" {
+			taskID = result.taskID
+		} else if taskID != result.taskID {
+			t.Fatalf("concurrent task IDs diverged: %q and %q", taskID, result.taskID)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("concurrent created count = %d, want 1", createdCount)
 	}
 }
 

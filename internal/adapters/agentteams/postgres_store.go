@@ -83,11 +83,17 @@ func (s *PostgresExecutionStore) Reserve(
 	if execution.InvocationID == "" || execution.HostRef == "" {
 		return executionRecord{}, false, kernel.InvalidArgument("AgentTeams invocation_id and host_ref are required")
 	}
-	tx, err := s.beginWrite(ctx)
+	tx, err := s.beginReserve(ctx)
 	if err != nil {
 		return executionRecord{}, false, err
 	}
 	defer tx.Rollback()
+	// A row lock cannot serialize the first reservation because the row does
+	// not exist yet. Lock the stable InvocationRef key for this transaction so
+	// concurrent processes also converge on one attempt before reading state.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, invocationRef); err != nil {
+		return executionRecord{}, false, err
+	}
 
 	existing, found, err := scanExecutionRecord(tx.QueryRowContext(ctx, `
 SELECT invocation_ref, attempt, invocation_id, agentteams_task_id, host_ref, dispatch_fingerprint, state, COALESCE(termination_mode, '')
@@ -224,6 +230,16 @@ func (s *PostgresExecutionStore) beginWrite(ctx context.Context) (*sql.Tx, error
 		return nil, kernel.Error{Code: kernel.CodeInternalError, Message: "Postgres execution store database is required", Recoverable: false}
 	}
 	return s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+}
+
+func (s *PostgresExecutionStore) beginReserve(ctx context.Context) (*sql.Tx, error) {
+	if s == nil || s.db == nil {
+		return nil, kernel.Error{Code: kernel.CodeInternalError, Message: "Postgres execution store database is required", Recoverable: false}
+	}
+	// Read committed is intentional: a waiter must see the reservation that
+	// committed while it waited for the advisory lock. Serializable would keep
+	// the pre-wait snapshot and re-open the missing-row race.
+	return s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 }
 
 func insertExecutionRecord(
