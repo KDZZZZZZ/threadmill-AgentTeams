@@ -145,12 +145,46 @@ func (l *EventLog) Replay(ctx context.Context, after Cursor, limit int) ([]Event
 	return events, next, nil
 }
 
-type ProjectionReader struct {
-	events    *EventLog
-	artifacts *ArtifactRegistry
+func (l *EventLog) ReplayTask(ctx context.Context, projectID kernel.ProjectID, taskID kernel.TaskID, after Cursor, limit int) ([]Event, Cursor, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, after, err
+	}
+	if projectID == "" {
+		return nil, after, kernel.InvalidArgument("project_id is required")
+	}
+	if taskID == "" {
+		return nil, after, kernel.InvalidArgument("task_id is required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var events []Event
+	next := after
+	for _, event := range l.events {
+		if event.Sequence <= after {
+			continue
+		}
+		if event.ProjectID != projectID || event.TaskID != taskID {
+			continue
+		}
+		events = append(events, cloneEvent(event))
+		next = event.Sequence
+		if len(events) == limit {
+			break
+		}
+	}
+	return events, next, nil
 }
 
-func NewProjectionReader(events *EventLog, artifacts *ArtifactRegistry) *ProjectionReader {
+type ProjectionReader struct {
+	events    EventStore
+	artifacts ArtifactStore
+}
+
+func NewProjectionReader(events EventStore, artifacts ArtifactStore) *ProjectionReader {
 	return &ProjectionReader{events: events, artifacts: artifacts}
 }
 
@@ -170,28 +204,15 @@ func (r *ProjectionReader) ReadTask(ctx context.Context, principal Principal, ta
 	if limit <= 0 {
 		limit = 100
 	}
-	r.events.mu.Lock()
-	defer r.events.mu.Unlock()
-
 	var filtered []Event
-	next := after
-	for _, event := range r.events.events {
-		if event.Sequence <= after {
-			continue
-		}
-		next = event.Sequence
-		if event.TaskID != taskID {
-			continue
-		}
-		if event.ProjectID != principal.ProjectID {
-			return nil, next, kernel.Forbidden("principal cannot read task projection")
-		}
+	events, next, err := r.events.ReplayTask(ctx, principal.ProjectID, taskID, after, limit)
+	if err != nil {
+		return nil, after, err
+	}
+	for _, event := range events {
 		event = cloneEvent(event)
 		event.ArtifactRefs = r.visibleArtifactRefs(principal, event.ArtifactRefs)
 		filtered = append(filtered, event)
-		if len(filtered) == limit {
-			break
-		}
 	}
 	return filtered, next, nil
 }

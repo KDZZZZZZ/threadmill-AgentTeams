@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -13,17 +14,19 @@ import (
 const (
 	defaultEventLogReplayBatch = 100
 	defaultEventLogStreamBuf   = 32
+	defaultEventLogPollEvery   = 25 * time.Millisecond
 )
 
 // EventLogQuery adapts the authoritative evidence.EventLog into the GUI event
 // query surface. It does not keep a second event store; every page is rebuilt
 // by replaying EventLog rows through EventMapper.
 type EventLogQuery struct {
-	log       *evidence.EventLog
+	log       evidence.EventStore
 	mapper    EventMapper
 	retained  evidence.Cursor
 	batchSize int
 	streamBuf int
+	pollEvery time.Duration
 
 	mu          sync.Mutex
 	nextSubID   int64
@@ -56,12 +59,21 @@ func WithEventLogStreamBuffer(size int) EventLogQueryOption {
 	}
 }
 
-func NewEventLogQuery(log *evidence.EventLog, permissions PermissionReader, options ...EventLogQueryOption) *EventLogQuery {
+func WithEventLogPollInterval(interval time.Duration) EventLogQueryOption {
+	return func(q *EventLogQuery) {
+		if interval > 0 {
+			q.pollEvery = interval
+		}
+	}
+}
+
+func NewEventLogQuery(log evidence.EventStore, permissions PermissionReader, options ...EventLogQueryOption) *EventLogQuery {
 	q := &EventLogQuery{
 		log:         log,
 		mapper:      NewEventMapper(permissions),
 		batchSize:   defaultEventLogReplayBatch,
 		streamBuf:   defaultEventLogStreamBuf,
+		pollEvery:   defaultEventLogPollEvery,
 		subscribers: make(map[int64]*eventLogSubscriber),
 	}
 	for _, option := range options {
@@ -113,12 +125,11 @@ func (q *EventLogQuery) SubscribeEvents(ctx context.Context, principal auth.Prin
 		return nil, err
 	}
 
-	q.mu.Lock()
-	backlog, cursor, err := q.visibleBacklogLocked(ctx, principal, projectID, afterCursor)
+	backlog, cursor, err := q.visibleBacklog(ctx, principal, projectID, afterCursor)
 	if err != nil {
-		q.mu.Unlock()
 		return nil, err
 	}
+	q.mu.Lock()
 	q.nextSubID++
 	id := q.nextSubID
 	sub := &eventLogSubscriber{
@@ -126,7 +137,7 @@ func (q *EventLogQuery) SubscribeEvents(ctx context.Context, principal auth.Prin
 		principal:  principal,
 		projectID:  projectID,
 		lastCursor: cursor,
-		live:       make(chan UIEvent, q.streamBuf),
+		wake:       make(chan struct{}, 1),
 		out:        make(chan UIEvent, q.streamBuf),
 	}
 	q.subscribers[id] = sub
@@ -155,10 +166,9 @@ func (q *EventLogQuery) CurrentCursor(ctx context.Context, _ kernel.ProjectID) (
 	}
 }
 
-// Append writes through the authoritative EventLog and broadcasts the mapped
-// event to active subscribers. Writers that bypass this adapter remain
-// replayable by ListEvents, but they cannot be pushed live until wiring uses
-// this method or EventLog grows a native subscribe hook.
+// Append writes through the authoritative EventLog and wakes active subscribers.
+// Subscribers poll the EventStore cursor, so writers that bypass this adapter
+// are still streamed without relying on this fast wake-up path.
 func (q *EventLogQuery) Append(ctx context.Context, event evidence.AppendEvent) (evidence.Event, error) {
 	if err := q.configured(); err != nil {
 		return evidence.Event{}, err
@@ -167,7 +177,7 @@ func (q *EventLogQuery) Append(ctx context.Context, event evidence.AppendEvent) 
 	if err != nil {
 		return evidence.Event{}, err
 	}
-	q.broadcast(ctx, appended)
+	q.wakeSubscribers(appended)
 	return appended, nil
 }
 
@@ -200,7 +210,7 @@ func (q *EventLogQuery) parseCursor(raw string) (evidence.Cursor, error) {
 	return cursor, nil
 }
 
-func (q *EventLogQuery) visibleBacklogLocked(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID, after evidence.Cursor) ([]UIEvent, evidence.Cursor, error) {
+func (q *EventLogQuery) visibleBacklog(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID, after evidence.Cursor) ([]UIEvent, evidence.Cursor, error) {
 	var backlog []UIEvent
 	cursor := after
 	for {
@@ -278,24 +288,16 @@ func (q *EventLogQuery) mapEvidenceEvent(ctx context.Context, principal auth.Pri
 	})
 }
 
-func (q *EventLogQuery) broadcast(ctx context.Context, event evidence.Event) {
+func (q *EventLogQuery) wakeSubscribers(event evidence.Event) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for id, sub := range q.subscribers {
+	for _, sub := range q.subscribers {
 		if event.Sequence <= sub.lastCursor {
 			continue
 		}
-		mapped, ok, err := q.mapEvidenceEvent(ctx, sub.principal, sub.projectID, event)
-		if err != nil || !ok {
-			sub.lastCursor = event.Sequence
-			continue
-		}
 		select {
-		case sub.live <- mapped:
-			sub.lastCursor = event.Sequence
+		case sub.wake <- struct{}{}:
 		default:
-			close(sub.live)
-			delete(q.subscribers, id)
 		}
 	}
 }
@@ -311,19 +313,41 @@ func (q *EventLogQuery) runSubscriber(ctx context.Context, sub *eventLogSubscrib
 		case sub.out <- event:
 		}
 	}
+	ticker := time.NewTicker(q.pollEvery)
+	defer ticker.Stop()
 	for {
+		if !q.pollSubscriber(ctx, sub) {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case event, ok := <-sub.live:
-			if !ok {
-				return
-			}
+		case <-sub.wake:
+		case <-ticker.C:
+		}
+	}
+}
+
+func (q *EventLogQuery) pollSubscriber(ctx context.Context, sub *eventLogSubscriber) bool {
+	for {
+		events, cursor, err := q.visibleEventsAfter(ctx, sub.principal, sub.projectID, sub.lastCursor, q.batchSize)
+		if err != nil {
+			return false
+		}
+		if len(events) == 0 {
+			sub.lastCursor = cursor
+			return true
+		}
+		for _, event := range events {
 			select {
 			case <-ctx.Done():
-				return
+				return false
 			case sub.out <- event:
 			}
+		}
+		sub.lastCursor = cursor
+		if len(events) < q.batchSize {
+			return true
 		}
 	}
 }
@@ -332,7 +356,7 @@ func (q *EventLogQuery) unsubscribe(id int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if sub, ok := q.subscribers[id]; ok {
-		close(sub.live)
+		close(sub.wake)
 		delete(q.subscribers, id)
 	}
 }
@@ -342,7 +366,7 @@ type eventLogSubscriber struct {
 	principal  auth.Principal
 	projectID  kernel.ProjectID
 	lastCursor evidence.Cursor
-	live       chan UIEvent
+	wake       chan struct{}
 	out        chan UIEvent
 }
 

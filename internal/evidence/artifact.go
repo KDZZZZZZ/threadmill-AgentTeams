@@ -3,6 +3,8 @@ package evidence
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"path"
@@ -72,9 +74,14 @@ type ArtifactRegistry struct {
 	bucket  string
 	store   objectstore.Store
 	records map[ArtifactID]Artifact
-	byHash  map[string]ArtifactID
+	byKey   map[artifactContentKey]ArtifactID
 	grants  map[ArtifactID]map[ArtifactGrant]struct{}
 	now     func() time.Time
+}
+
+type artifactContentKey struct {
+	typ  ArtifactType
+	hash string
 }
 
 func NewArtifactRegistry(store objectstore.Store, bucket string) *ArtifactRegistry {
@@ -85,7 +92,7 @@ func NewArtifactRegistry(store objectstore.Store, bucket string) *ArtifactRegist
 		bucket:  bucket,
 		store:   store,
 		records: make(map[ArtifactID]Artifact),
-		byHash:  make(map[string]ArtifactID),
+		byKey:   make(map[artifactContentKey]ArtifactID),
 		grants:  make(map[ArtifactID]map[ArtifactGrant]struct{}),
 		now:     time.Now,
 	}
@@ -111,9 +118,10 @@ func (r *ArtifactRegistry) Register(ctx context.Context, req RegisterArtifact) (
 		return Artifact{}, err
 	}
 	hash := hashBytes(req.Body)
+	key := artifactContentKey{typ: req.Type, hash: hash}
 
 	r.mu.RLock()
-	if existingID, ok := r.byHash[hash]; ok {
+	if existingID, ok := r.byKey[key]; ok {
 		existing := r.records[existingID]
 		r.mu.RUnlock()
 		r.addGrant(existingID, ArtifactGrant{ProjectID: req.ProjectID, TaskID: req.TaskID})
@@ -136,12 +144,12 @@ func (r *ArtifactRegistry) Register(ctx context.Context, req RegisterArtifact) (
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if existingID, ok := r.byHash[hash]; ok {
+	if existingID, ok := r.byKey[key]; ok {
 		r.addGrantLocked(existingID, ArtifactGrant{ProjectID: req.ProjectID, TaskID: req.TaskID})
 		return r.records[existingID], nil
 	}
 	artifact := Artifact{
-		ID:                ArtifactID("art_" + hash[:20]),
+		ID:                artifactID(req.Type, hash),
 		Type:              req.Type,
 		PathOrBlobRef:     put.Bucket + "/" + put.Key,
 		ContentHash:       hash,
@@ -152,7 +160,7 @@ func (r *ArtifactRegistry) Register(ctx context.Context, req RegisterArtifact) (
 		CreatedAt:         r.now().UTC(),
 	}
 	r.records[artifact.ID] = artifact
-	r.byHash[hash] = artifact.ID
+	r.byKey[key] = artifact.ID
 	r.addGrantLocked(artifact.ID, ArtifactGrant{ProjectID: req.ProjectID, TaskID: req.TaskID})
 	return artifact, nil
 }
@@ -239,6 +247,11 @@ func requirePrincipal(principal Principal) error {
 		return kernel.Forbidden("principal task is required")
 	}
 	return nil
+}
+
+func artifactID(typ ArtifactType, hash string) ArtifactID {
+	sum := sha256.Sum256([]byte(string(typ) + "\x00" + hash))
+	return ArtifactID("art_" + hex.EncodeToString(sum[:])[:20])
 }
 
 func parseBlobRef(ref string) (objectstore.ObjectRef, error) {

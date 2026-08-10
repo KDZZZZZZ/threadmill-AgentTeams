@@ -115,6 +115,13 @@ func TestEventLogQuerySubscribeReplaysThenStreamsWithoutDuplicates(t *testing.T)
 	if second.EventID != "evt_000000000002" || second.Cursor != "2" {
 		t.Fatalf("second event = %+v, want live cursor 2", second)
 	}
+	if _, err := log.Append(ctx, evidence.AppendEvent{StableKey: "direct", Type: "task.updated", ProjectID: projectID, TaskID: taskID, Payload: map[string]any{"task_id": taskID, "status": "done"}}); err != nil {
+		t.Fatal(err)
+	}
+	third := readStreamEvent(t, stream)
+	if third.EventID != "evt_000000000003" || third.Cursor != "3" {
+		t.Fatalf("third event = %+v, want polled cursor 3 from direct EventStore append", third)
+	}
 
 	if _, err := query.Append(ctx, evidence.AppendEvent{StableKey: "live", Type: "task.updated", ProjectID: projectID, TaskID: taskID, Payload: map[string]any{"task_id": taskID, "status": "running"}}); err != nil {
 		t.Fatal(err)
