@@ -150,6 +150,13 @@ type ContractStore interface {
 	TaskContract(context.Context, kernel.TaskID) (TaskContract, error)
 }
 
+// RuntimeContractRecorder is an internal trust seam. The Agent-facing tool
+// surface never receives this interface; Runtime calls it only after capturing
+// and validating the Task Manager Agent's normalized contract.
+type RuntimeContractRecorder interface {
+	PersistRequirementContract(context.Context, RequirementInput, TaskContract) error
+}
+
 type TaskContextProjector interface {
 	RegisterTaskSubgraph(context.Context, kernel.TaskID) error
 	EnqueueProjection(context.Context, ProjectionRequest) error
@@ -252,7 +259,7 @@ func (m *Manager) HandleRequirement(ctx context.Context, input RequirementInput)
 			return m.reply(ctx, ManagerReplyEvent{InputRef: input.InputRef, Status: ReplyDeferred, DecisionRef: ref, GraphRevision: revision, Reason: "graph applied; task context projection requires retry"}, err)
 		}
 	}
-	return Result{InputRef: input.InputRef, Status: ReplyAccepted, DecisionRef: ref, GraphRevision: revision}, nil
+	return m.reply(ctx, ManagerReplyEvent{InputRef: input.InputRef, Status: ReplyAccepted, DecisionRef: ref, GraphRevision: revision, Reason: decision.Reason}, nil)
 }
 
 func (m *Manager) HandleManagerDecision(ctx context.Context, input ManagerDecisionInput, decision TaskManagerDecision) (Result, error) {
@@ -407,7 +414,7 @@ func (m *Manager) HandlePhaseStopped(ctx context.Context, input PhaseStoppedInpu
 			return Result{}, err
 		}
 	}
-	return Result{InputRef: input.InputRef, Status: ReplyAccepted, DecisionRef: decisionRef, GraphRevision: snapshot.Revision}, nil
+	return m.reply(ctx, ManagerReplyEvent{InputRef: input.InputRef, Status: ReplyAccepted, DecisionRef: decisionRef, GraphRevision: snapshot.Revision, Reason: "authenticated stopped event applied"}, nil)
 }
 
 func (m *Manager) HandleDelivery(ctx context.Context, input DeliveryInput) (Result, error) {
@@ -472,7 +479,10 @@ func (m *Manager) HandleDelivery(ctx context.Context, input DeliveryInput) (Resu
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{InputRef: input.InputRef, Status: ReplyAccepted, DecisionRef: decisionRef, GraphRevision: snapshot.Revision}
+	result, replyErr := m.reply(ctx, ManagerReplyEvent{InputRef: input.InputRef, Status: ReplyAccepted, DecisionRef: decisionRef, GraphRevision: snapshot.Revision, Reason: "delivery policy and verify evidence satisfied"}, nil)
+	if replyErr != nil {
+		return result, replyErr
+	}
 	_, _ = m.RetryFinalize(ctx, input.TaskID)
 	return result, nil
 }
@@ -559,7 +569,7 @@ func (m *Manager) stoppedRejected(ctx context.Context, input PhaseStoppedInput, 
 	if submitErr != nil {
 		return Result{}, submitErr
 	}
-	return Result{InputRef: input.InputRef, Status: ReplyRejected, DecisionRef: decisionRef, GraphRevision: revision}, err
+	return m.reply(ctx, ManagerReplyEvent{InputRef: input.InputRef, Status: ReplyRejected, DecisionRef: decisionRef, GraphRevision: revision, Reason: reason}, err)
 }
 
 func (m *Manager) reply(ctx context.Context, reply ManagerReplyEvent, err error) (Result, error) {
