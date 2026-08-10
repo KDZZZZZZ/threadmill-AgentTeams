@@ -97,6 +97,9 @@ func (v runtimeView) pendingCommands() []PhaseCommand {
 		if record.CompletedEventRef != "" || record.Quarantined || record.NotExecutable {
 			continue
 		}
+		if isRunCommand(record.Command) && record.ObservedEventRef != "" {
+			continue
+		}
 		commands = append(commands, record.Command)
 	}
 	return commands
@@ -246,11 +249,15 @@ func (v runtimeView) hasPendingRunCommand(ref PhaseEndpointRef, generation int) 
 			continue
 		}
 		command := record.Command
-		if command.Endpoint == ref && command.Generation == generation && (command.Action == CommandStart || command.Action == CommandResume) {
+		if command.Endpoint == ref && command.Generation == generation && isRunCommand(command) && record.ObservedEventRef == "" {
 			return true
 		}
 	}
 	return false
+}
+
+func isRunCommand(command PhaseCommand) bool {
+	return command.Action == CommandStart || command.Action == CommandResume
 }
 
 func (v runtimeView) hasTerminalObservation(ref PhaseEndpointRef, generation int) bool {

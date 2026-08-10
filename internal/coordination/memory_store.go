@@ -80,6 +80,9 @@ func (s *MemoryStore) ReplacePending(_ context.Context, projectID kernel.Project
 	if err := validatePendingSubgraph(project.current, next); err != nil {
 		return GraphSnapshot{}, err
 	}
+	if err := validatePendingSubgraphRuntime(project.runtime, next); err != nil {
+		return GraphSnapshot{}, err
+	}
 	applyPendingSubgraph(&state, next)
 	if err := validateGraph(state); err != nil {
 		return GraphSnapshot{}, err

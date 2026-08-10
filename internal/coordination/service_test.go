@@ -141,6 +141,137 @@ func TestReplacePendingRejectsBindingMutationAndIdempotencyConflict(t *testing.T
 	}
 }
 
+func TestReplacePendingRejectsActiveLeaseAtStoreBoundary(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-a")
+	plan := mustEndpoint(t, mustSnapshot(t, graph, revision), ref("task-a", EndpointPlan))
+
+	if _, claimed, err := store.claimLeaseAndAppendCommand(ctx, projectID, revision, plan, CommandStart, "revision://2"); err != nil {
+		t.Fatal(err)
+	} else if !claimed {
+		t.Fatal("expected active lease to be claimed")
+	}
+
+	requestID := kernel.IdempotencyKey("store-replace-active-lease")
+	next := PendingSubgraph{
+		RequestID:    requestID,
+		BaseRevision: revision,
+		Endpoints:    []PhaseEndpoint{plan},
+	}
+	_, err := store.ReplacePending(ctx, projectID, next)
+	if !kernel.IsCode(err, kernel.CodeEndpointInFlight) {
+		t.Fatalf("store ReplacePending with active lease err = %v, want endpoint_in_flight", err)
+	}
+}
+
+func TestReplacePendingRequiresStoppedLeaseReleaseBeforeServiceReplace(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-a")
+	plan := mustEndpoint(t, mustSnapshot(t, graph, revision), ref("task-a", EndpointPlan))
+
+	start, claimed, err := store.claimLeaseAndAppendCommand(ctx, projectID, revision, plan, CommandStart, "revision://2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("expected active lease to be claimed")
+	}
+
+	blockedID := kernel.IdempotencyKey("decision-active-lease-blocked")
+	if err := decisions.RegisterReplacePending(projectID, blockedID); err != nil {
+		t.Fatal(err)
+	}
+	blocked := PendingSubgraph{
+		RequestID:    blockedID,
+		BaseRevision: revision,
+		Endpoints:    []PhaseEndpoint{plan},
+	}
+	_, err = graph.ReplacePending(ctx, blocked)
+	if !kernel.IsCode(err, kernel.CodeEndpointInFlight) {
+		t.Fatalf("service ReplacePending with active lease err = %v, want endpoint_in_flight", err)
+	}
+
+	registerTransition(t, decisions, "hold-plan-before-stop", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   plan.Ref,
+		Action:     "held",
+		Generation: plan.Generation,
+	})
+	revision = mustTransition(t, graph, revision, "hold-plan-before-stop")
+	held := mustEndpoint(t, mustSnapshot(t, graph, revision), plan.Ref)
+
+	heldBlockedID := kernel.IdempotencyKey("decision-held-active-lease-blocked")
+	if err := decisions.RegisterReplacePending(projectID, heldBlockedID); err != nil {
+		t.Fatal(err)
+	}
+	heldBlocked := PendingSubgraph{
+		RequestID:    heldBlockedID,
+		BaseRevision: revision,
+		Endpoints:    []PhaseEndpoint{held},
+	}
+	_, err = graph.ReplacePending(ctx, heldBlocked)
+	if !kernel.IsCode(err, kernel.CodeEndpointInFlight) {
+		t.Fatalf("held endpoint with active lease err = %v, want endpoint_in_flight", err)
+	}
+
+	stop, deliverable, err := store.getOrCreateStopCommand(ctx, projectID, revision, phaseLease{
+		LeaseRef:   start.LeaseRef,
+		Endpoint:   start.Endpoint,
+		Generation: start.Generation,
+		BindingRef: start.BindingRef,
+		State:      "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deliverable {
+		t.Fatal("expected stop command to be deliverable")
+	}
+	if err := store.completeCommandAndReleaseLease(ctx, projectID, phaseObservation{
+		ID:            "event://stopped/task-a/plan/1",
+		Kind:          "PhaseInvocationStopped",
+		CommandID:     stop.ID,
+		Endpoint:      stop.Endpoint,
+		Generation:    stop.Generation,
+		BindingRef:    stop.BindingRef,
+		LeaseRef:      stop.LeaseRef,
+		CheckpointRef: "checkpoint://task-a/plan/1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	registerTransition(t, decisions, "stopped-plan-after-lease-release", GraphTransition{
+		TargetKind:    TargetPhaseEndpoint,
+		Endpoint:      plan.Ref,
+		Action:        "stopped",
+		Generation:    plan.Generation,
+		NewBindingRef: "binding://task-a/plan/2",
+		CheckpointRef: "checkpoint://task-a/plan/1",
+		EvidenceRefs:  []string{"event://stopped/task-a/plan/1"},
+	})
+	revision = mustTransition(t, graph, revision, "stopped-plan-after-lease-release")
+	stopped := mustEndpoint(t, mustSnapshot(t, graph, revision), plan.Ref)
+
+	allowedID := kernel.IdempotencyKey("decision-stopped-released-allowed")
+	if err := decisions.RegisterReplacePending(projectID, allowedID); err != nil {
+		t.Fatal(err)
+	}
+	allowed := PendingSubgraph{
+		RequestID:    allowedID,
+		BaseRevision: revision,
+		Endpoints:    []PhaseEndpoint{stopped},
+	}
+	nextRevision, err := graph.ReplacePending(ctx, allowed)
+	if err != nil {
+		t.Fatalf("ReplacePending after stopped lease release failed: %v", err)
+	}
+	if nextRevision != revision.Next() {
+		t.Fatalf("revision = %d, want %d", nextRevision, revision.Next())
+	}
+}
+
 func TestReplacePendingSameRequestIDIsConcurrentIdempotent(t *testing.T) {
 	graph, decisions, _ := newGraphHarness()
 	ctx := context.Background()

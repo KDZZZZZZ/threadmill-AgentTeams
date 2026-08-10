@@ -59,6 +59,9 @@ func TestDispatchIsStableAndCreatesOnlyOneEffectiveTask(t *testing.T) {
 	if host.TaskCount() != 1 {
 		t.Fatalf("AgentTeams task count = %d, want 1", host.TaskCount())
 	}
+	if preparations := host.Preparations(); len(preparations) != 1 {
+		t.Fatalf("PrepareHost calls = %d, want 1", len(preparations))
+	}
 	before := host.DelegateCalls()
 	replayed, err := service.Dispatch(context.Background(), "execution://inv-a/1")
 	if err != nil || replayed != first {
@@ -232,10 +235,171 @@ func TestTerminateSupportsThreeModesAndFencesBeforeCancel(t *testing.T) {
 			if err := service.Terminate(context.Background(), execution, "cancel"); mode != "cancel" && !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 				t.Fatalf("different termination mode = %v, want idempotency_conflict", err)
 			}
+			if mode == "release_wait" {
+				return
+			}
 			if _, err := service.Dispatch(context.Background(), ref); !kernel.IsCode(err, kernel.CodeStaleCommand) {
-				t.Fatalf("redispatch terminated execution = %v, want stale_command", err)
+				t.Fatalf("redispatch stopped/cancelled execution = %v, want stale_command", err)
 			}
 		})
+	}
+}
+
+func TestReleaseWaitRedispatchCreatesNewAttemptForSameInvocation(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host, source, service := newHarness(t, now)
+	ref := "execution://wait/1"
+	source.Put(ref, prepared("inv-wait", auth.RoleExecutor, ""))
+
+	first, err := service.Dispatch(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Terminate(context.Background(), first, "release_wait"); err != nil {
+		t.Fatal(err)
+	}
+	if host.ActiveExecutions("worker-a") != 0 {
+		t.Fatalf("active executions after release_wait = %d, want 0", host.ActiveExecutions("worker-a"))
+	}
+
+	const workers = 50
+	var wg sync.WaitGroup
+	results := make(chan adapter.AgentTeamsExecutionRef, workers)
+	errs := make(chan error, workers)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := service.Dispatch(context.Background(), ref)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- result
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("release_wait redispatch failed: %v", err)
+	}
+	var second adapter.AgentTeamsExecutionRef
+	for result := range results {
+		if second.AgentTeamsTaskID == "" {
+			second = result
+		}
+		if result != second {
+			t.Fatalf("redispatch result = %#v, want stable second attempt %#v", result, second)
+		}
+	}
+	if second.InvocationID != first.InvocationID {
+		t.Fatalf("logical invocation changed: first=%#v second=%#v", first, second)
+	}
+	if second.AgentTeamsTaskID == first.AgentTeamsTaskID {
+		t.Fatalf("release_wait reused AgentTeams task ID %q", second.AgentTeamsTaskID)
+	}
+	if host.TaskCount() != 2 {
+		t.Fatalf("AgentTeams task count after redispatch = %d, want 2", host.TaskCount())
+	}
+	if preparations := host.Preparations(); len(preparations) != 2 {
+		t.Fatalf("PrepareHost calls after redispatch = %d, want 2", len(preparations))
+	}
+	if host.ActiveExecutions("worker-a") != 1 {
+		t.Fatalf("active executions after redispatch = %d, want 1", host.ActiveExecutions("worker-a"))
+	}
+	if err := service.Terminate(context.Background(), first, "release_wait"); err != nil {
+		t.Fatalf("old release_wait termination should remain idempotent: %v", err)
+	}
+}
+
+func TestDelayedOldAttemptMarkDispatchedDoesNotPolluteLatestAttempt(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := fake.NewClient()
+	host.AddHost(adapter.HostStatus{
+		Ref:           "worker-a",
+		Kind:          adapter.HostWorker,
+		Phase:         "Running",
+		LastHeartbeat: now,
+		Capacity:      8,
+		Capabilities:  []string{"shell"},
+	})
+	source := fake.NewInvocationSource()
+	store := adapter.NewMemoryExecutionStore()
+	ref := "execution://delayed-mark/1"
+	source.Put(ref, prepared("inv-delayed-mark", auth.RoleExecutor, ""))
+
+	service, err := adapter.NewAdapter(host, source, host, store, func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.Dispatch(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Terminate(context.Background(), first, "release_wait"); err != nil {
+		t.Fatal(err)
+	}
+
+	secondClient := newBlockingDelegateClient(host)
+	secondService, err := adapter.NewAdapter(secondClient, source, host, store, func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := secondService.Dispatch(context.Background(), ref)
+		secondDone <- err
+	}()
+	secondRequest := secondClient.wait(t)
+	second := adapter.AgentTeamsExecutionRef{
+		InvocationID:     first.InvocationID,
+		AgentTeamsTaskID: secondRequest.TaskID,
+		HostRef:          secondRequest.HostRef,
+	}
+	if err := service.Terminate(context.Background(), second, "release_wait"); err != nil {
+		t.Fatal(err)
+	}
+
+	thirdClient := newBlockingDelegateClient(host)
+	thirdService, err := adapter.NewAdapter(thirdClient, source, host, store, func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdDone := make(chan error, 1)
+	go func() {
+		_, err := thirdService.Dispatch(context.Background(), ref)
+		thirdDone <- err
+	}()
+	thirdRequest := thirdClient.wait(t)
+
+	secondClient.release()
+	if err := <-secondDone; !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("delayed second attempt Dispatch error = %v, want stale_command", err)
+	}
+
+	prepareErr := errors.New("latest attempt is still reserved")
+	poisonService, err := adapter.NewAdapter(
+		poisonPrepareClient{Client: host, err: prepareErr},
+		source,
+		host,
+		store,
+		func() time.Time { return now },
+		30*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := poisonService.Dispatch(context.Background(), ref); !errors.Is(err, prepareErr) {
+		t.Fatalf("Dispatch after delayed old mark = %v, want reserved latest attempt to call PrepareHost", err)
+	}
+
+	thirdClient.release()
+	if err := <-thirdDone; err != nil {
+		t.Fatalf("third attempt Dispatch failed: %v", err)
+	}
+	if thirdRequest.TaskID == secondRequest.TaskID {
+		t.Fatalf("third attempt reused second task ID %q", thirdRequest.TaskID)
 	}
 }
 
@@ -462,14 +626,41 @@ func TestAdapterSurfaceHasNoGraphOrContextDependency(t *testing.T) {
 		}
 	}
 
-	migration, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "5002_agentteams_execution.up.sql"))
+	baseline, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "5002_agentteams_execution.up.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(migration)
+	baselineText := string(baseline)
 	for _, required := range []string{"invocation_ref TEXT PRIMARY KEY", "agentteams_task_id TEXT NOT NULL UNIQUE", "release_wait", "recoverable_stop", "cancel"} {
-		if !strings.Contains(text, required) {
-			t.Errorf("execution migration is missing %q", required)
+		if !strings.Contains(baselineText, required) {
+			t.Errorf("5002 execution baseline migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"attempt INTEGER", "PRIMARY KEY (invocation_ref, attempt)", "agentteams_execution_refs_active_invocation_idx"} {
+		if strings.Contains(baselineText, forbidden) {
+			t.Errorf("5002 execution baseline migration must not contain %q", forbidden)
+		}
+	}
+
+	attemptsUp, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "5003_agentteams_execution_attempts.up.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptsUpText := string(attemptsUp)
+	for _, required := range []string{"ADD COLUMN IF NOT EXISTS attempt INTEGER", "SET attempt = 1", "ALTER COLUMN attempt SET NOT NULL", "agentteams_execution_refs_attempt_check CHECK (attempt > 0)", "PRIMARY KEY (invocation_ref, attempt)", "agentteams_execution_refs_active_invocation_idx", "WHERE state IN ('reserved', 'dispatched')", "ON agentteams_execution_refs (invocation_id, attempt, created_at)"} {
+		if !strings.Contains(attemptsUpText, required) {
+			t.Errorf("5003 execution attempts migration is missing %q", required)
+		}
+	}
+
+	attemptsDown, err := os.ReadFile(filepath.Join("..", "..", "..", "migrations", "5003_agentteams_execution_attempts.down.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptsDownText := string(attemptsDown)
+	for _, required := range []string{"cannot downgrade agentteams_execution_refs with non-baseline attempts", "HAVING count(*) > 1", "DROP COLUMN IF EXISTS attempt", "PRIMARY KEY (invocation_ref)", "ON agentteams_execution_refs (invocation_id, created_at)"} {
+		if !strings.Contains(attemptsDownText, required) {
+			t.Errorf("5003 execution attempts down migration is missing %q", required)
 		}
 	}
 }
@@ -513,4 +704,56 @@ func indexWithPrefix(values []string, prefix string) int {
 		}
 	}
 	return -1
+}
+
+type blockingDelegateClient struct {
+	adapter.Client
+	started chan adapter.DelegateTaskRequest
+	blocked chan struct{}
+}
+
+func newBlockingDelegateClient(client adapter.Client) *blockingDelegateClient {
+	return &blockingDelegateClient{
+		Client:  client,
+		started: make(chan adapter.DelegateTaskRequest, 1),
+		blocked: make(chan struct{}),
+	}
+}
+
+func (c *blockingDelegateClient) DelegateTask(ctx context.Context, request adapter.DelegateTaskRequest) (adapter.TaskSnapshot, error) {
+	task, err := c.Client.DelegateTask(ctx, request)
+	if err != nil {
+		return adapter.TaskSnapshot{}, err
+	}
+	c.started <- request
+	select {
+	case <-c.blocked:
+		return task, nil
+	case <-ctx.Done():
+		return adapter.TaskSnapshot{}, ctx.Err()
+	}
+}
+
+func (c *blockingDelegateClient) wait(t *testing.T) adapter.DelegateTaskRequest {
+	t.Helper()
+	select {
+	case request := <-c.started:
+		return request
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for DelegateTask")
+		return adapter.DelegateTaskRequest{}
+	}
+}
+
+func (c *blockingDelegateClient) release() {
+	close(c.blocked)
+}
+
+type poisonPrepareClient struct {
+	adapter.Client
+	err error
+}
+
+func (c poisonPrepareClient) PrepareHost(context.Context, adapter.HostPreparation) error {
+	return c.err
 }

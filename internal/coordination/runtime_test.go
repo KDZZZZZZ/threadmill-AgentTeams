@@ -120,6 +120,133 @@ func TestGraphRuntimeStopSuppressesPendingRunAndReleaseChoosesResume(t *testing.
 	}
 }
 
+func TestGraphRuntimeDoesNotRedispatchStartedStartAfterStopCompletes(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	revision := createTask(t, graph, decisions, "task-a")
+	controller := &countingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := controller.lastCommand()
+	if start.Action != CommandStart {
+		t.Fatalf("initial command = %#v, want start", start)
+	}
+	appendStarted(t, store, "event-started-start", start)
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	registerTransition(t, decisions, "hold-started-start", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("task-a", EndpointPlan),
+		Action:     "held",
+		Generation: 1,
+	})
+	revision = mustTransition(t, graph, revision, "hold-started-start")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stop := controller.lastCommand()
+	if stop.Action != CommandStop {
+		t.Fatalf("command after hold = %#v, want stop; all=%#v", stop, controller.commands)
+	}
+	appendStopped(t, store, "event-stopped-start", stop, "checkpoint://task-a/plan/1")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := controller.count(start.ID); got != 1 {
+		t.Fatalf("start command Apply count = %d, want 1; all=%#v", got, controller.commands)
+	}
+	if got := controller.count(stop.ID); got != 1 {
+		t.Fatalf("stop command Apply count = %d, want 1; all=%#v", got, controller.commands)
+	}
+}
+
+func TestGraphRuntimeDoesNotRedispatchStartedResumeAfterStopCompletes(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	revision := createTask(t, graph, decisions, "task-a")
+	controller := &countingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := controller.lastCommand()
+	appendStarted(t, store, "event-started-before-resume", start)
+	registerTransition(t, decisions, "hold-before-resume", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("task-a", EndpointPlan),
+		Action:     "held",
+		Generation: 1,
+	})
+	revision = mustTransition(t, graph, revision, "hold-before-resume")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	firstStop := controller.lastCommand()
+	appendStopped(t, store, "event-stopped-before-resume", firstStop, "checkpoint://task-a/plan/1")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	registerTransition(t, decisions, "stopped-before-resume", GraphTransition{
+		TargetKind:    TargetPhaseEndpoint,
+		Endpoint:      ref("task-a", EndpointPlan),
+		Action:        "stopped",
+		Generation:    1,
+		NewBindingRef: "binding://task-a/plan/2",
+		CheckpointRef: "checkpoint://task-a/plan/1",
+		EvidenceRefs:  []string{"event-stopped-before-resume"},
+	})
+	revision = mustTransition(t, graph, revision, "stopped-before-resume")
+	registerTransition(t, decisions, "release-before-resume", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("task-a", EndpointPlan),
+		Action:     "released",
+		Generation: 2,
+	})
+	revision = mustTransition(t, graph, revision, "release-before-resume")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	resume := controller.lastCommand()
+	if resume.Action != CommandResume {
+		t.Fatalf("command after release = %#v, want resume; all=%#v", resume, controller.commands)
+	}
+	appendStarted(t, store, "event-started-resume", resume)
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	registerTransition(t, decisions, "hold-started-resume", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("task-a", EndpointPlan),
+		Action:     "held",
+		Generation: 2,
+	})
+	revision = mustTransition(t, graph, revision, "hold-started-resume")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	secondStop := controller.lastCommand()
+	if secondStop.Action != CommandStop {
+		t.Fatalf("command after holding resumed phase = %#v, want stop; all=%#v", secondStop, controller.commands)
+	}
+	appendStopped(t, store, "event-stopped-resume", secondStop, "checkpoint://task-a/plan/2")
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := controller.count(resume.ID); got != 1 {
+		t.Fatalf("resume command Apply count = %d, want 1; all=%#v", got, controller.commands)
+	}
+	if got := controller.count(secondStop.ID); got != 1 {
+		t.Fatalf("second stop command Apply count = %d, want 1; all=%#v", got, controller.commands)
+	}
+}
+
 func TestGraphRuntimeCheckpointFailClosedAndOrphanTerminalRejected(t *testing.T) {
 	graph, decisions, store := newGraphHarness()
 	revision := createTask(t, graph, decisions, "task-a")
@@ -338,6 +465,11 @@ type recordingController struct {
 	commands []PhaseCommand
 }
 
+type countingController struct {
+	mu       sync.Mutex
+	commands []PhaseCommand
+}
+
 type rejectingController struct {
 	err   error
 	calls int
@@ -397,4 +529,63 @@ func (c *recordingController) lastCommand() PhaseCommand {
 		return PhaseCommand{}
 	}
 	return c.commands[len(c.commands)-1]
+}
+
+func (c *countingController) Apply(_ context.Context, command PhaseCommand) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commands = append(c.commands, command)
+	return nil
+}
+
+func (c *countingController) lastCommand() PhaseCommand {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.commands) == 0 {
+		return PhaseCommand{}
+	}
+	return c.commands[len(c.commands)-1]
+}
+
+func (c *countingController) count(commandID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, command := range c.commands {
+		if command.ID == commandID {
+			count++
+		}
+	}
+	return count
+}
+
+func appendStarted(t *testing.T, store *MemoryStore, eventID string, command PhaseCommand) {
+	t.Helper()
+	if err := store.appendObservation(context.Background(), projectID, phaseObservation{
+		ID:         eventID,
+		Kind:       "PhaseInvocationStarted",
+		CommandID:  command.ID,
+		Endpoint:   command.Endpoint,
+		Generation: command.Generation,
+		BindingRef: command.BindingRef,
+		LeaseRef:   command.LeaseRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendStopped(t *testing.T, store *MemoryStore, eventID string, command PhaseCommand, checkpointRef string) {
+	t.Helper()
+	if err := store.appendObservation(context.Background(), projectID, phaseObservation{
+		ID:            eventID,
+		Kind:          "PhaseInvocationStopped",
+		CommandID:     command.ID,
+		Endpoint:      command.Endpoint,
+		Generation:    command.Generation,
+		BindingRef:    command.BindingRef,
+		LeaseRef:      command.LeaseRef,
+		CheckpointRef: checkpointRef,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

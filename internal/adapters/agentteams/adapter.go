@@ -70,6 +70,7 @@ const (
 
 type executionRecord struct {
 	InvocationRef   string
+	Attempt         int
 	Execution       AgentTeamsExecutionRef
 	Fingerprint     string
 	State           executionState
@@ -85,15 +86,15 @@ type ExecutionStore interface {
 }
 
 type MemoryExecutionStore struct {
-	mu            sync.RWMutex
-	byInvocation  map[string]executionRecord
-	invocationRef map[string]string
+	mu           sync.RWMutex
+	byInvocation map[string]executionRecord
+	byTaskID     map[string]executionRecord
 }
 
 func NewMemoryExecutionStore() *MemoryExecutionStore {
 	return &MemoryExecutionStore{
-		byInvocation:  make(map[string]executionRecord),
-		invocationRef: make(map[string]string),
+		byInvocation: make(map[string]executionRecord),
+		byTaskID:     make(map[string]executionRecord),
 	}
 }
 
@@ -113,11 +114,8 @@ func (s *MemoryExecutionStore) GetByTaskID(ctx context.Context, taskID string) (
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ref, ok := s.invocationRef[taskID]
-	if !ok {
-		return executionRecord{}, false, nil
-	}
-	return s.byInvocation[ref], true, nil
+	record, ok := s.byTaskID[taskID]
+	return record, ok, nil
 }
 
 func (s *MemoryExecutionStore) Reserve(
@@ -135,37 +133,69 @@ func (s *MemoryExecutionStore) Reserve(
 		if existing.Fingerprint != fingerprint {
 			return executionRecord{}, false, kernel.IdempotencyConflict()
 		}
-		return existing, false, nil
+		if existing.State != executionTerminated || existing.TerminationMode != TerminateReleaseWait {
+			return existing, false, nil
+		}
+		execution.AgentTeamsTaskID = attemptedTaskID(invocationRef, existing.Attempt+1)
+		execution.HostRef = strings.TrimSpace(execution.HostRef)
+		if execution.HostRef == "" {
+			return executionRecord{}, false, kernel.InvalidArgument("AgentTeams host_ref is required")
+		}
+		record := executionRecord{
+			InvocationRef: invocationRef,
+			Attempt:       existing.Attempt + 1,
+			Execution:     execution,
+			Fingerprint:   fingerprint,
+			State:         executionReserved,
+		}
+		if _, ok := s.byTaskID[execution.AgentTeamsTaskID]; ok {
+			return executionRecord{}, false, kernel.IdempotencyConflict()
+		}
+		s.byInvocation[invocationRef] = record
+		s.byTaskID[execution.AgentTeamsTaskID] = record
+		return record, true, nil
 	}
-	if otherRef, ok := s.invocationRef[execution.AgentTeamsTaskID]; ok && otherRef != invocationRef {
+	execution.AgentTeamsTaskID = attemptedTaskID(invocationRef, 1)
+	execution.HostRef = strings.TrimSpace(execution.HostRef)
+	if execution.HostRef == "" {
+		return executionRecord{}, false, kernel.InvalidArgument("AgentTeams host_ref is required")
+	}
+	if existing, ok := s.byTaskID[execution.AgentTeamsTaskID]; ok && existing.InvocationRef != invocationRef {
 		return executionRecord{}, false, kernel.IdempotencyConflict()
 	}
 	record := executionRecord{
 		InvocationRef: invocationRef,
+		Attempt:       1,
 		Execution:     execution,
 		Fingerprint:   fingerprint,
 		State:         executionReserved,
 	}
 	s.byInvocation[invocationRef] = record
-	s.invocationRef[execution.AgentTeamsTaskID] = invocationRef
+	s.byTaskID[execution.AgentTeamsTaskID] = record
 	return record, true, nil
 }
 
-func (s *MemoryExecutionStore) MarkDispatched(ctx context.Context, invocationRef string) error {
+func (s *MemoryExecutionStore) MarkDispatched(ctx context.Context, taskID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	record, ok := s.byInvocation[invocationRef]
+	record, ok := s.byTaskID[taskID]
 	if !ok {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution reservation not found"}
 	}
 	if record.State == executionTerminated {
 		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "terminated AgentTeams execution cannot be dispatched", Recoverable: true}
 	}
+	if record.State == executionDispatched {
+		return nil
+	}
 	record.State = executionDispatched
-	s.byInvocation[invocationRef] = record
+	s.byTaskID[taskID] = record
+	if latest, ok := s.byInvocation[record.InvocationRef]; ok && latest.Execution.AgentTeamsTaskID == taskID {
+		s.byInvocation[record.InvocationRef] = record
+	}
 	return nil
 }
 
@@ -175,11 +205,10 @@ func (s *MemoryExecutionStore) MarkTerminated(ctx context.Context, taskID string
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ref, ok := s.invocationRef[taskID]
+	record, ok := s.byTaskID[taskID]
 	if !ok {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
 	}
-	record := s.byInvocation[ref]
 	if record.State == executionTerminated {
 		if record.TerminationMode == mode {
 			return nil
@@ -188,7 +217,10 @@ func (s *MemoryExecutionStore) MarkTerminated(ctx context.Context, taskID string
 	}
 	record.State = executionTerminated
 	record.TerminationMode = mode
-	s.byInvocation[ref] = record
+	if latest, ok := s.byInvocation[record.InvocationRef]; ok && latest.Execution.AgentTeamsTaskID == taskID {
+		s.byInvocation[record.InvocationRef] = record
+	}
+	s.byTaskID[taskID] = record
 	return nil
 }
 
@@ -200,6 +232,14 @@ type Adapter struct {
 	now             func() time.Time
 	heartbeatMaxAge time.Duration
 	projector       ObservationProjector
+	dispatchMu      sync.Mutex
+	dispatches      map[string]*dispatchCall
+}
+
+type dispatchCall struct {
+	done   chan struct{}
+	result AgentTeamsExecutionRef
+	err    error
 }
 
 func NewAdapter(
@@ -226,6 +266,7 @@ func NewAdapter(
 		store:           store,
 		now:             now,
 		heartbeatMaxAge: heartbeatMaxAge,
+		dispatches:      make(map[string]*dispatchCall),
 	}, nil
 }
 
@@ -233,6 +274,45 @@ func (a *Adapter) Dispatch(ctx context.Context, invocationRef string) (AgentTeam
 	if strings.TrimSpace(invocationRef) == "" {
 		return AgentTeamsExecutionRef{}, kernel.InvalidArgument("invocation_ref is required")
 	}
+	return a.dispatchOnce(ctx, invocationRef, func() (AgentTeamsExecutionRef, error) {
+		return a.dispatchReserved(ctx, invocationRef)
+	})
+}
+
+func (a *Adapter) dispatchOnce(
+	ctx context.Context,
+	invocationRef string,
+	fn func() (AgentTeamsExecutionRef, error),
+) (AgentTeamsExecutionRef, error) {
+	// MVP process-local singleflight only coalesces concurrent Dispatch calls in
+	// this adapter instance. Cross-process or post-restart retries rely on
+	// stable task IDs plus the AgentTeams taskflow idempotency contract; this is
+	// not a global exactly-once fence for external calls.
+	a.dispatchMu.Lock()
+	if call, ok := a.dispatches[invocationRef]; ok {
+		done := call.done
+		a.dispatchMu.Unlock()
+		select {
+		case <-done:
+			return call.result, call.err
+		case <-ctx.Done():
+			return AgentTeamsExecutionRef{}, ctx.Err()
+		}
+	}
+	call := &dispatchCall{done: make(chan struct{})}
+	a.dispatches[invocationRef] = call
+	a.dispatchMu.Unlock()
+
+	call.result, call.err = fn()
+	close(call.done)
+
+	a.dispatchMu.Lock()
+	delete(a.dispatches, invocationRef)
+	a.dispatchMu.Unlock()
+	return call.result, call.err
+}
+
+func (a *Adapter) dispatchReserved(ctx context.Context, invocationRef string) (AgentTeamsExecutionRef, error) {
 	prepared, err := a.source.LoadPreparedInvocation(ctx, invocationRef)
 	if err != nil {
 		return AgentTeamsExecutionRef{}, err
@@ -257,7 +337,24 @@ func (a *Adapter) Dispatch(ctx context.Context, invocationRef string) (AgentTeam
 			return record.Execution, nil
 		}
 		if record.State == executionTerminated {
-			return AgentTeamsExecutionRef{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "terminated AgentTeams execution cannot be redispatched", Recoverable: true}
+			if record.TerminationMode != TerminateReleaseWait {
+				return AgentTeamsExecutionRef{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "terminated AgentTeams execution cannot be redispatched", Recoverable: true}
+			}
+			host, err := a.selectHost(ctx, prepared)
+			if err != nil {
+				return AgentTeamsExecutionRef{}, err
+			}
+			proposed := AgentTeamsExecutionRef{
+				InvocationID: prepared.InvocationID,
+				HostRef:      host.Ref,
+			}
+			record, _, err = a.store.Reserve(ctx, invocationRef, fingerprint, proposed)
+			if err != nil {
+				return AgentTeamsExecutionRef{}, err
+			}
+			if record.State == executionDispatched {
+				return record.Execution, nil
+			}
 		}
 	} else {
 		host, err := a.selectHost(ctx, prepared)
@@ -265,9 +362,8 @@ func (a *Adapter) Dispatch(ctx context.Context, invocationRef string) (AgentTeam
 			return AgentTeamsExecutionRef{}, err
 		}
 		proposed := AgentTeamsExecutionRef{
-			InvocationID:     prepared.InvocationID,
-			AgentTeamsTaskID: stableTaskID(invocationRef),
-			HostRef:          host.Ref,
+			InvocationID: prepared.InvocationID,
+			HostRef:      host.Ref,
 		}
 		record, _, err = a.store.Reserve(ctx, invocationRef, fingerprint, proposed)
 		if err != nil {
@@ -302,7 +398,7 @@ func (a *Adapter) Dispatch(ctx context.Context, invocationRef string) (AgentTeam
 		_ = a.client.ReleaseHostSlot(context.Background(), record.Execution.AgentTeamsTaskID, record.Execution.HostRef)
 		return AgentTeamsExecutionRef{}, kernel.Error{Code: kernel.CodeInternalError, Message: "AgentTeams returned a mismatched execution identity"}
 	}
-	if err := a.store.MarkDispatched(ctx, invocationRef); err != nil {
+	if err := a.store.MarkDispatched(ctx, record.Execution.AgentTeamsTaskID); err != nil {
 		return AgentTeamsExecutionRef{}, err
 	}
 	return record.Execution, nil

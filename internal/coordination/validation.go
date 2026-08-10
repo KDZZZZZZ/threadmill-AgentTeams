@@ -120,6 +120,22 @@ func applyPendingSubgraph(state *graphState, next PendingSubgraph) {
 	}
 }
 
+func validatePendingSubgraphRuntime(runtime memoryRuntimeState, next PendingSubgraph) error {
+	scope := make(map[PhaseEndpointRef]struct{}, len(next.Endpoints))
+	for _, endpoint := range next.Endpoints {
+		scope[endpoint.Ref] = struct{}{}
+	}
+	for _, lease := range runtime.leases {
+		if lease.State != "active" {
+			continue
+		}
+		if _, ok := scope[lease.Endpoint]; ok {
+			return kernel.EndpointInFlight("ReplacePending scope contains an endpoint with an active phase lease; hold and stop the phase before replacing it")
+		}
+	}
+	return nil
+}
+
 func validateGraph(state graphState) error {
 	for _, task := range state.tasks {
 		if err := validateTask(task); err != nil {
