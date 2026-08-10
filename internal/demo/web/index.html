@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Threadmill Control Room</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true" focusable="false">
+    <symbol id="icon-minus" viewBox="0 0 24 24">
+      <path d="M5 12h14"></path>
+    </symbol>
+    <symbol id="icon-plus" viewBox="0 0 24 24">
+      <path d="M12 5v14m-7-7h14"></path>
+    </symbol>
+    <symbol id="icon-pause" viewBox="0 0 24 24">
+      <path d="M6 6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1zm8 0a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1z"></path>
+    </symbol>
+    <symbol id="icon-play" viewBox="0 0 24 24">
+      <path d="M7 4v16l13-8z"></path>
+    </symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24">
+      <path d="m5 12l5 5L20 7"></path>
+    </symbol>
+    <symbol id="icon-git-branch" viewBox="0 0 24 24">
+      <path d="M5 18a2 2 0 1 0 4 0a2 2 0 1 0-4 0M5 6a2 2 0 1 0 4 0a2 2 0 1 0-4 0m10 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0M7 8v8m2 2h6a2 2 0 0 0 2-2v-5"></path>
+      <path d="m14 14l3-3l3 3"></path>
+    </symbol>
+    <symbol id="icon-message-circle" viewBox="0 0 24 24">
+      <path d="m3 20l1.3-3.9C1.976 12.663 2.874 8.228 6.4 5.726c3.526-2.501 8.59-2.296 11.845.48c3.255 2.777 3.695 7.266 1.029 10.501S11.659 20.922 7.7 19z"></path>
+    </symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24">
+      <path d="M4 6a8 3 0 1 0 16 0A8 3 0 1 0 4 6"></path>
+      <path d="M4 6v6a8 3 0 0 0 16 0V6"></path>
+      <path d="M4 12v6a8 3 0 0 0 16 0v-6"></path>
+    </symbol>
+    <symbol id="icon-activity-heartbeat" viewBox="0 0 24 24">
+      <path d="M3 12h4.5L9 6l4 12l2-9l1.5 3H21"></path>
+    </symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24">
+      <path d="M20 11A8.1 8.1 0 0 0 4.5 9M4 5v4h4m-4 4a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"></path>
+    </symbol>
+  </svg>
+
+  <a class="skip-link" href="#main">跳到主内容</a>
+
+  <header class="app-header">
+    <div class="brand-block">
+      <p class="eyebrow">AgentTeams Demo</p>
+      <h1>Threadmill 协调控制室</h1>
+    </div>
+    <div class="header-status" aria-live="polite">
+      <span class="live-status">
+        <span id="liveDot" class="status-dot status-warn" aria-hidden="true"></span>
+        <span id="liveText">正在连接</span>
+      </span>
+      <span id="revisionText" class="data-ref">revision -</span>
+      <span id="lastSyncText" class="data-ref">last sync -</span>
+    </div>
+  </header>
+
+  <main id="main" class="layout">
+    <section class="capacity-panel panel" aria-labelledby="capacityTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Capacity</p>
+          <h2 id="capacityTitle">运行容量</h2>
+        </div>
+        <span id="capacityRevision" class="data-ref">capacity revision -</span>
+      </div>
+
+      <div class="capacity-controls" aria-label="调整期望并发">
+        <button id="decreaseCapacity" type="button" class="icon-button" aria-label="减少期望并发">
+          <svg class="icon" aria-hidden="true"><use href="#icon-minus"></use></svg>
+        </button>
+        <output id="desiredCapacity" class="capacity-number" aria-live="polite">-</output>
+        <button id="increaseCapacity" type="button" class="icon-button" aria-label="增加期望并发">
+          <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
+        </button>
+      </div>
+
+      <p class="hint">降低 desired 只会让正在运行的 invocation 自然 drain，不会强制终止 active invocation。</p>
+
+      <dl class="metrics" aria-label="容量指标">
+        <div class="meta-item">
+          <dt class="meta-label">desired</dt>
+          <dd id="metricDesired" class="meta-value">-</dd>
+        </div>
+        <div class="meta-item">
+          <dt class="meta-label">healthy</dt>
+          <dd id="metricHealthy" class="meta-value">-</dd>
+        </div>
+        <div class="meta-item">
+          <dt class="meta-label">active</dt>
+          <dd id="metricActive" class="meta-value">-</dd>
+        </div>
+        <div class="meta-item">
+          <dt class="meta-label">waiting</dt>
+          <dd id="metricWaiting" class="meta-value">-</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="graph-panel panel" aria-labelledby="graphTitle">
+      <div class="panel-heading graph-toolbar">
+        <div>
+          <p class="eyebrow">Coordination Graph</p>
+          <h2 id="graphTitle">按 Task 分组的端点</h2>
+        </div>
+        <span id="graphSummary" class="pill">0 个端点</span>
+      </div>
+
+      <div id="graphList" class="task-groups" aria-live="polite">
+        <div class="graph-lane" aria-hidden="true">
+          <div class="task-identity">
+            <span class="skeleton-row skeleton-title"></span>
+            <span class="skeleton-row skeleton-meta"></span>
+          </div>
+          <div class="phase-slot"><span class="skeleton-row skeleton-node"></span></div>
+          <div class="phase-slot"><span class="skeleton-row skeleton-node"></span></div>
+          <div class="phase-slot"><span class="skeleton-row skeleton-node"></span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="manager-panel panel" aria-labelledby="managerTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Task Manager Agent</p>
+          <h2 id="managerTitle">决策与指令</h2>
+        </div>
+        <span id="selectedEndpointBadge" class="pill">未选择 endpoint</span>
+      </div>
+
+      <div id="selectedEndpointContext" class="selected-target" aria-live="polite">
+        <span class="target-token">未选择 endpoint</span>
+      </div>
+
+      <div id="managerMessages" class="message-list" aria-live="polite">
+        <div class="message-row" aria-hidden="true">
+          <span class="skeleton-row skeleton-title"></span>
+          <span class="skeleton-row skeleton-meta"></span>
+        </div>
+        <div class="message-row" aria-hidden="true">
+          <span class="skeleton-row skeleton-title"></span>
+          <span class="skeleton-row skeleton-meta"></span>
+        </div>
+      </div>
+
+      <div class="quick-prompts" aria-label="快捷 Manager 指令">
+        <button type="button" data-prompt="暂停并保存检查点">
+          <svg class="icon" aria-hidden="true"><use href="#icon-pause"></use></svg>
+          暂停并保存检查点
+        </button>
+        <button type="button" data-prompt="从检查点恢复继续">
+          <svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg>
+          从检查点恢复继续
+        </button>
+        <button type="button" data-prompt="完成并通过">
+          <svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg>
+          完成并通过
+        </button>
+        <button type="button" data-prompt="添加一个前置依赖">
+          <svg class="icon" aria-hidden="true"><use href="#icon-git-branch"></use></svg>
+          添加一个前置依赖
+        </button>
+        <button type="button" data-prompt="创建一个可运行 endpoint">
+          <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
+          创建一个可运行 endpoint
+        </button>
+      </div>
+
+      <form id="messageForm" class="message-form">
+        <label for="managerInput">发送给选中 endpoint 的 Manager 消息</label>
+        <textarea id="managerInput" name="message" rows="4" placeholder="输入 Manager 指令"></textarea>
+        <button id="managerSubmit" type="submit">
+          <svg class="icon" aria-hidden="true"><use href="#icon-message-circle"></use></svg>
+          发送消息
+        </button>
+      </form>
+    </section>
+
+    <section class="inspector-panel panel" aria-labelledby="inspectorTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Endpoint Inspector</p>
+          <h2 id="inspectorTitle">端点详情</h2>
+        </div>
+        <span id="inspectorEndpoint" class="pill">未加载</span>
+      </div>
+
+      <div id="inspectorMeta" class="meta-grid">
+        <div class="meta-item" aria-hidden="true">
+          <span class="skeleton-row skeleton-title"></span>
+          <span class="skeleton-row skeleton-meta"></span>
+        </div>
+      </div>
+
+      <div class="inspector-grid">
+        <section class="inspector-section" aria-labelledby="subsTitle">
+          <div class="section-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-git-branch"></use></svg>
+            <h3 id="subsTitle">订阅子图</h3>
+          </div>
+          <div id="subscriptionsList" class="dense-list">
+            <span class="skeleton-row skeleton-title"></span>
+            <span class="skeleton-row skeleton-meta"></span>
+          </div>
+          <div id="effectiveUnionList" class="union-list" aria-label="effective subgraph union">
+            <span class="union-chip skeleton-row"></span>
+          </div>
+        </section>
+
+        <section class="inspector-section" aria-labelledby="contextTitle">
+          <div class="section-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-activity-heartbeat"></use></svg>
+            <h3 id="contextTitle">有效上下文</h3>
+          </div>
+          <div id="contextSlice" class="dense-list">
+            <span class="skeleton-row skeleton-title"></span>
+            <span class="skeleton-row skeleton-meta"></span>
+          </div>
+        </section>
+
+        <section class="inspector-section" aria-labelledby="memoryTitle">
+          <div class="section-title">
+            <svg class="icon" aria-hidden="true"><use href="#icon-database"></use></svg>
+            <h3 id="memoryTitle">TaskMemoryBuffer</h3>
+          </div>
+          <div class="scope-toggle" role="group" aria-label="上下文缓冲区范围">
+            <button id="memoryCurrent" type="button" aria-pressed="true">当前 invocation</button>
+            <button id="memoryTask" type="button" aria-pressed="false">同 Task</button>
+          </div>
+          <div id="memoryBuffer" class="dense-list">
+            <div class="list-row" aria-hidden="true">
+              <span class="skeleton-row skeleton-title"></span>
+              <span class="skeleton-row skeleton-meta"></span>
+            </div>
+            <div class="list-row" aria-hidden="true">
+              <span class="skeleton-row skeleton-title"></span>
+              <span class="skeleton-row skeleton-meta"></span>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <aside class="events-panel panel" aria-labelledby="eventsTitle">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Events</p>
+          <h2 id="eventsTitle">实时更新</h2>
+        </div>
+        <svg class="icon event-icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>
+      </div>
+      <div id="errorBox" class="error-box" role="alert" hidden></div>
+      <ol id="eventList" class="event-list" aria-live="polite"></ol>
+    </aside>
+  </main>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>
