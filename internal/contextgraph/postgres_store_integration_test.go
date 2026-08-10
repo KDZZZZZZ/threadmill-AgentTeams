@@ -347,6 +347,167 @@ func TestPostgresStoreRuntimeCriticalContextGraph(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreSearchHonorsAnchorRefs(t *testing.T) {
+	ctx := context.Background()
+	db := openContextGraphTestDB(t, ctx)
+	defer db.Close()
+
+	now := time.Date(2026, 8, 11, 11, 0, 0, 0, time.UTC)
+	store := NewPostgresStore(db, func() time.Time { return now })
+	curator := contextPrincipal(auth.ToolContextCreateSubgraph, auth.ToolContextCreateNode)
+	sgA, err := store.CreateSubgraph(ctx, curator, CreateGeneralSubgraphRequest{Name: "Anchor A", Summary: "runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sgB, err := store.CreateSubgraph(ctx, curator, CreateGeneralSubgraphRequest{Name: "Anchor B", Summary: "runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeA, err := store.CreateNode(ctx, curator, CreateGeneralNodeRequest{
+		Statement:   "needle anchored alpha",
+		Kind:        string(NodeKindFact),
+		SourceRefs:  []string{"source:alpha"},
+		SubgraphIDs: []string{sgA.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeB, err := store.CreateNode(ctx, curator, CreateGeneralNodeRequest{
+		Statement:   "needle anchored beta",
+		Kind:        string(NodeKindFact),
+		SourceRefs:  []string{"source:beta"},
+		SubgraphIDs: []string{sgB.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectBCurator := curator
+	projectBCurator.ProjectID = "project-b"
+	projectBSubgraph, err := store.CreateSubgraph(ctx, projectBCurator, CreateGeneralSubgraphRequest{Name: "Project B Anchor", Summary: "isolation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	searcher := contextPrincipal(auth.ToolContextSearch)
+	searcher.ConsumerInvocationID = "inv-anchor-consumer"
+	searcher.ConsumerTaskID = "task-anchor"
+	searcher.ConsumerRole = auth.RoleExecutor
+
+	byNode, err := store.Search(ctx, searcher, SearchRequest{Keywords: []string{"needle"}, AnchorRefs: []string{"node:" + string(nodeA)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byNode.Slice.Nodes) != 1 || byNode.Slice.Nodes[0].ID != string(nodeA) {
+		t.Fatalf("node anchor search = %#v, want %s only", byNode.Slice.Nodes, nodeA)
+	}
+	bySubgraph, err := store.Search(ctx, searcher, SearchRequest{Keywords: []string{"needle"}, AnchorRefs: []string{"subgraph:" + sgB.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bySubgraph.Slice.Nodes) != 1 || bySubgraph.Slice.Nodes[0].ID != string(nodeB) {
+		t.Fatalf("subgraph anchor search = %#v, want %s only", bySubgraph.Slice.Nodes, nodeB)
+	}
+	disjoint, err := store.Search(ctx, searcher, SearchRequest{
+		Keywords:   []string{"needle"},
+		Scope:      []string{"subgraph:" + sgA.ID},
+		AnchorRefs: []string{"subgraph:" + sgB.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(disjoint.Slice.Nodes) != 0 || len(disjoint.SubscriptionIDs) != 0 {
+		t.Fatalf("disjoint scope/anchor search = nodes %#v subscriptions %#v, want empty", disjoint.Slice.Nodes, disjoint.SubscriptionIDs)
+	}
+	if _, err := store.Search(ctx, searcher, SearchRequest{AnchorRefs: []string{"subgraph:" + projectBSubgraph.ID}}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("cross-project anchor err = %v, want not_found", err)
+	}
+}
+
+func TestPostgresStoreTaskContextFirstCreateIsIdempotentUnderConcurrency(t *testing.T) {
+	ctx := context.Background()
+	db := openContextGraphTestDB(t, ctx)
+	defer db.Close()
+
+	resolver := &mutableTaskEndpointResolver{
+		tasks: map[string]bool{
+			"project-a/task-race": true,
+		},
+		done: map[string]bool{},
+		endpoints: map[string]bool{
+			"project-a/task-race/plan": true,
+		},
+	}
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store := NewPostgresStore(db, func() time.Time { return now })
+	store.SetTaskEndpointResolver(resolver)
+	tm := principal(auth.RoleTaskManager, "tm-race", "task-race", auth.ToolSet(
+		auth.ToolContextRegisterTaskSubgraph,
+		auth.ToolContextProjectTaskContext,
+	))
+
+	var bindingResults [2]TaskContextSubgraphBinding
+	runContextGraphRace(t, func(i int) error {
+		binding, err := store.RegisterTaskSubgraph(ctx, tm, "task-race")
+		if err != nil {
+			return err
+		}
+		bindingResults[i] = binding
+		return nil
+	})
+	if bindingResults[0].SubgraphID == "" || bindingResults[0] != bindingResults[1] {
+		t.Fatalf("concurrent RegisterTaskSubgraph = %#v", bindingResults)
+	}
+
+	projection := TaskContextProjection{
+		ProjectionID:   "projection-race",
+		SourceRevision: "1",
+		Statement:      "race directive",
+		Kind:           string(NodeKindDirective),
+		SourceRefs:     []string{"contract:race"},
+		SubgraphIDs:    []string{bindingResults[0].SubgraphID},
+		Recipients: []TaskContextRecipient{{
+			TaskID:       "task-race",
+			EndpointRefs: []PhaseEndpointRef{{TaskID: "task-race", EndpointID: "plan"}},
+		}},
+	}
+	var nodeResults [2]ContextNodeRef
+	runContextGraphRace(t, func(i int) error {
+		nodeID, err := store.ProjectTaskContext(ctx, tm, ProjectTaskContextRequest{Projection: projection})
+		if err != nil {
+			return err
+		}
+		nodeResults[i] = nodeID
+		return nil
+	})
+	if nodeResults[0] == "" || nodeResults[0] != nodeResults[1] {
+		t.Fatalf("concurrent ProjectTaskContext = %#v", nodeResults)
+	}
+}
+
+func runContextGraphRace(t *testing.T, fn func(int) error) {
+	t.Helper()
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- fn(i)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func openContextGraphTestDB(t *testing.T, ctx context.Context) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("CONTEXTGRAPH_POSTGRES_DSN")

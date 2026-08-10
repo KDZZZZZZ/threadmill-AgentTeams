@@ -245,9 +245,22 @@ func (s *PostgresStore) Search(ctx context.Context, principal auth.Principal, re
 	if err != nil {
 		return ContextSearchResult{}, err
 	}
+	anchored, err := visibleAnchorNodesSQL(ctx, tx, principal, req.AnchorRefs)
+	if err != nil {
+		return ContextSearchResult{}, err
+	}
 	nodes, err := searchNodesSQL(ctx, tx, principal, lowerAll(req.Keywords), scope)
 	if err != nil {
 		return ContextSearchResult{}, err
+	}
+	if len(anchored) > 0 {
+		filtered := nodes[:0]
+		for _, node := range nodes {
+			if _, ok := anchored[node.ID]; ok {
+				filtered = append(filtered, node)
+			}
+		}
+		nodes = append([]ContextNode(nil), filtered...)
 	}
 	hitSubgraphs := map[string]struct{}{}
 	for _, node := range nodes {
@@ -862,11 +875,14 @@ func (s *PostgresStore) RegisterTaskSubgraph(ctx context.Context, principal auth
 	if !exists {
 		return TaskContextSubgraphBinding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "task not found"}
 	}
-	tx, err := s.begin(ctx, serializableContextTx())
+	tx, err := s.begin(ctx, idempotentContextTx())
 	if err != nil {
 		return TaskContextSubgraphBinding{}, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, fmt.Sprintf("context-task-subgraph:%s:%s", principal.ProjectID, taskID)); err != nil {
+		return TaskContextSubgraphBinding{}, mapContextPostgresError(err)
+	}
 	var existing string
 	err = tx.QueryRowContext(ctx, `SELECT subgraph_id FROM context_task_subgraph_bindings WHERE project_id = $1 AND task_id = $2 FOR UPDATE`, principal.ProjectID, taskID).Scan(&existing)
 	if err == nil {
@@ -906,11 +922,14 @@ func (s *PostgresStore) ProjectTaskContext(ctx context.Context, principal auth.P
 	if err := validateTaskProjectionShape(projection); err != nil {
 		return "", err
 	}
-	tx, err := s.begin(ctx, serializableContextTx())
+	tx, err := s.begin(ctx, idempotentContextTx())
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, fmt.Sprintf("context-task-projection:%s:%s", principal.ProjectID, projection.ProjectionID)); err != nil {
+		return "", mapContextPostgresError(err)
+	}
 	if err := validateProjectionBindingsSQL(ctx, tx, principal, s.taskResolver, projection); err != nil {
 		return "", err
 	}
@@ -1184,6 +1203,10 @@ func (s *PostgresStore) begin(ctx context.Context, opts *sql.TxOptions) (*sql.Tx
 
 func serializableContextTx() *sql.TxOptions {
 	return &sql.TxOptions{Isolation: sql.LevelSerializable}
+}
+
+func idempotentContextTx() *sql.TxOptions {
+	return &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 }
 
 func newContextID(prefix string, projectID kernel.ProjectID) string {
@@ -1777,6 +1800,45 @@ func visibleScopeSQL(ctx context.Context, q postgresDBTX, principal auth.Princip
 	return out, nil
 }
 
+func visibleAnchorNodesSQL(ctx context.Context, q postgresDBTX, principal auth.Principal, anchorRefs []string) (map[string]struct{}, error) {
+	if len(anchorRefs) == 0 {
+		return nil, nil
+	}
+	nodes := map[string]struct{}{}
+	for _, ref := range uniqueStrings(anchorRefs) {
+		kind, id, err := parseAnchorRef(ref)
+		if err != nil {
+			return nil, err
+		}
+		switch kind {
+		case "node":
+			if _, err := visibleNodeSQL(ctx, q, principal, id); err != nil {
+				if kernel.IsCode(err, kernel.CodeNotFound) {
+					return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
+				}
+				return nil, err
+			}
+			nodes[id] = struct{}{}
+		case "subgraph":
+			ok, err := canSeeSubgraphSQL(ctx, q, principal, id)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
+			}
+			anchored, err := nodesInSubgraphsSQL(ctx, q, principal, []string{id})
+			if err != nil {
+				return nil, err
+			}
+			for _, node := range anchored {
+				nodes[node.ID] = struct{}{}
+			}
+		}
+	}
+	return nodes, nil
+}
+
 func searchNodesSQL(ctx context.Context, q postgresDBTX, principal auth.Principal, keywords, scope []string) ([]ContextNode, error) {
 	if len(scope) > 0 {
 		nodes, err := nodesInSubgraphsSQL(ctx, q, principal, scope)
@@ -1790,12 +1852,22 @@ func searchNodesSQL(ctx context.Context, q postgresDBTX, principal auth.Principa
 		return nil, mapContextPostgresError(err)
 	}
 	defer rows.Close()
-	var out []ContextNode
+	var ids []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return nil, mapContextPostgresError(err)
 		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapContextPostgresError(err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, mapContextPostgresError(err)
+	}
+	var out []ContextNode
+	for _, id := range ids {
 		node, err := visibleNodeSQL(ctx, q, principal, id)
 		if kernel.IsCode(err, kernel.CodeNotFound) {
 			continue
@@ -1807,7 +1879,7 @@ func searchNodesSQL(ctx context.Context, q postgresDBTX, principal auth.Principa
 			out = append(out, node)
 		}
 	}
-	return out, mapContextPostgresError(rows.Err())
+	return out, nil
 }
 
 func filterKeywordNodes(nodes []ContextNode, keywords []string) []ContextNode {

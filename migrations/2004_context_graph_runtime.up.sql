@@ -13,6 +13,3 @@ CREATE INDEX IF NOT EXISTS context_outbox_events_project_topic_created_idx
 
 ALTER TABLE context_task_memory_candidates
   ADD COLUMN IF NOT EXISTS creation_context JSONB NOT NULL DEFAULT '{}'::jsonb;
-
-ALTER TABLE context_task_memory_candidates
-  ADD COLUMN IF NOT EXISTS creation_context JSONB NOT NULL DEFAULT '{}'::jsonb;
