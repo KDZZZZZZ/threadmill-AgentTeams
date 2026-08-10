@@ -13,7 +13,7 @@ import (
 )
 
 type Reconciler struct {
-	store      *MemoryStore
+	store      Store
 	workspaces WorkspaceReader
 	verifier   TargetedVerifier
 	backend    GitBackend
@@ -21,7 +21,19 @@ type Reconciler struct {
 	events     *evidence.EventLog
 }
 
-func NewReconciler(store *MemoryStore, workspaces WorkspaceReader, verifier TargetedVerifier, backend GitBackend, artifacts *evidence.ArtifactRegistry, events *evidence.EventLog) *Reconciler {
+type Store interface {
+	enqueue(context.Context, EnqueueRequest, auditRecord) (Candidate, error)
+	Get(context.Context, CandidateID) (Candidate, error)
+	ClaimNext(context.Context, string) (Candidate, bool, error)
+	advance(context.Context, CandidateID, Status, Status, []evidence.ArtifactID, string) (Candidate, error)
+	commitMerged(context.Context, CandidateID, []evidence.ArtifactID, string, auditRecord) (Candidate, error)
+	fail(context.Context, CandidateID, Status, FailureReason, []evidence.ArtifactID, auditRecord) (Candidate, error)
+	pendingAudits(context.Context) ([]auditRecord, error)
+	markAuditDelivered(context.Context, kernel.IdempotencyKey) error
+	ReleaseClaim(context.Context, string, CandidateID) error
+}
+
+func NewReconciler(store Store, workspaces WorkspaceReader, verifier TargetedVerifier, backend GitBackend, artifacts *evidence.ArtifactRegistry, events *evidence.EventLog) *Reconciler {
 	return &Reconciler{store: store, workspaces: workspaces, verifier: verifier, backend: backend, artifacts: artifacts, events: events}
 }
 
@@ -67,7 +79,7 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 	if err != nil || !claimed {
 		return Candidate{}, claimed, err
 	}
-	defer r.store.ReleaseClaim(candidate.TargetRepository, candidate.ID)
+	defer func() { _ = r.store.ReleaseClaim(context.Background(), candidate.TargetRepository, candidate.ID) }()
 
 	binding, err := r.workspaces.Get(ctx, candidate.WorkspaceRef)
 	if err != nil {

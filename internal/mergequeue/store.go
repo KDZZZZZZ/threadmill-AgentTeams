@@ -314,12 +314,16 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return out
 }
 
-func (s *MemoryStore) ReleaseClaim(targetRepository string, id CandidateID) {
+func (s *MemoryStore) ReleaseClaim(ctx context.Context, targetRepository string, id CandidateID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.repoClaims[targetRepository] == id {
 		delete(s.repoClaims, targetRepository)
 	}
+	return nil
 }
 
 func validateEnqueue(req EnqueueRequest) error {
@@ -428,3 +432,5 @@ func validRevision(revision string) bool {
 	_, err := hex.DecodeString(revision)
 	return err == nil
 }
+
+var _ Store = (*MemoryStore)(nil)
