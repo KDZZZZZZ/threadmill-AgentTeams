@@ -117,7 +117,7 @@ func (s *PostgresRecoveryStore) RecordStopEvidence(ctx context.Context, active A
 		return err
 	}
 	if found {
-		if existing.CommandID == command.ID && string(existing.Payload) == string(payload) {
+		if existing.CommandID == command.ID && sameStopResultPayload(existing.Payload, result) {
 			return nil
 		}
 		return kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "stop evidence already exists with different payload", Recoverable: false}
@@ -143,7 +143,7 @@ WHERE run_command_id = $1
 	if err != nil {
 		return err
 	}
-	if found && existing.CommandID == command.ID && string(existing.Payload) == string(payload) {
+	if found && existing.CommandID == command.ID && sameStopResultPayload(existing.Payload, result) {
 		return nil
 	}
 	return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "stop evidence was not recorded", Recoverable: true}
@@ -202,8 +202,11 @@ func (s *PostgresRecoveryStore) ValidateResume(ctx context.Context, command Phas
 	if binding.NonResumable || binding.CheckpointRef == "" {
 		return kernel.Error{Code: kernel.CodeStaleCheckpoint, Message: "checkpoint is not resumable", Recoverable: true}
 	}
+	if s.invocations == nil {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "invocation store is required for resume validation", Recoverable: false}
+	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT stop_result
+SELECT run_command_id, stop_result
 FROM phase_recovery_obligations
 WHERE stop_result IS NOT NULL`)
 	if err != nil {
@@ -211,8 +214,9 @@ WHERE stop_result IS NOT NULL`)
 	}
 	defer rows.Close()
 	for rows.Next() {
+		var runCommandID string
 		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
+		if err := rows.Scan(&runCommandID, &payload); err != nil {
 			return err
 		}
 		var result StopResult
@@ -222,7 +226,17 @@ WHERE stop_result IS NOT NULL`)
 		if result.NonResumable {
 			continue
 		}
-		if result.CheckpointRef == binding.CheckpointRef {
+		if result.CheckpointRef != binding.CheckpointRef {
+			continue
+		}
+		stoppedInvocation, ok, err := s.invocations.Get(ctx, deterministicInvocationID(PhaseCommand{ID: runCommandID}))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if resumeScopeMatches(stoppedInvocation, command, binding) {
 			return nil
 		}
 	}
@@ -230,6 +244,17 @@ WHERE stop_result IS NOT NULL`)
 		return err
 	}
 	return kernel.Error{Code: kernel.CodeStaleCheckpoint, Message: "resume checkpoint has no persisted stop evidence", Recoverable: true}
+}
+
+func resumeScopeMatches(stopped baseruntime.Invocation, command PhaseCommand, binding BindingSnapshot) bool {
+	return stopped.ProjectID == binding.ProjectID &&
+		stopped.TaskID == command.Endpoint.TaskID &&
+		stopped.EndpointID == command.Endpoint.EndpointID &&
+		command.Generation > 0 &&
+		uint64(command.Generation) == stopped.Generation+1 &&
+		binding.TaskID == command.Endpoint.TaskID &&
+		binding.EndpointID == command.Endpoint.EndpointID &&
+		binding.Generation == command.Generation
 }
 
 type persistedStopEvidence struct {
@@ -276,6 +301,11 @@ ORDER BY run_command_id`)
 		return "", false, err
 	}
 	return "", false, nil
+}
+
+func sameStopResultPayload(payload []byte, expected StopResult) bool {
+	var actual StopResult
+	return json.Unmarshal(payload, &actual) == nil && actual == expected
 }
 
 var _ RecoveryStore = (*PostgresRecoveryStore)(nil)

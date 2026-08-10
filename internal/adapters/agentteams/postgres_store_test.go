@@ -7,12 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	adapter "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
 )
 
 func TestPostgresExecutionStoreReserveCreatesReleaseWaitAttempt(t *testing.T) {
@@ -98,6 +103,80 @@ func TestPostgresExecutionStoreGetByTaskIDReadsHistoricalAttempt(t *testing.T) {
 		t.Fatalf("historical record = %#v, want attempt 1 release_wait", record)
 	}
 	assertScriptDone(t, db)
+}
+
+func TestPostgresExecutionStoreRealPostgresLifecycle(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, err := postgres.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer admin.Close(context.Background())
+
+	schema := fmt.Sprintf("tm_agentteams_%d", time.Now().UnixNano())
+	if _, err := admin.SQL().ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.SQL().ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+	})
+
+	scopedURL, err := databaseURLWithSearchPath(databaseURL, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := postgres.Open(ctx, scopedURL)
+	if err != nil {
+		t.Fatalf("open scoped postgres: %v", err)
+	}
+	defer db.Close(context.Background())
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if err := postgres.NewMigrator(db.SQL()).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	store := adapter.NewPostgresExecutionStore(db.SQL())
+	ref := "execution://real-postgres/1"
+	first, created, err := store.Reserve(ctx, ref, "fp-a", adapter.AgentTeamsExecutionRef{
+		InvocationID: "inv-real",
+		HostRef:      "worker-a",
+	})
+	if err != nil || !created || first.Attempt != 1 {
+		t.Fatalf("first Reserve() = %#v created %v err %v, want created attempt 1", first, created, err)
+	}
+	if err := store.MarkDispatched(ctx, first.Execution.AgentTeamsTaskID); err != nil {
+		t.Fatalf("MarkDispatched(first): %v", err)
+	}
+	if err := store.MarkTerminated(ctx, first.Execution.AgentTeamsTaskID, adapter.TerminateReleaseWait); err != nil {
+		t.Fatalf("release_wait first: %v", err)
+	}
+	second, created, err := store.Reserve(ctx, ref, "fp-a", adapter.AgentTeamsExecutionRef{
+		InvocationID: "inv-real",
+		HostRef:      "worker-b",
+	})
+	if err != nil || !created || second.Attempt != 2 || second.Execution.AgentTeamsTaskID == first.Execution.AgentTeamsTaskID {
+		t.Fatalf("second Reserve() = %#v created %v err %v, want new second attempt", second, created, err)
+	}
+	history, ok, err := store.GetByTaskID(ctx, first.Execution.AgentTeamsTaskID)
+	if err != nil || !ok || history.Attempt != 1 || history.TerminationMode != adapter.TerminateReleaseWait {
+		t.Fatalf("GetByTaskID(first) = %#v ok %v err %v, want retained first attempt history", history, ok, err)
+	}
+	if err := store.MarkTerminated(ctx, second.Execution.AgentTeamsTaskID, adapter.TerminateCancel); err != nil {
+		t.Fatalf("cancel second: %v", err)
+	}
+	if _, _, err := store.Reserve(ctx, ref, "fp-b", adapter.AgentTeamsExecutionRef{InvocationID: "inv-real", HostRef: "worker-c"}); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
+		t.Fatalf("Reserve different fingerprint = %v, want idempotency_conflict", err)
+	}
+	if err := store.MarkDispatched(ctx, first.Execution.AgentTeamsTaskID); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("MarkDispatched(old terminated) = %v, want stale_command", err)
+	}
 }
 
 type sqlStep struct {
@@ -311,4 +390,15 @@ func compareArgs(want []driver.Value, got []driver.NamedValue) error {
 		}
 	}
 	return nil
+}
+
+func databaseURLWithSearchPath(raw, schema string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
