@@ -1,0 +1,315 @@
+package agentteams
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
+)
+
+type InvocationMCPMaterial struct {
+	URL             string
+	BearerToken     string
+	TokenIdentifier string
+	ExpectedTools   []string
+}
+
+type InvocationMCPResolver interface {
+	ResolveInvocationMCP(context.Context, HostPreparation) (InvocationMCPMaterial, error)
+}
+
+type QwenPawProvider interface {
+	ForHost(context.Context, string) (*QwenPawAPI, error)
+}
+
+type TaskflowCaller interface {
+	Call(context.Context, string, TaskflowCall) (TaskflowCallResult, error)
+}
+
+type ContainerResolver interface {
+	ContainerForHost(context.Context, string) (string, error)
+}
+
+type RawObservationReader interface {
+	ReadRawObservations(context.Context, string) ([]RawObservation, error)
+}
+
+type hostSlotStore interface {
+	ActiveCounts(context.Context) (map[string]int, error)
+	Claim(context.Context, string, kernel.InvocationID, string, []byte, string) error
+	Release(context.Context, string, string) error
+	MarkRevoked(context.Context, string, kernel.InvocationID) error
+	ByInvocation(context.Context, string, kernel.InvocationID) (HostSlotClaim, bool, error)
+	ByTaskID(context.Context, string) (HostSlotClaim, bool, error)
+}
+
+type ProductionClientOptions struct {
+	Controller   *AgentTeamsControllerClient
+	Slots        hostSlotStore
+	MCPResolver  InvocationMCPResolver
+	QwenPaw      QwenPawProvider
+	Taskflow     TaskflowCaller
+	Containers   ContainerResolver
+	Observations RawObservationReader
+}
+
+type ProductionClient struct {
+	controller   *AgentTeamsControllerClient
+	slots        hostSlotStore
+	mcpResolver  InvocationMCPResolver
+	qwenPaw      QwenPawProvider
+	taskflow     TaskflowCaller
+	containers   ContainerResolver
+	observations RawObservationReader
+}
+
+func NewProductionClient(options ProductionClientOptions) (*ProductionClient, error) {
+	if options.Controller == nil || options.Slots == nil || options.MCPResolver == nil ||
+		options.QwenPaw == nil || options.Taskflow == nil || options.Containers == nil {
+		return nil, kernel.InvalidArgument("AgentTeams production client dependencies are required")
+	}
+	return &ProductionClient{
+		controller:   options.Controller,
+		slots:        options.Slots,
+		mcpResolver:  options.MCPResolver,
+		qwenPaw:      options.QwenPaw,
+		taskflow:     options.Taskflow,
+		containers:   options.Containers,
+		observations: options.Observations,
+	}, nil
+}
+
+func (c *ProductionClient) Check(ctx context.Context) error {
+	return c.controller.Check(ctx)
+}
+
+func (c *ProductionClient) ListHosts(ctx context.Context) ([]HostStatus, error) {
+	hosts, err := c.controller.ListHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	counts, err := c.slots.ActiveCounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range hosts {
+		hosts[index].ActiveExecutions = counts[hosts[index].Ref]
+		if hosts[index].Capacity <= 0 {
+			hosts[index].Capacity = 1
+		}
+	}
+	return hosts, nil
+}
+
+func (c *ProductionClient) PrepareHost(ctx context.Context, prep HostPreparation) error {
+	if err := validateHostPreparation(prep); err != nil {
+		return err
+	}
+	material, err := c.mcpResolver.ResolveInvocationMCP(ctx, prep)
+	if err != nil {
+		return err
+	}
+	key, err := InvocationMCPKey(prep.InvocationID)
+	if err != nil {
+		return err
+	}
+	desired := InvocationMCP{
+		Key:           key,
+		URL:           strings.TrimSpace(material.URL),
+		BearerToken:   strings.TrimSpace(material.BearerToken),
+		ExpectedTools: material.ExpectedTools,
+	}
+	if err := validateInvocationMCP(desired); err != nil {
+		return err
+	}
+	tokenIdentifier := strings.TrimSpace(material.TokenIdentifier)
+	if tokenIdentifier == "" {
+		tokenIdentifier = key
+	}
+	if err := c.slots.Claim(ctx, prep.HostRef, prep.InvocationID, key, auth.HashOpaqueSecret(desired.BearerToken), tokenIdentifier); err != nil {
+		return err
+	}
+	qwenPaw, err := c.qwenPaw.ForHost(ctx, prep.HostRef)
+	if err != nil {
+		_ = c.releaseByInvocation(context.Background(), prep.HostRef, prep.InvocationID)
+		return err
+	}
+	if err := qwenPaw.InstallInvocationMCP(ctx, desired); err != nil {
+		_ = c.releaseByInvocation(context.Background(), prep.HostRef, prep.InvocationID)
+		return err
+	}
+	if prep.Role != auth.RoleTaskManager && prep.Role != auth.RoleContext {
+		if err := c.controller.EnsureWorkerReady(ctx, prep.HostRef); err != nil {
+			_ = qwenPaw.RevokeInvocationMCP(context.Background(), key)
+			_ = c.releaseByInvocation(context.Background(), prep.HostRef, prep.InvocationID)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ProductionClient) DelegateTask(ctx context.Context, req DelegateTaskRequest) (TaskSnapshot, error) {
+	if strings.TrimSpace(req.HostRef) == "" || strings.TrimSpace(req.TaskID) == "" {
+		return TaskSnapshot{}, kernel.InvalidArgument("delegate_task host_ref and task_id are required")
+	}
+	container, err := c.containers.ContainerForHost(ctx, req.HostRef)
+	if err != nil {
+		return TaskSnapshot{}, err
+	}
+	result, err := c.taskflow.Call(ctx, container, TaskflowCall{
+		Action:     "delegate_task",
+		ProjectID:  string(req.ProjectID),
+		TaskID:     req.TaskID,
+		RoomID:     req.RoomID,
+		AssignedTo: req.HostRef,
+		Spec:       req.Spec,
+	})
+	if err != nil {
+		return TaskSnapshot{}, err
+	}
+	return result.Task, nil
+}
+
+func (c *ProductionClient) ReleaseHostSlot(ctx context.Context, taskID string, hostRef string) error {
+	return c.slots.Release(ctx, taskID, hostRef)
+}
+
+func (c *ProductionClient) RevokeInvocation(ctx context.Context, hostRef string, invocationID kernel.InvocationID) error {
+	claim, ok, err := c.slots.ByInvocation(ctx, hostRef, invocationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams invocation MCP slot not found"}
+	}
+	qwenPaw, err := c.qwenPaw.ForHost(ctx, hostRef)
+	if err != nil {
+		return err
+	}
+	if err := qwenPaw.RevokeInvocationMCP(ctx, claim.MCPClientKey); err != nil {
+		return err
+	}
+	return c.slots.MarkRevoked(ctx, hostRef, invocationID)
+}
+
+func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) error {
+	hosts, err := c.controller.ListHosts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, host := range hosts {
+		if host.Ref != hostRef {
+			continue
+		}
+		if host.Kind == HostManager {
+			return c.controller.StopManager(ctx, hostRef)
+		}
+		return c.controller.StopWorker(ctx, hostRef)
+	}
+	return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams host not found"}
+}
+
+func (c *ProductionClient) CancelTask(ctx context.Context, taskID string, reason string) error {
+	claim, ok, err := c.slots.ByTaskID(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams task slot not found"}
+	}
+	container, err := c.containers.ContainerForHost(ctx, claim.HostRef)
+	if err != nil {
+		return err
+	}
+	_, err = c.taskflow.Call(ctx, container, TaskflowCall{Action: "cancel_task", TaskID: taskID, Reason: reason})
+	return err
+}
+
+func (c *ProductionClient) CheckTask(ctx context.Context, taskID string) (TaskCheck, error) {
+	claim, ok, err := c.slots.ByTaskID(ctx, taskID)
+	if err != nil {
+		return TaskCheck{}, err
+	}
+	if !ok {
+		return TaskCheck{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams task slot not found"}
+	}
+	container, err := c.containers.ContainerForHost(ctx, claim.HostRef)
+	if err != nil {
+		return TaskCheck{}, err
+	}
+	result, err := c.taskflow.Call(ctx, container, TaskflowCall{Action: "check_task", TaskID: taskID})
+	if err != nil {
+		return TaskCheck{}, err
+	}
+	return TaskCheck{
+		Task:             result.Task,
+		ResultStatus:     result.ResultStatus,
+		Summary:          result.Summary,
+		Deliverables:     append([]string(nil), result.Deliverables...),
+		Effective:        result.Effective,
+		ValidationErrors: append([]string(nil), result.ValidationErrors...),
+	}, nil
+}
+
+func (c *ProductionClient) ReadObservations(ctx context.Context, cursor string) ([]RawObservation, error) {
+	if c.observations == nil {
+		return nil, nil
+	}
+	return c.observations.ReadRawObservations(ctx, cursor)
+}
+
+func (c *ProductionClient) releaseByInvocation(ctx context.Context, hostRef string, invocationID kernel.InvocationID) error {
+	claim, ok, err := c.slots.ByInvocation(ctx, hostRef, invocationID)
+	if err != nil || !ok {
+		return err
+	}
+	return c.slots.Release(ctx, claim.TaskID, hostRef)
+}
+
+func validateHostPreparation(prep HostPreparation) error {
+	if strings.TrimSpace(prep.HostRef) == "" {
+		return kernel.InvalidArgument("AgentTeams host_ref is required")
+	}
+	if err := kernel.RequireID("invocation_id", prep.InvocationID); err != nil {
+		return err
+	}
+	if _, err := hostKindForRole(prep.Role); err != nil {
+		return err
+	}
+	if strings.TrimSpace(prep.RuntimeConfigRef) == "" || strings.TrimSpace(prep.EnvelopeRef) == "" {
+		return kernel.InvalidArgument("Runtime config and signed envelope references are required")
+	}
+	return nil
+}
+
+type StaticContainerResolver map[string]string
+
+func (r StaticContainerResolver) ContainerForHost(_ context.Context, hostRef string) (string, error) {
+	container := strings.TrimSpace(r[hostRef])
+	if !safeContainerName(container) {
+		return "", kernel.InvalidArgument("QwenPaw container name is invalid")
+	}
+	return container, nil
+}
+
+type DockerQwenPawProvider struct {
+	Containers   ContainerResolver
+	DockerBinary string
+	PythonBinary string
+}
+
+func (p DockerQwenPawProvider) ForHost(ctx context.Context, hostRef string) (*QwenPawAPI, error) {
+	container, err := p.Containers.ContainerForHost(ctx, hostRef)
+	if err != nil {
+		return nil, err
+	}
+	transport, err := NewDockerExecRoundTripper(container, p.DockerBinary, p.PythonBinary)
+	if err != nil {
+		return nil, err
+	}
+	return NewQwenPawAPI("http://127.0.0.1:8088", &http.Client{Transport: transport})
+}
+
+var _ Client = (*ProductionClient)(nil)
