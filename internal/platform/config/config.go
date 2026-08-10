@@ -14,6 +14,8 @@ const (
 	envObjectStoreBucket    = "THREADMILL_OBJECT_STORE_BUCKET"
 	envObjectStoreSecure    = "THREADMILL_OBJECT_STORE_SECURE"
 	envHTTPAddr             = "THREADMILL_HTTP_ADDR"
+	envProjectID            = "THREADMILL_PROJECT_ID"
+	envWebDistDir           = "THREADMILL_WEB_DIST_DIR"
 )
 
 type Config struct {
@@ -24,6 +26,8 @@ type Config struct {
 	ObjectStoreBucket    string
 	ObjectStoreSecure    bool
 	HTTPAddr             string
+	ProjectID            string
+	WebDistDir           string
 }
 
 type Environment map[string]string
@@ -64,9 +68,17 @@ func Load(env Environment) (Config, error) {
 		ObjectStoreBucket:    lookup(env, envObjectStoreBucket),
 		ObjectStoreSecure:    true,
 		HTTPAddr:             lookup(env, envHTTPAddr),
+		ProjectID:            lookup(env, envProjectID),
+		WebDistDir:           lookup(env, envWebDistDir),
 	}
 	if cfg.HTTPAddr == "" {
 		cfg.HTTPAddr = ":8080"
+	}
+	if cfg.ProjectID == "" {
+		cfg.ProjectID = "default-project"
+	}
+	if cfg.WebDistDir == "" {
+		cfg.WebDistDir = "web/dist"
 	}
 	if value := lookup(env, envObjectStoreSecure); value != "" {
 		switch strings.ToLower(strings.TrimSpace(value)) {
@@ -126,7 +138,7 @@ func Check(cfg Config) Diagnostic {
 	return Diagnostic{
 		OK:          true,
 		Code:        "ok",
-		Message:     fmt.Sprintf("configuration valid; http address %s; object store endpoint %s bucket %s secure %t", cfg.HTTPAddr, cfg.ObjectStoreEndpoint, cfg.ObjectStoreBucket, cfg.ObjectStoreSecure),
+		Message:     fmt.Sprintf("configuration valid; http address %s; project %s; web dist %s; object store endpoint %s bucket %s secure %t", cfg.HTTPAddr, cfg.ProjectID, cfg.WebDistDir, cfg.ObjectStoreEndpoint, cfg.ObjectStoreBucket, cfg.ObjectStoreSecure),
 		Recoverable: true,
 	}
 }

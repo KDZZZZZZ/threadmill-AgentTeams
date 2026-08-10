@@ -40,6 +40,12 @@ func TestLoadAppliesDefaultsWhenRequiredConfigurationExists(t *testing.T) {
 	if cfg.HTTPAddr != ":8080" {
 		t.Fatalf("HTTPAddr = %q, want :8080", cfg.HTTPAddr)
 	}
+	if cfg.ProjectID != "default-project" {
+		t.Fatalf("ProjectID = %q, want default-project", cfg.ProjectID)
+	}
+	if cfg.WebDistDir != "web/dist" {
+		t.Fatalf("WebDistDir = %q, want web/dist", cfg.WebDistDir)
+	}
 	if !cfg.ObjectStoreSecure {
 		t.Fatal("ObjectStoreSecure = false, want default true")
 	}

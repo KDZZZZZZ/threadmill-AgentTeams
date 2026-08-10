@@ -71,7 +71,11 @@ func (a *App) HTTPAddr() string {
 }
 
 func Serve(ctx context.Context, cfg config.Config) error {
-	return New(cfg).Run(ctx)
+	host, err := newProductionHost(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	return errors.Join(serveHTTP(ctx, cfg.HTTPAddr, host.Handler()), host.Close(context.Background()))
 }
 
 // ServeFake runs the local acceptance host through the same HTTP/SSE and Web
