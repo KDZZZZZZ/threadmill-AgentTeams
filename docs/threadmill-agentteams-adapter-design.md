@@ -37,6 +37,7 @@ flowchart LR
 | AgentTeams 必需能力 | 直接使用的原语 | Threadmill 基于此的改造 |
 | --- | --- | --- |
 | Agent 宿主与容量 | Manager / Worker CR、Pod 生命周期、`Running / Sleeping / Stopped`、heartbeat、ready worker 数 | Agent Runtime 把宿主视为可替换容量；Scheduler 只读取容量，不能让 controller 决定 Phase runnable；新增 Invocation 与宿主执行的关联及掉线处理。 |
+| taskflow 运输载体 | `projectflow.resolve_project / create_project / plan_dag` | `delegate_task` 在基座中要求 task 已属于 provider project。Adapter 因此为每个 AgentTeams task 幂等创建一个不透明的单任务 carrier；该 carrier 只满足 TeamHarness 前置条件，不进入 Coordination Graph，不调用 `ready_nodes` 或 `accept_task_result`，也不暴露给 Agent。 |
 | 有界执行协议 | `delegate_task / ack_task / submit_task / check_task / cancel_task` | 一次 AgentTeams task 只承载一次有界执行；Adapter 使用内部 dispatcher 身份生成只读执行说明、幂等委派并转换 observation，任何 Agent 都不获得 delegate/cancel 权限。 |
 | 模型、MCP、Skill 与策略注入 | QwenPaw agent 配置、MCP server 管理、工具列表、MCP policy、`ToolWhitelist` | 按 Invocation 注入角色工具、短期 token、目录权限和预算；Phase、Task Manager、Context Agent 使用不同 capability；停止时撤销权限。 |
 | 文件与对象运输 | `shared/tasks/{id}`、FileSync、MinIO、deliverable 路径校验、敏感内容拦截 | 任务目录只作载体；新增 Workspace Binding、基线、单写 lease、Observed Write Set、ArtifactRef、hash、ACL 与 Merge Queue。 |
@@ -50,7 +51,7 @@ flowchart LR
 Adapter 只负责：
 
 1. 选择或准备符合要求的 Manager / Worker 宿主；
-2. 将 Runtime 已批准的 Invocation 投影成 AgentTeams task、QwenPaw 配置和执行目录；
+2. 将 Runtime 已批准的 Invocation 投影成不透明的单任务 carrier、AgentTeams task、QwenPaw 配置和执行目录；
 3. 维护 Invocation 与 AgentTeams execution task 的关联；
 4. 结束、取消或回收当前执行载体；
 5. 读取未信任结果并输出原始 observation；
@@ -133,7 +134,7 @@ type AgentTeamsHostAdapter interface {
 | Threadmill 动作 | AgentTeams 行为 | 约束 |
 | --- | --- | --- |
 | 启动 Task Manager / Context Agent | 在 Manager 宿主创建有界 Invocation，注入对应工具集 | Manager 不拥有持久 Task 身份，也不能绕过 Runtime 使用宿主凭据。 |
-| `PhaseCommand.start` | Agent Runtime 调用 `Dispatch`；Adapter 执行 `delegate_task` | 一个 Endpoint + generation 只有一个幂等 Command ID；重复投递不能创建第二个有效 Invocation。 |
+| `PhaseCommand.start` | Agent Runtime 调用 `Dispatch`；Adapter 先幂等确认单任务 carrier，再执行 `delegate_task` | carrier 只是 taskflow 的运输前置，不是 Threadmill 图；一个 Endpoint + generation 只有一个幂等 Command ID，重复投递不能创建第二个有效 Invocation。 |
 | Worker `ack_task` | 产生 `execution_acked` observation | 只说明执行已开始，不能写 endpoint 状态。 |
 | `runtime.awaitInputs` | `Terminate(release_wait)`，释放模型线程和 Worker capacity | 保留同一逻辑 Invocation 与订阅；输入到达后重新物化 Context、Inputs 和 Workspace，再创建新 execution task。 |
 | `PhaseCommand.stop` | Runtime 先调用可恢复 stop 回调、固定 Workspace 和 checkpoint，再 `Terminate(recoverable_stop)` | 没有 checkpoint 时必须显式记录 `non_resumable`；不能伪装成成功停止。 |
@@ -200,7 +201,7 @@ QwenPaw 的配置 API 能证明“可以设置策略”，不能证明 Invocatio
 
 ## 10. 明确不复用
 
-- 不把 `projectflow`、`ready_nodes` 或 WorkerFlow DAG 当作 Coordination Graph；
+- 不把 `projectflow`、`ready_nodes` 或 WorkerFlow DAG 当作 Coordination Graph；仅允许 Adapter 内部使用 `resolve_project / create_project / plan_dag` 创建单任务运输 carrier，禁止把 carrier 状态投影为 runnable、satisfied、done 或 merge；
 - 不让 AgentTeams Leader 写图、接受结果或决定 Task done；
 - 不把 Matrix 房间、mention 或 message 工具当作 Agent 间通信；
 - 不把 `TaskMeta` / `ProjectMeta` 当作 Threadmill 状态存储；
