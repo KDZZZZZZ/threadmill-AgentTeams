@@ -3,6 +3,7 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -85,6 +87,8 @@ const (
 	maxWorkspaceReadBytes  = 4 << 20
 	maxWorkspaceWriteBytes = 4 << 20
 	maxCommandOutputBytes  = 4 << 20
+	maxCommandCopyBytes    = 512 << 20
+	maxCommandApplyBytes   = 32 << 20
 )
 
 // AgentTools is the invocation-scoped implementation of AgentToolPort. The
@@ -248,31 +252,29 @@ func (t *AgentTools) Run(ctx context.Context, invocationID kernel.InvocationID, 
 		if err := validateWorkspaceSymlinks(binding.Root); err != nil {
 			return err
 		}
-		commandEnv, cleanupEnv, err := newWorkspaceCommandEnvironment()
+		commandEnv, commandRoot, cleanupEnv, err := newWorkspaceCommandEnvironment()
 		if err != nil {
 			return err
 		}
 		defer cleanupEnv()
-		workDir, cleanWorkDir, err := resolveReadPath(binding, req.WorkDir, true)
+		_, cleanWorkDir, err := resolveReadPath(binding, req.WorkDir, true)
 		if err != nil {
 			return err
 		}
-		readOnlyPhase := binding.ActivePhase != PhaseExecute
-		cleanup := func() {}
-		if readOnlyPhase {
-			copyRoot, copyErr := copyWorkspaceForReadOnlyRun(binding)
-			if copyErr != nil {
-				return copyErr
-			}
-			cleanup = func() { _ = os.RemoveAll(copyRoot) }
-			workDir = filepath.Join(copyRoot, filepath.FromSlash(cleanWorkDir))
-			if normalizeExecutable(req.Command[0]) == "git" {
-				if initErr := initializeReadOnlyGitCopy(lockCtx, copyRoot, commandEnv); initErr != nil {
-					return initErr
-				}
+		copyRoot, copyErr := copyWorkspaceForCommand(binding, commandRoot)
+		if copyErr != nil {
+			return copyErr
+		}
+		if normalizeExecutable(req.Command[0]) == "git" {
+			if initErr := initializeReadOnlyGitCopy(lockCtx, copyRoot, commandEnv); initErr != nil {
+				return initErr
 			}
 		}
-		defer cleanup()
+		before, err := snapshotWorkspaceFiles(copyRoot)
+		if err != nil {
+			return err
+		}
+		workDir := filepath.Join(copyRoot, filepath.FromSlash(cleanWorkDir))
 		cmd := exec.CommandContext(lockCtx, req.Command[0], req.Command[1:]...)
 		cmd.Dir = workDir
 		cmd.Env = commandEnv
@@ -291,9 +293,13 @@ func (t *AgentTools) Run(ctx context.Context, invocationID kernel.InvocationID, 
 			}
 		}
 		updated := binding
-		if binding.ActivePhase == PhaseExecute {
-			if err := validateWorkspaceSymlinks(binding.Root); err != nil {
-				return err
+		if binding.ActivePhase == PhaseExecute && exitCode == 0 {
+			after, snapshotErr := snapshotWorkspaceFiles(copyRoot)
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			if applyErr := applySandboxChanges(binding, copyRoot, before, after); applyErr != nil {
+				return applyErr
 			}
 			var refreshErr error
 			updated, refreshErr = t.service.refreshLocked(lockCtx, binding)
@@ -431,7 +437,7 @@ func validateCommand(allowed map[string]struct{}, command []string) error {
 			return kernel.Forbidden("git global options are not allowed")
 		}
 		switch command[1] {
-		case "status", "diff", "add", "commit", "rev-parse", "ls-files", "show":
+		case "status", "diff", "rev-parse", "ls-files", "show":
 		default:
 			return kernel.Forbidden("git subcommand is not allowed in an agent workspace")
 		}
@@ -444,20 +450,13 @@ func normalizeExecutable(command string) string {
 	return strings.TrimSuffix(command, ".exe")
 }
 
-func copyWorkspaceForReadOnlyRun(binding Binding) (string, error) {
-	copyRoot, err := os.MkdirTemp("", "threadmill-workspace-run-*")
-	if err != nil {
-		return "", fmt.Errorf("create read-only phase workspace copy: %w", err)
+func copyWorkspaceForCommand(binding Binding, commandRoot string) (string, error) {
+	copyRoot := filepath.Join(commandRoot, "workspace")
+	if err := os.MkdirAll(copyRoot, 0o700); err != nil {
+		return "", fmt.Errorf("create command workspace copy: %w", err)
 	}
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.RemoveAll(copyRoot)
-		}
-	}()
-	const maxCopiedBytes int64 = 512 << 20
 	var copiedBytes int64
-	err = filepath.WalkDir(binding.Root, func(source string, entry os.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(binding.Root, func(source string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -509,8 +508,8 @@ func copyWorkspaceForReadOnlyRun(binding Binding) (string, error) {
 			return kernel.Forbidden("workspace copy contains an unsupported special file")
 		}
 		copiedBytes += info.Size()
-		if copiedBytes > maxCopiedBytes {
-			return kernel.Forbidden("workspace exceeds read-only command copy limit")
+		if copiedBytes > maxCommandCopyBytes {
+			return kernel.Forbidden("workspace exceeds command copy limit")
 		}
 		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 			return err
@@ -518,9 +517,8 @@ func copyWorkspaceForReadOnlyRun(binding Binding) (string, error) {
 		return copyRegularFile(source, destination, info.Mode().Perm())
 	})
 	if err != nil {
-		return "", fmt.Errorf("copy workspace for read-only phase command: %w", err)
+		return "", fmt.Errorf("copy workspace for command: %w", err)
 	}
-	ok = true
 	return copyRoot, nil
 }
 
@@ -567,16 +565,16 @@ func gitRunWithEnvironment(ctx context.Context, root string, env []string, args 
 	return nil
 }
 
-func newWorkspaceCommandEnvironment() ([]string, func(), error) {
+func newWorkspaceCommandEnvironment() ([]string, string, func(), error) {
 	runRoot, err := os.MkdirTemp("", "threadmill-command-env-*")
 	if err != nil {
-		return nil, nil, fmt.Errorf("create workspace command environment: %w", err)
+		return nil, "", nil, fmt.Errorf("create workspace command environment: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(runRoot) }
 	hooks := filepath.Join(runRoot, "empty-hooks")
 	if err := os.MkdirAll(hooks, 0o700); err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("create empty git hooks directory: %w", err)
+		return nil, "", nil, fmt.Errorf("create empty git hooks directory: %w", err)
 	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -605,22 +603,283 @@ func newWorkspaceCommandEnvironment() ([]string, func(), error) {
 		localAppData := filepath.Join(userProfile, "AppData", "Local")
 		if err := os.MkdirAll(appData, 0o700); err != nil {
 			cleanup()
-			return nil, nil, err
+			return nil, "", nil, err
 		}
 		if err := os.MkdirAll(localAppData, 0o700); err != nil {
 			cleanup()
-			return nil, nil, err
+			return nil, "", nil, err
 		}
 		env = append(env, "USERPROFILE="+userProfile, "APPDATA="+appData, "LOCALAPPDATA="+localAppData)
 	} else {
 		home := filepath.Join(runRoot, "home")
 		if err := os.MkdirAll(home, 0o700); err != nil {
 			cleanup()
-			return nil, nil, err
+			return nil, "", nil, err
 		}
 		env = append(env, "HOME="+home)
 	}
-	return env, cleanup, nil
+	return env, runRoot, cleanup, nil
+}
+
+type workspaceFileState struct {
+	hash [sha256.Size]byte
+	mode os.FileMode
+	size int64
+}
+
+func snapshotWorkspaceFiles(root string) (map[string]workspaceFileState, error) {
+	states := make(map[string]workspaceFileState)
+	var total int64
+	err := filepath.WalkDir(root, func(filePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, filePath)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		clean := filepath.ToSlash(relative)
+		if protectedWorkspacePath(clean) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("inspect command workspace path %q: %w", clean, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return kernel.Forbidden("command workspace contains a symbolic link")
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return kernel.Forbidden("command workspace contains an unsupported special file")
+		}
+		total += info.Size()
+		if total > maxCommandCopyBytes {
+			return kernel.Forbidden("command workspace snapshot exceeds size limit")
+		}
+		state, err := hashWorkspaceFile(filePath, info)
+		if err != nil {
+			return fmt.Errorf("snapshot command workspace file %q: %w", clean, err)
+		}
+		states[clean] = state
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return states, nil
+}
+
+func hashWorkspaceFile(filePath string, info os.FileInfo) (workspaceFileState, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return workspaceFileState{}, err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return workspaceFileState{}, err
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], hash.Sum(nil))
+	return workspaceFileState{hash: sum, mode: info.Mode().Perm(), size: info.Size()}, nil
+}
+
+type sandboxChange struct {
+	path            string
+	target          string
+	afterExists     bool
+	afterContent    []byte
+	afterMode       os.FileMode
+	originalExists  bool
+	originalContent []byte
+	originalMode    os.FileMode
+}
+
+func applySandboxChanges(binding Binding, copyRoot string, before, after map[string]workspaceFileState) error {
+	paths := make(map[string]struct{}, len(before)+len(after))
+	for filePath := range before {
+		paths[filePath] = struct{}{}
+	}
+	for filePath := range after {
+		paths[filePath] = struct{}{}
+	}
+	ordered := make([]string, 0, len(paths))
+	for filePath := range paths {
+		if beforeState, beforeOK := before[filePath]; beforeOK {
+			if afterState, afterOK := after[filePath]; afterOK && beforeState == afterState {
+				continue
+			}
+		}
+		ordered = append(ordered, filePath)
+	}
+	sort.Strings(ordered)
+
+	changes := make([]sandboxChange, 0, len(ordered))
+	var applyBytes int64
+	for _, filePath := range ordered {
+		if protectedWorkspacePath(filePath) || !phaseAllows(binding, PhaseExecute, filePath) {
+			return kernel.Forbidden("workspace command wrote outside the execute phase boundary")
+		}
+		target, err := ResolveWritePath(binding, PhaseExecute, filePath)
+		if err != nil {
+			return err
+		}
+		change := sandboxChange{path: filePath, target: target}
+		if afterState, ok := after[filePath]; ok {
+			if afterState.size > maxWorkspaceWriteBytes {
+				return kernel.Forbidden("workspace command output file exceeds write size limit")
+			}
+			content, err := os.ReadFile(filepath.Join(copyRoot, filepath.FromSlash(filePath)))
+			if err != nil {
+				return fmt.Errorf("read command workspace change %q: %w", filePath, err)
+			}
+			if sha256.Sum256(content) != afterState.hash {
+				return commandRevisionConflict(filePath)
+			}
+			change.afterExists = true
+			change.afterContent = content
+			change.afterMode = afterState.mode
+			applyBytes += int64(len(content))
+		}
+		if applyBytes > maxCommandApplyBytes {
+			return kernel.Forbidden("workspace command changes exceed apply size limit")
+		}
+
+		currentState, currentContent, currentExists, err := readWorkspaceFile(target)
+		if err != nil {
+			return fmt.Errorf("validate authoritative workspace file %q: %w", filePath, err)
+		}
+		beforeState, beforeExists := before[filePath]
+		if currentExists != beforeExists || (beforeExists && currentState != beforeState) {
+			return commandRevisionConflict(filePath)
+		}
+		if len(currentContent) > maxWorkspaceWriteBytes {
+			return kernel.Forbidden("workspace command cannot replace an oversized file")
+		}
+		change.originalExists = currentExists
+		change.originalContent = currentContent
+		change.originalMode = currentState.mode
+		changes = append(changes, change)
+	}
+
+	applied := make([]sandboxChange, 0, len(changes))
+	for _, change := range changes {
+		if err := applySandboxChange(binding.Root, change); err != nil {
+			return rollbackSandboxChanges(binding.Root, applied, err)
+		}
+		applied = append(applied, change)
+	}
+	return nil
+}
+
+func readWorkspaceFile(filePath string) (workspaceFileState, []byte, bool, error) {
+	info, err := os.Lstat(filePath)
+	if os.IsNotExist(err) {
+		return workspaceFileState{}, nil, false, nil
+	}
+	if err != nil {
+		return workspaceFileState{}, nil, false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return workspaceFileState{}, nil, false, kernel.Forbidden("authoritative workspace target is not a regular file")
+	}
+	if info.Size() > maxWorkspaceWriteBytes {
+		return workspaceFileState{mode: info.Mode().Perm(), size: info.Size()}, nil, true, nil
+	}
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return workspaceFileState{}, nil, false, err
+	}
+	return workspaceFileState{
+		hash: sha256.Sum256(content),
+		mode: info.Mode().Perm(),
+		size: info.Size(),
+	}, content, true, nil
+}
+
+func applySandboxChange(root string, change sandboxChange) error {
+	if err := ensureNoSymlinkEscape(root, change.target); err != nil {
+		return err
+	}
+	if !change.afterExists {
+		if err := os.Remove(change.target); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove workspace file %q: %w", change.path, err)
+		}
+		return nil
+	}
+	return atomicWorkspaceWrite(root, change.target, change.afterContent, change.afterMode)
+}
+
+func rollbackSandboxChanges(root string, applied []sandboxChange, cause error) error {
+	var rollbackErr error
+	for index := len(applied) - 1; index >= 0; index-- {
+		change := applied[index]
+		if change.originalExists {
+			rollbackErr = errors.Join(rollbackErr, atomicWorkspaceWrite(root, change.target, change.originalContent, change.originalMode))
+			continue
+		}
+		if err := os.Remove(change.target); err != nil && !os.IsNotExist(err) {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	if rollbackErr != nil {
+		return errors.Join(cause, fmt.Errorf("rollback workspace command changes: %w", rollbackErr))
+	}
+	return cause
+}
+
+func atomicWorkspaceWrite(root, target string, content []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("create workspace command output directory: %w", err)
+	}
+	if err := ensureNoSymlinkEscape(root, target); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(target), ".threadmill-command-*")
+	if err != nil {
+		return fmt.Errorf("create workspace command output: %w", err)
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err := temporary.Write(content); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(temporaryName, mode.Perm()); err != nil {
+		return err
+	}
+	if err := ensureNoSymlinkEscape(root, target); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryName, target); err != nil {
+		return fmt.Errorf("replace workspace command output: %w", err)
+	}
+	return nil
+}
+
+func commandRevisionConflict(filePath string) error {
+	return kernel.Error{
+		Code:        kernel.CodeRevisionConflict,
+		Message:     "workspace changed while command was running",
+		Recoverable: true,
+		Details:     map[string]string{"path": filePath},
+	}
 }
 
 func appendNonEmptyEnvironment(env []string, pairs ...string) []string {

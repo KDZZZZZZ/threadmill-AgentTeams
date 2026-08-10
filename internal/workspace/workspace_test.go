@@ -214,6 +214,31 @@ func TestCreateRollbackPreservesPreexistingDeterministicBranch(t *testing.T) {
 	}
 }
 
+func TestWorkspaceCommandEnvironmentIsMinimalAndEphemeral(t *testing.T) {
+	t.Setenv("THREADMILL_WORKSPACE_TEST_SECRET", "must-not-leak")
+	env, root, cleanup, err := newWorkspaceCommandEnvironment()
+	if err != nil {
+		t.Fatalf("create command environment: %v", err)
+	}
+	for _, item := range env {
+		if strings.HasPrefix(item, "THREADMILL_WORKSPACE_TEST_SECRET=") {
+			cleanup()
+			t.Fatal("command environment inherited an unrelated parent secret")
+		}
+	}
+	joined := strings.Join(env, "\n")
+	for _, required := range []string{"GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_KEY_0=core.hooksPath"} {
+		if !strings.Contains(joined, required) {
+			cleanup()
+			t.Fatalf("command environment missing %q: %s", required, joined)
+		}
+	}
+	cleanup()
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("command environment root survived cleanup: %v", err)
+	}
+}
+
 func assertAllowed(t *testing.T, binding Binding, phase Phase, rel string) {
 	t.Helper()
 	if _, err := ResolveWritePath(binding, phase, rel); err != nil {

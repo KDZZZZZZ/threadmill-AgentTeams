@@ -121,7 +121,7 @@ func TestPostgresWorkspaceRealLifecycleConcurrencyRestartAndAgentTools(t *testin
 	if err != nil {
 		t.Fatalf("bind execute: %v", err)
 	}
-	tools := NewAgentTools(restarted, "git", "go")
+	tools := NewAgentTools(restarted, "git", "go", "gofmt")
 	read, err := tools.Read(ctx, "inv-execute-real", PathRequest{Path: "README.md"})
 	if err != nil || strings.TrimSpace(read.Content) != "seed" {
 		t.Fatalf("read through invocation scope = %+v err %v", read, err)
@@ -141,7 +141,7 @@ func TestPostgresWorkspaceRealLifecycleConcurrencyRestartAndAgentTools(t *testin
 	if _, err := tools.Write(ctx, "inv-execute-real", WriteRequest{Path: "../outside.txt", Content: "no"}); !kernel.IsCode(err, kernel.CodeForbidden) {
 		t.Fatalf("parent traversal write error = %v, want forbidden", err)
 	}
-	write, err := tools.Write(ctx, "inv-execute-real", WriteRequest{Path: "workspace/app.go", Content: "package app\n"})
+	write, err := tools.Write(ctx, "inv-execute-real", WriteRequest{Path: "workspace/app.go", Content: "package app\n\nfunc Value( )int{return 1}\n"})
 	if err != nil || write.WorkspaceRevision == "" {
 		t.Fatalf("write through invocation scope = %+v err %v", write, err)
 	}
@@ -152,34 +152,63 @@ func TestPostgresWorkspaceRealLifecycleConcurrencyRestartAndAgentTools(t *testin
 		t.Fatalf("escaping workdir error = %v, want forbidden", err)
 	}
 	run, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "status", "--short"}})
-	if err != nil || run.ExitCode != 0 || !strings.Contains(run.Stdout, "workspace/") {
+	if err != nil || run.ExitCode != 0 {
 		t.Fatalf("real git run = %+v err %v", run, err)
+	}
+	formatted, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"gofmt", "-w", "workspace/app.go"}})
+	if err != nil || formatted.ExitCode != 0 {
+		t.Fatalf("isolated gofmt with controlled copy-back = %+v err %v", formatted, err)
+	}
+	formattedRead, err := tools.Read(ctx, "inv-execute-real", PathRequest{Path: "workspace/app.go"})
+	if err != nil || !strings.Contains(formattedRead.Content, "func Value() int") {
+		t.Fatalf("isolated command change was not copied back = %+v err %v", formattedRead, err)
 	}
 	diff, err := tools.Diff(ctx, "inv-execute-real", PathRequest{Path: "workspace"})
 	if err != nil || !strings.Contains(diff.Patch, "workspace/app.go") || len(diff.ObservedWrites.Files) != 1 {
 		t.Fatalf("real git diff = %+v err %v", diff, err)
 	}
-	secret := "workspace-secret-must-not-leak"
-	t.Setenv("THREADMILL_WORKSPACE_TEST_SECRET", secret)
-	hookPath := filepath.Join(repository, "hooks", "pre-commit")
-	writeFile(t, hookPath, "#!/bin/sh\necho $THREADMILL_WORKSPACE_TEST_SECRET >&2\necho hook-ran > workspace/hook-ran\n")
-	if err := os.Chmod(hookPath, 0o755); err != nil {
-		t.Fatalf("chmod pre-commit hook: %v", err)
+	probeRoot := t.TempDir()
+	probeLink := filepath.Join(probeRoot, "link")
+	if err := os.Symlink(".", probeLink); err == nil {
+		if err := os.Remove(probeLink); err != nil {
+			t.Fatalf("remove symlink capability probe: %v", err)
+		}
+		escapeTest := `package app
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestEphemeralSymlinkEscape(t *testing.T) {
+	if err := os.Symlink("..", "ephemeral"); err != nil {
+		t.Fatal(err)
 	}
-	git(t, binding.Root, "config", "user.name", "Threadmill Test")
-	git(t, binding.Root, "config", "user.email", "threadmill-test@invalid")
-	if added, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "add", "workspace/app.go"}}); err != nil || added.ExitCode != 0 {
-		t.Fatalf("git add with scrubbed environment = %+v err %v", added, err)
+	if err := os.WriteFile(filepath.Join("ephemeral", "escaped.txt"), []byte("escape"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	committed, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "commit", "-m", "candidate"}})
-	if err != nil || committed.ExitCode != 0 {
-		t.Fatalf("git commit with hooks disabled = %+v err %v", committed, err)
+	if err := os.Remove("ephemeral"); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(committed.Stdout, secret) || strings.Contains(committed.Stderr, secret) {
-		t.Fatalf("workspace command leaked parent environment secret: %+v", committed)
+}
+`
+		if _, err := tools.Write(ctx, "inv-execute-real", WriteRequest{Path: "workspace/escape_test.go", Content: escapeTest}); err != nil {
+			t.Fatalf("write ephemeral symlink regression fixture: %v", err)
+		}
+		if _, err := tools.Write(ctx, "inv-execute-real", WriteRequest{Path: "workspace/go.mod", Content: "module example.com/escape-test\n\ngo 1.23.3\n"}); err != nil {
+			t.Fatalf("write ephemeral symlink regression module: %v", err)
+		}
+		escapeRun, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"go", "test", ".", "-run", "TestEphemeralSymlinkEscape", "-count=1"}, WorkDir: "workspace"})
+		if !kernel.IsCode(err, kernel.CodeForbidden) {
+			t.Fatalf("ephemeral symlink escape command = %+v error = %v, want forbidden", escapeRun, err)
+		}
+		if _, statErr := os.Stat(filepath.Join(binding.Root, "escaped.txt")); !os.IsNotExist(statErr) {
+			t.Fatalf("isolated command wrote outside authoritative allowed dirs, stat err = %v", statErr)
+		}
 	}
-	if _, statErr := os.Stat(filepath.Join(binding.Root, "workspace", "hook-ran")); !os.IsNotExist(statErr) {
-		t.Fatalf("workspace command executed repository hook, stat err = %v", statErr)
+	if _, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "commit", "-m", "candidate"}}); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("agent git commit error = %v, want forbidden", err)
 	}
 
 	outside := t.TempDir()
