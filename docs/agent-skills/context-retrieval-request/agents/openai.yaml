@@ -1,0 +1,7 @@
+interface:
+  display_name: "上下文检索请求"
+  short_description: "在普通导航不足时通过 Context Agent 发起受控语义检索"
+  default_prompt: "使用 $context-retrieval-request 请求 Context Agent 检索缺失上下文。"
+
+policy:
+  allow_implicit_invocation: false

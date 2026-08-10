@@ -1,0 +1,7 @@
+interface:
+  display_name: "通用上下文维护"
+  short_description: "按照权限规则创建、更新和删除通用上下文节点、边以及通用子图"
+  default_prompt: "使用 $general-context-curation 执行本次通用上下文维护。"
+
+policy:
+  allow_implicit_invocation: false

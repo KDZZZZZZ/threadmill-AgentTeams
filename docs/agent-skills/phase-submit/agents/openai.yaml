@@ -1,0 +1,7 @@
+interface:
+  display_name: "阶段提交"
+  short_description: "提交符合当前交付规格、报告规格以及输入约束的正式阶段输出"
+  default_prompt: "使用 $phase-submit 提交当前阶段的正式输出。"
+
+policy:
+  allow_implicit_invocation: false
