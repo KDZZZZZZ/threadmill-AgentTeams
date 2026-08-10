@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"os"
 
-	"threadmill-agentteams/internal/demo"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/demo"
 )
 
 func main() {

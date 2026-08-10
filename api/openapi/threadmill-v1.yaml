@@ -1,0 +1,1305 @@
+openapi: 3.1.0
+info:
+  title: Threadmill User and UI API
+  version: 1.0.0
+  description: >
+    Threadmill v1 HTTP/JSON and SSE contract. External browser and operator
+    API for requirements, capacity, human
+    decisions, Manager conversation, UI projections, event cursor replay, SSE,
+    and health. This contract exposes only command and read-projection
+    endpoints for callers outside the service.
+servers:
+  - url: /
+security:
+  - browserSession: []
+tags:
+  - name: Requirements
+  - name: Capacity
+  - name: Decisions
+  - name: Tasks
+  - name: Coordination UI
+  - name: Manager
+  - name: Events
+  - name: Health
+
+paths:
+  /v1/requirements:
+    post:
+      tags: [Requirements]
+      summary: Register a user requirement and request Task Manager handling.
+      operationId: submitRequirement
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RequirementCreateRequest"
+      responses:
+        "202":
+          description: Requirement persisted and routed to a bounded Task Manager invocation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequirementCreateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/capacity:
+    get:
+      tags: [Capacity]
+      summary: Read project Agent Invocation capacity state.
+      operationId: getCapacity
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "200":
+          description: Current capacity projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapacityState"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /v1/capacity-adjustments:
+    post:
+      tags: [Capacity]
+      summary: Adjust desired project-level Agent Invocation concurrency.
+      operationId: adjustCapacity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CapacityAdjustmentRequest"
+      responses:
+        "202":
+          description: Capacity command accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapacityAdjustmentResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/human-decisions:
+    post:
+      tags: [Decisions]
+      summary: Record an external human decision and request Task Manager adjudication.
+      operationId: submitHumanDecision
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HumanDecisionRequest"
+      responses:
+        "202":
+          description: Decision recorded and routed to Task Manager.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanDecisionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/tasks/{task_id}:
+    get:
+      tags: [Tasks]
+      summary: Read a permission-filtered Task projection.
+      operationId: getTask
+      parameters:
+        - $ref: "#/components/parameters/TaskID"
+      responses:
+        "200":
+          description: Task, endpoint, delivery, and decision projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskProjection"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/coordination/snapshot:
+    get:
+      tags: [Coordination UI]
+      summary: Read a permission-filtered Coordination Graph UI snapshot.
+      operationId: getCoordinationSnapshot
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+        - name: revision
+          in: query
+          required: false
+          description: Graph revision to read. Omit or pass 0 for latest.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: Rebuildable UI snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CoordinationSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/CursorExpired"
+  /v1/coordination/endpoints/{task_id}/{endpoint_id}/inspector:
+    get:
+      tags: [Coordination UI]
+      summary: Read an endpoint inspector projection.
+      operationId: getEndpointInspector
+      parameters:
+        - $ref: "#/components/parameters/TaskID"
+        - $ref: "#/components/parameters/EndpointID"
+        - name: generation
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: ACL-filtered endpoint inspection view.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EndpointInspector"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/manager/messages:
+    post:
+      tags: [Manager]
+      summary: Submit a natural-language Manager message.
+      description: >
+        The message is persisted as ManagerInputRef and may include selected
+        endpoint context plus the client's observed graph revision. It cannot
+        carry arbitrary graph mutation fields.
+      operationId: submitManagerMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagerMessageRequest"
+      responses:
+        "202":
+          description: Manager input accepted and routed to Task Manager.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagerMessageResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /v1/manager/conversations/{conversation_id}:
+    get:
+      tags: [Manager]
+      summary: Read a Manager conversation projection.
+      operationId: getManagerConversation
+      parameters:
+        - $ref: "#/components/parameters/ConversationID"
+        - name: after
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventCursor"
+      responses:
+        "200":
+          description: Conversation reconstructed from structured Manager interaction events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagerConversation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/events:
+    get:
+      tags: [Events]
+      summary: Read a page of permission-filtered UI events.
+      operationId: listEvents
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+        - name: after
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventCursor"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: Event page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "410":
+          $ref: "#/components/responses/CursorExpired"
+  /v1/events/stream:
+    get:
+      tags: [Events]
+      summary: Stream permission-filtered UI events with Server-Sent Events.
+      operationId: streamEvents
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+        - name: after
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventCursor"
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventCursor"
+      responses:
+        "200":
+          description: >
+            SSE stream. Each event uses `id` as the next EventCursor, `event`
+            as UiEvent.type, and JSON `data` matching UiEvent.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                capacity:
+                  value: |
+                    id: evt_01HZX
+                    event: capacity.updated
+                    data: {"event_id":"evt_01HZX","cursor":"evt_01HZX","type":"capacity.updated","occurred_at":"2026-08-10T00:00:00Z","project_id":"proj_1","payload":{"revision":2,"desired_concurrency":4,"healthy_capacity":3,"active_invocations":2,"waiting_invocations":1}}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "410":
+          $ref: "#/components/responses/CursorExpired"
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Process liveness.
+      operationId: healthz
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Dependency readiness.
+      operationId: readyz
+      security: []
+      responses:
+        "200":
+          description: Service is ready to accept traffic.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessStatus"
+        "503":
+          description: One or more required dependencies are unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessStatus"
+
+components:
+  securitySchemes:
+    browserSession:
+      type: apiKey
+      in: cookie
+      name: threadmill_session
+      description: Same-origin HttpOnly browser session or trusted reverse-proxy identity.
+  parameters:
+    ProjectID:
+      name: project_id
+      in: query
+      required: true
+      schema:
+        $ref: "#/components/schemas/ProjectID"
+    TaskID:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/TaskID"
+    EndpointID:
+      name: endpoint_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/EndpointID"
+    ConversationID:
+      name: conversation_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ConversationID"
+  responses:
+    BadRequest:
+      description: Request body or parameter failed schema validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Authentication is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: The caller lacks project or object permission.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: The requested object is absent or not visible to the caller.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Expected revision or idempotency key conflict.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    CursorExpired:
+      description: Cursor is too old or not replayable; client must fetch a fresh snapshot.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    ProjectID:
+      type: string
+      minLength: 1
+      maxLength: 128
+    TaskID:
+      type: string
+      minLength: 1
+      maxLength: 128
+    EndpointID:
+      type: string
+      enum: [plan, execute, verify]
+    ConversationID:
+      type: string
+      minLength: 1
+      maxLength: 128
+    InvocationID:
+      type: string
+      minLength: 1
+      maxLength: 128
+    DecisionRef:
+      type: string
+      minLength: 1
+      maxLength: 128
+    ManagerInputRef:
+      type: string
+      minLength: 1
+      maxLength: 128
+    RequirementID:
+      type: string
+      minLength: 1
+      maxLength: 128
+    EventCursor:
+      type: string
+      minLength: 1
+      maxLength: 256
+      description: Stable Event Log cursor suitable for page replay and SSE resume.
+    Timestamp:
+      type: string
+      format: date-time
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unauthorized
+            - forbidden
+            - not_found
+            - revision_conflict
+            - idempotency_conflict
+            - cursor_expired
+            - command_conflict
+            - stale_command
+            - stale_checkpoint
+            - lease_conflict
+            - executor_unavailable
+            - rate_limited
+            - internal_error
+        message:
+          type: string
+        correlation_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+    RequirementCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, project_id, body]
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Idempotency key supplied by the client.
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        conversation_id:
+          $ref: "#/components/schemas/ConversationID"
+        body:
+          type: string
+          minLength: 1
+          maxLength: 50000
+        motivation:
+          type: string
+          maxLength: 20000
+        constraints:
+          type: array
+          items:
+            type: string
+            maxLength: 4000
+        acceptance:
+          type: array
+          items:
+            type: string
+            maxLength: 4000
+        source:
+          $ref: "#/components/schemas/InputSource"
+    RequirementCreateResponse:
+      type: object
+      additionalProperties: false
+      required: [requirement_id, manager_input_ref, invocation_ref, status]
+      properties:
+        requirement_id:
+          $ref: "#/components/schemas/RequirementID"
+        manager_input_ref:
+          $ref: "#/components/schemas/ManagerInputRef"
+        invocation_ref:
+          $ref: "#/components/schemas/InvocationID"
+        conversation_id:
+          $ref: "#/components/schemas/ConversationID"
+        status:
+          type: string
+          enum: [accepted]
+    InputSource:
+      type: object
+      additionalProperties: false
+      properties:
+        kind:
+          type: string
+          enum: [browser, api, import]
+        external_ref:
+          type: string
+          maxLength: 512
+    CapacityState:
+      type: object
+      additionalProperties: false
+      required:
+        - project_id
+        - revision
+        - desired_concurrency
+        - healthy_capacity
+        - active_invocations
+        - waiting_invocations
+        - updated_at
+      properties:
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        desired_concurrency:
+          type: integer
+          minimum: 0
+        healthy_capacity:
+          type: integer
+          minimum: 0
+        active_invocations:
+          type: integer
+          minimum: 0
+        waiting_invocations:
+          type: integer
+          minimum: 0
+        degraded_reason:
+          type: string
+        updated_at:
+          $ref: "#/components/schemas/Timestamp"
+    CapacityAdjustmentRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, project_id, expected_revision, desired_concurrency]
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        expected_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        desired_concurrency:
+          type: integer
+          minimum: 0
+          maximum: 10000
+    CapacityAdjustmentResponse:
+      type: object
+      additionalProperties: false
+      required: [command_ref, capacity]
+      properties:
+        command_ref:
+          type: string
+        capacity:
+          $ref: "#/components/schemas/CapacityState"
+    HumanDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, project_id, target, decision, reason]
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        target:
+          $ref: "#/components/schemas/DecisionTarget"
+        decision:
+          type: string
+          enum: [approve, reject, defer, cancel, answer]
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        expected_graph_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        evidence_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+    HumanDecisionResponse:
+      type: object
+      additionalProperties: false
+      required: [human_decision_ref, manager_input_ref, invocation_ref, status]
+      properties:
+        human_decision_ref:
+          type: string
+        manager_input_ref:
+          $ref: "#/components/schemas/ManagerInputRef"
+        invocation_ref:
+          $ref: "#/components/schemas/InvocationID"
+        status:
+          type: string
+          enum: [accepted]
+    DecisionTarget:
+      type: object
+      additionalProperties: false
+      required: [kind, ref]
+      properties:
+        kind:
+          type: string
+          enum: [task, endpoint, blocker, requirement, manager_input]
+        ref:
+          type: string
+          minLength: 1
+          maxLength: 256
+    TaskProjection:
+      type: object
+      additionalProperties: false
+      required: [task_id, project_id, status, graph_revision, endpoints, delivery_policy]
+      properties:
+        task_id:
+          $ref: "#/components/schemas/TaskID"
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        title:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, blocked, done, canceled, failed]
+        graph_revision:
+          type: integer
+          format: int64
+        contract_ref:
+          type: string
+        delivery_policy:
+          type: string
+          enum: [code_merge, non_code_artifact, human_acceptance, external_delivery]
+        endpoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/EndpointProjection"
+        blockers:
+          type: array
+          items:
+            $ref: "#/components/schemas/BlockerProjection"
+        decisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/DecisionProjection"
+        delivery:
+          $ref: "#/components/schemas/TaskDeliveryProjection"
+    EndpointProjection:
+      type: object
+      additionalProperties: false
+      required: [task_id, endpoint_id, generation, state, run_policy]
+      properties:
+        task_id:
+          $ref: "#/components/schemas/TaskID"
+        endpoint_id:
+          $ref: "#/components/schemas/EndpointID"
+        generation:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          enum: [pending, runnable, starting, running, waiting, submitted, satisfied, rejected, stopped, invalidated]
+        run_policy:
+          type: string
+          enum: [enabled, held]
+        binding_ref:
+          type: string
+        latest_invocation_ref:
+          $ref: "#/components/schemas/InvocationID"
+        delivery_spec:
+          $ref: "#/components/schemas/DeliverySpec"
+        report_spec:
+          $ref: "#/components/schemas/ReportSpec"
+    BlockerProjection:
+      type: object
+      additionalProperties: false
+      required: [blocker_id, target, state]
+      properties:
+        blocker_id:
+          type: string
+        target:
+          $ref: "#/components/schemas/EndpointRef"
+        state:
+          type: string
+          enum: [active, resolved, denied, obsolete]
+        reason:
+          type: string
+    DecisionProjection:
+      type: object
+      additionalProperties: false
+      required: [decision_ref, target, action, disposition, created_at]
+      properties:
+        decision_ref:
+          $ref: "#/components/schemas/DecisionRef"
+        target:
+          $ref: "#/components/schemas/DecisionTarget"
+        action:
+          type: string
+        disposition:
+          type: string
+          enum: [pending, applied, rejected, deferred, conflict]
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+    TaskDeliveryProjection:
+      type: object
+      additionalProperties: false
+      properties:
+        merge_state:
+          type: string
+          enum: [not_applicable, queued, checking, merged, failed]
+        delivery_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+        report_ref:
+          $ref: "#/components/schemas/ArtifactRef"
+        evidence_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+    CoordinationSnapshot:
+      type: object
+      additionalProperties: false
+      required: [project_id, revision, cursor, tasks, nodes, edges, capacity]
+      properties:
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        cursor:
+          $ref: "#/components/schemas/EventCursor"
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskSummary"
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdge"
+        capacity:
+          $ref: "#/components/schemas/CapacityState"
+    TaskSummary:
+      type: object
+      additionalProperties: false
+      required: [task_id, status]
+      properties:
+        task_id:
+          $ref: "#/components/schemas/TaskID"
+        title:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, blocked, done, canceled, failed]
+    GraphNode:
+      type: object
+      additionalProperties: false
+      required: [id, kind, label, task_id, endpoint_id, generation, state]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [task, endpoint]
+        label:
+          type: string
+        task_id:
+          $ref: "#/components/schemas/TaskID"
+        endpoint_id:
+          $ref: "#/components/schemas/EndpointID"
+        generation:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+        run_policy:
+          type: string
+          enum: [enabled, held]
+    GraphEdge:
+      type: object
+      additionalProperties: false
+      required: [id, from, to, required_by, state]
+      properties:
+        id:
+          type: string
+        from:
+          $ref: "#/components/schemas/EndpointRef"
+        to:
+          $ref: "#/components/schemas/EndpointRef"
+        required_by:
+          type: string
+          enum: [start, completion]
+        state:
+          type: string
+          enum: [pending, satisfied, failed, obsolete]
+        artifact_kinds:
+          type: array
+          items:
+            type: string
+    EndpointRef:
+      type: object
+      additionalProperties: false
+      required: [task_id, endpoint_id]
+      properties:
+        task_id:
+          $ref: "#/components/schemas/TaskID"
+        endpoint_id:
+          $ref: "#/components/schemas/EndpointID"
+    EndpointInspector:
+      type: object
+      additionalProperties: false
+      required: [endpoint, generation, graph_revision, invocation, subscriptions, context_slice, task_memory_buffer]
+      properties:
+        endpoint:
+          $ref: "#/components/schemas/EndpointRef"
+        generation:
+          type: integer
+          minimum: 1
+        graph_revision:
+          type: integer
+          format: int64
+        invocation:
+          $ref: "#/components/schemas/InvocationProjection"
+        subscriptions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubscriptionProjection"
+        context_slice:
+          $ref: "#/components/schemas/ContextSliceView"
+        task_memory_buffer:
+          $ref: "#/components/schemas/TaskMemoryBufferView"
+    InvocationProjection:
+      type: object
+      additionalProperties: false
+      required: [invocation_id, status]
+      properties:
+        invocation_id:
+          $ref: "#/components/schemas/InvocationID"
+        provider:
+          type: string
+          enum: [agentteams_qwenpaw_taskflow]
+        status:
+          type: string
+          enum: [pending, running, waiting, stopped, failed, completed]
+        started_at:
+          $ref: "#/components/schemas/Timestamp"
+        ended_at:
+          $ref: "#/components/schemas/Timestamp"
+        input_revision:
+          type: string
+        workspace_ref:
+          type: string
+        context_slice_ref:
+          type: string
+        task_memory_buffer_ref:
+          type: string
+    SubscriptionProjection:
+      type: object
+      additionalProperties: false
+      required: [subscription_id, subgraph_ids, active]
+      properties:
+        subscription_id:
+          type: string
+        subgraph_ids:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+        source:
+          type: string
+          enum: [initial_slice, search, explicit]
+    ContextSliceView:
+      type: object
+      additionalProperties: false
+      required: [context_slice_ref, revision, nodes, omitted]
+      properties:
+        context_slice_ref:
+          type: string
+        revision:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContextNodeView"
+        omitted:
+          type: array
+          items:
+            $ref: "#/components/schemas/OmittedContext"
+    ContextNodeView:
+      type: object
+      additionalProperties: false
+      required: [node_id, kind, statement, source_refs]
+      properties:
+        node_id:
+          type: string
+        kind:
+          type: string
+          enum: [directive, fact, hypothesis]
+        statement:
+          type: string
+        source_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+        subgraph_ids:
+          type: array
+          items:
+            type: string
+    OmittedContext:
+      type: object
+      additionalProperties: false
+      required: [reason, count]
+      properties:
+        reason:
+          type: string
+          enum: [forbidden, redacted, stale, budget_limited]
+        count:
+          type: integer
+          minimum: 0
+    TaskMemoryBufferView:
+      type: object
+      additionalProperties: false
+      required: [task_memory_buffer_ref, candidates]
+      properties:
+        task_memory_buffer_ref:
+          type: string
+        candidates:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskMemoryCandidateView"
+    TaskMemoryCandidateView:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, candidate]
+      properties:
+        candidate_id:
+          type: string
+        candidate:
+          $ref: "#/components/schemas/MemoryCandidate"
+    MemoryCandidate:
+      type: object
+      additionalProperties: false
+      required: [statement, kind, source_refs, subgraph_ids]
+      properties:
+        statement:
+          type: string
+        kind:
+          type: string
+          enum: [directive, fact, hypothesis]
+        source_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+        subgraph_ids:
+          type: array
+          description: Suggested general subgraphs only.
+          items:
+            type: string
+    ManagerMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [request_id, project_id, conversation_id, body]
+      properties:
+        request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        conversation_id:
+          $ref: "#/components/schemas/ConversationID"
+        body:
+          type: string
+          minLength: 1
+          maxLength: 50000
+        selected_endpoint:
+          $ref: "#/components/schemas/EndpointRef"
+        observed_graph_revision:
+          type: integer
+          format: int64
+          minimum: 0
+    ManagerMessageResponse:
+      type: object
+      additionalProperties: false
+      required: [manager_input_ref, invocation_ref, status]
+      properties:
+        manager_input_ref:
+          $ref: "#/components/schemas/ManagerInputRef"
+        invocation_ref:
+          $ref: "#/components/schemas/InvocationID"
+        conversation_id:
+          $ref: "#/components/schemas/ConversationID"
+        status:
+          type: string
+          enum: [accepted]
+    ManagerConversation:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, project_id, messages, cursor]
+      properties:
+        conversation_id:
+          $ref: "#/components/schemas/ConversationID"
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ManagerConversationEntry"
+        cursor:
+          $ref: "#/components/schemas/EventCursor"
+    ManagerConversationEntry:
+      type: object
+      additionalProperties: false
+      required: [entry_id, kind, created_at]
+      properties:
+        entry_id:
+          type: string
+        kind:
+          type: string
+          enum: [user_message, manager_reply, decision, mutation_result]
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+        manager_input_ref:
+          $ref: "#/components/schemas/ManagerInputRef"
+        decision_ref:
+          $ref: "#/components/schemas/DecisionRef"
+        graph_revision:
+          type: integer
+          format: int64
+        body:
+          type: string
+        disposition:
+          type: string
+          enum: [pending, accepted, rejected, conflict, applied, no_change]
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [events, next_cursor]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/UiEvent"
+        next_cursor:
+          $ref: "#/components/schemas/EventCursor"
+    UiEvent:
+      type: object
+      additionalProperties: false
+      required: [event_id, cursor, type, occurred_at, project_id, payload]
+      properties:
+        event_id:
+          type: string
+        cursor:
+          $ref: "#/components/schemas/EventCursor"
+        type:
+          type: string
+          enum:
+            - capacity.updated
+            - graph.revision
+            - task.updated
+            - endpoint.updated
+            - invocation.updated
+            - subscription.updated
+            - context.delta
+            - task_memory_buffer.updated
+            - manager.interaction
+        occurred_at:
+          $ref: "#/components/schemas/Timestamp"
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        task_id:
+          $ref: "#/components/schemas/TaskID"
+        endpoint_id:
+          $ref: "#/components/schemas/EndpointID"
+        payload:
+          type: object
+          additionalProperties: true
+    InputWaitResult:
+      type: object
+      additionalProperties: false
+      required: [input_revision, delivered, pending]
+      properties:
+        input_revision:
+          type: string
+        delivered:
+          type: array
+          items:
+            $ref: "#/components/schemas/InputDelivery"
+        pending:
+          type: array
+          items:
+            $ref: "#/components/schemas/PendingInput"
+        terminal_reason:
+          type: string
+          enum: [source_failed, source_cancelled, input_stale, lease_expired, deadline_exceeded]
+        join_token:
+          type: string
+          description: Runtime-issued opaque token for the current wait, never supplied by the Agent as authority.
+        deadline_at:
+          $ref: "#/components/schemas/Timestamp"
+        error_code:
+          type: string
+          enum: [input_not_declared, input_already_terminal, wait_conflict, deadline_exceeded, lease_expired]
+    InputDelivery:
+      type: object
+      additionalProperties: false
+      required: [input_id, source, phase_output_ref, artifact_refs]
+      properties:
+        input_id:
+          type: string
+        source:
+          $ref: "#/components/schemas/EndpointRef"
+        phase_output_ref:
+          type: string
+        artifact_refs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactRef"
+    PendingInput:
+      type: object
+      additionalProperties: false
+      required: [input_id, source, required_by]
+      properties:
+        input_id:
+          type: string
+        source:
+          $ref: "#/components/schemas/EndpointRef"
+        required_by:
+          type: string
+          enum: [start, completion]
+    DeliverySpec:
+      type: object
+      additionalProperties: false
+      required: [kind, required_artifact_kinds]
+      properties:
+        kind:
+          type: string
+          enum: [submitted_plan, implementation_candidate, verify_result, custom]
+        required_artifact_kinds:
+          type: array
+          items:
+            type: string
+        write_set:
+          $ref: "#/components/schemas/WriteSet"
+        acceptance:
+          type: array
+          items:
+            type: string
+    ReportSpec:
+      type: object
+      additionalProperties: false
+      required: [required_sections]
+      properties:
+        required_sections:
+          type: array
+          items:
+            type: string
+        must_include_evidence:
+          type: boolean
+          default: true
+        max_length:
+          type: integer
+          minimum: 1
+    WriteSet:
+      type: object
+      additionalProperties: false
+      required: [mode, paths]
+      properties:
+        mode:
+          type: string
+          enum: [none, read_only, declared, observed]
+        paths:
+          type: array
+          items:
+            type: string
+        allowed_dirs:
+          type: array
+          items:
+            type: string
+        denied_dirs:
+          type: array
+          items:
+            type: string
+    ArtifactRef:
+      type: object
+      additionalProperties: false
+      required: [artifact_id, sha256, media_type, size_bytes]
+      properties:
+        artifact_id:
+          type: string
+        object_key:
+          type: string
+          readOnly: true
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        media_type:
+          type: string
+        size_bytes:
+          type: integer
+          minimum: 0
+        acl:
+          type: array
+          items:
+            type: string
+        source_event_id:
+          type: string
+        source_invocation_id:
+          $ref: "#/components/schemas/InvocationID"
+    HealthStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    ReadinessStatus:
+      type: object
+      additionalProperties: false
+      required: [status, dependencies]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        dependencies:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, status]
+            properties:
+              name:
+                type: string
+                enum: [postgres, object_store, outbox, agentteams]
+              status:
+                type: string
+                enum: [ok, degraded, unavailable]
+              message:
+                type: string
