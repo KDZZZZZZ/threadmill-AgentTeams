@@ -30,8 +30,8 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 	repoB := seedRepo(t)
 	storeA := NewPostgresStore(db)
 	storeB := NewPostgresStore(db)
-	storeA.SetClaimTTL(80 * time.Millisecond)
-	storeB.SetClaimTTL(80 * time.Millisecond)
+	storeA.SetClaimTTL(2 * time.Second)
+	storeB.SetClaimTTL(2 * time.Second)
 
 	candidateA := insertMergeQueueCandidateFixture(t, ctx, db, storeA, "project-a", "task-a", "candidate-a", repoA)
 	candidateB := insertMergeQueueCandidateFixture(t, ctx, db, storeA, "project-a", "task-b", "candidate-b", repoA)
@@ -81,6 +81,12 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 		t.Fatalf("parallel repoB claims count=%d id=%s, want exactly %s", claimedCount, repoBClaim, candidateOtherRepo.ID)
 	}
 
+	storeA.SetClaimTTL(80 * time.Millisecond)
+	storeB.SetClaimTTL(80 * time.Millisecond)
+	first, err = storeA.RenewClaim(ctx, first)
+	if err != nil {
+		t.Fatalf("shorten repoA lease for expiry test: %v", err)
+	}
 	time.Sleep(120 * time.Millisecond)
 	reclaimed, claimed, err := storeB.ClaimNext(ctx, repoA)
 	if err != nil || !claimed || reclaimed.Candidate.ID != candidateA.ID {
@@ -147,6 +153,48 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 	}
 	if delivered, err := mergeAuditDelivered(ctx, db, mergeAudit(candidateA, "failed-a").StableKey); err != nil || !delivered {
 		t.Fatalf("delivered audit = %v err=%v", delivered, err)
+	}
+}
+
+func TestPostgresMergeFenceCoversIrreversibleActionPastLeaseExpiry(t *testing.T) {
+	ctx := context.Background()
+	db := openMergeQueuePostgresSchema(t, ctx)
+	repo := seedRepo(t)
+	storeA := NewPostgresStore(db)
+	storeB := NewPostgresStore(db)
+	storeA.SetClaimTTL(80 * time.Millisecond)
+	storeB.SetClaimTTL(80 * time.Millisecond)
+
+	candidate := insertMergeQueueCandidateFixture(t, ctx, db, storeA, "project-a", "task-fenced-action", "candidate-fenced-action", repo)
+	claim, claimed, err := storeA.ClaimNext(ctx, repo)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimNext = %#v claimed=%v err=%v", claim, claimed, err)
+	}
+	advanced, err := storeA.advance(ctx, claim, StatusMergeCheck, StatusTargetedVerify, nil, "")
+	if err != nil {
+		t.Fatalf("advance targeted verify: %v", err)
+	}
+	claim.Candidate = advanced
+
+	op, err := storeA.beginMergeOperation(ctx, claim, mergeOperationRequest{
+		ExpectedMainRevision:   strings.Repeat("b", 40),
+		ExpectedMergedRevision: strings.Repeat("d", 40),
+		Audit:                  mergeAudit(advanced, "merged-fenced-action"),
+	})
+	if err != nil {
+		t.Fatalf("beginMergeOperation: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if stolen, got, claimErr := storeB.ClaimNext(ctx, repo); claimErr != nil || got {
+		t.Fatalf("claim during active merge operation = %#v claimed=%v err=%v", stolen, got, claimErr)
+	}
+	outcome, err := storeA.finalizeMergeOperation(ctx, op)
+	if err != nil || outcome.Status != StatusMerged || outcome.MergedRevision != strings.Repeat("d", 40) {
+		t.Fatalf("merge outcome = %#v err=%v", outcome, err)
+	}
+	stored, err := storeB.Get(ctx, candidate.ID)
+	if err != nil || stored.Status != StatusMerged || stored.MergedRevision != strings.Repeat("d", 40) {
+		t.Fatalf("stored candidate = %#v err=%v", stored, err)
 	}
 }
 
@@ -228,6 +276,90 @@ func TestPostgresReconcilerFencePreventsExpiredOwnerFromWritingMain(t *testing.T
 	}
 	if stored.Status == StatusMerged {
 		t.Fatalf("expired owner merged candidate: %#v", stored)
+	}
+}
+
+func TestPostgresReconcilerRecoversPendingMergeOperationWithExactRevision(t *testing.T) {
+	ctx := context.Background()
+	db := openMergeQueuePostgresSchema(t, ctx)
+	repo := seedRepo(t)
+	binding := createMergeQueueGitBinding(t, repo, "task-durable-op", "workspace/fenced.txt", "durable\n")
+	insertMergeQueueWorkspaceBinding(t, ctx, db, binding)
+
+	verifyRef := evidence.ArtifactID("artifact-verify-durable-op")
+	diffRef := evidence.ArtifactID("artifact-diff-durable-op")
+	passRef := evidence.ArtifactID("artifact-pass-durable-op")
+	for _, ref := range []evidence.ArtifactID{verifyRef, diffRef, passRef} {
+		insertMergeQueueArtifact(t, ctx, db, ref, "project-a", binding.TaskID)
+	}
+
+	store := NewPostgresStore(db)
+	candidate, err := store.enqueue(ctx, EnqueueRequest{
+		ID:                "candidate-durable-op",
+		ProjectID:         "project-a",
+		TaskID:            binding.TaskID,
+		WorkspaceRef:      binding.ID,
+		VerifyResultRef:   verifyRef,
+		DiffArtifactRef:   diffRef,
+		TargetRepository:  repo,
+		TargetBranch:      "main",
+		BaseRevision:      binding.BaseRevision,
+		MainRevision:      binding.BaseRevision,
+		CandidateRevision: binding.CurrentRevision,
+		EvidenceRefs:      []evidence.ArtifactID{verifyRef, diffRef},
+	}, mergeAudit(Candidate{ID: "candidate-durable-op", ProjectID: "project-a", TaskID: binding.TaskID, WorkspaceRef: binding.ID, MainRevision: binding.BaseRevision}, "queued"))
+	if err != nil {
+		t.Fatalf("enqueue durable op candidate: %v", err)
+	}
+	claim, claimed, err := store.ClaimNext(ctx, repo)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimNext = %#v claimed=%v err=%v", claim, claimed, err)
+	}
+	advanced, err := store.advance(ctx, claim, StatusMergeCheck, StatusTargetedVerify, nil, "")
+	if err != nil {
+		t.Fatalf("advance targeted verify: %v", err)
+	}
+	claim.Candidate = advanced
+
+	backend := GitBackend{TempParent: t.TempDir()}
+	prepared, err := backend.Prepare(ctx, advanced, binding)
+	if err != nil {
+		t.Fatalf("prepare merge: %v", err)
+	}
+	defer backend.Cleanup(prepared)
+	expectedMerged, err := backend.CreateMergeCommit(ctx, prepared, advanced)
+	if err != nil {
+		t.Fatalf("create merge commit: %v", err)
+	}
+	op, err := store.beginMergeOperation(ctx, claim, mergeOperationRequest{
+		ExpectedMainRevision:   prepared.LatestMainRevision,
+		ExpectedMergedRevision: expectedMerged,
+		EvidenceRefs:           []evidence.ArtifactID{passRef},
+		Audit:                  mergeSucceededAudit(advanced, expectedMerged, prepared.LatestMainRevision, []evidence.ArtifactID{passRef}),
+	})
+	if err != nil {
+		t.Fatalf("begin merge operation: %v", err)
+	}
+	if err := backend.PushExact(ctx, prepared, op.ExpectedMergedRevision); err != nil {
+		t.Fatalf("push exact merge commit: %v", err)
+	}
+	pushChange(t, repo, "after-durable.txt", "main advanced after push\n")
+	if head := gitOut(t, repo, "rev-parse", "refs/heads/main"); head == op.ExpectedMergedRevision {
+		t.Fatalf("test setup failed: main did not advance after exact merge commit")
+	}
+
+	artifacts := evidence.NewArtifactRegistry(objectstore.NewMemoryStore(), "artifacts")
+	reconciler := NewReconciler(NewPostgresStore(db), staticWorkspaceReader{binding: binding}, &fakeVerifier{}, backend, artifacts, evidence.NewEventLog(64*1024))
+	recovered, processed, err := reconciler.ReconcileOne(ctx, repo)
+	if err != nil || !processed {
+		t.Fatalf("recover pending operation = %#v processed=%v err=%v", recovered, processed, err)
+	}
+	if recovered.ID != candidate.ID || recovered.Status != StatusMerged || recovered.MergedRevision != op.ExpectedMergedRevision {
+		t.Fatalf("recovered candidate = %#v, want exact merged revision %s", recovered, op.ExpectedMergedRevision)
+	}
+	stored, err := store.Get(ctx, candidate.ID)
+	if err != nil || stored.MergedRevision != op.ExpectedMergedRevision {
+		t.Fatalf("stored candidate = %#v err=%v", stored, err)
 	}
 }
 

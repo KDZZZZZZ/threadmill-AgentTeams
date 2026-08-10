@@ -24,14 +24,39 @@ type Reconciler struct {
 type Store interface {
 	enqueue(context.Context, EnqueueRequest, auditRecord) (Candidate, error)
 	Get(context.Context, CandidateID) (Candidate, error)
+	pendingMergeOperation(context.Context, string) (mergeOperation, bool, error)
 	ClaimNext(context.Context, string) (Claim, bool, error)
 	RenewClaim(context.Context, Claim) (Claim, error)
 	advance(context.Context, Claim, Status, Status, []evidence.ArtifactID, string) (Candidate, error)
-	commitMerged(context.Context, Claim, []evidence.ArtifactID, string, auditRecord) (Candidate, error)
+	beginMergeOperation(context.Context, Claim, mergeOperationRequest) (mergeOperation, error)
+	finalizeMergeOperation(context.Context, mergeOperation) (Candidate, error)
+	abortMergeOperation(context.Context, mergeOperation) error
+	markMergeOperationRecoveryRequired(context.Context, mergeOperation, string) (Candidate, error)
 	fail(context.Context, Claim, Status, FailureReason, []evidence.ArtifactID, auditRecord) (Candidate, error)
 	pendingAudits(context.Context, kernel.ProjectID, int) ([]auditRecord, error)
 	markAuditDelivered(context.Context, kernel.IdempotencyKey) error
 	ReleaseClaim(context.Context, Claim) error
+}
+
+type mergeOperation struct {
+	ID                     string
+	Token                  string
+	CandidateID            CandidateID
+	TargetRepository       string
+	TargetBranch           string
+	ExpectedMainRevision   string
+	ExpectedMergedRevision string
+	Status                 string
+	EvidenceRefs           []evidence.ArtifactID
+	Audit                  auditRecord
+	RecoveryReason         string
+}
+
+type mergeOperationRequest struct {
+	ExpectedMainRevision   string
+	ExpectedMergedRevision string
+	EvidenceRefs           []evidence.ArtifactID
+	Audit                  auditRecord
 }
 
 func NewReconciler(store Store, workspaces WorkspaceReader, verifier TargetedVerifier, backend GitBackend, artifacts *evidence.ArtifactRegistry, events *evidence.EventLog) *Reconciler {
@@ -68,10 +93,14 @@ func (r *Reconciler) Enqueue(ctx context.Context, req EnqueueRequest) (Candidate
 }
 
 // ReconcileOne processes at most one candidate for a target repository. The
-// store claim serializes all main writes for that repository.
+// store holds a repository fence across the irreversible Git write and the
+// durable merged transition, so an expired lease cannot create two writers.
 func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) (Candidate, bool, error) {
 	if err := r.ready(); err != nil {
 		return Candidate{}, false, err
+	}
+	if recovered, ok, err := r.recoverPendingMergeOperation(ctx, targetRepository); err != nil || ok {
+		return recovered, ok, err
 	}
 	claim, claimed, err := r.store.ClaimNext(ctx, targetRepository)
 	if err != nil || !claimed {
@@ -132,36 +161,76 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		return failed, true, failErr
 	}
 
-	claim, err = r.store.RenewClaim(ctx, claim)
+	mergedRevision, err := r.backend.CreateMergeCommit(ctx, prepared, candidate)
 	if err != nil {
-		return Candidate{}, true, err
-	}
-	candidate = claim.Candidate
-	mergedRevision, err := r.backend.Merge(ctx, prepared, candidate)
-	if err != nil {
-		reason := failureReason(err, FailureMainDrift)
+		reason := failureReason(err, FailureConflict)
 		failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, reason, err)
 		return failed, true, failErr
 	}
-	mergedRefs := dedupeEvidence(append(candidateArtifacts(candidate), verifyResult.EvidenceRefs...))
-	audit := auditRecord{
-		StableKey:    kernel.IdempotencyKey("merge-candidate:" + string(candidate.ID) + ":merged"),
-		Type:         "MergeCandidateMerged",
-		ProjectID:    candidate.ProjectID,
-		TaskID:       candidate.TaskID,
-		WorkspaceRef: candidate.WorkspaceRef,
-		Payload: map[string]string{
-			"candidate_id":    string(candidate.ID),
-			"merged_revision": mergedRevision,
-			"main_revision":   prepared.LatestMainRevision,
-		},
-		ArtifactRefs: mergedRefs,
+	op, err := r.store.beginMergeOperation(ctx, claim, mergeOperationRequest{
+		ExpectedMainRevision:   prepared.LatestMainRevision,
+		ExpectedMergedRevision: mergedRevision,
+		EvidenceRefs:           verifyResult.EvidenceRefs,
+		Audit:                  mergeSucceededAudit(candidate, mergedRevision, prepared.LatestMainRevision, verifyResult.EvidenceRefs),
+	})
+	if err != nil {
+		return Candidate{}, true, err
 	}
-	merged, err := r.store.commitMerged(ctx, claim, verifyResult.EvidenceRefs, mergedRevision, audit)
+	if err := r.backend.PushExact(ctx, prepared, op.ExpectedMergedRevision); err != nil {
+		if failureReason(err, "") == FailureMainDrift {
+			if abortErr := r.store.abortMergeOperation(ctx, op); abortErr != nil {
+				return Candidate{}, true, abortErr
+			}
+			failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, FailureMainDrift, err)
+			return failed, true, failErr
+		}
+		contained, containsErr := r.backend.ContainsRevision(ctx, op.TargetRepository, op.TargetBranch, op.ExpectedMergedRevision)
+		if containsErr != nil {
+			return Candidate{}, true, containsErr
+		}
+		if !contained {
+			blocked, markErr := r.store.markMergeOperationRecoveryRequired(ctx, op, err.Error())
+			if markErr != nil {
+				return Candidate{}, true, markErr
+			}
+			return blocked, true, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge operation requires manual recovery before new claims", Recoverable: true}
+		}
+	}
+	merged, err := r.store.finalizeMergeOperation(ctx, op)
 	if err != nil {
 		return Candidate{}, true, err
 	}
 	return merged, true, r.flushAudits(ctx, candidate.ProjectID)
+}
+
+func (r *Reconciler) recoverPendingMergeOperation(ctx context.Context, targetRepository string) (Candidate, bool, error) {
+	op, ok, err := r.store.pendingMergeOperation(ctx, targetRepository)
+	if err != nil || !ok {
+		return Candidate{}, ok, err
+	}
+	candidate, getErr := r.store.Get(ctx, op.CandidateID)
+	if getErr != nil {
+		return Candidate{}, true, getErr
+	}
+	if op.Status == "recovery_required" {
+		return candidate, true, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge operation requires manual recovery before new claims", Recoverable: true}
+	}
+	contained, err := r.backend.ContainsRevision(ctx, op.TargetRepository, op.TargetBranch, op.ExpectedMergedRevision)
+	if err != nil {
+		return candidate, true, err
+	}
+	if !contained {
+		blocked, markErr := r.store.markMergeOperationRecoveryRequired(ctx, op, "expected merge commit is not contained in target branch")
+		if markErr != nil {
+			return Candidate{}, true, markErr
+		}
+		return blocked, true, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge operation requires manual recovery before new claims", Recoverable: true}
+	}
+	merged, err := r.store.finalizeMergeOperation(ctx, op)
+	if err != nil {
+		return Candidate{}, true, err
+	}
+	return merged, true, r.flushAudits(ctx, merged.ProjectID)
 }
 
 func (r *Reconciler) fail(ctx context.Context, claim Claim, candidate Candidate, from Status, reason FailureReason, cause error, extraEvidence ...evidence.ArtifactID) (Candidate, error) {
@@ -270,4 +339,21 @@ func withinAllowed(file string, allowed []string) bool {
 func candidateArtifacts(candidate Candidate) []evidence.ArtifactID {
 	refs := []evidence.ArtifactID{candidate.VerifyResultRef, candidate.DiffArtifactRef}
 	return dedupeEvidence(append(refs, candidate.EvidenceRefs...))
+}
+
+func mergeSucceededAudit(candidate Candidate, mergedRevision, mainRevision string, refs []evidence.ArtifactID) auditRecord {
+	mergedRefs := dedupeEvidence(append(candidateArtifacts(candidate), refs...))
+	return auditRecord{
+		StableKey:    kernel.IdempotencyKey("merge-candidate:" + string(candidate.ID) + ":merged"),
+		Type:         "MergeCandidateMerged",
+		ProjectID:    candidate.ProjectID,
+		TaskID:       candidate.TaskID,
+		WorkspaceRef: candidate.WorkspaceRef,
+		Payload: map[string]string{
+			"candidate_id":    string(candidate.ID),
+			"merged_revision": mergedRevision,
+			"main_revision":   mainRevision,
+		},
+		ArtifactRefs: mergedRefs,
+	}
 }

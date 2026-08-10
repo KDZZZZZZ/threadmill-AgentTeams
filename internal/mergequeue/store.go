@@ -20,6 +20,7 @@ type MemoryStore struct {
 	mu         sync.Mutex
 	candidates map[CandidateID]Candidate
 	repoClaims map[string]Claim
+	operations map[string]mergeOperation
 	audits     map[kernel.IdempotencyKey]auditRecord
 	auditOrder []kernel.IdempotencyKey
 	now        func() time.Time
@@ -40,6 +41,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		candidates: make(map[CandidateID]Candidate),
 		repoClaims: make(map[string]Claim),
+		operations: make(map[string]mergeOperation),
 		audits:     make(map[kernel.IdempotencyKey]auditRecord),
 		now:        time.Now,
 	}
@@ -120,6 +122,9 @@ func (s *MemoryStore) ClaimNext(ctx context.Context, targetRepository string) (C
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.activeOperationLocked(targetRepository); ok {
+		return Claim{}, false, nil
+	}
 	if _, claimed := s.repoClaims[targetRepository]; claimed {
 		return Claim{}, false, nil
 	}
@@ -174,6 +179,21 @@ func (s *MemoryStore) RenewClaim(ctx context.Context, claim Claim) (Claim, error
 	return current, nil
 }
 
+func (s *MemoryStore) pendingMergeOperation(ctx context.Context, targetRepository string) (mergeOperation, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return mergeOperation{}, false, err
+	}
+	var err error
+	targetRepository, err = normalizeTargetRepository(targetRepository)
+	if err != nil {
+		return mergeOperation{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, ok := s.activeOperationLocked(targetRepository)
+	return op, ok, nil
+}
+
 func (s *MemoryStore) advance(ctx context.Context, claim Claim, from, to Status, evidenceRefs []evidence.ArtifactID, mergedRevision string) (Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return Candidate{}, err
@@ -200,43 +220,116 @@ func (s *MemoryStore) advance(ctx context.Context, claim Claim, from, to Status,
 	candidate.EvidenceRefs = dedupeEvidence(append(candidate.EvidenceRefs, evidenceRefs...))
 	candidate.MergedRevision = mergedRevision
 	candidate.UpdatedAt = s.now().UTC()
-	s.candidates[claim.Candidate.ID] = candidate
+	s.candidates[candidate.ID] = candidate
 	return cloneCandidate(candidate), nil
 }
 
-func (s *MemoryStore) commitMerged(ctx context.Context, claim Claim, evidenceRefs []evidence.ArtifactID, mergedRevision string, audit auditRecord) (Candidate, error) {
+func (s *MemoryStore) beginMergeOperation(ctx context.Context, claim Claim, req mergeOperationRequest) (mergeOperation, error) {
 	if err := ctx.Err(); err != nil {
-		return Candidate{}, err
+		return mergeOperation{}, err
 	}
-	if strings.TrimSpace(mergedRevision) == "" {
-		return Candidate{}, kernel.InvalidArgument("merged_revision is required")
+	if strings.TrimSpace(req.ExpectedMainRevision) == "" || strings.TrimSpace(req.ExpectedMergedRevision) == "" {
+		return mergeOperation{}, kernel.InvalidArgument("merge operation revisions are required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.requireClaimLocked(claim); err != nil {
-		return Candidate{}, err
+		return mergeOperation{}, err
 	}
 	candidate, ok := s.candidates[claim.Candidate.ID]
 	if !ok {
+		return mergeOperation{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
+	}
+	if candidate.Status != StatusTargetedVerify {
+		return mergeOperation{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge candidate status changed", Recoverable: true}
+	}
+	if existing, ok := s.activeOperationLocked(candidate.TargetRepository); ok {
+		if existing.CandidateID == candidate.ID && existing.ExpectedMainRevision == req.ExpectedMainRevision && existing.ExpectedMergedRevision == req.ExpectedMergedRevision {
+			return cloneMergeOperation(existing), nil
+		}
+		return mergeOperation{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "active merge operation already exists for repository", Recoverable: true}
+	}
+	op := mergeOperation{
+		ID:                     "memory:" + string(candidate.ID),
+		Token:                  newMergeQueueClaimToken(),
+		CandidateID:            candidate.ID,
+		TargetRepository:       candidate.TargetRepository,
+		TargetBranch:           candidate.TargetBranch,
+		ExpectedMainRevision:   req.ExpectedMainRevision,
+		ExpectedMergedRevision: req.ExpectedMergedRevision,
+		Status:                 "pending",
+		EvidenceRefs:           dedupeEvidence(req.EvidenceRefs),
+		Audit:                  cloneAudit(req.Audit),
+	}
+	s.operations[op.ID] = op
+	return cloneMergeOperation(op), nil
+}
+
+func (s *MemoryStore) finalizeMergeOperation(ctx context.Context, op mergeOperation) (Candidate, error) {
+	if err := ctx.Err(); err != nil {
+		return Candidate{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, err := s.requireOperationLocked(op)
+	if err != nil {
+		return Candidate{}, err
+	}
+	candidate, ok := s.candidates[stored.CandidateID]
+	if !ok {
 		return Candidate{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
 	}
-	if candidate.Status == StatusMerged && candidate.MergedRevision == mergedRevision {
-		if err := s.appendAuditLocked(audit); err != nil {
-			return Candidate{}, err
-		}
+	if candidate.Status == StatusMerged && candidate.MergedRevision == stored.ExpectedMergedRevision {
 		return cloneCandidate(candidate), nil
 	}
 	if candidate.Status != StatusTargetedVerify {
 		return Candidate{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge candidate status changed", Recoverable: true}
 	}
-	if err := s.appendAuditLocked(audit); err != nil {
+	if err := s.appendAuditLocked(stored.Audit); err != nil {
 		return Candidate{}, err
 	}
 	candidate.Status = StatusMerged
-	candidate.EvidenceRefs = dedupeEvidence(append(candidate.EvidenceRefs, evidenceRefs...))
-	candidate.MergedRevision = mergedRevision
+	candidate.EvidenceRefs = dedupeEvidence(append(candidate.EvidenceRefs, stored.EvidenceRefs...))
+	candidate.MergedRevision = stored.ExpectedMergedRevision
 	candidate.UpdatedAt = s.now().UTC()
-	s.candidates[claim.Candidate.ID] = candidate
+	s.candidates[candidate.ID] = candidate
+	stored.Status = "finalized"
+	s.operations[stored.ID] = stored
+	return cloneCandidate(candidate), nil
+}
+
+func (s *MemoryStore) abortMergeOperation(ctx context.Context, op mergeOperation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, err := s.requireOperationLocked(op)
+	if err != nil {
+		return err
+	}
+	stored.Status = "aborted"
+	s.operations[stored.ID] = stored
+	return nil
+}
+
+func (s *MemoryStore) markMergeOperationRecoveryRequired(ctx context.Context, op mergeOperation, reason string) (Candidate, error) {
+	if err := ctx.Err(); err != nil {
+		return Candidate{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stored, err := s.requireOperationLocked(op)
+	if err != nil {
+		return Candidate{}, err
+	}
+	stored.Status = "recovery_required"
+	stored.RecoveryReason = reason
+	s.operations[stored.ID] = stored
+	candidate, ok := s.candidates[stored.CandidateID]
+	if !ok {
+		return Candidate{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
+	}
 	return cloneCandidate(candidate), nil
 }
 
@@ -373,6 +466,26 @@ func (s *MemoryStore) requireClaimLocked(claim Claim) error {
 	return nil
 }
 
+func (s *MemoryStore) activeOperationLocked(targetRepository string) (mergeOperation, bool) {
+	for _, op := range s.operations {
+		if op.TargetRepository == targetRepository && (op.Status == "pending" || op.Status == "recovery_required") {
+			return cloneMergeOperation(op), true
+		}
+	}
+	return mergeOperation{}, false
+}
+
+func (s *MemoryStore) requireOperationLocked(op mergeOperation) (mergeOperation, error) {
+	stored, ok := s.operations[op.ID]
+	if !ok || stored.Token != op.Token {
+		return mergeOperation{}, kernel.LeaseConflict("merge operation is no longer current")
+	}
+	if stored.Status != "pending" && stored.Status != "recovery_required" {
+		return mergeOperation{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge operation is not active", Recoverable: true}
+	}
+	return cloneMergeOperation(stored), nil
+}
+
 func validateEnqueue(req EnqueueRequest) error {
 	if req.ID == "" || req.ProjectID == "" || req.TaskID == "" || req.WorkspaceRef == "" || req.VerifyResultRef == "" || req.DiffArtifactRef == "" || strings.TrimSpace(req.TargetRepository) == "" || strings.TrimSpace(req.BaseRevision) == "" || strings.TrimSpace(req.MainRevision) == "" || strings.TrimSpace(req.CandidateRevision) == "" {
 		return kernel.InvalidArgument("merge candidate requires identity, workspace, verify/diff refs, target, and revisions")
@@ -405,6 +518,12 @@ func validFailureReason(reason FailureReason) bool {
 func cloneCandidate(candidate Candidate) Candidate {
 	candidate.EvidenceRefs = append([]evidence.ArtifactID(nil), candidate.EvidenceRefs...)
 	return candidate
+}
+
+func cloneMergeOperation(op mergeOperation) mergeOperation {
+	op.EvidenceRefs = append([]evidence.ArtifactID(nil), op.EvidenceRefs...)
+	op.Audit = cloneAudit(op.Audit)
+	return op
 }
 
 func dedupeEvidence(refs []evidence.ArtifactID) []evidence.ArtifactID {

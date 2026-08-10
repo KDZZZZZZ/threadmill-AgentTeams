@@ -85,16 +85,9 @@ func (b GitBackend) Prepare(ctx context.Context, candidate Candidate, binding wo
 	}, nil
 }
 
-func (b GitBackend) Merge(ctx context.Context, prepared PreparedMerge, candidate Candidate) (string, error) {
-	latest, err := gitOutput(ctx, prepared.TargetRepository, "rev-parse", "refs/heads/"+prepared.TargetBranch)
-	if err != nil {
-		return "", backendFailure{reason: FailureMainDrift, err: err}
-	}
-	if latest != prepared.LatestMainRevision {
-		return "", backendFailure{reason: FailureMainDrift, err: fmt.Errorf("main advanced from %s to %s", prepared.LatestMainRevision, latest)}
-	}
+func (b GitBackend) CreateMergeCommit(ctx context.Context, prepared PreparedMerge, candidate Candidate) (string, error) {
 	if prepared.AlreadyMerged {
-		return latest, nil
+		return prepared.LatestMainRevision, nil
 	}
 	message := fmt.Sprintf("Merge Threadmill candidate %s", candidate.ID)
 	if err := gitRun(ctx, prepared.Root, "-c", "user.email=threadmill@local", "-c", "user.name=Threadmill Merge Queue", "commit", "-m", message); err != nil {
@@ -104,7 +97,66 @@ func (b GitBackend) Merge(ctx context.Context, prepared PreparedMerge, candidate
 	if err != nil {
 		return "", backendFailure{reason: FailureConflict, err: err}
 	}
-	if err := gitRun(ctx, prepared.Root, "push", "--porcelain", "origin", "HEAD:refs/heads/"+prepared.TargetBranch); err != nil {
+	return merged, nil
+}
+
+func (b GitBackend) PushExact(ctx context.Context, prepared PreparedMerge, expectedMergedRevision string) error {
+	if strings.TrimSpace(expectedMergedRevision) == "" {
+		return backendFailure{reason: FailureConflict, err: fmt.Errorf("expected merged revision is required")}
+	}
+	latest, err := gitOutput(ctx, prepared.TargetRepository, "rev-parse", "refs/heads/"+prepared.TargetBranch)
+	if err != nil {
+		return backendFailure{reason: FailureMainDrift, err: err}
+	}
+	if latest != prepared.LatestMainRevision {
+		return backendFailure{reason: FailureMainDrift, err: fmt.Errorf("main advanced from %s to %s", prepared.LatestMainRevision, latest)}
+	}
+	if prepared.AlreadyMerged && expectedMergedRevision == latest {
+		return nil
+	}
+	actual, err := gitOutput(ctx, prepared.Root, "rev-parse", "HEAD")
+	if err != nil {
+		return backendFailure{reason: FailureConflict, err: err}
+	}
+	if actual != expectedMergedRevision {
+		return backendFailure{reason: FailureConflict, err: fmt.Errorf("prepared merge commit changed from %s to %s", expectedMergedRevision, actual)}
+	}
+	if err := gitRun(ctx, prepared.Root, "push", "--porcelain", "origin", expectedMergedRevision+":refs/heads/"+prepared.TargetBranch); err != nil {
+		return backendFailure{reason: FailureMainDrift, err: err}
+	}
+	return nil
+}
+
+func (b GitBackend) ContainsRevision(ctx context.Context, targetRepository, targetBranch, revision string) (bool, error) {
+	if strings.TrimSpace(revision) == "" {
+		return false, backendFailure{reason: FailureConflict, err: fmt.Errorf("revision is required")}
+	}
+	branch := targetBranch
+	if branch == "" {
+		branch = "main"
+	}
+	if err := gitRun(ctx, targetRepository, "cat-file", "-e", revision+"^{commit}"); err != nil {
+		return false, nil
+	}
+	err := gitRun(ctx, targetRepository, "merge-base", "--is-ancestor", revision, "refs/heads/"+branch)
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(err.Error(), "exit status 1") {
+		return false, nil
+	}
+	if _, refErr := gitOutput(ctx, targetRepository, "rev-parse", "refs/heads/"+branch); refErr != nil {
+		return false, backendFailure{reason: FailureMainDrift, err: refErr}
+	}
+	return false, nil
+}
+
+func (b GitBackend) Merge(ctx context.Context, prepared PreparedMerge, candidate Candidate) (string, error) {
+	merged, err := b.CreateMergeCommit(ctx, prepared, candidate)
+	if err != nil {
+		return "", err
+	}
+	if err := b.PushExact(ctx, prepared, merged); err != nil {
 		return "", backendFailure{reason: FailureMainDrift, err: err}
 	}
 	return merged, nil
