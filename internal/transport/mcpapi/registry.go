@@ -71,6 +71,23 @@ func (r *Registry) ToolIDs() []auth.Tool {
 	return tools
 }
 
+// VisibleToolIDs returns the registered tools that the authenticated
+// invocation may actually call. It deliberately uses the same authorization
+// path as Invoke so tools/list cannot advertise a wider capability set than
+// tools/call enforces.
+func (r *Registry) VisibleToolIDs(principal auth.Principal) []auth.Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	tools := make([]auth.Tool, 0, len(r.tools))
+	for tool := range r.tools {
+		if _, err := auth.RequireTool(principal, tool, auth.Scope{}); err == nil {
+			tools = append(tools, tool)
+		}
+	}
+	sort.Slice(tools, func(i, j int) bool { return tools[i] < tools[j] })
+	return tools
+}
+
 func (r *Registry) Invoke(
 	ctx context.Context,
 	principal auth.Principal,
