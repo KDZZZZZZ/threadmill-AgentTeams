@@ -98,19 +98,21 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		WorkspaceRoot:      prepared.Root,
 		LatestMainRevision: prepared.LatestMainRevision,
 	})
+	principal := evidence.Principal{Role: evidence.RoleTaskManager, ProjectID: candidate.ProjectID, TaskID: candidate.TaskID}
+	trustedVerifyRefs := append([]evidence.ArtifactID(nil), verifyResult.EvidenceRefs...)
+	for _, ref := range trustedVerifyRefs {
+		if !r.artifacts.CanRead(principal, ref) {
+			verifyErr = kernel.Forbidden("targeted verify evidence is outside task scope")
+			trustedVerifyRefs = nil
+			break
+		}
+	}
 	if verifyErr != nil || !verifyResult.Passed || len(verifyResult.EvidenceRefs) == 0 {
 		if verifyErr == nil {
 			verifyErr = fmt.Errorf("targeted verify did not pass with evidence")
 		}
-		failed, failErr := r.fail(ctx, candidate, StatusTargetedVerify, FailureVerifyFailed, verifyErr)
+		failed, failErr := r.fail(ctx, candidate, StatusTargetedVerify, failureReason(verifyErr, FailureVerifyFailed), verifyErr, trustedVerifyRefs...)
 		return failed, true, failErr
-	}
-	principal := evidence.Principal{Role: evidence.RoleTaskManager, ProjectID: candidate.ProjectID, TaskID: candidate.TaskID}
-	for _, ref := range verifyResult.EvidenceRefs {
-		if !r.artifacts.CanRead(principal, ref) {
-			failed, failErr := r.fail(ctx, candidate, StatusTargetedVerify, FailureVerifyFailed, kernel.Forbidden("targeted verify evidence is outside task scope"))
-			return failed, true, failErr
-		}
 	}
 
 	mergedRevision, err := r.backend.Merge(ctx, prepared, candidate)
@@ -140,7 +142,7 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 	return merged, true, r.flushAudits(ctx)
 }
 
-func (r *Reconciler) fail(ctx context.Context, candidate Candidate, from Status, reason FailureReason, cause error) (Candidate, error) {
+func (r *Reconciler) fail(ctx context.Context, candidate Candidate, from Status, reason FailureReason, cause error, extraEvidence ...evidence.ArtifactID) (Candidate, error) {
 	body, err := json.Marshal(map[string]string{
 		"candidate_id": string(candidate.ID),
 		"reason":       string(reason),
@@ -160,7 +162,7 @@ func (r *Reconciler) fail(ctx context.Context, candidate Candidate, from Status,
 	if err != nil {
 		return Candidate{}, err
 	}
-	refs := []evidence.ArtifactID{artifact.ID}
+	refs := dedupeEvidence(append(append([]evidence.ArtifactID(nil), extraEvidence...), artifact.ID))
 	audit := auditRecord{
 		StableKey:    kernel.IdempotencyKey("merge-candidate:" + string(candidate.ID) + ":failed:" + string(reason)),
 		Type:         "MergeCandidateFailed",

@@ -14,10 +14,13 @@ func TestRegistryUsesSameEntryForVisibilityAndDispatch(t *testing.T) {
 	called := false
 	registry, err := NewRegistry(ToolSpec{
 		ID: auth.ToolContextExplore,
-		Handler: HandlerFunc(func(_ context.Context, scope auth.BoundScope, _ json.RawMessage) (any, error) {
+		Handler: HandlerFunc(func(_ context.Context, principal auth.Principal, scope auth.BoundScope, _ json.RawMessage) (any, error) {
 			called = true
 			if scope.TaskID != "task-a" || scope.InvocationID != "inv-a" {
 				t.Fatalf("handler received unbound scope: %#v", scope)
+			}
+			if principal.InvocationID != scope.InvocationID || principal.Role != auth.RoleExecutor {
+				t.Fatalf("handler did not receive authenticated principal: %#v", principal)
 			}
 			return "ok", nil
 		}),
@@ -45,7 +48,7 @@ func TestRegistryUsesSameEntryForVisibilityAndDispatch(t *testing.T) {
 }
 
 func TestRegistryRejectsUnknownDuplicateMissingAndUnauthorizedTools(t *testing.T) {
-	noop := HandlerFunc(func(context.Context, auth.BoundScope, json.RawMessage) (any, error) { return nil, nil })
+	noop := HandlerFunc(func(context.Context, auth.Principal, auth.BoundScope, json.RawMessage) (any, error) { return nil, nil })
 	if _, err := NewRegistry(ToolSpec{ID: "unknown.tool", Handler: noop}); err == nil {
 		t.Fatal("unknown tool registration succeeded")
 	}

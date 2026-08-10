@@ -1,8 +1,6 @@
 package contract
 
 import (
-	"context"
-	"encoding/json"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -16,14 +14,12 @@ import (
 func TestSkillToolsMatchRegistryAndRoleBoundaries(t *testing.T) {
 	t.Parallel()
 
-	noop := mcpapi.HandlerFunc(func(context.Context, auth.BoundScope, json.RawMessage) (any, error) { return nil, nil })
-	specs := make([]mcpapi.ToolSpec, 0, len(auth.CanonicalTools()))
-	for _, tool := range auth.CanonicalTools() {
-		specs = append(specs, mcpapi.ToolSpec{ID: tool, Handler: noop})
-	}
-	registry, err := mcpapi.NewRegistry(specs...)
+	registry, err := mcpapi.NewRegistry(mcpapi.AllRuntimeToolSpecs(mcpapi.RuntimeToolDependencies{})...)
 	if err != nil {
 		t.Fatalf("build canonical MCP registry: %v", err)
+	}
+	if got, want := registry.ToolIDs(), auth.CanonicalTools(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("real ToolSpec factories = %v, want exact canonical set %v", got, want)
 	}
 	catalog, err := promptcatalog.Load(filepath.Join("..", ".."), registry.AvailableTools())
 	if err != nil {

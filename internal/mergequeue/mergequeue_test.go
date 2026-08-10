@@ -71,9 +71,22 @@ func TestMergeQueueFailsWithEvidenceForPermissionConflictVerifyAndMainDrift(t *t
 		h := newHarness(t)
 		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
 		h.enqueue(t, "candidate-verify", binding)
-		h.verifier.result.Passed = false
+		failureEvidence := registerArtifact(t, h.artifacts, "project-a", "task-a", "targeted verification failure")
+		h.verifier.result = TargetedVerifyResult{Passed: false, EvidenceRefs: []evidence.ArtifactID{failureEvidence}}
 		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
 		assertFailure(t, failed, claimed, err, FailureVerifyFailed)
+		if !containsArtifact(failed.EvidenceRefs, failureEvidence) {
+			t.Fatalf("failed targeted verify dropped verifier evidence: %#v", failed.EvidenceRefs)
+		}
+	})
+
+	t.Run("targeted_verify_main_drift", func(t *testing.T) {
+		h := newHarness(t)
+		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+		h.enqueue(t, "candidate-targeted-drift", binding)
+		h.verifier.err = MainDrift("main-old", "main-new")
+		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+		assertFailure(t, failed, claimed, err, FailureMainDrift)
 	})
 
 	t.Run("main_drift", func(t *testing.T) {
@@ -143,6 +156,15 @@ func assertFailure(t *testing.T, candidate Candidate, claimed bool, err error, r
 	if candidate.Status != StatusFailed || candidate.FailureReason != reason || len(candidate.EvidenceRefs) == 0 {
 		t.Fatalf("failed candidate = %#v, want reason %s with evidence", candidate, reason)
 	}
+}
+
+func containsArtifact(refs []evidence.ArtifactID, target evidence.ArtifactID) bool {
+	for _, ref := range refs {
+		if ref == target {
+			return true
+		}
+	}
+	return false
 }
 
 type harness struct {

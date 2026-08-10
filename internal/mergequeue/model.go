@@ -5,6 +5,7 @@ package mergequeue
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
@@ -89,4 +90,14 @@ type TargetedVerifyResult struct {
 // It may produce evidence only; it cannot edit the candidate or target repo.
 type TargetedVerifier interface {
 	Verify(context.Context, TargetedVerifyRequest) (TargetedVerifyResult, error)
+}
+
+// MainDrift reports that a latest-main-bound operation observed a different
+// target revision. Keeping the concrete error private lets integration
+// adapters classify drift without exporting another persistent domain object.
+func MainDrift(expected, actual string) error {
+	return backendFailure{
+		reason: FailureMainDrift,
+		err:    fmt.Errorf("main advanced from %s to %s", expected, actual),
+	}
 }

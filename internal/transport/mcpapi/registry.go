@@ -12,13 +12,13 @@ import (
 )
 
 type Handler interface {
-	Call(context.Context, auth.BoundScope, json.RawMessage) (any, error)
+	Call(context.Context, auth.Principal, auth.BoundScope, json.RawMessage) (any, error)
 }
 
-type HandlerFunc func(context.Context, auth.BoundScope, json.RawMessage) (any, error)
+type HandlerFunc func(context.Context, auth.Principal, auth.BoundScope, json.RawMessage) (any, error)
 
-func (f HandlerFunc) Call(ctx context.Context, scope auth.BoundScope, request json.RawMessage) (any, error) {
-	return f(ctx, scope, request)
+func (f HandlerFunc) Call(ctx context.Context, principal auth.Principal, scope auth.BoundScope, request json.RawMessage) (any, error) {
+	return f(ctx, principal, scope, request)
 }
 
 type ToolSpec struct {
@@ -88,5 +88,5 @@ func (r *Registry) Invoke(
 	if handler == nil {
 		return nil, kernel.Error{Code: kernel.CodeForbidden, Message: "tool is not registered in this runtime"}
 	}
-	return handler.Call(ctx, scope, payload)
+	return handler.Call(ctx, principal, scope, payload)
 }
