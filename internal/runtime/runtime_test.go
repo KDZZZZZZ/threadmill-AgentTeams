@@ -81,8 +81,22 @@ func TestMemoryInvocationStoreIsIdempotentAndTransitionsClosedStateMachine(t *te
 	if err := store.Transition(context.Background(), invocation.ID, InvocationPrepared, InvocationRunning); err != nil {
 		t.Fatal(err)
 	}
+	byLease, ok, err := store.GetByLease(context.Background(), invocation.LeaseID)
+	if err != nil || !ok {
+		t.Fatalf("get by lease = %#v %v, %v; want invocation", byLease, ok, err)
+	}
+	if byLease.ID != invocation.ID || byLease.Status != InvocationRunning {
+		t.Fatalf("get by lease returned %#v, want running invocation", byLease)
+	}
 	if err := store.Create(context.Background(), invocation); err != nil {
 		t.Fatalf("create replay after status transition failed: %v", err)
+	}
+	if err := store.Transition(context.Background(), invocation.ID, InvocationRunning, InvocationStopped); err != nil {
+		t.Fatal(err)
+	}
+	stopped, ok, err := store.GetByLease(context.Background(), invocation.LeaseID)
+	if err != nil || !ok || stopped.Status != InvocationStopped {
+		t.Fatalf("get stopped by lease = %#v %v, %v; want stopped invocation", stopped, ok, err)
 	}
 	if err := store.Transition(context.Background(), invocation.ID, InvocationPrepared, InvocationCompleted); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
 		t.Fatalf("illegal transition = %v, want invalid_request", err)

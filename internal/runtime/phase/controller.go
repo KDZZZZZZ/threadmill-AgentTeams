@@ -173,11 +173,17 @@ type Host interface {
 	Rehydrate(context.Context, DispatchRequest) error
 	Suspend(context.Context, kernel.InvocationID) error
 	Stop(context.Context, StopRequest) (StopResult, error)
+	// Revoke is keyed by invocation ID and must be idempotent across recovery
+	// retries after stop evidence has already been persisted.
 	Revoke(context.Context, kernel.InvocationID) error
 }
 
 type RecoveryStore interface {
-	RecordStopEvidence(context.Context, ActiveInvocation, StopResult) error
+	RecordActiveInvocation(context.Context, ActiveInvocation) error
+	RecoverActiveInvocation(context.Context, PhaseCommand, BindingSnapshot) (ActiveInvocation, bool, error)
+	RecordStopEvidence(context.Context, ActiveInvocation, PhaseCommand, StopResult) error
+	GetStopEvidence(context.Context, kernel.InvocationID, string) (StopResult, bool, error)
+	ClearActiveInvocation(context.Context, kernel.InvocationID) error
 	ValidateResume(context.Context, PhaseCommand, BindingSnapshot) error
 }
 
@@ -189,6 +195,7 @@ type Config struct {
 	ArtifactRouter  ArtifactRouter
 	Host            Host
 	RecoveryStore   RecoveryStore
+	Lifecycle       baseruntime.InvocationLifecycle
 	Now             func() time.Time
 	InvocationTTL   time.Duration
 }
@@ -201,6 +208,7 @@ type Controller struct {
 	artifacts ArtifactRouter
 	host      Host
 	recovery  RecoveryStore
+	lifecycle baseruntime.InvocationLifecycle
 	now       func() time.Time
 	ttl       time.Duration
 
@@ -230,6 +238,10 @@ func NewController(cfg Config) *Controller {
 	if ttl <= 0 {
 		ttl = defaultInvocationTTL
 	}
+	lifecycle := cfg.Lifecycle
+	if lifecycle == nil {
+		lifecycle = baseruntime.NoopInvocationLifecycle{}
+	}
 	c := &Controller{
 		store:     cfg.InvocationStore,
 		assembler: cfg.Assembler,
@@ -238,6 +250,7 @@ func NewController(cfg Config) *Controller {
 		artifacts: cfg.ArtifactRouter,
 		host:      cfg.Host,
 		recovery:  cfg.RecoveryStore,
+		lifecycle: lifecycle,
 		now:       now,
 		ttl:       ttl,
 		commands:  make(map[string]commandRecord),
@@ -353,8 +366,16 @@ func (c *Controller) SubmitPhaseOutput(ctx context.Context, invocationID kernel.
 	if err := c.host.Revoke(ctx, invocationID); err != nil {
 		return OutputReceipt{}, err
 	}
-	if err := c.store.Transition(ctx, invocationID, baseruntime.InvocationRunning, baseruntime.InvocationCompleted); err != nil {
+	if err := c.lifecycle.End(ctx, active.Invocation); err != nil {
 		return OutputReceipt{}, err
+	}
+	if err := c.transitionToCompleted(ctx, invocationID); err != nil {
+		return OutputReceipt{}, err
+	}
+	if c.recovery != nil {
+		if err := c.recovery.ClearActiveInvocation(ctx, invocationID); err != nil {
+			return OutputReceipt{}, err
+		}
 	}
 	c.mu.Lock()
 	c.receipts[invocationID] = receipt
@@ -520,6 +541,17 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 	if err := c.store.Create(ctx, invocation); err != nil {
 		return err
 	}
+	active := ActiveInvocation{
+		Invocation: invocation,
+		Command:    command,
+		Binding:    cloneBindingSnapshot(binding),
+		Inputs:     clonePhaseInputSet(binding.Inputs),
+	}
+	if c.recovery != nil {
+		if err := c.recovery.RecordActiveInvocation(ctx, active); err != nil {
+			return err
+		}
+	}
 	dispatch := DispatchRequest{
 		Invocation:    invocation,
 		Capability:    invocation.Capability(),
@@ -529,6 +561,9 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 		CheckpointRef: binding.CheckpointRef,
 	}
 	if err := c.host.Dispatch(ctx, dispatch); err != nil {
+		if c.recovery != nil {
+			_ = c.recovery.ClearActiveInvocation(ctx, invocation.ID)
+		}
 		_ = c.host.Revoke(ctx, invocation.ID)
 		return err
 	}
@@ -536,11 +571,12 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 		_ = c.host.Revoke(ctx, invocation.ID)
 		return err
 	}
-	active := ActiveInvocation{
-		Invocation: invocation,
-		Command:    command,
-		Binding:    cloneBindingSnapshot(binding),
-		Inputs:     clonePhaseInputSet(binding.Inputs),
+	active.Invocation.Status = baseruntime.InvocationRunning
+	if c.recovery != nil {
+		if err := c.recovery.RecordActiveInvocation(ctx, active); err != nil {
+			_ = c.host.Revoke(ctx, invocation.ID)
+			return err
+		}
 	}
 	c.mu.Lock()
 	c.active[invocation.ID] = active
@@ -559,10 +595,41 @@ func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error 
 	}
 	active, err := c.activeByLease(command.LeaseRef)
 	if err != nil {
-		return err
+		recovered, ok, recoverErr := c.recoverActiveByLease(ctx, command, binding)
+		if recoverErr != nil {
+			return recoverErr
+		}
+		if !ok {
+			if stopped, stopErr := c.stopAlreadyApplied(ctx, command); stopErr != nil {
+				return stopErr
+			} else if stopped {
+				return nil
+			}
+			return err
+		}
+		active = recovered
 	}
 	if active.Command.BindingRef != command.BindingRef || active.Command.Generation != command.Generation {
 		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "stop command does not match active invocation", Recoverable: true}
+	}
+	if active.Invocation.Status == baseruntime.InvocationStopped {
+		if c.recovery != nil {
+			if err := c.recovery.ClearActiveInvocation(ctx, active.Invocation.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if c.recovery == nil {
+		return kernel.IncompleteStopEvidence("stop evidence store is required")
+	}
+	if existing, ok, err := c.recovery.GetStopEvidence(ctx, active.Invocation.ID, command.ID); err != nil {
+		return err
+	} else if ok {
+		if err := validateStopResult(existing); err != nil {
+			return err
+		}
+		return c.finishPersistedStop(ctx, active)
 	}
 	result, err := c.host.Stop(ctx, StopRequest{Invocation: active.Invocation, Command: command, Binding: binding})
 	if err != nil {
@@ -571,24 +638,122 @@ func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error 
 	if err := validateStopResult(result); err != nil {
 		return err
 	}
-	if c.recovery == nil {
-		return kernel.IncompleteStopEvidence("stop evidence store is required")
-	}
-	if err := c.recovery.RecordStopEvidence(ctx, active, result); err != nil {
+	if err := c.recovery.RecordStopEvidence(ctx, active, command, result); err != nil {
 		return err
 	}
+	return c.finishPersistedStop(ctx, active)
+}
+
+func (c *Controller) finishPersistedStop(ctx context.Context, active ActiveInvocation) error {
 	if err := c.host.Revoke(ctx, active.Invocation.ID); err != nil {
 		return err
+	}
+	if err := c.lifecycle.End(ctx, active.Invocation); err != nil {
+		return err
+	}
+	if err := c.transitionToStopped(ctx, active.Invocation.ID); err != nil {
+		return err
+	}
+	if c.recovery != nil {
+		if err := c.recovery.ClearActiveInvocation(ctx, active.Invocation.ID); err != nil {
+			return err
+		}
 	}
 	c.mu.Lock()
 	active.Revoked = true
 	delete(c.active, active.Invocation.ID)
-	delete(c.byLease, command.LeaseRef)
+	delete(c.byLease, active.Command.LeaseRef)
 	c.mu.Unlock()
-	if err := c.store.Transition(ctx, active.Invocation.ID, baseruntime.InvocationRunning, baseruntime.InvocationStopped); err != nil && !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+	return nil
+}
+
+func (c *Controller) recoverActiveByLease(ctx context.Context, command PhaseCommand, binding BindingSnapshot) (ActiveInvocation, bool, error) {
+	if c.recovery == nil {
+		return ActiveInvocation{}, false, nil
+	}
+	active, ok, err := c.recovery.RecoverActiveInvocation(ctx, command, binding)
+	if err != nil || !ok {
+		return ActiveInvocation{}, ok, err
+	}
+	if err := validateBindingForActive(binding, active); err != nil {
+		return ActiveInvocation{}, false, err
+	}
+	invocation, ok, err := c.store.Get(ctx, active.Invocation.ID)
+	if err != nil {
+		return ActiveInvocation{}, false, err
+	}
+	if !ok {
+		return ActiveInvocation{}, false, kernel.Error{Code: kernel.CodeNotFound, Message: "invocation not found"}
+	}
+	active.Invocation = invocation
+	switch invocation.Status {
+	case baseruntime.InvocationCompleted, baseruntime.InvocationFailed:
+		if err := c.recovery.ClearActiveInvocation(ctx, invocation.ID); err != nil {
+			return ActiveInvocation{}, false, err
+		}
+		return ActiveInvocation{}, false, nil
+	case baseruntime.InvocationStopped:
+		if err := c.recovery.ClearActiveInvocation(ctx, invocation.ID); err != nil {
+			return ActiveInvocation{}, false, err
+		}
+		return active, true, nil
+	}
+	c.mu.Lock()
+	c.active[active.Invocation.ID] = active
+	c.byLease[command.LeaseRef] = active.Invocation.ID
+	c.mu.Unlock()
+	return active, true, nil
+}
+
+func (c *Controller) stopAlreadyApplied(ctx context.Context, command PhaseCommand) (bool, error) {
+	invocation, ok, err := c.store.GetByLease(ctx, command.LeaseRef)
+	if err != nil {
+		return false, err
+	}
+	if !ok || invocation.BindingRef != command.BindingRef || invocation.Generation != uint64(command.Generation) {
+		return false, nil
+	}
+	return invocation.Status == baseruntime.InvocationStopped, nil
+}
+
+func (c *Controller) transitionToCompleted(ctx context.Context, invocationID kernel.InvocationID) error {
+	invocation, ok, err := c.store.Get(ctx, invocationID)
+	if err != nil {
 		return err
 	}
-	return nil
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "invocation not found"}
+	}
+	switch invocation.Status {
+	case baseruntime.InvocationRunning:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationRunning, baseruntime.InvocationCompleted)
+	case baseruntime.InvocationCompleted:
+		return nil
+	default:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation is not running or completed", Recoverable: true}
+	}
+}
+
+func (c *Controller) transitionToStopped(ctx context.Context, invocationID kernel.InvocationID) error {
+	invocation, ok, err := c.store.Get(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "invocation not found"}
+	}
+	switch invocation.Status {
+	case baseruntime.InvocationPrepared:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationPrepared, baseruntime.InvocationStopped)
+	case baseruntime.InvocationRunning:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationRunning, baseruntime.InvocationStopped)
+	case baseruntime.InvocationWaiting:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationWaiting, baseruntime.InvocationStopped)
+	case baseruntime.InvocationStopped:
+		return nil
+	default:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation is not running or waiting", Recoverable: true}
+	}
 }
 
 func (c *Controller) rehydrate(ctx context.Context, active ActiveInvocation) error {

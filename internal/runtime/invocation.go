@@ -133,7 +133,21 @@ func (i Invocation) Capability() auth.Capability {
 type InvocationStore interface {
 	Create(context.Context, Invocation) error
 	Get(context.Context, kernel.InvocationID) (Invocation, bool, error)
+	GetByLease(context.Context, kernel.LeaseID) (Invocation, bool, error)
 	Transition(context.Context, kernel.InvocationID, InvocationStatus, InvocationStatus) error
+}
+
+type InvocationLifecycle interface {
+	// End is keyed by invocation ID and must be idempotent. Implementations
+	// terminate tokens, model sessions, task handles, and subscriptions exactly
+	// once even when recovery retries call End again after persisted evidence.
+	End(context.Context, Invocation) error
+}
+
+type NoopInvocationLifecycle struct{}
+
+func (NoopInvocationLifecycle) End(context.Context, Invocation) error {
+	return nil
 }
 
 type MemoryInvocationStore struct {
@@ -181,6 +195,20 @@ func (s *MemoryInvocationStore) Get(ctx context.Context, id kernel.InvocationID)
 	defer s.mu.RUnlock()
 	invocation, ok := s.invocations[id]
 	return cloneInvocation(invocation), ok, nil
+}
+
+func (s *MemoryInvocationStore) GetByLease(ctx context.Context, lease kernel.LeaseID) (Invocation, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Invocation{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, invocation := range s.invocations {
+		if invocation.LeaseID == lease {
+			return cloneInvocation(invocation), true, nil
+		}
+	}
+	return Invocation{}, false, nil
 }
 
 func (s *MemoryInvocationStore) Transition(ctx context.Context, id kernel.InvocationID, from, to InvocationStatus) error {

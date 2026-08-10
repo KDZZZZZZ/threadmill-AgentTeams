@@ -125,6 +125,40 @@ func TestApplyStartRejectsStaleBindingLeaseAndDispatchFailureLeavesNoActiveSessi
 	}
 }
 
+func TestStopAfterDispatchCrashBeforeRunningTransitionRecoversActiveInvocation(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.host.dispatchReturnBlock = make(chan struct{})
+	first := harness.controller()
+	start := validCommand("cmd-start-dispatch-crash", coordination.CommandStart, "binding-1", "lease-1", 1)
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- first.Apply(ctx, start)
+	}()
+	for len(harness.host.dispatches) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+
+	rebuilt := harness.controller()
+	stop := validCommand("cmd-stop-after-dispatch-crash", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("rebuilt stop after dispatch crash: %v", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("stop calls = %d, want 1", got)
+	}
+	stopped, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || stopped.Status != baseruntime.InvocationStopped {
+		t.Fatalf("stopped invocation = %#v %v, %v; want stopped", stopped, ok, err)
+	}
+
+	close(harness.host.dispatchReturnBlock)
+	if err := <-startErr; !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("original start after recovered stop = %v, want revision_conflict", err)
+	}
+}
+
 func TestControllerFailClosesMismatchedResolverSnapshots(t *testing.T) {
 	ctx := context.Background()
 	harness := newHarness(t)
@@ -340,6 +374,92 @@ func TestSubmitPhaseOutputCompletedTransitionFailureUsesPendingReceiptOnRetry(t 
 	}
 }
 
+func TestSubmitPhaseOutputEndsInvocationLifecycle(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	cmd := validCommand("cmd-output-lifecycle", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err != nil {
+		t.Fatalf("submit output: %v", err)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 1 {
+		t.Fatalf("lifecycle end calls = %d, want 1", got)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("completed invocation kept active recovery obligation")
+	}
+}
+
+func TestSubmitPhaseOutputClearActiveFailureCanRetryCompletedCleanup(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.recovery.clearErrOnce = errors.New("recovery cleanup unavailable")
+	controller := harness.controller()
+	cmd := validCommand("cmd-output-clear-retry", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err == nil {
+		t.Fatal("submit unexpectedly succeeded with clear failure")
+	}
+	completed, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || completed.Status != baseruntime.InvocationCompleted {
+		t.Fatalf("invocation after clear failure = %#v %v, %v; want completed", completed, ok, err)
+	}
+	routed := harness.artifacts.next
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err != nil {
+		t.Fatalf("retry submit after clear failure: %v", err)
+	}
+	if harness.artifacts.next != routed {
+		t.Fatalf("retry rerouted artifacts: got counter %d, want %d", harness.artifacts.next, routed)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("retry left completed active recovery obligation")
+	}
+}
+
+func TestStopWithStaleCompletedRecoveryObligationDoesNotCallHostStop(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	cmd := validCommand("cmd-output-clears-stale", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	staleActive := harness.recovery.active[invocationID]
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err != nil {
+		t.Fatalf("submit output: %v", err)
+	}
+	harness.recovery.active[invocationID] = staleActive
+
+	rebuilt := harness.controller()
+	stop := validCommand("cmd-stop-stale-completed", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := rebuilt.Apply(ctx, stop); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("stop with completed stale obligation = %v, want stale_command", err)
+	}
+	if got := len(harness.host.stops); got != 0 {
+		t.Fatalf("host stop calls = %d, want 0", got)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("completed stale obligation was not cleared")
+	}
+}
+
 func TestSubmitPhaseOutputRejectsIncompleteCompletionDeliveryMetadata(t *testing.T) {
 	ctx := context.Background()
 	harness := newHarness(t)
@@ -414,6 +534,9 @@ func TestStopAndResumeInvalidateOldInvocationAndCreateFreshRuntime(t *testing.T)
 	if !harness.host.revoked[oldInvocation] {
 		t.Fatalf("old invocation %s was not revoked", oldInvocation)
 	}
+	if got := harness.lifecycle.endCalls[oldInvocation]; got != 1 {
+		t.Fatalf("old invocation lifecycle end calls = %d, want 1", got)
+	}
 	if got := len(harness.host.stops); got != 1 {
 		t.Fatalf("stop calls = %d, want 1", got)
 	}
@@ -450,6 +573,199 @@ func TestStopAndResumeInvalidateOldInvocationAndCreateFreshRuntime(t *testing.T)
 	newDispatch := harness.host.dispatches[1]
 	if newDispatch.Invocation.ID == oldInvocation || newDispatch.CheckpointRef != "checkpoint-1" || newDispatch.Invocation.Generation != 2 {
 		t.Fatalf("resume did not create fresh checkpoint-bound invocation: %#v", newDispatch)
+	}
+	if newDispatch.Invocation.LeaseID == start.LeaseRef || newDispatch.Invocation.Generation == 1 {
+		t.Fatalf("resume reused old lease or generation: %#v", newDispatch.Invocation)
+	}
+}
+
+func TestStopAfterControllerRebuildRecoversActiveInvocationAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	first := harness.controller()
+	if err := first.Apply(ctx, validCommand("cmd-start-rebuild", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+
+	rebuilt := harness.controller()
+	stop := validCommand("cmd-stop-rebuild", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("rebuilt stop: %v", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("stop calls after rebuilt stop = %d, want 1", got)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 1 {
+		t.Fatalf("lifecycle end calls after rebuilt stop = %d, want 1", got)
+	}
+
+	again := harness.controller()
+	if err := again.Apply(ctx, stop); err != nil {
+		t.Fatalf("duplicate stop after rebuild: %v", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("duplicate stop called host again: %d, want 1", got)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 1 {
+		t.Fatalf("duplicate stop ended lifecycle again: %d, want 1", got)
+	}
+}
+
+func TestStopEvidenceFailureKeepsRecoveryObligation(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	if err := controller.Apply(ctx, validCommand("cmd-start-evidence-retry", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	harness.recovery.recordErrOnce = errors.New("event log unavailable")
+	stop := validCommand("cmd-stop-evidence-retry", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, stop); err == nil {
+		t.Fatal("stop unexpectedly succeeded with evidence failure")
+	}
+	if harness.host.revoked[invocationID] {
+		t.Fatal("evidence failure revoked invocation before recovery obligation was persisted")
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 0 {
+		t.Fatalf("evidence failure ended lifecycle = %d, want 0", got)
+	}
+
+	rebuilt := harness.controller()
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("retry stop after evidence failure: %v", err)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 1 {
+		t.Fatalf("lifecycle end calls after retry = %d, want 1", got)
+	}
+}
+
+func TestStopTransitionFailureKeepsRecoveryObligation(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.store.failTransitions = append(harness.store.failTransitions, transitionFailure{
+		from: baseruntime.InvocationRunning,
+		to:   baseruntime.InvocationStopped,
+		err:  kernel.Error{Code: kernel.CodeRevisionConflict, Message: "transient terminal transition conflict", Recoverable: true},
+	})
+	controller := harness.controller()
+	if err := controller.Apply(ctx, validCommand("cmd-start-transition-retry", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	stop := validCommand("cmd-stop-transition-retry", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, stop); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("stop with transition failure = %v, want revision_conflict", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("first stop host calls = %d, want 1", got)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 1 {
+		t.Fatalf("first stop lifecycle end calls = %d, want 1", got)
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("transition failure removed persistent active recovery obligation")
+	}
+	rebuilt := harness.controller()
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("retry stop after transition failure: %v", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("retry called host stop again: %d, want 1", got)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 2 {
+		t.Fatalf("retry lifecycle end attempts = %d, want 2 idempotent attempts", got)
+	}
+	if !harness.host.revoked[invocationID] || !harness.lifecycle.ended[invocationID] {
+		t.Fatal("retry did not leave invocation mechanically revoked and ended")
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("successful retry kept persistent active recovery obligation")
+	}
+}
+
+func TestStopRevokeFailureAfterEvidenceRetriesMechanicalEndAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.host.revokeErrOnce = errors.New("token revocation unavailable")
+	controller := harness.controller()
+	if err := controller.Apply(ctx, validCommand("cmd-start-revoke-retry", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	stop := validCommand("cmd-stop-revoke-retry", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, stop); err == nil {
+		t.Fatal("stop unexpectedly succeeded with revoke failure")
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("host stop calls after revoke failure = %d, want 1", got)
+	}
+	if harness.host.revoked[invocationID] || harness.lifecycle.ended[invocationID] {
+		t.Fatal("failed revoke should not mark invocation revoked or ended")
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("revoke failure removed active recovery obligation")
+	}
+
+	rebuilt := harness.controller()
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("retry stop after revoke failure: %v", err)
+	}
+	stopped, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || stopped.Status != baseruntime.InvocationStopped {
+		t.Fatalf("invocation after revoke retry = %#v %v, %v; want stopped", stopped, ok, err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("retry called host stop again: %d, want 1", got)
+	}
+	if !harness.host.revoked[invocationID] || !harness.lifecycle.ended[invocationID] {
+		t.Fatal("retry did not complete idempotent revoke/end")
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("retry kept active recovery obligation")
+	}
+}
+
+func TestStopLifecycleEndFailureAfterEvidenceRetriesMechanicalEndAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.lifecycle.errOnce = errors.New("session termination unavailable")
+	controller := harness.controller()
+	if err := controller.Apply(ctx, validCommand("cmd-start-end-retry", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	stop := validCommand("cmd-stop-end-retry", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, stop); err == nil {
+		t.Fatal("stop unexpectedly succeeded with lifecycle end failure")
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("host stop calls after end failure = %d, want 1", got)
+	}
+	if !harness.host.revoked[invocationID] || harness.lifecycle.ended[invocationID] {
+		t.Fatal("end failure should leave revoked true and ended false")
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("end failure removed active recovery obligation")
+	}
+
+	rebuilt := harness.controller()
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("retry stop after lifecycle end failure: %v", err)
+	}
+	stopped, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || stopped.Status != baseruntime.InvocationStopped {
+		t.Fatalf("invocation after end retry = %#v %v, %v; want stopped", stopped, ok, err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("retry called host stop again: %d, want 1", got)
+	}
+	if !harness.host.revoked[invocationID] || !harness.lifecycle.ended[invocationID] {
+		t.Fatal("retry did not complete idempotent revoke/end")
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("retry kept active recovery obligation")
 	}
 }
 
@@ -497,6 +813,7 @@ type testHarness struct {
 	artifacts *fakeArtifactRouter
 	host      *fakeHost
 	recovery  *fakeRecoveryStore
+	lifecycle *fakeLifecycle
 }
 
 func newHarness(t *testing.T) *testHarness {
@@ -543,7 +860,8 @@ func newHarness(t *testing.T) *testHarness {
 		}},
 		artifacts: &fakeArtifactRouter{},
 		host:      newFakeHost(),
-		recovery:  &fakeRecoveryStore{},
+		recovery:  newFakeRecoveryStore(),
+		lifecycle: &fakeLifecycle{endCalls: map[kernel.InvocationID]int{}, ended: map[kernel.InvocationID]bool{}},
 	}
 }
 
@@ -556,6 +874,7 @@ func (h *testHarness) controller() *Controller {
 		ArtifactRouter:  h.artifacts,
 		Host:            h.host,
 		RecoveryStore:   h.recovery,
+		Lifecycle:       h.lifecycle,
 		Now:             func() time.Time { return time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC) },
 	})
 }
@@ -643,6 +962,10 @@ func (s *fakeInvocationStore) Get(ctx context.Context, id kernel.InvocationID) (
 	return s.base.Get(ctx, id)
 }
 
+func (s *fakeInvocationStore) GetByLease(ctx context.Context, lease kernel.LeaseID) (baseruntime.Invocation, bool, error) {
+	return s.base.GetByLease(ctx, lease)
+}
+
 func (s *fakeInvocationStore) Transition(ctx context.Context, id kernel.InvocationID, from, to baseruntime.InvocationStatus) error {
 	for i, failure := range s.failTransitions {
 		if failure.from == from && failure.to == to {
@@ -708,17 +1031,20 @@ func (r *fakeArtifactRouter) Route(_ context.Context, _ ActiveInvocation, ref st
 }
 
 type fakeHost struct {
-	dispatchErr    error
-	revokeErr      error
-	dispatchBlock  chan struct{}
-	dispatches     []DispatchRequest
-	rehydrates     []DispatchRequest
-	stops          []StopRequest
-	stopResult     StopResult
-	activeSessions map[kernel.InvocationID]bool
-	suspended      map[kernel.InvocationID]bool
-	suspendCalls   map[kernel.InvocationID]int
-	revoked        map[kernel.InvocationID]bool
+	dispatchErr         error
+	revokeErr           error
+	revokeErrOnce       error
+	dispatchBlock       chan struct{}
+	dispatchReturnBlock chan struct{}
+	dispatches          []DispatchRequest
+	rehydrates          []DispatchRequest
+	stops               []StopRequest
+	stopResult          StopResult
+	activeSessions      map[kernel.InvocationID]bool
+	suspended           map[kernel.InvocationID]bool
+	suspendCalls        map[kernel.InvocationID]int
+	revoked             map[kernel.InvocationID]bool
+	revokeCalls         map[kernel.InvocationID]int
 }
 
 func newFakeHost() *fakeHost {
@@ -728,6 +1054,7 @@ func newFakeHost() *fakeHost {
 		suspended:      map[kernel.InvocationID]bool{},
 		suspendCalls:   map[kernel.InvocationID]int{},
 		revoked:        map[kernel.InvocationID]bool{},
+		revokeCalls:    map[kernel.InvocationID]int{},
 	}
 }
 
@@ -740,6 +1067,9 @@ func (h *fakeHost) Dispatch(_ context.Context, req DispatchRequest) error {
 	}
 	h.dispatches = append(h.dispatches, req)
 	h.activeSessions[req.Invocation.ID] = true
+	if h.dispatchReturnBlock != nil {
+		<-h.dispatchReturnBlock
+	}
 	return nil
 }
 
@@ -762,6 +1092,12 @@ func (h *fakeHost) Stop(_ context.Context, req StopRequest) (StopResult, error) 
 }
 
 func (h *fakeHost) Revoke(_ context.Context, invocationID kernel.InvocationID) error {
+	h.revokeCalls[invocationID]++
+	if h.revokeErrOnce != nil {
+		err := h.revokeErrOnce
+		h.revokeErrOnce = nil
+		return err
+	}
 	if h.revokeErr != nil {
 		return h.revokeErr
 	}
@@ -770,12 +1106,77 @@ func (h *fakeHost) Revoke(_ context.Context, invocationID kernel.InvocationID) e
 	return nil
 }
 
-type fakeRecoveryStore struct {
-	stops []StopResult
+type fakeLifecycle struct {
+	endCalls map[kernel.InvocationID]int
+	ended    map[kernel.InvocationID]bool
+	errOnce  error
 }
 
-func (s *fakeRecoveryStore) RecordStopEvidence(_ context.Context, _ ActiveInvocation, result StopResult) error {
-	s.stops = append(s.stops, result)
+func (l *fakeLifecycle) End(_ context.Context, invocation baseruntime.Invocation) error {
+	l.endCalls[invocation.ID]++
+	if l.errOnce != nil {
+		err := l.errOnce
+		l.errOnce = nil
+		return err
+	}
+	l.ended[invocation.ID] = true
+	return nil
+}
+
+type fakeRecoveryStore struct {
+	active        map[kernel.InvocationID]ActiveInvocation
+	stops         map[string]StopResult
+	recordErrOnce error
+	clearErrOnce  error
+}
+
+func newFakeRecoveryStore() *fakeRecoveryStore {
+	return &fakeRecoveryStore{
+		active: map[kernel.InvocationID]ActiveInvocation{},
+		stops:  map[string]StopResult{},
+	}
+}
+
+func (s *fakeRecoveryStore) RecordActiveInvocation(_ context.Context, active ActiveInvocation) error {
+	s.active[active.Invocation.ID] = cloneActiveInvocation(active)
+	return nil
+}
+
+func (s *fakeRecoveryStore) RecoverActiveInvocation(_ context.Context, command PhaseCommand, _ BindingSnapshot) (ActiveInvocation, bool, error) {
+	for _, active := range s.active {
+		if active.Command.LeaseRef == command.LeaseRef {
+			return cloneActiveInvocation(active), true, nil
+		}
+	}
+	return ActiveInvocation{}, false, nil
+}
+
+func (s *fakeRecoveryStore) RecordStopEvidence(_ context.Context, active ActiveInvocation, command PhaseCommand, result StopResult) error {
+	if s.recordErrOnce != nil {
+		err := s.recordErrOnce
+		s.recordErrOnce = nil
+		return err
+	}
+	key := stopEvidenceKey(active.Invocation.ID, command.ID)
+	if _, ok := s.stops[key]; ok {
+		return nil
+	}
+	s.stops[key] = result
+	return nil
+}
+
+func (s *fakeRecoveryStore) GetStopEvidence(_ context.Context, invocationID kernel.InvocationID, commandID string) (StopResult, bool, error) {
+	result, ok := s.stops[stopEvidenceKey(invocationID, commandID)]
+	return result, ok, nil
+}
+
+func (s *fakeRecoveryStore) ClearActiveInvocation(_ context.Context, invocationID kernel.InvocationID) error {
+	if s.clearErrOnce != nil {
+		err := s.clearErrOnce
+		s.clearErrOnce = nil
+		return err
+	}
+	delete(s.active, invocationID)
 	return nil
 }
 
@@ -789,4 +1190,8 @@ func (s *fakeRecoveryStore) ValidateResume(_ context.Context, _ PhaseCommand, bi
 func containsTool(tools map[auth.Tool]struct{}, target auth.Tool) bool {
 	_, ok := tools[target]
 	return ok
+}
+
+func stopEvidenceKey(invocationID kernel.InvocationID, commandID string) string {
+	return string(invocationID) + "/" + commandID
 }

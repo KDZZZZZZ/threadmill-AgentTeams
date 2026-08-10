@@ -35,35 +35,25 @@ type BudgetPolicy struct {
 	ExplorationLevel    ExplorationLevel `json:"exploration_level"`
 }
 
-type BudgetStatus struct {
-	TokensUsed           int
-	CostUSD              float64
-	WallTimeMS           int
-	AgentInvocationsUsed int
-	RetriesUsed          int
-}
+type BudgetStatus = coordination.RuntimeBudgetStatus
 
-type Candidate struct {
-	Endpoint                 coordination.PhaseEndpoint
-	Runnable                 bool
-	CapacityCost             int
-	CapabilityMatched        bool
-	LatestMainMergeCandidate bool
-	UnblocksDependents       bool
-	WriteConflictRisk        int
-	Exploratory              bool
-}
+type Candidate = coordination.RuntimeCandidate
 
-type Capacity struct {
-	Desired  int `json:"desired"`
-	Healthy  int `json:"healthy"`
-	Active   int `json:"active"`
-	Revision int `json:"revision"`
-}
+type Capacity = coordination.RuntimeCapacity
 
 type CapacityLedger struct {
 	mu       sync.Mutex
 	capacity Capacity
+}
+
+type BudgetLedger struct {
+	mu     sync.Mutex
+	budget BudgetStatus
+}
+
+type SchedulingStateProvider struct {
+	capacity *CapacityLedger
+	budget   *BudgetLedger
 }
 
 func NewCapacityLedger(healthy, desired int) *CapacityLedger {
@@ -72,9 +62,6 @@ func NewCapacityLedger(healthy, desired int) *CapacityLedger {
 	}
 	if desired < 0 {
 		desired = 0
-	}
-	if desired > healthy {
-		desired = healthy
 	}
 	return &CapacityLedger{capacity: Capacity{Desired: desired, Healthy: healthy, Revision: 1}}
 }
@@ -91,8 +78,8 @@ func (l *CapacityLedger) SetDesired(_ context.Context, expectedRevision int, des
 	if expectedRevision != l.capacity.Revision {
 		return l.capacity, kernel.RevisionConflict(kernel.Revision(expectedRevision), kernel.Revision(l.capacity.Revision))
 	}
-	if desired < 0 || desired > l.capacity.Healthy {
-		return l.capacity, kernel.InvalidArgument("desired concurrency must be between zero and healthy capacity")
+	if desired < 0 {
+		return l.capacity, kernel.InvalidArgument("desired concurrency must be zero or greater")
 	}
 	l.capacity.Desired = desired
 	l.capacity.Revision++
@@ -109,11 +96,46 @@ func (l *CapacityLedger) Observe(_ context.Context, healthy, active int) (Capaci
 	}
 	l.capacity.Healthy = healthy
 	l.capacity.Active = active
-	if l.capacity.Desired > healthy {
-		l.capacity.Desired = healthy
-	}
 	l.capacity.Revision++
 	return l.capacity, nil
+}
+
+func NewBudgetLedger(initial BudgetStatus) *BudgetLedger {
+	return &BudgetLedger{budget: initial}
+}
+
+func (l *BudgetLedger) Snapshot() BudgetStatus {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.budget
+}
+
+func (l *BudgetLedger) Observe(_ context.Context, budget BudgetStatus) (BudgetStatus, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if budget.TokensUsed < 0 || budget.CostUSD < 0 || budget.WallTimeMS < 0 || budget.AgentInvocationsUsed < 0 || budget.RetriesUsed < 0 {
+		return l.budget, kernel.InvalidArgument("budget usage cannot be negative")
+	}
+	l.budget = budget
+	return l.budget, nil
+}
+
+func NewSchedulingStateProvider(capacity *CapacityLedger, budget *BudgetLedger) *SchedulingStateProvider {
+	return &SchedulingStateProvider{capacity: capacity, budget: budget}
+}
+
+func (p *SchedulingStateProvider) RuntimeSchedulingState(ctx context.Context) (coordination.RuntimeSchedulingState, error) {
+	if err := ctx.Err(); err != nil {
+		return coordination.RuntimeSchedulingState{}, err
+	}
+	state := coordination.RuntimeSchedulingState{}
+	if p != nil && p.capacity != nil {
+		state.Capacity = p.capacity.Snapshot()
+	}
+	if p != nil && p.budget != nil {
+		state.Budget = p.budget.Snapshot()
+	}
+	return state, nil
 }
 
 type Scheduler struct {
@@ -124,8 +146,12 @@ func New(policy BudgetPolicy) Scheduler {
 	return Scheduler{policy: policy}
 }
 
+func (s Scheduler) SelectRunnable(_ context.Context, request coordination.RuntimeSelectionRequest) ([]coordination.PhaseEndpoint, error) {
+	return s.Select(request.Candidates, request.Capacity, request.Budget), nil
+}
+
 func (s Scheduler) Select(candidates []Candidate, capacity Capacity, budget BudgetStatus) []coordination.PhaseEndpoint {
-	available := capacity.Desired - capacity.Active
+	available := capacity.Available()
 	if available <= 0 {
 		return nil
 	}

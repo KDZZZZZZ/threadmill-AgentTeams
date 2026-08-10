@@ -10,6 +10,8 @@ import (
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/app/fakehost"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/config"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
 )
 
 type Component interface {
@@ -17,8 +19,9 @@ type Component interface {
 }
 
 type App struct {
-	config     config.Config
-	components []Component
+	config        config.Config
+	components    []Component
+	migrationFunc func(context.Context, config.Config) error
 }
 
 type Option func(*App)
@@ -37,6 +40,12 @@ func WithComponent(component Component) Option {
 	}
 }
 
+func WithMigrationRunner(runner func(context.Context, config.Config) error) Option {
+	return func(a *App) {
+		a.migrationFunc = runner
+	}
+}
+
 func (a *App) Run(ctx context.Context) error {
 	<-ctx.Done()
 	return a.Shutdown(context.Background())
@@ -50,8 +59,11 @@ func (a *App) Shutdown(ctx context.Context) error {
 	return err
 }
 
-func (a *App) Migrate(context.Context) error {
-	return nil
+func (a *App) Migrate(ctx context.Context) error {
+	if a.migrationFunc != nil {
+		return a.migrationFunc(ctx, a.config)
+	}
+	return runMigrations(ctx, a.config)
 }
 
 func (a *App) HTTPAddr() string {
@@ -113,4 +125,21 @@ func Migrate(ctx context.Context, cfg config.Config) error {
 		return fmt.Errorf("database url is required")
 	}
 	return New(cfg).Migrate(ctx)
+}
+
+func runMigrations(ctx context.Context, cfg config.Config) error {
+	db, err := postgres.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close(context.Background())
+
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		return fmt.Errorf("load migrations: %w", err)
+	}
+	if err := postgres.NewMigrator(db.SQL()).Apply(ctx, loaded); err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+	return nil
 }

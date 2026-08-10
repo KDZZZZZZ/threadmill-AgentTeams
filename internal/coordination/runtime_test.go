@@ -430,7 +430,7 @@ func TestGraphRuntimeRepairsOrphanLeaseAndQuarantinesOrphanRunCommand(t *testing
 
 	controller := &recordingController{}
 	runtime := newGraphRuntime(projectID, store, controller)
-	runtime.capacity = func(runtimeView) int { return 0 }
+	runtime.schedulingStateProvider = fixedSchedulingStateProvider{state: RuntimeSchedulingState{Capacity: RuntimeCapacity{Desired: 0, Healthy: 0}}}
 	if err := runtime.reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}

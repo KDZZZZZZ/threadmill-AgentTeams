@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
-	"strings"
 	"sync"
 )
 
@@ -74,6 +72,9 @@ func (s *MemoryStore) Put(ctx context.Context, obj PutObject) (PutResult, error)
 	if obj.Bucket == "" {
 		return PutResult{}, errors.New("bucket is required")
 	}
+	if err := validateBucket(obj.Bucket); err != nil {
+		return PutResult{}, err
+	}
 	if obj.Body == nil {
 		return PutResult{}, errors.New("body is required")
 	}
@@ -96,7 +97,10 @@ func (s *MemoryStore) Put(ctx context.Context, obj PutObject) (PutResult, error)
 	if key == "" {
 		key = hash
 	}
-	key = strings.TrimPrefix(path.Clean("/"+key), "/")
+	key, err = cleanKey(key)
+	if err != nil {
+		return PutResult{}, err
+	}
 	ref := ObjectRef{Bucket: obj.Bucket, Key: key}
 	stored := memoryObject{
 		ref:         ref,

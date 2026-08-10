@@ -9,20 +9,20 @@ import (
 )
 
 type graphRuntime struct {
-	projectID       kernel.ProjectID
-	store           *MemoryStore
-	phaseController PhaseController
-	capacity        func(runtimeView) int
+	projectID               kernel.ProjectID
+	store                   *MemoryStore
+	phaseController         PhaseController
+	selectionRuntime        RuntimeSelectionRuntime
+	schedulingStateProvider RuntimeSchedulingStateProvider
 }
 
 func newGraphRuntime(projectID kernel.ProjectID, store *MemoryStore, controller PhaseController) *graphRuntime {
 	return &graphRuntime{
-		projectID:       projectID,
-		store:           store,
-		phaseController: controller,
-		capacity: func(view runtimeView) int {
-			return len(view.endpoints)
-		},
+		projectID:               projectID,
+		store:                   store,
+		phaseController:         controller,
+		selectionRuntime:        fixedCapacitySelectionRuntime{},
+		schedulingStateProvider: fixedSchedulingStateProvider{state: RuntimeSchedulingState{Capacity: RuntimeCapacity{Desired: 1, Healthy: 1}}},
 	}
 }
 
@@ -36,6 +36,10 @@ func (r *graphRuntime) reconcile(ctx context.Context) error {
 		return err
 	}
 	if err := r.repairDecisionPairs(ctx, &view); err != nil {
+		return err
+	}
+	schedulingState, err := r.schedulingState(ctx, view)
+	if err != nil {
 		return err
 	}
 
@@ -61,24 +65,55 @@ func (r *graphRuntime) reconcile(ctx context.Context) error {
 		deliver = append(deliver, cmd)
 	}
 
-	for _, endpoint := range selectRuntimeEndpoints(r.graphRunnable(view), r.capacity(view)) {
-		cmd, claimed, err := r.claimRun(ctx, view, endpoint)
+	candidates := runtimeCandidates(r.graphRunnable(view))
+	for len(candidates) > 0 {
+		selected, err := r.selectionRuntime.SelectRunnable(ctx, RuntimeSelectionRequest{
+			Candidates: candidates,
+			Capacity:   schedulingState.Capacity,
+			Budget:     schedulingState.Budget,
+		})
 		if err != nil {
-			if kernel.IsCode(err, kernel.CodeStaleCheckpoint) {
-				r.store.recordEndpointDispatchRejection(ctx, r.projectID, endpoint.Ref, endpoint.Generation, endpoint.BindingRef, err)
-				continue
-			}
 			return err
 		}
-		if claimed {
-			deliver = append(deliver, cmd)
+		if len(selected) == 0 {
+			break
 		}
+		selectedRefs := make(map[PhaseEndpointRef]struct{}, len(selected))
+		claimedAny := false
+		for _, endpoint := range selected {
+			selectedRefs[endpoint.Ref] = struct{}{}
+			cmd, claimed, err := r.claimRun(ctx, view, endpoint)
+			if err != nil {
+				if kernel.IsCode(err, kernel.CodeStaleCheckpoint) {
+					r.store.recordEndpointDispatchRejection(ctx, r.projectID, endpoint.Ref, endpoint.Generation, endpoint.BindingRef, err)
+					continue
+				}
+				return err
+			}
+			if claimed {
+				claimedAny = true
+				deliver = append(deliver, cmd)
+			}
+		}
+		if claimedAny {
+			break
+		}
+		candidates = removeSelectedCandidates(candidates, selectedRefs)
 	}
 
 	for _, cmd := range uniqueByCommandID(deliver) {
 		r.deliver(ctx, cmd)
 	}
 	return nil
+}
+
+func (r *graphRuntime) schedulingState(ctx context.Context, view runtimeView) (RuntimeSchedulingState, error) {
+	state, err := r.schedulingStateProvider.RuntimeSchedulingState(ctx)
+	if err != nil {
+		return RuntimeSchedulingState{}, err
+	}
+	state.Capacity.Active = len(view.activeLeases())
+	return state, nil
 }
 
 func (r *graphRuntime) foldObservations(ctx context.Context, view runtimeView) (runtimeView, error) {
@@ -218,6 +253,40 @@ func selectRuntimeEndpoints(candidates []PhaseEndpoint, capacity int) []PhaseEnd
 		return append([]PhaseEndpoint(nil), candidates...)
 	}
 	return append([]PhaseEndpoint(nil), candidates[:capacity]...)
+}
+
+func runtimeCandidates(endpoints []PhaseEndpoint) []RuntimeCandidate {
+	candidates := make([]RuntimeCandidate, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		candidates = append(candidates, RuntimeCandidate{
+			Endpoint:          endpoint,
+			Runnable:          true,
+			CapacityCost:      1,
+			CapabilityMatched: true,
+		})
+	}
+	return candidates
+}
+
+func runtimeCandidateEndpoints(candidates []RuntimeCandidate) []PhaseEndpoint {
+	endpoints := make([]PhaseEndpoint, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Runnable {
+			endpoints = append(endpoints, candidate.Endpoint)
+		}
+	}
+	return endpoints
+}
+
+func removeSelectedCandidates(candidates []RuntimeCandidate, selected map[PhaseEndpointRef]struct{}) []RuntimeCandidate {
+	remaining := candidates[:0]
+	for _, candidate := range candidates {
+		if _, ok := selected[candidate.Endpoint.Ref]; ok {
+			continue
+		}
+		remaining = append(remaining, candidate)
+	}
+	return remaining
 }
 
 func uniqueByCommandID(commands []PhaseCommand) []PhaseCommand {

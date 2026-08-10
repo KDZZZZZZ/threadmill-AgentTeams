@@ -8,6 +8,9 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
 
+var _ coordination.RuntimeSelectionRuntime = Scheduler{}
+var _ coordination.RuntimeSchedulingStateProvider = (*SchedulingStateProvider)(nil)
+
 func TestSchedulerSelectsRunnableCapacityBudgetAndProtectsVerify(t *testing.T) {
 	s := New(BudgetPolicy{MaxAgentInvocations: 1, VerifyLevel: VerifyStrict})
 	selected := s.Select([]Candidate{
@@ -40,6 +43,73 @@ func TestCapacityLedgerCASAndDecreaseDoesNotCancelActive(t *testing.T) {
 	_, err = ledger.SetDesired(context.Background(), current.Revision, 2)
 	if !kernel.IsCode(err, kernel.CodeRevisionConflict) {
 		t.Fatalf("stale CAS err = %v, want revision_conflict", err)
+	}
+}
+
+func TestCapacityLedgerKeepsDesiredSeparateFromHealthy(t *testing.T) {
+	ledger := NewCapacityLedger(2, 5)
+	current := ledger.Snapshot()
+	var err error
+	if current.Desired != 5 || current.Healthy != 2 {
+		t.Fatalf("initial capacity = %#v, want desired=5 healthy=2", current)
+	}
+	current, err = ledger.SetDesired(context.Background(), current.Revision, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Desired != 7 || current.Healthy != 2 {
+		t.Fatalf("capacity after desired increase = %#v, want desired=7 healthy=2", current)
+	}
+	current, err = ledger.Observe(context.Background(), 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Desired != 7 || current.Healthy != 1 || current.Active != 1 {
+		t.Fatalf("observed capacity = %#v, want desired=7 healthy=1 active=1", current)
+	}
+}
+
+func TestSchedulerAvailabilityUsesDesiredHealthyMinAndAllowsDrain(t *testing.T) {
+	s := New(BudgetPolicy{})
+	candidates := []Candidate{
+		{Endpoint: endpoint("task-a", coordination.EndpointPlan), Runnable: true, CapabilityMatched: true},
+		{Endpoint: endpoint("task-b", coordination.EndpointPlan), Runnable: true, CapabilityMatched: true},
+		{Endpoint: endpoint("task-c", coordination.EndpointPlan), Runnable: true, CapabilityMatched: true},
+	}
+	selected := s.Select(candidates, Capacity{Desired: 5, Healthy: 2, Active: 1}, BudgetStatus{})
+	if len(selected) != 1 {
+		t.Fatalf("selected = %#v, want one available slot from min(desired, healthy)-active", selected)
+	}
+	selected = s.Select(candidates, Capacity{Desired: 1, Healthy: 5, Active: 3}, BudgetStatus{})
+	if len(selected) != 0 {
+		t.Fatalf("selected = %#v, want drain with active above desired", selected)
+	}
+}
+
+func TestSchedulingStateProviderReadsCapacityAndBudgetDynamically(t *testing.T) {
+	capacity := NewCapacityLedger(1, 3)
+	budget := NewBudgetLedger(BudgetStatus{})
+	provider := NewSchedulingStateProvider(capacity, budget)
+
+	state, err := provider.RuntimeSchedulingState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Capacity.Desired != 3 || state.Capacity.Healthy != 1 || state.Budget.AgentInvocationsUsed != 0 {
+		t.Fatalf("initial scheduling state = %#v", state)
+	}
+	if _, err := capacity.Observe(context.Background(), 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := budget.Observe(context.Background(), BudgetStatus{AgentInvocationsUsed: 2}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = provider.RuntimeSchedulingState(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Capacity.Desired != 3 || state.Capacity.Healthy != 2 || state.Capacity.Active != 1 || state.Budget.AgentInvocationsUsed != 2 {
+		t.Fatalf("updated scheduling state = %#v", state)
 	}
 }
 
