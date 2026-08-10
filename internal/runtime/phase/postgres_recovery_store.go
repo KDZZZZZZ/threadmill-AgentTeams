@@ -212,23 +212,34 @@ WHERE stop_result IS NOT NULL`)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	var matchingRunCommandIDs []string
 	for rows.Next() {
 		var runCommandID string
 		var payload []byte
 		if err := rows.Scan(&runCommandID, &payload); err != nil {
+			_ = rows.Close()
 			return err
 		}
 		var result StopResult
 		if err := json.Unmarshal(payload, &result); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		if result.NonResumable {
-			continue
+		if !result.NonResumable && result.CheckpointRef == binding.CheckpointRef {
+			matchingRunCommandIDs = append(matchingRunCommandIDs, runCommandID)
 		}
-		if result.CheckpointRef != binding.CheckpointRef {
-			continue
-		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	// Close the recovery scan before consulting InvocationStore. Production
+	// deployments may intentionally use a single SQL connection, so holding
+	// rows open here would otherwise deadlock the nested lookup.
+	for _, runCommandID := range matchingRunCommandIDs {
 		stoppedInvocation, ok, err := s.invocations.Get(ctx, deterministicInvocationID(PhaseCommand{ID: runCommandID}))
 		if err != nil {
 			return err
@@ -239,9 +250,6 @@ WHERE stop_result IS NOT NULL`)
 		if resumeScopeMatches(stoppedInvocation, command, binding) {
 			return nil
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 	return kernel.Error{Code: kernel.CodeStaleCheckpoint, Message: "resume checkpoint has no persisted stop evidence", Recoverable: true}
 }

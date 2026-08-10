@@ -38,7 +38,11 @@ func TestPostgresRuntimeStoresAgainstRealDatabase(t *testing.T) {
 	if err := db.PingContext(ctx); err != nil {
 		t.Fatalf("ping postgres: %v", err)
 	}
-	schema := "threadmill_runtime_it_" + strings.NewReplacer("/", "_", "-", "_").Replace(strings.ToLower(t.Name()))
+	schema := fmt.Sprintf(
+		"threadmill_runtime_it_%d_%s",
+		time.Now().UnixNano(),
+		strings.NewReplacer("/", "_", "-", "_").Replace(strings.ToLower(t.Name())),
+	)
 	if _, err := db.ExecContext(ctx, `CREATE SCHEMA `+quoteIdent(schema)); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
@@ -132,6 +136,30 @@ func TestPostgresRuntimeStoresAgainstRealDatabase(t *testing.T) {
 	resumeBinding.CheckpointRef = "checkpoint-missing"
 	if err := rebuiltRecovery.ValidateResume(ctx, resume, resumeBinding); !kernel.IsCode(err, kernel.CodeStaleCheckpoint) {
 		t.Fatalf("resume mismatch = %v, want stale_checkpoint", err)
+	}
+	otherStart := validCommand("cmd-real-other-start", coordination.CommandStart, "binding-real-other-1", "lease-real-other-1", 1)
+	otherBinding := realPostgresBinding("binding-real-other-1", "lease-real-other-1", 1)
+	otherBinding.ProjectID = "project-other"
+	otherInvocation := realPostgresInvocation(otherStart, otherBinding)
+	if err := invocations.Create(ctx, otherInvocation); err != nil {
+		t.Fatalf("create other-project invocation: %v", err)
+	}
+	otherActive := ActiveInvocation{Invocation: otherInvocation, Command: otherStart, Binding: otherBinding, Inputs: otherBinding.Inputs}
+	if err := rebuiltRecovery.RecordActiveInvocation(ctx, otherActive); err != nil {
+		t.Fatalf("record other-project active: %v", err)
+	}
+	otherStop := validCommand("cmd-real-other-stop", coordination.CommandStop, "binding-real-other-1", "lease-real-other-1", 1)
+	crossProjectCheckpoint := "checkpoint-cross-project"
+	if err := rebuiltRecovery.RecordStopEvidence(ctx, otherActive, otherStop, StopResult{
+		ResumeStateRef:    "resume-other",
+		CheckpointRef:     crossProjectCheckpoint,
+		WorkspaceRevision: "main-other-stop",
+	}); err != nil {
+		t.Fatalf("record other-project stop evidence: %v", err)
+	}
+	resumeBinding.CheckpointRef = crossProjectCheckpoint
+	if err := rebuiltRecovery.ValidateResume(ctx, resume, resumeBinding); !kernel.IsCode(err, kernel.CodeStaleCheckpoint) {
+		t.Fatalf("cross-project checkpoint = %v, want stale_checkpoint", err)
 	}
 	if err := rebuiltRecovery.ClearActiveInvocation(ctx, invocation.ID); err != nil {
 		t.Fatalf("clear active: %v", err)

@@ -190,9 +190,9 @@ func (db *fakeRecoveryDB) QueryContext(_ context.Context, query string, _ ...any
 			}
 		}
 	case strings.Contains(query, "WHERE stop_result IS NOT NULL"):
-		for _, row := range db.rows {
+		for runCommandID, row := range db.rows {
 			if row.stopResult != nil {
-				rows = append(rows, []any{row.stopResult})
+				rows = append(rows, []any{runCommandID, row.stopResult})
 			}
 		}
 	default:
