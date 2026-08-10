@@ -129,20 +129,21 @@ func (s *PostgresStore) Get(ctx context.Context, id CandidateID) (Candidate, err
 	return candidate, nil
 }
 
-func (s *PostgresStore) ClaimNext(ctx context.Context, targetRepository string) (Candidate, bool, error) {
+func (s *PostgresStore) ClaimNext(ctx context.Context, targetRepository string) (Claim, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return Candidate{}, false, err
+		return Claim{}, false, err
 	}
 	normalizedTarget, err := normalizeTargetRepository(targetRepository)
 	if err != nil {
-		return Candidate{}, false, err
+		return Claim{}, false, err
 	}
 	tx, err := s.begin(ctx, serializableTx())
 	if err != nil {
-		return Candidate{}, false, err
+		return Claim{}, false, err
 	}
 	defer tx.Rollback()
-	var id CandidateID
+	token := newMergeQueueClaimToken()
+	var claim Claim
 	claimMillis := s.claimTTL.Milliseconds()
 	if claimMillis <= 0 {
 		claimMillis = 1
@@ -157,43 +158,77 @@ WITH next_candidate AS (
 	LIMIT 1
 	FOR UPDATE SKIP LOCKED
 ), claimed AS (
-	INSERT INTO merge_repository_claims(target_repository, candidate_id, lease_owner, claimed_at, lease_expires_at)
-	SELECT $1, id, $2, now(), now() + ($3 * interval '1 millisecond')
+	INSERT INTO merge_repository_claims(target_repository, candidate_id, lease_owner, claim_token, claimed_at, lease_expires_at)
+	SELECT $1, id, $2, $3, now(), now() + ($4 * interval '1 millisecond')
 	FROM next_candidate
 	ON CONFLICT (target_repository) DO UPDATE
 	SET candidate_id = EXCLUDED.candidate_id,
 	    lease_owner = EXCLUDED.lease_owner,
+	    claim_token = EXCLUDED.claim_token,
 	    claimed_at = now(),
 	    lease_expires_at = EXCLUDED.lease_expires_at
 	WHERE merge_repository_claims.lease_expires_at <= now()
-	RETURNING candidate_id
+	RETURNING candidate_id, lease_owner, claim_token, lease_expires_at
 )
 UPDATE merge_candidates c
 SET status = CASE WHEN c.status = 'queued' THEN 'merge_check' ELSE c.status END,
     updated_at = CASE WHEN c.status = 'queued' THEN now() ELSE c.updated_at END
 FROM claimed
 WHERE c.id = claimed.candidate_id
-RETURNING c.id`, normalizedTarget, s.ownerID, claimMillis).Scan(&id)
+RETURNING c.id, claimed.lease_owner, claimed.claim_token, claimed.lease_expires_at`, normalizedTarget, s.ownerID, token, claimMillis).Scan(&claim.Candidate.ID, &claim.OwnerID, &claim.Token, &claim.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
-			return Candidate{}, false, mapPostgresMergeQueueError(err)
+			return Claim{}, false, mapPostgresMergeQueueError(err)
 		}
-		return Candidate{}, false, nil
+		return Claim{}, false, nil
 	}
 	if err != nil {
-		return Candidate{}, false, mapPostgresMergeQueueError(err)
+		return Claim{}, false, mapPostgresMergeQueueError(err)
 	}
-	candidate, err := loadCandidate(ctx, tx, id)
+	candidate, err := loadCandidate(ctx, tx, claim.Candidate.ID)
 	if err != nil {
-		return Candidate{}, false, err
+		return Claim{}, false, err
 	}
+	claim.Candidate = candidate
+	claim.ExpiresAt = claim.ExpiresAt.UTC()
 	if err := tx.Commit(); err != nil {
-		return Candidate{}, false, mapPostgresMergeQueueError(err)
+		return Claim{}, false, mapPostgresMergeQueueError(err)
 	}
-	return candidate, true, nil
+	return claim, true, nil
 }
 
-func (s *PostgresStore) advance(ctx context.Context, id CandidateID, from, to Status, evidenceRefs []evidence.ArtifactID, mergedRevision string) (Candidate, error) {
+func (s *PostgresStore) RenewClaim(ctx context.Context, claim Claim) (Claim, error) {
+	tx, err := s.begin(ctx, serializableTx())
+	if err != nil {
+		return Claim{}, err
+	}
+	defer tx.Rollback()
+	current, err := s.requireClaimForUpdate(ctx, tx, claim)
+	if err != nil {
+		return Claim{}, err
+	}
+	claimMillis := s.claimTTL.Milliseconds()
+	if claimMillis <= 0 {
+		claimMillis = 1
+	}
+	var expires time.Time
+	err = tx.QueryRowContext(ctx, `
+UPDATE merge_repository_claims
+SET lease_expires_at = now() + ($5 * interval '1 millisecond')
+WHERE target_repository = $1 AND candidate_id = $2 AND lease_owner = $3 AND claim_token = $4 AND lease_expires_at > now()
+RETURNING lease_expires_at`, claim.Candidate.TargetRepository, claim.Candidate.ID, claim.OwnerID, claim.Token, claimMillis).Scan(&expires)
+	if err != nil {
+		return Claim{}, mapClaimUpdateError(err)
+	}
+	claim.Candidate = current
+	claim.ExpiresAt = expires.UTC()
+	if err := tx.Commit(); err != nil {
+		return Claim{}, mapPostgresMergeQueueError(err)
+	}
+	return claim, nil
+}
+
+func (s *PostgresStore) advance(ctx context.Context, claim Claim, from, to Status, evidenceRefs []evidence.ArtifactID, mergedRevision string) (Candidate, error) {
 	if !validAdvance(from, to) {
 		return Candidate{}, kernel.InvalidArgument("invalid merge candidate transition")
 	}
@@ -205,26 +240,26 @@ func (s *PostgresStore) advance(ctx context.Context, id CandidateID, from, to St
 		return Candidate{}, err
 	}
 	defer tx.Rollback()
-	candidate, err := loadCandidateForUpdate(ctx, tx, id)
+	candidate, err := s.requireClaimForUpdate(ctx, tx, claim)
 	if err != nil {
 		return Candidate{}, err
 	}
 	if candidate.Status != from {
 		return Candidate{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge candidate status changed", Recoverable: true}
 	}
-	if err := insertEvidenceRefs(ctx, tx, id, evidenceRefs); err != nil {
+	if err := insertEvidenceRefs(ctx, tx, claim.Candidate.ID, evidenceRefs); err != nil {
 		return Candidate{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE merge_candidates SET status = $2, merged_revision = NULLIF($3, ''), updated_at = now() WHERE id = $1`, id, to, mergedRevision); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE merge_candidates SET status = $2, merged_revision = NULLIF($3, ''), updated_at = now() WHERE id = $1`, claim.Candidate.ID, to, mergedRevision); err != nil {
 		return Candidate{}, mapPostgresMergeQueueError(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Candidate{}, mapPostgresMergeQueueError(err)
 	}
-	return s.Get(ctx, id)
+	return s.Get(ctx, claim.Candidate.ID)
 }
 
-func (s *PostgresStore) commitMerged(ctx context.Context, id CandidateID, evidenceRefs []evidence.ArtifactID, mergedRevision string, audit auditRecord) (Candidate, error) {
+func (s *PostgresStore) commitMerged(ctx context.Context, claim Claim, evidenceRefs []evidence.ArtifactID, mergedRevision string, audit auditRecord) (Candidate, error) {
 	if strings.TrimSpace(mergedRevision) == "" {
 		return Candidate{}, kernel.InvalidArgument("merged_revision is required")
 	}
@@ -233,7 +268,7 @@ func (s *PostgresStore) commitMerged(ctx context.Context, id CandidateID, eviden
 		return Candidate{}, err
 	}
 	defer tx.Rollback()
-	candidate, err := loadCandidateForUpdate(ctx, tx, id)
+	candidate, err := s.requireClaimForUpdate(ctx, tx, claim)
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -249,22 +284,22 @@ func (s *PostgresStore) commitMerged(ctx context.Context, id CandidateID, eviden
 	if candidate.Status != StatusTargetedVerify {
 		return Candidate{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge candidate status changed", Recoverable: true}
 	}
-	if err := insertEvidenceRefs(ctx, tx, id, evidenceRefs); err != nil {
+	if err := insertEvidenceRefs(ctx, tx, claim.Candidate.ID, evidenceRefs); err != nil {
 		return Candidate{}, err
 	}
 	if err := appendAudit(ctx, tx, audit); err != nil {
 		return Candidate{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE merge_candidates SET status = 'merged', merged_revision = $2, updated_at = now() WHERE id = $1`, id, mergedRevision); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE merge_candidates SET status = 'merged', merged_revision = $2, updated_at = now() WHERE id = $1`, claim.Candidate.ID, mergedRevision); err != nil {
 		return Candidate{}, mapPostgresMergeQueueError(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Candidate{}, mapPostgresMergeQueueError(err)
 	}
-	return s.Get(ctx, id)
+	return s.Get(ctx, claim.Candidate.ID)
 }
 
-func (s *PostgresStore) fail(ctx context.Context, id CandidateID, from Status, reason FailureReason, evidenceRefs []evidence.ArtifactID, audit auditRecord) (Candidate, error) {
+func (s *PostgresStore) fail(ctx context.Context, claim Claim, from Status, reason FailureReason, evidenceRefs []evidence.ArtifactID, audit auditRecord) (Candidate, error) {
 	if !validFailureReason(reason) || len(evidenceRefs) == 0 {
 		return Candidate{}, kernel.InvalidArgument("merge failure requires a valid reason and evidence refs")
 	}
@@ -273,7 +308,7 @@ func (s *PostgresStore) fail(ctx context.Context, id CandidateID, from Status, r
 		return Candidate{}, err
 	}
 	defer tx.Rollback()
-	candidate, err := loadCandidateForUpdate(ctx, tx, id)
+	candidate, err := s.requireClaimForUpdate(ctx, tx, claim)
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -289,22 +324,28 @@ func (s *PostgresStore) fail(ctx context.Context, id CandidateID, from Status, r
 	if candidate.Status != from || (from != StatusMergeCheck && from != StatusTargetedVerify) {
 		return Candidate{}, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge candidate cannot fail from current status", Recoverable: true}
 	}
-	if err := insertEvidenceRefs(ctx, tx, id, evidenceRefs); err != nil {
+	if err := insertEvidenceRefs(ctx, tx, claim.Candidate.ID, evidenceRefs); err != nil {
 		return Candidate{}, err
 	}
 	if err := appendAudit(ctx, tx, audit); err != nil {
 		return Candidate{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE merge_candidates SET status = 'failed', failure_reason = $2, failure_evidence_ref = $3, updated_at = now() WHERE id = $1`, id, reason, evidenceRefs[0]); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE merge_candidates SET status = 'failed', failure_reason = $2, failure_evidence_ref = $3, updated_at = now() WHERE id = $1`, claim.Candidate.ID, reason, evidenceRefs[0]); err != nil {
 		return Candidate{}, mapPostgresMergeQueueError(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Candidate{}, mapPostgresMergeQueueError(err)
 	}
-	return s.Get(ctx, id)
+	return s.Get(ctx, claim.Candidate.ID)
 }
 
-func (s *PostgresStore) pendingAudits(ctx context.Context) ([]auditRecord, error) {
+func (s *PostgresStore) pendingAudits(ctx context.Context, projectID kernel.ProjectID, limit int) ([]auditRecord, error) {
+	if projectID == "" {
+		return nil, kernel.InvalidArgument("project_id is required")
+	}
+	if limit <= 0 {
+		limit = 64
+	}
 	tx, err := s.begin(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
@@ -313,8 +354,9 @@ func (s *PostgresStore) pendingAudits(ctx context.Context) ([]auditRecord, error
 	rows, err := tx.QueryContext(ctx, `
 SELECT stable_key, type, project_id, task_id, workspace_ref, payload::text, COALESCE(array_to_json(artifact_refs)::text, '[]'), delivered
 FROM merge_audits
-WHERE delivered = false
-ORDER BY created_at, stable_key`)
+WHERE delivered = false AND project_id = $1
+ORDER BY created_at, stable_key
+LIMIT $2`, projectID, limit)
 	if err != nil {
 		return nil, mapPostgresMergeQueueError(err)
 	}
@@ -347,12 +389,11 @@ func (s *PostgresStore) markAuditDelivered(ctx context.Context, key kernel.Idemp
 	return nil
 }
 
-func (s *PostgresStore) ReleaseClaim(ctx context.Context, targetRepository string, id CandidateID) error {
-	normalizedTarget, err := normalizeTargetRepository(targetRepository)
-	if err != nil {
-		return err
-	}
-	_, err = s.exec(ctx, `DELETE FROM merge_repository_claims WHERE target_repository = $1 AND candidate_id = $2`, normalizedTarget, id)
+func (s *PostgresStore) ReleaseClaim(ctx context.Context, claim Claim) error {
+	_, err := s.exec(ctx, `
+DELETE FROM merge_repository_claims
+WHERE target_repository = $1 AND candidate_id = $2 AND lease_owner = $3 AND claim_token = $4`,
+		claim.Candidate.TargetRepository, claim.Candidate.ID, claim.OwnerID, claim.Token)
 	return err
 }
 
@@ -400,6 +441,26 @@ SELECT c.id, c.project_id, c.task_id, c.workspace_ref, c.verify_result_ref, c.di
 FROM merge_candidates c
 WHERE c.id = $1
 FOR UPDATE`, id)
+}
+
+func (s *PostgresStore) requireClaimForUpdate(ctx context.Context, q postgresDBTX, claim Claim) (Candidate, error) {
+	if claim.Candidate.ID == "" || claim.Candidate.TargetRepository == "" || claim.OwnerID == "" || claim.Token == "" {
+		return Candidate{}, kernel.InvalidArgument("merge claim identity is required")
+	}
+	var currentID CandidateID
+	err := q.QueryRowContext(ctx, `
+SELECT candidate_id
+FROM merge_repository_claims
+WHERE target_repository = $1
+  AND candidate_id = $2
+  AND lease_owner = $3
+  AND claim_token = $4
+  AND lease_expires_at > now()
+FOR UPDATE`, claim.Candidate.TargetRepository, claim.Candidate.ID, claim.OwnerID, claim.Token).Scan(&currentID)
+	if err != nil {
+		return Candidate{}, mapClaimUpdateError(err)
+	}
+	return loadCandidateForUpdate(ctx, q, currentID)
 }
 
 func loadCandidateWithQuery(ctx context.Context, q postgresDBTX, query string, id CandidateID) (Candidate, error) {
@@ -535,6 +596,22 @@ func newMergeQueueOwnerID() string {
 		return fmt.Sprintf("mergequeue:%d:%d", os.Getpid(), time.Now().UnixNano())
 	}
 	return fmt.Sprintf("mergequeue:%d:%s", os.Getpid(), hex.EncodeToString(token[:]))
+}
+
+func newMergeQueueClaimToken() string {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", os.Getpid(), time.Now().UnixNano())))
+		return hex.EncodeToString(sum[:])
+	}
+	return hex.EncodeToString(token[:])
+}
+
+func mapClaimUpdateError(err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return kernel.LeaseConflict("merge claim is no longer current")
+	}
+	return mapPostgresMergeQueueError(err)
 }
 
 func mapPostgresMergeQueueError(err error) error {

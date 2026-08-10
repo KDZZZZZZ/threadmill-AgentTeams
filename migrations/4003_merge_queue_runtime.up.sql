@@ -1,5 +1,6 @@
 ALTER TABLE merge_repository_claims
 	ADD COLUMN IF NOT EXISTS lease_owner text NOT NULL DEFAULT 'legacy',
+	ADD COLUMN IF NOT EXISTS claim_token text NOT NULL DEFAULT 'legacy',
 	ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS merge_repository_claims_expiry_idx

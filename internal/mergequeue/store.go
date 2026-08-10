@@ -19,7 +19,7 @@ import (
 type MemoryStore struct {
 	mu         sync.Mutex
 	candidates map[CandidateID]Candidate
-	repoClaims map[string]CandidateID
+	repoClaims map[string]Claim
 	audits     map[kernel.IdempotencyKey]auditRecord
 	auditOrder []kernel.IdempotencyKey
 	now        func() time.Time
@@ -39,7 +39,7 @@ type auditRecord struct {
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		candidates: make(map[CandidateID]Candidate),
-		repoClaims: make(map[string]CandidateID),
+		repoClaims: make(map[string]Claim),
 		audits:     make(map[kernel.IdempotencyKey]auditRecord),
 		now:        time.Now,
 	}
@@ -109,19 +109,19 @@ func (s *MemoryStore) Get(ctx context.Context, id CandidateID) (Candidate, error
 	return cloneCandidate(candidate), nil
 }
 
-func (s *MemoryStore) ClaimNext(ctx context.Context, targetRepository string) (Candidate, bool, error) {
+func (s *MemoryStore) ClaimNext(ctx context.Context, targetRepository string) (Claim, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return Candidate{}, false, err
+		return Claim{}, false, err
 	}
 	var err error
 	targetRepository, err = normalizeTargetRepository(targetRepository)
 	if err != nil {
-		return Candidate{}, false, err
+		return Claim{}, false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, claimed := s.repoClaims[targetRepository]; claimed {
-		return Candidate{}, false, nil
+		return Claim{}, false, nil
 	}
 	queued := make([]Candidate, 0)
 	for _, candidate := range s.candidates {
@@ -130,7 +130,7 @@ func (s *MemoryStore) ClaimNext(ctx context.Context, targetRepository string) (C
 		}
 	}
 	if len(queued) == 0 {
-		return Candidate{}, false, nil
+		return Claim{}, false, nil
 	}
 	sort.Slice(queued, func(i, j int) bool {
 		if queued[i].CreatedAt.Equal(queued[j].CreatedAt) {
@@ -144,11 +144,37 @@ func (s *MemoryStore) ClaimNext(ctx context.Context, targetRepository string) (C
 		candidate.UpdatedAt = s.now().UTC()
 		s.candidates[candidate.ID] = candidate
 	}
-	s.repoClaims[targetRepository] = candidate.ID
-	return cloneCandidate(candidate), true, nil
+	claim := Claim{
+		Candidate: cloneCandidate(candidate),
+		OwnerID:   "memory",
+		Token:     "memory:" + string(candidate.ID),
+		ExpiresAt: s.now().UTC().Add(time.Hour),
+	}
+	s.repoClaims[targetRepository] = claim
+	return claim, true, nil
 }
 
-func (s *MemoryStore) advance(ctx context.Context, id CandidateID, from, to Status, evidenceRefs []evidence.ArtifactID, mergedRevision string) (Candidate, error) {
+func (s *MemoryStore) RenewClaim(ctx context.Context, claim Claim) (Claim, error) {
+	if err := ctx.Err(); err != nil {
+		return Claim{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.repoClaims[claim.Candidate.TargetRepository]
+	if !ok || current.Candidate.ID != claim.Candidate.ID || current.Token != claim.Token {
+		return Claim{}, kernel.LeaseConflict("merge claim is no longer current")
+	}
+	candidate, ok := s.candidates[claim.Candidate.ID]
+	if !ok {
+		return Claim{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
+	}
+	current.Candidate = cloneCandidate(candidate)
+	current.ExpiresAt = s.now().UTC().Add(time.Hour)
+	s.repoClaims[claim.Candidate.TargetRepository] = current
+	return current, nil
+}
+
+func (s *MemoryStore) advance(ctx context.Context, claim Claim, from, to Status, evidenceRefs []evidence.ArtifactID, mergedRevision string) (Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return Candidate{}, err
 	}
@@ -157,7 +183,10 @@ func (s *MemoryStore) advance(ctx context.Context, id CandidateID, from, to Stat
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate, ok := s.candidates[id]
+	if err := s.requireClaimLocked(claim); err != nil {
+		return Candidate{}, err
+	}
+	candidate, ok := s.candidates[claim.Candidate.ID]
 	if !ok {
 		return Candidate{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
 	}
@@ -171,11 +200,11 @@ func (s *MemoryStore) advance(ctx context.Context, id CandidateID, from, to Stat
 	candidate.EvidenceRefs = dedupeEvidence(append(candidate.EvidenceRefs, evidenceRefs...))
 	candidate.MergedRevision = mergedRevision
 	candidate.UpdatedAt = s.now().UTC()
-	s.candidates[id] = candidate
+	s.candidates[claim.Candidate.ID] = candidate
 	return cloneCandidate(candidate), nil
 }
 
-func (s *MemoryStore) commitMerged(ctx context.Context, id CandidateID, evidenceRefs []evidence.ArtifactID, mergedRevision string, audit auditRecord) (Candidate, error) {
+func (s *MemoryStore) commitMerged(ctx context.Context, claim Claim, evidenceRefs []evidence.ArtifactID, mergedRevision string, audit auditRecord) (Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return Candidate{}, err
 	}
@@ -184,7 +213,10 @@ func (s *MemoryStore) commitMerged(ctx context.Context, id CandidateID, evidence
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate, ok := s.candidates[id]
+	if err := s.requireClaimLocked(claim); err != nil {
+		return Candidate{}, err
+	}
+	candidate, ok := s.candidates[claim.Candidate.ID]
 	if !ok {
 		return Candidate{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
 	}
@@ -204,11 +236,11 @@ func (s *MemoryStore) commitMerged(ctx context.Context, id CandidateID, evidence
 	candidate.EvidenceRefs = dedupeEvidence(append(candidate.EvidenceRefs, evidenceRefs...))
 	candidate.MergedRevision = mergedRevision
 	candidate.UpdatedAt = s.now().UTC()
-	s.candidates[id] = candidate
+	s.candidates[claim.Candidate.ID] = candidate
 	return cloneCandidate(candidate), nil
 }
 
-func (s *MemoryStore) fail(ctx context.Context, id CandidateID, from Status, reason FailureReason, evidenceRefs []evidence.ArtifactID, audit auditRecord) (Candidate, error) {
+func (s *MemoryStore) fail(ctx context.Context, claim Claim, from Status, reason FailureReason, evidenceRefs []evidence.ArtifactID, audit auditRecord) (Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return Candidate{}, err
 	}
@@ -217,7 +249,10 @@ func (s *MemoryStore) fail(ctx context.Context, id CandidateID, from Status, rea
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate, ok := s.candidates[id]
+	if err := s.requireClaimLocked(claim); err != nil {
+		return Candidate{}, err
+	}
+	candidate, ok := s.candidates[claim.Candidate.ID]
 	if !ok {
 		return Candidate{}, kernel.Error{Code: kernel.CodeNotFound, Message: "merge candidate not found"}
 	}
@@ -237,11 +272,11 @@ func (s *MemoryStore) fail(ctx context.Context, id CandidateID, from Status, rea
 	if err := s.appendAuditLocked(audit); err != nil {
 		return Candidate{}, err
 	}
-	s.candidates[id] = candidate
+	s.candidates[claim.Candidate.ID] = candidate
 	return cloneCandidate(candidate), nil
 }
 
-func (s *MemoryStore) pendingAudits(ctx context.Context) ([]auditRecord, error) {
+func (s *MemoryStore) pendingAudits(ctx context.Context, projectID kernel.ProjectID, limit int) ([]auditRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -250,8 +285,11 @@ func (s *MemoryStore) pendingAudits(ctx context.Context) ([]auditRecord, error) 
 	out := make([]auditRecord, 0)
 	for _, key := range s.auditOrder {
 		audit := s.audits[key]
-		if !audit.Delivered {
+		if !audit.Delivered && (projectID == "" || audit.ProjectID == projectID) {
 			out = append(out, cloneAudit(audit))
+			if limit > 0 && len(out) >= limit {
+				break
+			}
 		}
 	}
 	return out, nil
@@ -314,14 +352,23 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return out
 }
 
-func (s *MemoryStore) ReleaseClaim(ctx context.Context, targetRepository string, id CandidateID) error {
+func (s *MemoryStore) ReleaseClaim(ctx context.Context, claim Claim) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.repoClaims[targetRepository] == id {
-		delete(s.repoClaims, targetRepository)
+	current, ok := s.repoClaims[claim.Candidate.TargetRepository]
+	if ok && current.Candidate.ID == claim.Candidate.ID && current.Token == claim.Token {
+		delete(s.repoClaims, claim.Candidate.TargetRepository)
+	}
+	return nil
+}
+
+func (s *MemoryStore) requireClaimLocked(claim Claim) error {
+	current, ok := s.repoClaims[claim.Candidate.TargetRepository]
+	if !ok || current.Candidate.ID != claim.Candidate.ID || current.Token != claim.Token {
+		return kernel.LeaseConflict("merge claim is no longer current")
 	}
 	return nil
 }

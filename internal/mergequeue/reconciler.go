@@ -24,13 +24,14 @@ type Reconciler struct {
 type Store interface {
 	enqueue(context.Context, EnqueueRequest, auditRecord) (Candidate, error)
 	Get(context.Context, CandidateID) (Candidate, error)
-	ClaimNext(context.Context, string) (Candidate, bool, error)
-	advance(context.Context, CandidateID, Status, Status, []evidence.ArtifactID, string) (Candidate, error)
-	commitMerged(context.Context, CandidateID, []evidence.ArtifactID, string, auditRecord) (Candidate, error)
-	fail(context.Context, CandidateID, Status, FailureReason, []evidence.ArtifactID, auditRecord) (Candidate, error)
-	pendingAudits(context.Context) ([]auditRecord, error)
+	ClaimNext(context.Context, string) (Claim, bool, error)
+	RenewClaim(context.Context, Claim) (Claim, error)
+	advance(context.Context, Claim, Status, Status, []evidence.ArtifactID, string) (Candidate, error)
+	commitMerged(context.Context, Claim, []evidence.ArtifactID, string, auditRecord) (Candidate, error)
+	fail(context.Context, Claim, Status, FailureReason, []evidence.ArtifactID, auditRecord) (Candidate, error)
+	pendingAudits(context.Context, kernel.ProjectID, int) ([]auditRecord, error)
 	markAuditDelivered(context.Context, kernel.IdempotencyKey) error
-	ReleaseClaim(context.Context, string, CandidateID) error
+	ReleaseClaim(context.Context, Claim) error
 }
 
 func NewReconciler(store Store, workspaces WorkspaceReader, verifier TargetedVerifier, backend GitBackend, artifacts *evidence.ArtifactRegistry, events *evidence.EventLog) *Reconciler {
@@ -60,7 +61,7 @@ func (r *Reconciler) Enqueue(ctx context.Context, req EnqueueRequest) (Candidate
 	if err != nil {
 		return Candidate{}, err
 	}
-	if err := r.flushAudits(ctx); err != nil {
+	if err := r.flushAudits(ctx, req.ProjectID); err != nil {
 		return Candidate{}, err
 	}
 	return candidate, nil
@@ -72,38 +73,42 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 	if err := r.ready(); err != nil {
 		return Candidate{}, false, err
 	}
-	if err := r.flushAudits(ctx); err != nil {
-		return Candidate{}, false, err
-	}
-	candidate, claimed, err := r.store.ClaimNext(ctx, targetRepository)
+	claim, claimed, err := r.store.ClaimNext(ctx, targetRepository)
 	if err != nil || !claimed {
 		return Candidate{}, claimed, err
 	}
-	defer func() { _ = r.store.ReleaseClaim(context.Background(), candidate.TargetRepository, candidate.ID) }()
+	candidate := claim.Candidate
+	defer func() { _ = r.store.ReleaseClaim(context.Background(), claim) }()
 
 	binding, err := r.workspaces.Get(ctx, candidate.WorkspaceRef)
 	if err != nil {
-		failed, failErr := r.fail(ctx, candidate, candidate.Status, FailurePermission, err)
+		failed, failErr := r.fail(ctx, claim, candidate, candidate.Status, FailurePermission, err)
 		return failed, true, failErr
 	}
 	if err := validateWorkspace(candidate, binding); err != nil {
-		failed, failErr := r.fail(ctx, candidate, candidate.Status, FailurePermission, err)
+		failed, failErr := r.fail(ctx, claim, candidate, candidate.Status, FailurePermission, err)
 		return failed, true, failErr
 	}
 
 	prepared, err := r.backend.Prepare(ctx, candidate, binding)
 	if err != nil {
 		reason := failureReason(err, FailureConflict)
-		failed, failErr := r.fail(ctx, candidate, candidate.Status, reason, err)
+		failed, failErr := r.fail(ctx, claim, candidate, candidate.Status, reason, err)
 		return failed, true, failErr
 	}
 	defer r.backend.Cleanup(prepared)
 
+	claim, err = r.store.RenewClaim(ctx, claim)
+	if err != nil {
+		return Candidate{}, true, err
+	}
+	candidate = claim.Candidate
 	if candidate.Status == StatusMergeCheck {
-		candidate, err = r.store.advance(ctx, candidate.ID, StatusMergeCheck, StatusTargetedVerify, nil, "")
+		candidate, err = r.store.advance(ctx, claim, StatusMergeCheck, StatusTargetedVerify, nil, "")
 		if err != nil {
 			return Candidate{}, true, err
 		}
+		claim.Candidate = candidate
 	}
 	verifyResult, verifyErr := r.verifier.Verify(ctx, TargetedVerifyRequest{
 		Candidate:          candidate,
@@ -123,14 +128,19 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		if verifyErr == nil {
 			verifyErr = fmt.Errorf("targeted verify did not pass with evidence")
 		}
-		failed, failErr := r.fail(ctx, candidate, StatusTargetedVerify, failureReason(verifyErr, FailureVerifyFailed), verifyErr, trustedVerifyRefs...)
+		failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, failureReason(verifyErr, FailureVerifyFailed), verifyErr, trustedVerifyRefs...)
 		return failed, true, failErr
 	}
 
+	claim, err = r.store.RenewClaim(ctx, claim)
+	if err != nil {
+		return Candidate{}, true, err
+	}
+	candidate = claim.Candidate
 	mergedRevision, err := r.backend.Merge(ctx, prepared, candidate)
 	if err != nil {
 		reason := failureReason(err, FailureMainDrift)
-		failed, failErr := r.fail(ctx, candidate, StatusTargetedVerify, reason, err)
+		failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, reason, err)
 		return failed, true, failErr
 	}
 	mergedRefs := dedupeEvidence(append(candidateArtifacts(candidate), verifyResult.EvidenceRefs...))
@@ -147,14 +157,14 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		},
 		ArtifactRefs: mergedRefs,
 	}
-	merged, err := r.store.commitMerged(ctx, candidate.ID, verifyResult.EvidenceRefs, mergedRevision, audit)
+	merged, err := r.store.commitMerged(ctx, claim, verifyResult.EvidenceRefs, mergedRevision, audit)
 	if err != nil {
 		return Candidate{}, true, err
 	}
-	return merged, true, r.flushAudits(ctx)
+	return merged, true, r.flushAudits(ctx, candidate.ProjectID)
 }
 
-func (r *Reconciler) fail(ctx context.Context, candidate Candidate, from Status, reason FailureReason, cause error, extraEvidence ...evidence.ArtifactID) (Candidate, error) {
+func (r *Reconciler) fail(ctx context.Context, claim Claim, candidate Candidate, from Status, reason FailureReason, cause error, extraEvidence ...evidence.ArtifactID) (Candidate, error) {
 	body, err := json.Marshal(map[string]string{
 		"candidate_id": string(candidate.ID),
 		"reason":       string(reason),
@@ -184,15 +194,15 @@ func (r *Reconciler) fail(ctx context.Context, candidate Candidate, from Status,
 		Payload:      map[string]string{"candidate_id": string(candidate.ID), "reason": string(reason)},
 		ArtifactRefs: dedupeEvidence(append(candidateArtifacts(candidate), refs...)),
 	}
-	failed, err := r.store.fail(ctx, candidate.ID, from, reason, refs, audit)
+	failed, err := r.store.fail(ctx, claim, from, reason, refs, audit)
 	if err != nil {
 		return Candidate{}, err
 	}
-	return failed, r.flushAudits(ctx)
+	return failed, r.flushAudits(ctx, candidate.ProjectID)
 }
 
-func (r *Reconciler) flushAudits(ctx context.Context) error {
-	audits, err := r.store.pendingAudits(ctx)
+func (r *Reconciler) flushAudits(ctx context.Context, projectID kernel.ProjectID) error {
+	audits, err := r.store.pendingAudits(ctx, projectID, 64)
 	if err != nil {
 		return err
 	}

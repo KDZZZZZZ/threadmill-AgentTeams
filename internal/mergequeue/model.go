@@ -56,6 +56,13 @@ type Candidate struct {
 	UpdatedAt         time.Time             `json:"updated_at"`
 }
 
+type Claim struct {
+	Candidate Candidate
+	OwnerID   string
+	Token     string
+	ExpiresAt time.Time
+}
+
 type EnqueueRequest struct {
 	ID                CandidateID
 	ProjectID         kernel.ProjectID

@@ -14,7 +14,9 @@ import (
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/objectstore"
 	platformpostgres "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/workspace"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -37,7 +39,7 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 	candidateOtherProject := insertMergeQueueCandidateFixture(t, ctx, db, storeA, "project-b", "task-z", "candidate-z", repoB)
 
 	first, claimed, err := storeA.ClaimNext(ctx, repoA)
-	if err != nil || !claimed || first.ID != candidateA.ID || first.Status != StatusMergeCheck {
+	if err != nil || !claimed || first.Candidate.ID != candidateA.ID || first.Candidate.Status != StatusMergeCheck {
 		t.Fatalf("first ClaimNext(repoA) = %#v claimed=%v err=%v", first, claimed, err)
 	}
 	if _, claimed, err := storeB.ClaimNext(ctx, repoA); err != nil || claimed {
@@ -57,7 +59,7 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 				return
 			}
 			if got {
-				claimedIDs <- candidate.ID
+				claimedIDs <- candidate.Candidate.ID
 			}
 		}(store)
 	}
@@ -81,21 +83,33 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 
 	time.Sleep(120 * time.Millisecond)
 	reclaimed, claimed, err := storeB.ClaimNext(ctx, repoA)
-	if err != nil || !claimed || reclaimed.ID != candidateA.ID {
+	if err != nil || !claimed || reclaimed.Candidate.ID != candidateA.ID {
 		t.Fatalf("expired lease reclaim = %#v claimed=%v err=%v", reclaimed, claimed, err)
 	}
+	if _, err := storeA.fail(ctx, first, StatusMergeCheck, FailureVerifyFailed, []evidence.ArtifactID{"artifact-failure-a"}, mergeAudit(candidateA, "failed-a")); !kernel.IsCode(err, kernel.CodeLeaseConflict) {
+		t.Fatalf("stale owner fail = %v, want lease_conflict", err)
+	}
+	if _, err := storeA.RenewClaim(ctx, first); !kernel.IsCode(err, kernel.CodeLeaseConflict) {
+		t.Fatalf("stale owner renew = %v, want lease_conflict", err)
+	}
+	if err := storeA.ReleaseClaim(ctx, first); err != nil {
+		t.Fatalf("stale owner release should be idempotent: %v", err)
+	}
+	if _, claimed, err := storeA.ClaimNext(ctx, repoA); err != nil || claimed {
+		t.Fatalf("stale owner release deleted new claim: claimed=%v err=%v", claimed, err)
+	}
 	restarted := NewPostgresStore(db)
-	if err := storeB.ReleaseClaim(ctx, repoA, candidateA.ID); err != nil {
+	if err := storeB.ReleaseClaim(ctx, reclaimed); err != nil {
 		t.Fatalf("ReleaseClaim: %v", err)
 	}
-	if err := storeB.ReleaseClaim(ctx, repoA, candidateA.ID); err != nil {
+	if err := storeB.ReleaseClaim(ctx, reclaimed); err != nil {
 		t.Fatalf("idempotent ReleaseClaim: %v", err)
 	}
 	afterRestart, claimed, err := restarted.ClaimNext(ctx, repoA)
-	if err != nil || !claimed || afterRestart.ID != candidateA.ID || afterRestart.Status != StatusMergeCheck {
+	if err != nil || !claimed || afterRestart.Candidate.ID != candidateA.ID || afterRestart.Candidate.Status != StatusMergeCheck {
 		t.Fatalf("restart claim existing in-flight candidate = %#v claimed=%v err=%v", afterRestart, claimed, err)
 	}
-	if _, err := storeA.fail(ctx, candidateA.ID, StatusMergeCheck, FailureVerifyFailed, []evidence.ArtifactID{"artifact-failure-a"}, mergeAudit(candidateA, "failed-a")); err != nil {
+	if _, err := restarted.fail(ctx, afterRestart, StatusMergeCheck, FailureVerifyFailed, []evidence.ArtifactID{"artifact-failure-a"}, mergeAudit(candidateA, "failed-a")); err != nil {
 		t.Fatalf("fail candidateA: %v", err)
 	}
 	failed, err := storeB.Get(ctx, candidateA.ID)
@@ -106,18 +120,18 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 		t.Fatalf("failed candidate = %#v", failed)
 	}
 
-	if err := restarted.ReleaseClaim(ctx, repoA, candidateA.ID); err != nil {
+	if err := restarted.ReleaseClaim(ctx, afterRestart); err != nil {
 		t.Fatalf("release failed candidate claim: %v", err)
 	}
 	next, claimed, err := restarted.ClaimNext(ctx, repoA)
-	if err != nil || !claimed || next.ID != candidateB.ID {
+	if err != nil || !claimed || next.Candidate.ID != candidateB.ID {
 		t.Fatalf("next after failed = %#v claimed=%v err=%v, want %s", next, claimed, err, candidateB.ID)
 	}
 	if candidateOtherProject.ProjectID != "project-b" {
 		t.Fatalf("project-b fixture mutated: %#v", candidateOtherProject)
 	}
 
-	audits, err := restarted.pendingAudits(ctx)
+	audits, err := restarted.pendingAudits(ctx, "project-a", 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,14 +139,95 @@ func TestPostgresStoreRealPostgresMergeQueueRuntime(t *testing.T) {
 	for _, audit := range audits {
 		byProject[audit.ProjectID]++
 	}
-	if byProject["project-a"] == 0 || byProject["project-b"] == 0 {
-		t.Fatalf("pending audits not project-scoped: %#v", byProject)
+	if byProject["project-a"] == 0 || byProject["project-b"] != 0 {
+		t.Fatalf("pending audits not isolated to requested project: %#v", byProject)
 	}
 	if err := restarted.markAuditDelivered(ctx, mergeAudit(candidateA, "failed-a").StableKey); err != nil {
 		t.Fatalf("markAuditDelivered: %v", err)
 	}
 	if delivered, err := mergeAuditDelivered(ctx, db, mergeAudit(candidateA, "failed-a").StableKey); err != nil || !delivered {
 		t.Fatalf("delivered audit = %v err=%v", delivered, err)
+	}
+}
+
+func TestPostgresReconcilerFencePreventsExpiredOwnerFromWritingMain(t *testing.T) {
+	ctx := context.Background()
+	db := openMergeQueuePostgresSchema(t, ctx)
+	repo := seedRepo(t)
+	binding := createMergeQueueGitBinding(t, repo, "task-fence", "workspace/fenced.txt", "fenced\n")
+	insertMergeQueueWorkspaceBinding(t, ctx, db, binding)
+
+	artifacts := evidence.NewArtifactRegistry(objectstore.NewMemoryStore(), "artifacts")
+	verifyRef := registerArtifact(t, artifacts, "project-a", binding.TaskID, "verify fence")
+	diffRef := registerArtifact(t, artifacts, "project-a", binding.TaskID, "diff fence")
+	passRef := registerArtifact(t, artifacts, "project-a", binding.TaskID, "targeted verify passed")
+	for _, ref := range []evidence.ArtifactID{verifyRef, diffRef, passRef} {
+		insertMergeQueueArtifact(t, ctx, db, ref, "project-a", binding.TaskID)
+	}
+
+	storeA := NewPostgresStore(db)
+	storeB := NewPostgresStore(db)
+	storeA.SetClaimTTL(2 * time.Second)
+	storeB.SetClaimTTL(2 * time.Second)
+	verifier := &fakeVerifier{
+		result:  TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{passRef}},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	reconciler := NewReconciler(storeA, staticWorkspaceReader{binding: binding}, verifier, GitBackend{TempParent: t.TempDir()}, artifacts, evidence.NewEventLog(64*1024))
+	if _, err := reconciler.Enqueue(ctx, EnqueueRequest{
+		ID:                "candidate-fence",
+		ProjectID:         "project-a",
+		TaskID:            binding.TaskID,
+		WorkspaceRef:      binding.ID,
+		VerifyResultRef:   verifyRef,
+		DiffArtifactRef:   diffRef,
+		TargetRepository:  repo,
+		TargetBranch:      "main",
+		BaseRevision:      binding.BaseRevision,
+		MainRevision:      binding.BaseRevision,
+		CandidateRevision: binding.CurrentRevision,
+		EvidenceRefs:      []evidence.ArtifactID{verifyRef, diffRef},
+	}); err != nil {
+		t.Fatalf("enqueue fence candidate: %v", err)
+	}
+
+	type outcome struct {
+		candidate Candidate
+		claimed   bool
+		err       error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		candidate, claimed, err := reconciler.ReconcileOne(ctx, repo)
+		done <- outcome{candidate: candidate, claimed: claimed, err: err}
+	}()
+	select {
+	case <-verifier.entered:
+	case got := <-done:
+		t.Fatalf("reconcile finished before verify: candidate:%#v claimed:%v err:%v", got.candidate, got.claimed, got.err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("reconcile did not reach targeted verify")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	stolen, claimed, err := storeB.ClaimNext(ctx, repo)
+	if err != nil || !claimed || stolen.Candidate.ID != "candidate-fence" || stolen.Token == "" {
+		t.Fatalf("storeB takeover = %#v claimed=%v err=%v", stolen, claimed, err)
+	}
+	close(verifier.release)
+	got := <-done
+	if !got.claimed || !kernel.IsCode(got.err, kernel.CodeLeaseConflict) {
+		t.Fatalf("expired owner reconcile = candidate:%#v claimed:%v err:%v, want lease_conflict", got.candidate, got.claimed, got.err)
+	}
+	if contents := fileAtBranchIfExists(t, repo, "main", "workspace/fenced.txt"); contents != "" {
+		t.Fatalf("expired owner wrote main: %q", contents)
+	}
+	stored, err := storeB.Get(ctx, "candidate-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status == StatusMerged {
+		t.Fatalf("expired owner merged candidate: %#v", stored)
 	}
 }
 
@@ -175,6 +270,67 @@ VALUES ($1, $2, 1, 'git_worktree', $3, $4, $5, 'sealed')`,
 	if err != nil {
 		t.Fatalf("insert workspace %s: %v", id, err)
 	}
+}
+
+func insertMergeQueueWorkspaceBinding(t *testing.T, ctx context.Context, db *sql.DB, binding workspace.Binding) {
+	t.Helper()
+	_, err := db.ExecContext(ctx, `
+INSERT INTO workspace_bindings(
+	id, task_id, generation, kind, root, branch_name, base_revision, current_revision,
+	allowed_dirs, observed_writes, phase_leases, status
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text[], $10::jsonb, $11::jsonb, $12)`,
+		binding.ID, binding.TaskID, binding.Generation, binding.Kind, binding.Root, binding.BranchName,
+		binding.BaseRevision, binding.CurrentRevision, textArrayLiteral(binding.AllowedDirs),
+		`{"files":["workspace/fenced.txt"]}`, `{"verify":"inv-verify"}`, binding.Status)
+	if err != nil {
+		t.Fatalf("insert workspace binding %s: %v", binding.ID, err)
+	}
+}
+
+func createMergeQueueGitBinding(t *testing.T, repo string, taskID kernel.TaskID, file, body string) workspace.Binding {
+	t.Helper()
+	mainRevision := gitOut(t, repo, "rev-parse", "refs/heads/main")
+	root := filepath.Join(t.TempDir(), "candidate")
+	git(t, t.TempDir(), "clone", repo, root)
+	branch := "threadmill/" + string(taskID) + "/001"
+	git(t, root, "checkout", "-b", branch, mainRevision)
+	write(t, filepath.Join(root, filepath.FromSlash(file)), body)
+	git(t, root, "add", file)
+	git(t, root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "candidate")
+	return workspace.Binding{
+		ID:              kernel.BindingRef("ws_" + string(taskID)),
+		TaskID:          taskID,
+		Generation:      1,
+		Kind:            workspace.KindGitWorktree,
+		Root:            root,
+		BranchName:      branch,
+		BaseRevision:    mainRevision,
+		CurrentRevision: gitOut(t, root, "rev-parse", "HEAD"),
+		AllowedDirs:     []string{"workspace"},
+		ObservedWrites:  workspace.WriteSet{Files: []string{file}},
+		PhaseLeases:     map[workspace.Phase]kernel.InvocationID{workspace.PhaseVerify: "inv-verify"},
+		Status:          workspace.StatusSealed,
+	}
+}
+
+type staticWorkspaceReader struct {
+	binding workspace.Binding
+}
+
+func (r staticWorkspaceReader) Get(_ context.Context, ref kernel.BindingRef) (workspace.Binding, error) {
+	if ref != r.binding.ID {
+		return workspace.Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
+	}
+	return r.binding, nil
+}
+
+func fileAtBranchIfExists(t *testing.T, repo, branch, file string) string {
+	t.Helper()
+	out, err := gitOutput(context.Background(), repo, "show", branch+":"+file)
+	if err != nil {
+		return ""
+	}
+	return out
 }
 
 func insertMergeQueueArtifact(t *testing.T, ctx context.Context, db *sql.DB, id evidence.ArtifactID, projectID kernel.ProjectID, taskID kernel.TaskID) {
