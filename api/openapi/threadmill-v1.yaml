@@ -28,6 +28,8 @@ paths:
       tags: [Requirements]
       summary: Register a user requirement and request Task Manager handling.
       operationId: submitRequirement
+      parameters:
+        - $ref: "#/components/parameters/CSRFToken"
       requestBody:
         required: true
         content:
@@ -72,6 +74,8 @@ paths:
       tags: [Capacity]
       summary: Adjust desired project-level Agent Invocation concurrency.
       operationId: adjustCapacity
+      parameters:
+        - $ref: "#/components/parameters/CSRFToken"
       requestBody:
         required: true
         content:
@@ -98,6 +102,8 @@ paths:
       tags: [Decisions]
       summary: Record an external human decision and request Task Manager adjudication.
       operationId: submitHumanDecision
+      parameters:
+        - $ref: "#/components/parameters/CSRFToken"
       requestBody:
         required: true
         content:
@@ -205,6 +211,8 @@ paths:
         endpoint context plus the client's observed graph revision. It cannot
         carry arbitrary graph mutation fields.
       operationId: submitManagerMessage
+      parameters:
+        - $ref: "#/components/parameters/CSRFToken"
       requestBody:
         required: true
         content:
@@ -363,6 +371,15 @@ components:
       name: threadmill_session
       description: Same-origin HttpOnly browser session or trusted reverse-proxy identity.
   parameters:
+    CSRFToken:
+      name: X-Threadmill-CSRF
+      in: header
+      required: true
+      description: Double-submit token bound to the authenticated same-origin operator session.
+      schema:
+        type: string
+        minLength: 32
+        maxLength: 256
     ProjectID:
       name: project_id
       in: query
@@ -475,12 +492,15 @@ components:
             - invalid_request
             - unauthorized
             - forbidden
+            - csrf_invalid
+            - origin_invalid
             - not_found
             - revision_conflict
             - idempotency_conflict
             - cursor_expired
             - command_conflict
             - stale_command
+            - stale_binding
             - stale_checkpoint
             - lease_conflict
             - executor_unavailable
