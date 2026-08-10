@@ -89,6 +89,38 @@ func TestMemoryInvocationStoreIsIdempotentAndTransitionsClosedStateMachine(t *te
 	}
 }
 
+func TestConsumerInvocationOnlyValidForContextRetrieveInvocation(t *testing.T) {
+	phase := validInvocation()
+	phase.ConsumerInvocationID = "inv-victim"
+	if err := phase.Validate(); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("phase consumer invocation err = %v, want forbidden", err)
+	}
+
+	review := validContextInvocation("review")
+	review.ConsumerInvocationID = "inv-victim"
+	if err := review.Validate(); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("review consumer invocation err = %v, want forbidden", err)
+	}
+
+	retrieve := validContextInvocation("retrieve")
+	retrieve.ConsumerInvocationID = "inv-victim"
+	retrieve.ConsumerTaskID = "task-a"
+	retrieve.ConsumerRole = auth.RoleExecutor
+	if err := retrieve.Validate(); err != nil {
+		t.Fatalf("retrieve consumer invocation err = %v", err)
+	}
+	capability := retrieve.Capability()
+	if capability.ConsumerInvocationID != "inv-victim" || capability.ConsumerTaskID != "task-a" || capability.ConsumerRole != auth.RoleExecutor {
+		t.Fatalf("capability lost consumer scope: %#v", capability)
+	}
+
+	badRole := validContextInvocation("retrieve")
+	badRole.ConsumerRole = auth.Role("operator")
+	if err := badRole.Validate(); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("bad consumer role err = %v, want forbidden", err)
+	}
+}
+
 func TestEffectiveToolsRequiresThreeWayIntersection(t *testing.T) {
 	tools, err := EffectiveTools(ToolSource{
 		RoleTools:      auth.ToolSet(auth.ToolContextExplore, auth.ToolContextSearch),
@@ -119,6 +151,23 @@ func validInvocation() Invocation {
 		PromptHashes:     map[string]string{"shared": "prompt-hash"},
 		SkillHashes:      map[string]string{"phase-runtime": "skill-hash"},
 		EffectiveTools:   []auth.Tool{auth.ToolContextExplore},
+		CreatedAt:        now,
+		ExpiresAt:        now.Add(time.Hour),
+	}
+}
+
+func validContextInvocation(operation string) Invocation {
+	now := time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC)
+	return Invocation{
+		ID:               kernel.InvocationID("inv-context-" + operation),
+		ActorPrincipalID: "ctx-agent",
+		ProjectID:        "project-a",
+		Role:             auth.RoleContext,
+		Operation:        operation,
+		Status:           InvocationPrepared,
+		PromptHashes:     map[string]string{"shared": "prompt-hash"},
+		SkillHashes:      map[string]string{"context": "skill-hash"},
+		EffectiveTools:   []auth.Tool{auth.ToolContextSearch},
 		CreatedAt:        now,
 		ExpiresAt:        now.Add(time.Hour),
 	}

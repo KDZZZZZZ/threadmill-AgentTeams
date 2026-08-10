@@ -23,27 +23,46 @@ const (
 )
 
 type MemoryStore struct {
-	mu            sync.Mutex
-	now           func() time.Time
-	graphRevision kernel.Revision
-	nextSeq       uint64
-	nodes         map[string]NodeRecord
-	subgraphs     map[string]SubgraphRecord
-	edges         map[string]ContextEdge
-	audit         []AuditEvent
-	outbox        []OutboxEvent
-	failNext      Fault
+	mu             sync.Mutex
+	now            func() time.Time
+	graphRevision  kernel.Revision
+	nextSeq        uint64
+	nodes          map[string]NodeRecord
+	subgraphs      map[string]SubgraphRecord
+	edges          map[string]ContextEdge
+	subscriptions  map[string]ContextSubscriptionRecord
+	deltas         map[string]ContextDelta
+	deltaAck       map[string]bool
+	taskBindings   map[taskScopeKey]TaskContextSubgraphBinding
+	projections    map[projectionScopeKey]string
+	recipients     map[string][]TaskContextRecipient
+	candidates     map[taskScopeKey][]CandidateBufferRecord
+	taskMemory     map[taskScopeKey]TaskMemoryReviewState
+	reviewReceipts map[taskScopeKey]TaskMemoryReviewReceipt
+	taskResolver   TaskEndpointResolver
+	audit          []AuditEvent
+	outbox         []OutboxEvent
+	failNext       Fault
 }
 
 type memoryData struct {
-	graphRevision kernel.Revision
-	nextSeq       uint64
-	nodes         map[string]NodeRecord
-	subgraphs     map[string]SubgraphRecord
-	edges         map[string]ContextEdge
-	audit         []AuditEvent
-	outbox        []OutboxEvent
-	failNext      Fault
+	graphRevision  kernel.Revision
+	nextSeq        uint64
+	nodes          map[string]NodeRecord
+	subgraphs      map[string]SubgraphRecord
+	edges          map[string]ContextEdge
+	subscriptions  map[string]ContextSubscriptionRecord
+	deltas         map[string]ContextDelta
+	deltaAck       map[string]bool
+	taskBindings   map[taskScopeKey]TaskContextSubgraphBinding
+	projections    map[projectionScopeKey]string
+	recipients     map[string][]TaskContextRecipient
+	candidates     map[taskScopeKey][]CandidateBufferRecord
+	taskMemory     map[taskScopeKey]TaskMemoryReviewState
+	reviewReceipts map[taskScopeKey]TaskMemoryReviewReceipt
+	audit          []AuditEvent
+	outbox         []OutboxEvent
+	failNext       Fault
 }
 
 func NewMemoryStore(now func() time.Time) *MemoryStore {
@@ -51,12 +70,27 @@ func NewMemoryStore(now func() time.Time) *MemoryStore {
 		now = time.Now
 	}
 	return &MemoryStore{
-		now:           now,
-		graphRevision: 1,
-		nodes:         make(map[string]NodeRecord),
-		subgraphs:     make(map[string]SubgraphRecord),
-		edges:         make(map[string]ContextEdge),
+		now:            now,
+		graphRevision:  1,
+		nodes:          make(map[string]NodeRecord),
+		subgraphs:      make(map[string]SubgraphRecord),
+		edges:          make(map[string]ContextEdge),
+		subscriptions:  make(map[string]ContextSubscriptionRecord),
+		deltas:         make(map[string]ContextDelta),
+		deltaAck:       make(map[string]bool),
+		taskBindings:   make(map[taskScopeKey]TaskContextSubgraphBinding),
+		projections:    make(map[projectionScopeKey]string),
+		recipients:     make(map[string][]TaskContextRecipient),
+		candidates:     make(map[taskScopeKey][]CandidateBufferRecord),
+		taskMemory:     make(map[taskScopeKey]TaskMemoryReviewState),
+		reviewReceipts: make(map[taskScopeKey]TaskMemoryReviewReceipt),
 	}
+}
+
+func (s *MemoryStore) SetTaskEndpointResolver(resolver TaskEndpointResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.taskResolver = resolver
 }
 
 func (s *MemoryStore) SetNextFault(fault Fault) {
@@ -99,6 +133,7 @@ func (s *MemoryStore) CreateNodes(ctx context.Context, principal auth.Principal,
 	}
 	var created []ContextNode
 	var createdEdges []ContextEdge
+	changedSubgraphs := map[string]struct{}{}
 	now := s.now().UTC()
 	for _, input := range req.Nodes {
 		node := normalizeNode(input.Node)
@@ -121,6 +156,7 @@ func (s *MemoryStore) CreateNodes(ctx context.Context, principal auth.Principal,
 			subgraph.Subgraph.Revision++
 			subgraph.UpdatedAt = now
 			working.subgraphs[subgraphID] = subgraph
+			changedSubgraphs[subgraphID] = struct{}{}
 		}
 		if input.CreationContext.PreviousNodeID != "" {
 			previous, ok := working.nodes[input.CreationContext.PreviousNodeID]
@@ -173,6 +209,7 @@ func (s *MemoryStore) CreateNodes(ctx context.Context, principal auth.Principal,
 		}
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.node.created", sortedStringSet(changedSubgraphs))
 	result := CreateNodesResult{
 		GraphRevision: working.graphRevision,
 		Nodes:         created,
@@ -278,6 +315,7 @@ func (s *MemoryStore) Search(ctx context.Context, principal auth.Principal, req 
 		return ContextSearchResult{}, err
 	}
 	var nodes []ContextNode
+	hitSubgraphs := map[string]struct{}{}
 	for _, record := range s.sortedNodesLocked() {
 		if !canSeeNode(principal, s.subgraphs, record) {
 			continue
@@ -292,7 +330,25 @@ func (s *MemoryStore) Search(ctx context.Context, principal auth.Principal, req 
 		}
 		if keywordMatch(record.Node.Statement, keywords) {
 			nodes = append(nodes, visibleNode(principal, s.subgraphs, record.Node))
+			for _, subgraphID := range record.Node.SubgraphIDs {
+				if subgraph, ok := s.subgraphs[subgraphID]; ok && canSeeSubgraph(principal, subgraph) {
+					hitSubgraphs[subgraphID] = struct{}{}
+				}
+			}
 		}
+	}
+	subgraphIDs := make([]string, 0, len(hitSubgraphs))
+	for subgraphID := range hitSubgraphs {
+		subgraphIDs = append(subgraphIDs, subgraphID)
+	}
+	sort.Strings(subgraphIDs)
+	var subscriptionIDs []string
+	if len(subgraphIDs) > 0 {
+		sub, err := s.createSubscription(s.now().UTC(), principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, subscriptionSourceSearch)
+		if err != nil {
+			return ContextSearchResult{}, err
+		}
+		subscriptionIDs = []string{sub.ID}
 	}
 	return ContextSearchResult{
 		Slice: ContextSliceDelta{
@@ -300,7 +356,7 @@ func (s *MemoryStore) Search(ctx context.Context, principal auth.Principal, req 
 			GraphRevision: int64(s.graphRevision),
 		},
 		MatchedKeywords: keywords,
-		SubscriptionIDs: nil,
+		SubscriptionIDs: subscriptionIDs,
 	}, nil
 }
 
@@ -497,6 +553,7 @@ func (s *MemoryStore) CreateNode(ctx context.Context, principal auth.Principal, 
 		return "", err
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.node.created", node.SubgraphIDs)
 	s.replaceLocked(working)
 	return ContextNodeRef(node.ID), nil
 }
@@ -552,6 +609,7 @@ func (s *MemoryStore) UpdateNode(ctx context.Context, principal auth.Principal, 
 		return "", err
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.node.updated", unionStringSlices(oldSubgraphIDs, node.SubgraphIDs))
 	s.replaceLocked(working)
 	return ContextNodeRef(node.ID), nil
 }
@@ -597,6 +655,7 @@ func (s *MemoryStore) DeleteNode(ctx context.Context, principal auth.Principal, 
 		return err
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.node.deleted", record.Node.SubgraphIDs)
 	s.replaceLocked(working)
 	return nil
 }
@@ -631,6 +690,7 @@ func (s *MemoryStore) CreateSubgraph(ctx context.Context, principal auth.Princip
 		return ContextSubgraph{}, err
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.subgraph.created", []string{id})
 	s.replaceLocked(working)
 	return cloneSubgraph(subgraph), nil
 }
@@ -667,6 +727,7 @@ func (s *MemoryStore) UpdateSubgraph(ctx context.Context, principal auth.Princip
 		return ContextSubgraph{}, err
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.subgraph.updated", []string{req.SubgraphID})
 	s.replaceLocked(working)
 	return cloneSubgraph(record.Subgraph), nil
 }
@@ -705,6 +766,7 @@ func (s *MemoryStore) DeleteSubgraph(ctx context.Context, principal auth.Princip
 		return err
 	}
 	working.graphRevision++
+	working.appendContextDeltas(principal, lastOutboxID(working), "context.subgraph.deleted", []string{req.SubgraphID})
 	s.replaceLocked(working)
 	return nil
 }
@@ -876,14 +938,23 @@ func (s *memoryData) appendOutbox(event OutboxEvent) error {
 
 func (s *MemoryStore) cloneLocked() *memoryData {
 	clone := &memoryData{
-		graphRevision: s.graphRevision,
-		nextSeq:       s.nextSeq,
-		nodes:         make(map[string]NodeRecord, len(s.nodes)),
-		subgraphs:     make(map[string]SubgraphRecord, len(s.subgraphs)),
-		edges:         make(map[string]ContextEdge, len(s.edges)),
-		audit:         append([]AuditEvent(nil), s.audit...),
-		outbox:        append([]OutboxEvent(nil), s.outbox...),
-		failNext:      s.failNext,
+		graphRevision:  s.graphRevision,
+		nextSeq:        s.nextSeq,
+		nodes:          make(map[string]NodeRecord, len(s.nodes)),
+		subgraphs:      make(map[string]SubgraphRecord, len(s.subgraphs)),
+		edges:          make(map[string]ContextEdge, len(s.edges)),
+		subscriptions:  make(map[string]ContextSubscriptionRecord, len(s.subscriptions)),
+		deltas:         make(map[string]ContextDelta, len(s.deltas)),
+		deltaAck:       make(map[string]bool, len(s.deltaAck)),
+		taskBindings:   make(map[taskScopeKey]TaskContextSubgraphBinding, len(s.taskBindings)),
+		projections:    make(map[projectionScopeKey]string, len(s.projections)),
+		recipients:     make(map[string][]TaskContextRecipient, len(s.recipients)),
+		candidates:     make(map[taskScopeKey][]CandidateBufferRecord, len(s.candidates)),
+		taskMemory:     make(map[taskScopeKey]TaskMemoryReviewState, len(s.taskMemory)),
+		reviewReceipts: make(map[taskScopeKey]TaskMemoryReviewReceipt, len(s.reviewReceipts)),
+		audit:          append([]AuditEvent(nil), s.audit...),
+		outbox:         append([]OutboxEvent(nil), s.outbox...),
+		failNext:       s.failNext,
 	}
 	for id, record := range s.nodes {
 		record.Node = cloneNode(record.Node)
@@ -896,6 +967,39 @@ func (s *MemoryStore) cloneLocked() *memoryData {
 	for key, edge := range s.edges {
 		clone.edges[key] = edge
 	}
+	for id, record := range s.subscriptions {
+		record.Subscription.SubgraphIDs = append([]string(nil), record.Subscription.SubgraphIDs...)
+		record.Subscription.EventKinds = append([]string(nil), record.Subscription.EventKinds...)
+		clone.subscriptions[id] = record
+	}
+	for id, delta := range s.deltas {
+		delta.SubgraphIDs = append([]string(nil), delta.SubgraphIDs...)
+		clone.deltas[id] = delta
+	}
+	for id, ack := range s.deltaAck {
+		clone.deltaAck[id] = ack
+	}
+	for key, binding := range s.taskBindings {
+		clone.taskBindings[key] = binding
+	}
+	for key, nodeID := range s.projections {
+		clone.projections[key] = nodeID
+	}
+	for nodeID, recipients := range s.recipients {
+		clone.recipients[nodeID] = cloneRecipients(recipients)
+	}
+	for key, candidates := range s.candidates {
+		clone.candidates[key] = cloneCandidateRecords(candidates)
+	}
+	for key, state := range s.taskMemory {
+		clone.taskMemory[key] = state
+	}
+	for key, receipt := range s.reviewReceipts {
+		receipt.ReviewedIDs = append([]string(nil), receipt.ReviewedIDs...)
+		receipt.NodeIDs = append([]string(nil), receipt.NodeIDs...)
+		receipt.RejectedIDs = append([]string(nil), receipt.RejectedIDs...)
+		clone.reviewReceipts[key] = receipt
+	}
 	return clone
 }
 
@@ -905,6 +1009,15 @@ func (s *MemoryStore) replaceLocked(working *memoryData) {
 	s.nodes = working.nodes
 	s.subgraphs = working.subgraphs
 	s.edges = working.edges
+	s.subscriptions = working.subscriptions
+	s.deltas = working.deltas
+	s.deltaAck = working.deltaAck
+	s.taskBindings = working.taskBindings
+	s.projections = working.projections
+	s.recipients = working.recipients
+	s.candidates = working.candidates
+	s.taskMemory = working.taskMemory
+	s.reviewReceipts = working.reviewReceipts
 	s.audit = working.audit
 	s.outbox = working.outbox
 	s.failNext = working.failNext
@@ -1031,4 +1144,74 @@ func mustJSON(value any) []byte {
 		panic(err)
 	}
 	return data
+}
+
+func cloneRecipients(recipients []TaskContextRecipient) []TaskContextRecipient {
+	if len(recipients) == 0 {
+		return nil
+	}
+	out := make([]TaskContextRecipient, len(recipients))
+	for i, recipient := range recipients {
+		recipient.EndpointRefs = append([]PhaseEndpointRef(nil), recipient.EndpointRefs...)
+		out[i] = recipient
+	}
+	return out
+}
+
+func cloneCandidateRecords(records []CandidateBufferRecord) []CandidateBufferRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	out := make([]CandidateBufferRecord, len(records))
+	for i, record := range records {
+		record.Candidate = cloneMemoryCandidate(record.Candidate)
+		record.CreationContext.SubscribedSubgraphIDs = append([]string(nil), record.CreationContext.SubscribedSubgraphIDs...)
+		out[i] = record
+	}
+	return out
+}
+
+func cloneMemoryCandidate(candidate MemoryCandidate) MemoryCandidate {
+	candidate.SourceRefs = append([]string(nil), candidate.SourceRefs...)
+	candidate.SubgraphIDs = append([]string(nil), candidate.SubgraphIDs...)
+	return candidate
+}
+
+func lastOutboxID(working *memoryData) string {
+	if len(working.outbox) == 0 {
+		return ""
+	}
+	return working.outbox[len(working.outbox)-1].ID
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func unionStringSlices(left, right []string) []string {
+	set := map[string]struct{}{}
+	for _, value := range left {
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	for _, value := range right {
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	return sortedStringSet(set)
+}
+
+func scopedTask(projectID kernel.ProjectID, taskID kernel.TaskID) taskScopeKey {
+	return taskScopeKey{ProjectID: projectID, TaskID: taskID}
+}
+
+func scopedProjection(projectID kernel.ProjectID, projectionID string) projectionScopeKey {
+	return projectionScopeKey{ProjectID: projectID, ProjectionID: projectionID}
 }

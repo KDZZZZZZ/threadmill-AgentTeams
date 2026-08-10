@@ -6,10 +6,11 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 )
 
-// ContextGraphReader is the read/explore seam available to ordinary agents.
-// Subscription lifecycle is implemented by a later W1-B/C batch; this first
-// batch intentionally keeps only already-designed read operations executable.
+// ContextGraphReader is the read/explore/subscribe seam available to ordinary
+// agents. Search stays isolated in ContextGraphSearcher for Context Agent only.
 type ContextGraphReader interface {
 	ListSubgraphs(context.Context, auth.Principal, ListSubgraphsRequest) ([]ContextSubgraph, error)
 	Explore(context.Context, auth.Principal, ExploreRequest) (ContextSliceDelta, error)
+	Subscribe(context.Context, auth.Principal, SubscribeRequest) (ContextSubscription, error)
+	Unsubscribe(context.Context, auth.Principal, string) error
 }

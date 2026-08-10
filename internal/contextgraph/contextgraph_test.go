@@ -237,8 +237,10 @@ func TestReturnedNodesAndEdgesDoNotLeakHiddenSubgraphs(t *testing.T) {
 
 func TestSearchAuthorizesScopeAndAnchorsBeforeMatching(t *testing.T) {
 	store := seededStore()
-	ctxAgent := contextPrincipal(auth.ToolContextSubmitReview, auth.ToolContextSearch)
-	createNode(t, store, ctxAgent, "visible", "creator-1", "", nil)
+	reviewer := contextPrincipal(auth.ToolContextSubmitReview)
+	createNode(t, store, reviewer, "visible", "creator-1", "", nil)
+	ctxAgent := contextPrincipal(auth.ToolContextSearch)
+	ctxAgent.ConsumerInvocationID = "inv-search-caller"
 
 	search, err := store.Search(context.Background(), ctxAgent, SearchRequest{Keywords: []string{"needle"}, Scope: []string{"subgraph:general-a"}})
 	if err != nil {
@@ -247,8 +249,8 @@ func TestSearchAuthorizesScopeAndAnchorsBeforeMatching(t *testing.T) {
 	if len(search.Slice.Nodes) != 1 || search.Slice.Nodes[0].ID != "visible" {
 		t.Fatalf("search returned unauthorized or missing nodes: %#v", search.Slice.Nodes)
 	}
-	if len(search.SubscriptionIDs) != 0 {
-		t.Fatalf("subscription IDs = %#v, want empty until CX03", search.SubscriptionIDs)
+	if len(search.SubscriptionIDs) != 1 {
+		t.Fatalf("subscription IDs = %#v, want one search subscription", search.SubscriptionIDs)
 	}
 	if _, err := store.Search(context.Background(), ctxAgent, SearchRequest{Keywords: []string{"needle"}, Scope: []string{"task-1-context"}}); !kernel.IsCode(err, kernel.CodeNotFound) {
 		t.Fatalf("hidden scope err = %v, want not_found", err)

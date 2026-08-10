@@ -129,15 +129,18 @@ func (a *Authenticator) AuthenticateAgentToken(ctx context.Context, tokenSecret 
 		return Principal{}, err
 	}
 	return Principal{
-		ActorPrincipalID: record.ActorPrincipalID,
-		Kind:             PrincipalAgent,
-		ProjectID:        capability.ProjectID,
-		Role:             capability.Role,
-		Operation:        capability.Operation,
-		TaskID:           capability.TaskID,
-		InvocationID:     capability.InvocationID,
-		Tools:            cloneTools(capability.Tools),
-		AuthenticatedAt:  a.now(),
+		ActorPrincipalID:     record.ActorPrincipalID,
+		Kind:                 PrincipalAgent,
+		ProjectID:            capability.ProjectID,
+		Role:                 capability.Role,
+		Operation:            capability.Operation,
+		TaskID:               capability.TaskID,
+		InvocationID:         capability.InvocationID,
+		ConsumerInvocationID: capability.ConsumerInvocationID,
+		ConsumerTaskID:       capability.ConsumerTaskID,
+		ConsumerRole:         capability.ConsumerRole,
+		Tools:                cloneTools(capability.Tools),
+		AuthenticatedAt:      a.now(),
 	}, nil
 }
 
@@ -178,6 +181,12 @@ func validateCapability(capability Capability, now time.Time) error {
 		}
 	} else if capability.Operation != "" {
 		return kernel.InvalidArgument("operation is only valid for context capability")
+	}
+	if (capability.ConsumerInvocationID != "" || capability.ConsumerTaskID != "" || capability.ConsumerRole != "") && (capability.Role != RoleContext || capability.Operation != "retrieve") {
+		return kernel.Forbidden("consumer invocation is only valid for context retrieve capability")
+	}
+	if capability.ConsumerRole != "" && !isAgentRole(capability.ConsumerRole) {
+		return kernel.Forbidden("consumer role is not a supported agent role")
 	}
 	if len(capability.Tools) == 0 {
 		return kernel.Forbidden("capability must include at least one tool")

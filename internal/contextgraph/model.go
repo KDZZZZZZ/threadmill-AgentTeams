@@ -1,6 +1,7 @@
 package contextgraph
 
 import (
+	"context"
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -66,10 +67,12 @@ type MemoryCandidate struct {
 }
 
 type CandidateBufferRecord struct {
-	CandidateID     string
-	TaskID          string
-	Candidate       MemoryCandidate
-	CreationContext NodeCreationContext
+	CandidateID           string
+	TaskID                string
+	Candidate             MemoryCandidate
+	CreationContext       NodeCreationContext
+	CreatedByInvocationID kernel.InvocationID
+	CreatedAt             time.Time
 }
 
 type ContextEdge struct {
@@ -164,7 +167,150 @@ type ContextSearchResult struct {
 	SubscriptionIDs []string          `json:"subscription_ids"`
 }
 
+type SubscribeRequest struct {
+	SubgraphIDs []string `json:"subgraph_ids"`
+	EventKinds  []string `json:"event_kinds"`
+}
+
+type ContextSubscription struct {
+	ID                   string   `json:"id"`
+	ConsumerInvocationID string   `json:"consumer_invocation_id"`
+	SubgraphIDs          []string `json:"subgraph_ids"`
+	EventKinds           []string `json:"event_kinds"`
+	PermissionSnapshot   string   `json:"permission_snapshot"`
+}
+
+type ContextSubscriptionRecord struct {
+	Subscription ContextSubscription
+	ProjectID    kernel.ProjectID
+	TaskID       kernel.TaskID
+	Role         string
+	Source       string
+	Active       bool
+	CanceledAt   *time.Time
+	ExpiredAt    *time.Time
+	CreatedAt    time.Time
+}
+
+type ContextDelta struct {
+	ID             string   `json:"id"`
+	ProjectID      string   `json:"project_id"`
+	SubscriptionID string   `json:"subscription_id"`
+	InvocationID   string   `json:"invocation_id"`
+	EventID        string   `json:"event_id"`
+	EventKind      string   `json:"event_kind"`
+	SubgraphIDs    []string `json:"subgraph_ids"`
+	GraphRevision  int64    `json:"graph_revision"`
+}
+
+type ContextSlice struct {
+	Nodes           []ContextNode `json:"nodes"`
+	SubscriptionIDs []string      `json:"subscription_ids"`
+	GraphRevision   int64         `json:"graph_revision"`
+}
+
+type SubscriptionInspection struct {
+	ID                   string   `json:"id"`
+	ConsumerInvocationID string   `json:"consumer_invocation_id"`
+	Source               string   `json:"source"`
+	SubgraphIDs          []string `json:"subgraph_ids"`
+	EventKinds           []string `json:"event_kinds"`
+	Active               bool     `json:"active"`
+}
+
 type ContextNodeRef = string
+
+type PhaseEndpointRef struct {
+	TaskID     kernel.TaskID     `json:"task_id"`
+	EndpointID kernel.EndpointID `json:"endpoint_id"`
+}
+
+type TaskContextSubgraphBinding struct {
+	TaskID     string `json:"task_id"`
+	SubgraphID string `json:"subgraph_id"`
+}
+
+type TaskContextRecipient struct {
+	TaskID       string             `json:"task_id"`
+	EndpointRefs []PhaseEndpointRef `json:"endpoint_refs"`
+}
+
+type TaskContextProjection struct {
+	ProjectionID   string                 `json:"projection_id"`
+	SourceRevision string                 `json:"source_revision"`
+	Statement      string                 `json:"statement"`
+	Kind           string                 `json:"kind"`
+	SourceRefs     []string               `json:"source_refs"`
+	SubgraphIDs    []string               `json:"subgraph_ids"`
+	Recipients     []TaskContextRecipient `json:"recipients"`
+}
+
+type ProjectTaskContextRequest struct {
+	Projection TaskContextProjection `json:"projection"`
+}
+
+type TaskMemoryCandidateView struct {
+	CandidateID string          `json:"candidate_id"`
+	Candidate   MemoryCandidate `json:"candidate"`
+}
+
+type TaskMemoryBufferView struct {
+	Candidates []TaskMemoryCandidateView `json:"candidates"`
+}
+
+type SubmitCandidateRequest struct {
+	Candidate MemoryCandidate `json:"candidate"`
+}
+
+type FrozenCandidateBatch struct {
+	TaskID     string                    `json:"task_id"`
+	Candidates []TaskMemoryCandidateView `json:"candidates"`
+}
+
+type CandidateReviewDecision struct {
+	CandidateID  string   `json:"candidate_id"`
+	Action       string   `json:"action"`
+	Statement    string   `json:"statement"`
+	Kind         string   `json:"kind"`
+	SubgraphIDs  []string `json:"subgraph_ids"`
+	TargetNodeID string   `json:"target_node_id"`
+	Reason       string   `json:"reason"`
+}
+
+type CandidateReviewSubmission struct {
+	Decisions []CandidateReviewDecision `json:"decisions"`
+}
+
+type TaskMemoryReviewReceipt struct {
+	TaskID      string   `json:"task_id"`
+	ReviewedIDs []string `json:"reviewed_ids"`
+	NodeIDs     []string `json:"node_ids"`
+	RejectedIDs []string `json:"rejected_ids"`
+}
+
+type TaskMemoryReviewState string
+
+const (
+	TaskMemoryOpen             TaskMemoryReviewState = "open"
+	TaskMemoryFrozenUnreviewed TaskMemoryReviewState = "frozen-unreviewed"
+	TaskMemoryReviewed         TaskMemoryReviewState = "reviewed"
+)
+
+type taskScopeKey struct {
+	ProjectID kernel.ProjectID
+	TaskID    kernel.TaskID
+}
+
+type projectionScopeKey struct {
+	ProjectID    kernel.ProjectID
+	ProjectionID string
+}
+
+type TaskEndpointResolver interface {
+	TaskExists(ctx context.Context, projectID kernel.ProjectID, taskID kernel.TaskID) (bool, error)
+	TaskDone(ctx context.Context, projectID kernel.ProjectID, taskID kernel.TaskID) (bool, error)
+	EndpointExists(ctx context.Context, projectID kernel.ProjectID, endpoint PhaseEndpointRef) (bool, error)
+}
 
 type GetSubgraphRequest struct {
 	SubgraphID string `json:"subgraph_id"`

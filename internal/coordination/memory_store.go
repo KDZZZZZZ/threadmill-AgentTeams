@@ -18,6 +18,7 @@ type projectState struct {
 	latest  kernel.Revision
 	history map[kernel.Revision]graphState
 	current graphState
+	runtime memoryRuntimeState
 }
 
 type graphState struct {
@@ -100,6 +101,13 @@ func (s *MemoryStore) Transition(_ context.Context, projectID kernel.ProjectID, 
 	if err := kernel.CheckExpectedRevision(expectedRevision, project.latest); err != nil {
 		return GraphSnapshot{}, err
 	}
+	if transition.TargetKind == TargetPhaseEndpoint && transition.Action == "released" {
+		for _, lease := range project.runtime.leases {
+			if lease.State == "active" && lease.Endpoint == transition.Endpoint {
+				return GraphSnapshot{}, kernel.TransitionRejected("released transition requires the phase lease to be terminally released")
+			}
+		}
+	}
 	state := project.current.clone()
 	if err := applyTransition(&state, transition); err != nil {
 		return GraphSnapshot{}, err
@@ -107,7 +115,9 @@ func (s *MemoryStore) Transition(_ context.Context, projectID kernel.ProjectID, 
 	if err := validateGraph(state); err != nil {
 		return GraphSnapshot{}, err
 	}
-	return s.commit(project, state), nil
+	snapshot := s.commit(project, state)
+	recordRuntimeBinding(project, transition)
+	return snapshot, nil
 }
 
 func (s *MemoryStore) ensureProject(projectID kernel.ProjectID) *projectState {
@@ -117,6 +127,7 @@ func (s *MemoryStore) ensureProject(projectID kernel.ProjectID) *projectState {
 			latest:  1,
 			history: make(map[kernel.Revision]graphState),
 			current: newGraphState(),
+			runtime: newMemoryRuntimeState(),
 		}
 		project.history[project.latest] = project.current.clone()
 		s.projects[projectID] = project
@@ -129,6 +140,26 @@ func (s *MemoryStore) commit(project *projectState, state graphState) GraphSnaps
 	project.current = state.clone()
 	project.history[project.latest] = state.clone()
 	return project.current.snapshot(project.latest)
+}
+
+func recordRuntimeBinding(project *projectState, transition GraphTransition) {
+	if transition.TargetKind != TargetPhaseEndpoint {
+		return
+	}
+	switch transition.Action {
+	case "stopped":
+		project.runtime.bindings[transition.NewBindingRef] = bindingRuntimeInfo{
+			CheckpointRef: transition.CheckpointRef,
+			NonResumable:  transition.NonResumable,
+		}
+	case "reopened":
+		if transition.NewBindingRef != "" {
+			project.runtime.bindings[transition.NewBindingRef] = bindingRuntimeInfo{
+				CheckpointRef: transition.CheckpointRef,
+				NonResumable:  transition.NonResumable,
+			}
+		}
+	}
 }
 
 func newGraphState() graphState {

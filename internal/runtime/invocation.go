@@ -25,25 +25,28 @@ const (
 )
 
 type Invocation struct {
-	ID                  kernel.InvocationID
-	ActorPrincipalID    kernel.ActorPrincipalID
-	ProjectID           kernel.ProjectID
-	TaskID              kernel.TaskID
-	EndpointID          kernel.EndpointID
-	Generation          uint64
-	Role                auth.Role
-	Operation           string
-	Status              InvocationStatus
-	BindingRef          kernel.BindingRef
-	LeaseID             kernel.LeaseID
-	WorkspaceRef        string
-	ContextSliceRef     string
-	TaskMemoryBufferRef string
-	PromptHashes        map[string]string
-	SkillHashes         map[string]string
-	EffectiveTools      []auth.Tool
-	CreatedAt           time.Time
-	ExpiresAt           time.Time
+	ID                   kernel.InvocationID
+	ActorPrincipalID     kernel.ActorPrincipalID
+	ProjectID            kernel.ProjectID
+	TaskID               kernel.TaskID
+	EndpointID           kernel.EndpointID
+	ConsumerInvocationID kernel.InvocationID
+	ConsumerTaskID       kernel.TaskID
+	ConsumerRole         auth.Role
+	Generation           uint64
+	Role                 auth.Role
+	Operation            string
+	Status               InvocationStatus
+	BindingRef           kernel.BindingRef
+	LeaseID              kernel.LeaseID
+	WorkspaceRef         string
+	ContextSliceRef      string
+	TaskMemoryBufferRef  string
+	PromptHashes         map[string]string
+	SkillHashes          map[string]string
+	EffectiveTools       []auth.Tool
+	CreatedAt            time.Time
+	ExpiresAt            time.Time
 }
 
 func (i Invocation) Validate() error {
@@ -93,6 +96,16 @@ func (i Invocation) Validate() error {
 	} else if i.Operation != "" {
 		return kernel.InvalidArgument("operation is only valid for context agent")
 	}
+	if (i.ConsumerInvocationID != "" || i.ConsumerTaskID != "" || i.ConsumerRole != "") && (i.Role != auth.RoleContext || i.Operation != "retrieve") {
+		return kernel.Forbidden("consumer invocation is only valid for context retrieve invocation")
+	}
+	if i.ConsumerRole != "" {
+		switch i.ConsumerRole {
+		case auth.RoleTaskManager, auth.RoleContext, auth.RolePlanner, auth.RoleExecutor, auth.RoleVerifier:
+		default:
+			return kernel.Forbidden("consumer role is not a supported agent role")
+		}
+	}
 	if len(i.EffectiveTools) == 0 {
 		return kernel.Forbidden("invocation has no effective tools")
 	}
@@ -104,13 +117,16 @@ func (i Invocation) Validate() error {
 
 func (i Invocation) Capability() auth.Capability {
 	return auth.Capability{
-		ProjectID:    i.ProjectID,
-		TaskID:       i.TaskID,
-		InvocationID: i.ID,
-		Role:         i.Role,
-		Operation:    i.Operation,
-		Tools:        auth.ToolSet(i.EffectiveTools...),
-		ExpiresAt:    i.ExpiresAt,
+		ProjectID:            i.ProjectID,
+		TaskID:               i.TaskID,
+		InvocationID:         i.ID,
+		ConsumerInvocationID: i.ConsumerInvocationID,
+		ConsumerTaskID:       i.ConsumerTaskID,
+		ConsumerRole:         i.ConsumerRole,
+		Role:                 i.Role,
+		Operation:            i.Operation,
+		Tools:                auth.ToolSet(i.EffectiveTools...),
+		ExpiresAt:            i.ExpiresAt,
 	}
 }
 

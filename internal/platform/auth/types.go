@@ -69,15 +69,18 @@ const (
 )
 
 type Principal struct {
-	ActorPrincipalID kernel.ActorPrincipalID
-	Kind             PrincipalKind
-	ProjectID        kernel.ProjectID
-	Role             Role
-	Operation        string
-	TaskID           kernel.TaskID
-	InvocationID     kernel.InvocationID
-	Tools            map[Tool]struct{}
-	AuthenticatedAt  time.Time
+	ActorPrincipalID     kernel.ActorPrincipalID
+	Kind                 PrincipalKind
+	ProjectID            kernel.ProjectID
+	Role                 Role
+	Operation            string
+	TaskID               kernel.TaskID
+	InvocationID         kernel.InvocationID
+	ConsumerInvocationID kernel.InvocationID
+	ConsumerTaskID       kernel.TaskID
+	ConsumerRole         Role
+	Tools                map[Tool]struct{}
+	AuthenticatedAt      time.Time
 }
 
 func (p Principal) HasTool(tool Tool) bool {
@@ -102,13 +105,16 @@ func ToolSet(tools ...Tool) map[Tool]struct{} {
 }
 
 type Capability struct {
-	ProjectID    kernel.ProjectID
-	TaskID       kernel.TaskID
-	InvocationID kernel.InvocationID
-	Role         Role
-	Operation    string
-	Tools        map[Tool]struct{}
-	ExpiresAt    time.Time
+	ProjectID            kernel.ProjectID
+	TaskID               kernel.TaskID
+	InvocationID         kernel.InvocationID
+	ConsumerInvocationID kernel.InvocationID
+	ConsumerTaskID       kernel.TaskID
+	ConsumerRole         Role
+	Role                 Role
+	Operation            string
+	Tools                map[Tool]struct{}
+	ExpiresAt            time.Time
 }
 
 type Scope struct {

@@ -319,6 +319,66 @@ func TestContextCapabilityIsBoundToOneOperation(t *testing.T) {
 	}
 }
 
+func TestConsumerInvocationCapabilityOnlyForContextRetrieve(t *testing.T) {
+	now := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
+	authenticator := NewAuthenticator(NewMemoryStore(), func() time.Time { return now })
+	for _, capability := range []Capability{
+		{
+			ProjectID:            "project-a",
+			TaskID:               "task-1",
+			InvocationID:         "inv-phase",
+			ConsumerInvocationID: "inv-victim",
+			Role:                 RoleExecutor,
+			Tools:                ToolSet(ToolContextSubscribe),
+			ExpiresAt:            now.Add(time.Minute),
+		},
+		{
+			ProjectID:            "project-a",
+			InvocationID:         "inv-context-review",
+			ConsumerInvocationID: "inv-victim",
+			Role:                 RoleContext,
+			Operation:            "review",
+			Tools:                ToolSet(ToolContextSearch),
+			ExpiresAt:            now.Add(time.Minute),
+		},
+		{
+			ProjectID:    "project-a",
+			InvocationID: "inv-context-bad-role",
+			ConsumerRole: Role("operator"),
+			Role:         RoleContext,
+			Operation:    "retrieve",
+			Tools:        ToolSet(ToolContextSearch),
+			ExpiresAt:    now.Add(time.Minute),
+		},
+	} {
+		if _, err := authenticator.IssueAgentToken(context.Background(), "agent-1", capability); !kernel.IsCode(err, kernel.CodeForbidden) {
+			t.Fatalf("consumer capability %#v err = %v, want forbidden", capability, err)
+		}
+	}
+
+	token, err := authenticator.IssueAgentToken(context.Background(), "ctx-1", Capability{
+		ProjectID:            "project-a",
+		InvocationID:         "inv-context-retrieve",
+		ConsumerInvocationID: "inv-victim",
+		ConsumerTaskID:       "task-1",
+		ConsumerRole:         RoleExecutor,
+		Role:                 RoleContext,
+		Operation:            "retrieve",
+		Tools:                ToolSet(ToolContextSearch),
+		ExpiresAt:            now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("context retrieve consumer token err = %v", err)
+	}
+	principal, err := authenticator.AuthenticateAgentToken(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.ConsumerInvocationID != "inv-victim" || principal.ConsumerTaskID != "task-1" || principal.ConsumerRole != RoleExecutor {
+		t.Fatalf("consumer scope not preserved: %#v", principal)
+	}
+}
+
 func TestRequireToolRechecksRolePolicy(t *testing.T) {
 	principal := Principal{
 		ActorPrincipalID: "agent-1",
