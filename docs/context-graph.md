@@ -568,11 +568,11 @@ Task Manager
 
 `StartPhaseInput` 中：
 
-- `ContractRef` 指向 Task Contract、DeliverySpec 和 ReportSpec，回答“做什么、为什么、怎样算完成”；
-- `PhaseInputSet` 投影入边，回答“谁要交付什么、哪些已到达、哪些仍需等待”；
-- `ContextSliceRef` 只补充相关的 `directive` | `fact` | `hypothesis` 上下文投影（含 Context Service 按 TaskID + EndpointRef 确定性装配的定向 task 节点，见 §8.2、§8.3），不定义任务要求。
+- `BindingRef` 固定 Task Contract、phase Spec（DeliverySpec / ReportSpec）、Workspace revision、Context Slice、Task Memory Buffer revision 和输入 revision，回答“本 generation 按哪组权威绑定执行”；
+- `PhaseInputSet` 是 BindingRef 所固定输入的只读物化视图，回答“谁要交付什么、哪些已到达、哪些仍需等待”；
+- Context Slice 只补充相关的 `directive` | `fact` | `hypothesis` 上下文投影（含 Context Service 按 TaskID + EndpointRef 确定性装配的定向 task 节点，见 §8.2、§8.3），不定义或覆盖任务要求。
 
-因此，所有入边相连的 Agent 都通过同一套 `ContractRef + PhaseInputSet` 得到任务，而不是通过 Context Graph 猜测 Manager 的编排意图。定向 task 节点由 **Context Service** 装配：Context Service 基于 Recipient bindings 的确定性匹配（§8.3）把节点并入 `ContextSliceRef`，Phase Agent 不感知 Recipient bindings，也不执行二次匹配；Phase Agent 的 `StartPhaseInput` interface 不变。
+因此，所有入边相连的 Agent 都通过同一套 `BindingRef + PhaseInputSet` 得到任务，而不是通过 Context Graph 猜测 Manager 的编排意图。定向 task 节点由 **Context Service** 装配：Context Service 基于 Recipient bindings 的确定性匹配（§8.3）把节点并入 BindingRef 固定的 Context Slice，Phase Agent 不感知 Recipient bindings，也不执行二次匹配；Phase Agent 的 `StartPhaseInput` interface 不变。
 
 Task Manager 的决定按语义分流：
 
@@ -605,7 +605,7 @@ Manager 不应把每次编排决定复制进 Context Graph。只有已经写入�
 
 ### 8.2 Task 定向投影权威对象
 
-Task 定向投影的字段集以本节为**权威**；其他文档只引用本节结构，不得重复定义。`PhaseEndpointRef` 唯一定义在 [task-graph.md §3.1](./task-graph.md)（至少含 `TaskID`、`EndpointID`），本文只引用。
+Task 定向投影的字段集以本节为**权威**；其他文档只引用本节结构，不得重复定义。`PhaseEndpointRef` 唯一定义在 [coordination-graph.md §2.1](./coordination-graph.md)（至少含 `TaskID`、`EndpointID`），本文只引用。
 
 ```go
 // 每个 Task 创建时由 Context Service 注册的唯一绑定；Task Manager 不自行推导或选择其他 Task 的 task 子图。

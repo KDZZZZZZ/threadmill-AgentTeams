@@ -1,9 +1,9 @@
 # Coordination Graph Module
 
-版本：v0.7
+版本：v0.8
 状态：Draft
 
-本文定义 Coordination Graph Module 的持久核心对象、内部 `GraphRuntime` 和两个边界 Interface。场景语义见 [统一设计](./threadmill-unified-design.md)，Agent 出站载荷见 [Phase Agent Module](./phase-agent.md)，事件载荷见 [Event Log / Artifact Store](./event-artifact-store.md)。
+本文定义 Coordination Graph Module 的持久核心对象、内部 `GraphRuntime` 和两个边界 Interface。场景语义见 [统一设计](./threadmill-unified-design.md)，Task Manager 行为见 [Task Manager Agent](./task-manager-agent.md)，Agent 出站载荷见 [Phase Agent Module](./phase-agent.md)，事件载荷见 [Event Log / Artifact Store](./event-artifact-store.md)。
 
 ## 1. 所有权与边界
 
@@ -134,6 +134,8 @@ type PendingSubgraph struct {
 ```
 
 `TaskManagerGraph` 必须同时校验 Task Manager capability 和 graph revision。`Snapshot(revision=0)` 返回 latest；其他 revision 返回对应一致快照。其他 Agent、`GraphRuntime` 和 Agent Runtime 均不持有该 Interface；Adapter 只负责保留并转发调用身份。
+
+`PendingSubgraph.RequestID` 与 `Transition` 的 `transitionRef` 都来自 Task Manager 已持久化的 DecisionRef，协议权威见 [task-manager-agent.md §3](./task-manager-agent.md)。Runtime Adapter 只注入当前 decision scope 的引用；Task Manager 不能自选、改写或跨 decision 复用该标识。
 
 `ReplacePending` 直接提交尚未执行 phase 切片的完整期望状态，不接收对象级 CRUD 或 JSON Patch。`Endpoints` 就是 scope；例如只调整 `A.verify` 时，只提交 `A.verify` 及所有目标为它的期望 Edge/Blocker，不连带提交 `A.plan` 和 `A.execute`。
 

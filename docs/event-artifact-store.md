@@ -39,6 +39,7 @@ Event Log 不是由 agent 显式写日志，而是 Runtime 在以下边界自动
 | Phase Endpoint 编排 | PhaseActivated | Scheduler 选中 runnable endpoint 并请求 Workspace Service 创建/复用该轮次的 Workspace Binding |
 | 结构化边界输出 | PhaseOutputSubmitted | 每个 phase 按 DeliverySpec / ReportSpec 提交输出；Runtime 只校验形状与必填引用 |
 | 编排建议 | OrchestrationProposalSubmitted / OrchestrationProposalDecided | 运行中 Agent 主动提交建议；Task Manager 裁决（接受/改写/拒绝）并明确当前 Invocation 处置 |
+| Task Manager 裁决 | TaskManagerDecisionSubmitted / TaskManagerDecisionFinalized | Runtime 将 DecisionRef 绑定 inputRef、expected graph revision、Graph mutation 结果与最终 disposition；Agent 不直接写日志 |
 | MemoryCandidate | `MemoryCandidateBuffered` / `MemoryCandidateRejected`、`CandidateBufferFrozen`、`CandidateReviewAccepted` / `CandidateReviewRejected` | 入缓冲后对同 Task plan/execute/verify 可读，跨 Task 不可见；不代表 ContextNode。done 后冻结、终审并原子落图 |
 | Context Graph 写入 | ContextGraphCommitted | 节点/边变更与 graph/subgraph revision 的原子提交 |
 | 订阅与推送 | ContextSubscriptionCreated / Expired、ContextDeltaDelivered / Consumed | Runtime 记录订阅关系与 Delta 是否被 Agent 消费 |
