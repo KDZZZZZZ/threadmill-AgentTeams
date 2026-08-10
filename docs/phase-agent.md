@@ -9,8 +9,8 @@
 Phase Agent 是一次受控 Invocation 内的计算者，不是编排者。它只需理解一个深 interface：
 
 ```text
-# Runtime 注入契约、工作区、上下文和正式输入
-接收当前 endpoint 契约、Workspace、Context 与输入集
+# Runtime 注入契约、工作区、上下文、正式输入和可选恢复状态
+接收当前 endpoint 的启动或恢复输入
   -> 执行当前可完成的工作
   -> 等待已声明但尚未交付的并行输入，或提出新的编排意图
   -> 汇总正式交付，提交阶段输出
@@ -19,15 +19,15 @@ Phase Agent 是一次受控 Invocation 内的计算者，不是编排者。它�
 这个 interface 向 Agent 隐藏 Coordination Graph 的拓扑、调度、边状态、worker 生命周期、Artifact Store 和上游 Invocation 的中间现场。其目标是：
 
 - **Leverage**：同一输入、等待和提交 interface 覆盖 plan、execute、verify 与不同 AgentTeams 承载方式。
-- **Locality**：输入满足、等待恢复、交付新鲜度和 worker 释放全部由 Runtime 一处实现。
-- **可测试性**：Agent 行为只依赖启动输入、Context 回调和四个出站调用；宿主可用替身 Runtime 验证，不必模拟整张协调图。
+- **Locality**：输入满足、等待、stop checkpoint、resume、交付新鲜度和 worker 释放全部由 Runtime 一处实现。
+- **可测试性**：Agent 行为只依赖生命周期输入、Context 回调和四个出站调用；宿主可用替身 Runtime 验证，不必模拟整张协调图。
 
 ## 2. 权限与责任
 
 | 决定 | Owner | Phase Agent 可见结果 |
 | --- | --- | --- |
 | endpoint 是否可启动、入边和交付规定 | Task Manager + Coordination Graph | `StartPhaseInput.Inputs` |
-| 何时派发和恢复 Invocation | Scheduler + Runtime | `runtime.startPhase`、`runtime.onInputsChanged` |
+| 何时启动、停止或恢复 Invocation | 内部 `GraphRuntime` + Agent Runtime | `runtime.startPhase`、`runtime.stopPhase`、`runtime.resumePhase` |
 | 输入已到达、失效或无法到达 | Runtime | `PhaseInputSet` 与 `runtime.awaitInputs` 结果 |
 | 当前工作如何完成、何时等待 | Phase Agent | 输出、等待调用或编排建议 |
 | 是否新增依赖、Task、endpoint 或更改图 | Task Manager | Proposal 裁决结果 |
@@ -35,26 +35,22 @@ Phase Agent 是一次受控 Invocation 内的计算者，不是编排者。它�
 
 Phase Agent 没有 Coordination Graph、Context Graph、main、mailbox 或 phase 跳转的写 interface。AgentTeams worker 或临时 agent 只是 Invocation 的执行宿主，不是编排者。
 
-## 3. 启动 Interface
+## 3. 生命周期 Interface
 
 ### 3.1 `runtime.startPhase`（Runtime 回调）
 
-Scheduler 选中 runnable Phase Endpoint 后，Runtime 调用 Agent。Agent 不调用此接口。
+内部 `GraphRuntime` 发布 `PhaseCommand{Action: "start"}` 后，Agent Runtime 调用 Agent。该动作只用于没有 checkpoint lineage 的 fresh binding；Agent 不调用此接口。
 
-任务要求来自 Coordination Graph 的权威投影。每个 Task 固定由 `plan / execute / verify` 三阶段组成；Runtime 启动当前阶段时同时提供两块上下文：`ContextSliceRef` 指向已落图、可探索/订阅的记忆切片，`TaskMemoryBufferRef` 指向该 Task 三阶段共享的候选缓冲快照。候选缓冲只在本 Task 内可见，不是 ContextNode，不参与图检索或订阅；两者都不能覆盖 `ContractRef` 或 `Inputs`。
+任务要求来自 Coordination Graph 的权威投影。每个 Task 固定由 `plan / execute / verify` 三阶段组成。`BindingRef` 集中固定当前 generation 的 Task Contract、phase Spec、Workspace revision、Context Slice、Task Memory Buffer revision 和已解析输入；Runtime 解析该引用并把对应内容装配到宿主，不把这些引用重复放进启动载荷。`Inputs` 是同一 BindingRef 的只读物化视图，便于 Agent 直接消费，不能独立改写。
 
 ```go
 // runtime.startPhase 注入的启动输入
 type StartPhaseInput struct {
-    InvocationID    string        `json:"invocation_id"`     // 当前受控 Invocation 的唯一标识
-    EndpointRef     string        `json:"endpoint_ref"`      // 被调度的 Phase Endpoint
-    TaskID          string        `json:"task_id"`           // 持久 Task 身份
-    Phase           string        `json:"phase"`             // plan | execute | verify
-    ContractRef     string        `json:"contract_ref"`      // Task Contract、DeliverySpec 和 ReportSpec
-    WorkspaceRef    string        `json:"workspace_ref"`     // 当前轮次共享的 Workspace Binding
-    ContextSliceRef     string        `json:"context_slice_ref"`      // 已落图、可检索/订阅的 Context 快照
-    TaskMemoryBufferRef string        `json:"task_memory_buffer_ref"` // 当前 Task 候选缓冲的只读快照
-    Inputs          PhaseInputSet `json:"inputs"`            // 入边交付的只读投影
+    InvocationID string           `json:"invocation_id"` // 当前受控 Invocation 的唯一标识
+    Endpoint     PhaseEndpointRef `json:"endpoint"`      // 被调度的 Phase Endpoint
+    Generation   int              `json:"generation"`    // 本次执行所属 generation
+    BindingRef   string           `json:"binding_ref"`   // 当前 generation 的不可变执行绑定
+    Inputs       PhaseInputSet    `json:"inputs"`        // BindingRef 所固定输入的只读物化视图
 }
 
 // 当前 endpoint 已声明入边的只读投影
@@ -67,14 +63,14 @@ type PhaseInputSet struct {
 
 type InputRequirement struct {
     InputID          string           `json:"input_id"`           // 输入要求的稳定标识
-    FromEndpoint     PhaseEndpointRef `json:"from_endpoint"`      // 负责交付的上游 endpoint（PhaseEndpointRef 权威定义见 task-graph.md §3.1）
+    FromEndpoint     PhaseEndpointRef `json:"from_endpoint"`      // 负责交付的上游 endpoint（权威定义见 coordination-graph.md §2.1）
     RequiredArtifacts []string        `json:"required_artifacts"` // 该输入必须包含的 artifact 类型或引用
     RequiredBy       string           `json:"required_by"`        // start | completion
 }
 
 type InputDelivery struct {
     InputID       string           `json:"input_id"`        // 对应的输入要求
-    FromEndpoint  PhaseEndpointRef `json:"from_endpoint"`   // 实际交付的上游 endpoint（PhaseEndpointRef 权威定义见 task-graph.md §3.1）
+    FromEndpoint  PhaseEndpointRef `json:"from_endpoint"`   // 实际交付的上游 endpoint（权威定义见 coordination-graph.md §2.1）
     PhaseOutputRef string          `json:"phase_output_ref"` // 上游正式 PhaseOutput 引用
     ArtifactRefs  []string         `json:"artifact_refs"`   // 可消费的正式 artifact 引用
     SourceRevision string          `json:"source_revision"` // 上游交付所基于的 revision
@@ -82,35 +78,70 @@ type InputDelivery struct {
 
 type PendingInput struct {
     InputID      string           `json:"input_id"`       // 尚未到达的输入要求
-    FromEndpoint PhaseEndpointRef `json:"from_endpoint"`  // 预计交付的上游 endpoint（PhaseEndpointRef 权威定义见 task-graph.md §3.1）
+    FromEndpoint PhaseEndpointRef `json:"from_endpoint"`  // 预计交付的上游 endpoint（权威定义见 coordination-graph.md §2.1）
     RequiredBy   string           `json:"required_by"`    // 仅 completion：并行等待，不能缺失提交
 }
 ```
 
-`inputs` 是当前 endpoint 已声明入边的只读投影：它明确告诉 Agent 谁应交付什么、哪些正式交付已经到达、哪些并行输入仍待到达。所有入边相连的 Agent 都通过相同的 `ContractRef + PhaseInputSet` 获得任务要求；Agent 不读取或推断 Coordination Graph。
+调用形态为 `runtime.startPhase(input: StartPhaseInput) -> accepted | error`；accepted 只表示新 Invocation 已被宿主接收，实际 started/failed 仍由 Runtime 写入 Event Log。
+
+`inputs` 是当前 endpoint 已声明入边的只读投影：它明确告诉 Agent 谁应交付什么、哪些正式交付已经到达、哪些并行输入仍待到达。所有入边相连的 Agent 都通过相同的 `BindingRef + PhaseInputSet` 获得任务要求；Agent 不读取或推断 Coordination Graph。
 
 - `requiredBy: "start"`：所有此类输入到达后，endpoint 才 runnable；它们不会出现在已启动 Invocation 的 `pending` 中。
 - `requiredBy: "completion"`：source 和 target 可以并行启动；target 的最终 PhaseOutput 提交前必须取得对应交付。
 - `phaseOutputRef` 与 `artifactRefs` 只引用上游正式边界输出，不暴露其过程上下文或工作目录。
 - `inputRevision` 随 delivered/pending 集合、输入 artifact 或新鲜度变化而变。Runtime 将它绑定到最终输出，防止旧输入静默复用。
-- `contractRef` 指向 Task Contract 及当前 endpoint 的 DeliverySpec、ReportSpec。缺少两者之一，endpoint 不可调度。
-- `workspaceRef` 标识同一轮次共享的 Workspace Binding；`contextSliceRef` 标识 Runtime 注入的初始 Context Slice。
+- `bindingRef` 是当前 Task Contract、phase Spec、Workspace、Context、Task Memory 和输入 revision 的唯一执行绑定；任一组成变化都必须产生新 BindingRef。
+- Runtime 必须验证 `Endpoint + Generation + BindingRef` 与 `PhaseCommand` 完全一致，再装配 Workspace、初始 Context Slice 和 Task Memory Buffer。
 
 Runtime 还在宿主侧强制 token/时间预算、工具白名单、可写目录和 phase lease；这些是实现细节，不进入 Agent 的公共 interface。
 
 ### 3.2 `runtime.stopPhase`（Runtime 回调）
 
-Runtime 可因取消、lease 失效、预算耗尽、输入终止或 Task Manager 裁决终止当前 Invocation。
+`runtime.stopPhase` 是可恢复停止回调，不等同于 Task cancellation、phase failed 或 phase completed。Agent Runtime 收到 `PhaseCommand{Action: "stop"}` 后调用；Phase Agent 不主动调用它。
 
 ```go
-// runtime.stopPhase 注入的终止输入
+// runtime.stopPhase 注入的停止输入
 type StopPhaseInput struct {
     InvocationID string `json:"invocation_id"` // 要终止的 Invocation
-    Reason       string `json:"reason"`        // 取消、lease 失效或裁决原因
+    CommandID    string `json:"command_id"`    // 幂等 stop 命令
+    Reason       string `json:"reason"`        // held、lease 失效、预算耗尽或控制面原因
+}
+
+// Phase Adapter 将 Agent 刷出的受控恢复状态注册为 artifact 后返回
+type StopPhaseAck struct {
+    ResumeStateRef string `json:"resume_state_ref"` // 结构化进度与下一安全恢复点；不是模型隐藏状态
 }
 ```
 
-Agent 收到后停止写入。已产生的受控产物仅能通过正常输出或 evidence 载体被引用；Agent 不自行推进 `plan -> execute -> verify`，也不宣布 Task 完成。
+调用形态为 `runtime.stopPhase(input: StopPhaseInput) -> StopPhaseAck | error`。Runtime 对回调设置截止时间；超时进入硬停止分支。
+
+stop 按以下顺序生效：
+
+1. Runtime 先阻止新的普通工具调用，只保留受控的状态刷出通道；Phase Agent 停在安全边界，写出已完成工作、待办、已消费输入和下一步位置，不保存隐藏推理或模型会话。
+2. Phase Adapter 注册该受控载荷并返回 `StopPhaseAck`。Runtime 将 `ResumeStateRef`、当前 BindingRef/generation 和权威 Workspace revision 固化为不透明 `CheckpointRef`。
+3. Runtime 终止旧 Invocation、撤销其写权限，并记录带 `CheckpointRef` 和 resumable 标记的 `PhaseInvocationStopped`；该事件持久化后才允许释放 lease。
+4. 若 Agent 不响应或宿主必须硬停止，Runtime 先围栏写入并尽力从已落盘 Workspace 生成 checkpoint；无法证明安全恢复时必须记录 `non_resumable`，不能返回虚假的 `CheckpointRef`。
+
+重复的 `CommandID` 返回同一停止结果。`StopPhaseAck` 不是 PhaseOutput，不推进 `plan -> execute -> verify`，也不宣布 Task 完成。
+
+### 3.3 `runtime.resumePhase`（Runtime 回调）
+
+```go
+// runtime.resumePhase 注入的新 Invocation 输入
+type ResumePhaseInput struct {
+    Start         StartPhaseInput `json:"start"`          // 当前 generation 的完整权威启动信封
+    CheckpointRef string          `json:"checkpoint_ref"` // 从 Start.BindingRef 解析出的已验证 checkpoint
+}
+```
+
+调用形态为 `runtime.resumePhase(input: ResumePhaseInput) -> accepted | error`；accepted 与 start 一样不代表 phase 完成。
+
+Agent Runtime 只在收到 `PhaseCommand{Action: "resume"}` 后调用该回调。`Start.InvocationID`、`Start.Generation` 和 lease 都必须是新的；旧 Invocation 已终止，不能复用其进程、线程、模型会话或内存。Runtime 在调用前验证 checkpoint 来自同一 Task/Endpoint 的上一 generation，且与当前 BindingRef 固定的 Contract、Spec、输入和 Workspace 基线兼容；`CheckpointRef` 不能覆盖 `Start` 中的当前权威绑定。
+
+Runtime 先恢复 Workspace 和 `ResumeStateRef`，再把当前 Context、Task Memory 与 `Inputs` 重新装配给 Agent。恢复后的 Agent 继续使用相同的 await、proposal 和 output interface。checkpoint 缺失、标记为 `non_resumable` 或绑定不兼容时，Runtime 返回 `stale_checkpoint`，不得降级为隐式 resume；Task Manager 必须通过 `Transition(reopened)` 建立 fresh binding，再由 `runtime.startPhase` 启动。
+
+这三个 `runtime.*Phase` 名称是 Agent Runtime/Adapter 内部映射到执行宿主的回调，不是暴露给 Task Manager 或 Phase Agent 自主调用的控制 API；统一控制入口仍是 Coordination Graph 内部的 `PhaseController.Apply(PhaseCommand)`。
 
 ## 4. 输入 Join Interface
 
@@ -137,7 +168,7 @@ type InputWaitResult struct {
 
 - 省略 `inputIds` 表示等待全部 `pending` completion 输入；指定时只能使用当前 `PhaseInputSet` 中已有的 `inputId`。
 - Runtime 根据既有 Coordination Edge 监听 source endpoint 的正式 `PhaseOutput`。新交付到达后，返回最新 `InputWaitResult`；Agent 汇总新旧交付后继续执行，必要时可再次等待。
-- 逻辑 Invocation 可以处于 waiting，但 Runtime 必须释放模型调用、线程和 worker capacity。恢复时可创建新的 AgentTeams 执行调用，重新注入当前 Workspace、Context 和最新输入；不要求模型进程或 worker 长驻。
+- 逻辑 Invocation 可以处于 waiting，但 Runtime 必须释放模型调用、线程和 worker capacity；再次承载时重新注入当前 Workspace、Context 和最新输入，不要求模型进程或 worker 长驻。该 join rehydration 不改变 generation，也不等同于控制面的 `PhaseCommand.resume`；只有 stop 后从 checkpoint 创建新 generation 才走 `runtime.resumePhase`。
 - `terminalReason` 表示已声明输入不能正常到达。Agent 可基于已有输入继续、提交编排建议，或将缺口写入最终报告；不得伪造已收交付。
 - `agent.submitPhaseOutput` 会拒绝仍缺少 completion 输入的最终输出。
 
@@ -216,7 +247,7 @@ type PhaseOutput struct {
 func SubmitPhaseOutput(output PhaseOutput) Accepted
 ```
 
-- Runtime 将输出绑定到当前 Task Contract、endpoint/phase、Input Revision、Workspace Binding/Head、`ContextSliceRef` 与 `TaskMemoryBufferRef`；Agent 不填写或改写这些绑定字段。
+- Runtime 将输出绑定到当前 `Endpoint + Generation + BindingRef`、Input Revision、Workspace Head 和 lease；Agent 不填写或改写这些绑定字段。
 - `deliveryRefs`、`reportRef`、`evidenceRefs` 必须满足当前 endpoint 的 DeliverySpec 和 ReportSpec。
 - Runtime 校验所有 required completion input 已交付且 source revision 仍满足约束。
 - 接受提交不等于通过；批准、拒绝、失效和 Task done 仍由授权方决定。
@@ -227,8 +258,7 @@ func SubmitPhaseOutput(output PhaseOutput) Accepted
 
 ```go
 // agent.proposeOrchestration 提交的编排意图
-// 结构与字段以 task-graph.md §5 的 OrchestrationProposal 为权威；此处为逐字段一致的引用摘录，
-// 不是独立定义，字段集变更只能发生在 task-graph.md。
+// Phase Agent 只提交意图；Task Manager 通过 TaskManagerGraph 独占图裁决与写入。
 type OrchestrationProposal struct {
     ProposalID               string           `json:"proposal_id"`                 // 幂等转交和裁决的标识
     ClientRef                string           `json:"client_ref"`                  // 提交方引用，用于去重
@@ -313,7 +343,7 @@ Phase Agent 不提供：
 - Coordination Graph 或 Context Graph 的写 interface；
 - main 写入、合并、done 判定；
 - mailbox、Agent 间消息、订阅外推送；
-- phase 跳转、lease、Workspace 或 worker 生命周期管理；
+- 主动 start/stop/resume、选择 checkpoint、phase 跳转、lease、Workspace 或 worker 生命周期管理；
 - 读取未提交的其他 Agent 过程上下文；
 - `Attempt`、`Split`、`Failure`、`Rework`、`Execution Graph` 等额外实体 interface。
 
@@ -323,7 +353,7 @@ Phase Agent 不提供：
 
 - MCP、HTTP、gRPC 或本地进程等传输协议；
 - `requiredArtifacts`、`ContextDelta.changes` 的完整字段；`contextAgent.retrieve` 请求/响应以 [context-agent.md](./context-agent.md) 为权威，本文不重复定义；
-- `InputWaitResult` 的持久化、恢复令牌、截止时间与错误码；
+- `InputWaitResult` 的持久化、join 等待令牌、截止时间与错误码；
 - Artifact ID、内容哈希、存储与去重策略；
 - 预算、重试、超时和可观测性字段；
 - DeliverySpec、ReportSpec、WriteSet 的完整结构。
@@ -334,7 +364,7 @@ Phase Agent 的上下文管理与运行内部配置需要结合具体宿主能�
 
 - **上下文装配**：ContextSlice 的构建、seed subgraph 选择、frontier 预算、按 role/purpose 的注入重排与正文注入量；
 - **订阅生命周期**：订阅绑定逻辑 Invocation、过期与清理时机、Delta 合并与重放策略；
-- **等待恢复**：`InputWaitResult` 的持久化、恢复令牌、截止时间与重试策略；
+- **输入等待**：`InputWaitResult` 的持久化、join 等待令牌、截止时间与重试策略；
 - **预算与门控**：token/时间预算、工具白名单、重试与超时参数。
 
 ### 8.2 AgentTeams 集成（待进一步研究）
@@ -354,10 +384,10 @@ AgentTeams 承载的具体集成细节需要结合实际能力与部署形态调
 AgentTeams 承载方式与控制保障同样未定案，本文不冻结：
 
 ```text
-# 图决定可运行性，Runtime 承载调用，Agent 只提交结构化结果
-Coordination Graph
-  -> Scheduler selects runnable endpoint
-  -> Runtime assembles input set and controlled invocation
+# GraphRuntime 决定动作，Agent Runtime 承载调用，Agent 只提交结构化结果
+Coordination Graph / GraphRuntime
+  -> PhaseController.Apply(start | resume)
+  -> Agent Runtime assembles binding, input set, checkpoint and controlled invocation
   -> AgentTeams taskflow worker or workerflow temporary agent
   -> agent waits, proposes, or submits structured output
   -> Runtime validates and routes it
@@ -396,6 +426,7 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 ## 9. 参考文档
 
 - [统一设计](./threadmill-unified-design.md)：两张图、输入边、三阶段、订阅与 Runtime 的语义权威。
+- [Coordination Graph](./coordination-graph.md)：PhaseEndpointRef、BindingRef、generation 与 start/stop/resume 控制语义。
 - [Agent Runtime](./agent-runtime.md)：AgentTeams 的 taskflow / workerflow 映射、lease、MCP 注入与 result.md 载体。
 - [Context Agent 定义与工具](./context-agent.md)：自然语言检索接口与 Context Agent 最小工具集。
 - [Workspace 与 Merge Queue](./workspace-merge.md)：Workspace Binding、路径和 WriteSet 边界。
