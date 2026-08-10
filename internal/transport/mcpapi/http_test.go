@@ -243,9 +243,48 @@ func TestDefinitionSchemasMatchStrictJSONFieldNames(t *testing.T) {
 	if definition.InputSchema["additionalProperties"] != false {
 		t.Fatalf("schema should mirror strict decoder: %#v", definition.InputSchema)
 	}
+	if got := definitionForTool(auth.ToolCoordinationReplacePending).InputSchema["required"]; !reflect.DeepEqual(got, []string{"endpoints"}) {
+		t.Fatalf("replace pending required = %#v", got)
+	}
+	if got := definitionForTool(auth.ToolContextListSubgraphs).InputSchema["required"]; got != nil {
+		t.Fatalf("list subgraphs required = %#v, want none", got)
+	}
+	if got := definitionForTool(auth.ToolContextExplore).InputSchema["required"]; got != nil {
+		t.Fatalf("context explore required = %#v, want none", got)
+	}
+	if got := definitionForTool(auth.ToolContextSearch).InputSchema["required"]; got != nil {
+		t.Fatalf("context search required = %#v, want none", got)
+	}
+	if got := definitionForTool(auth.ToolWorkspaceRead).InputSchema["required"]; !reflect.DeepEqual(got, []string{"path"}) {
+		t.Fatalf("workspace read required = %#v", got)
+	}
 	empty := definitionForTool(auth.ToolCoordinationTransition).InputSchema
 	if got := empty["properties"]; !reflect.DeepEqual(got, map[string]any{}) {
 		t.Fatalf("empty schema properties = %#v", got)
+	}
+}
+
+func TestHTTPHandlerRejectsUnsupportedProtocolHeaderWithHTTP400(t *testing.T) {
+	principal := principalWithTools(auth.RoleExecutor, auth.ToolContextExplore)
+	authenticator := &fakeAgentTokenAuthenticator{token: "secret", principal: principal}
+	registry, err := NewRegistry(ToolSpec{ID: auth.ToolContextExplore, Handler: HandlerFunc(func(context.Context, auth.Principal, auth.BoundScope, json.RawMessage) (any, error) {
+		return nil, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewHTTPHandler(authenticator, registry, HTTPOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := serveMCP(t, handler, "secret", "", `{"jsonrpc":"2.0","id":1,"method":"ping"}`, map[string]string{"MCP-Protocol-Version": "2099-01-01"})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported version status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload rpcResponse
+	decodeRecorderJSON(t, response, &payload)
+	if payload.Error == nil || payload.Error.Code != -32600 {
+		t.Fatalf("unsupported version response = %#v", payload)
 	}
 }
 

@@ -20,10 +20,14 @@ type toolDefinition struct {
 }
 
 func definitionForTool(tool auth.Tool) toolDefinition {
+	inputSchema := schemaForType(reflect.TypeOf(toolInputPrototype(tool)), map[reflect.Type]bool{})
+	if required := requiredFieldsForTool(tool); len(required) > 0 {
+		inputSchema["required"] = required
+	}
 	return toolDefinition{
 		Name:        string(tool),
 		Description: toolDescription(tool),
-		InputSchema: schemaForType(reflect.TypeOf(toolInputPrototype(tool)), map[reflect.Type]bool{}),
+		InputSchema: inputSchema,
 	}
 }
 
@@ -113,28 +117,21 @@ func schemaForType(t reflect.Type, active map[reflect.Type]bool) map[string]any 
 		active[t] = true
 		defer delete(active, t)
 		properties := make(map[string]any)
-		required := make([]string, 0)
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
 			if field.PkgPath != "" {
 				continue
 			}
-			name, optional, skip := jsonField(field)
+			name, _, skip := jsonField(field)
 			if skip {
 				continue
 			}
 			properties[name] = schemaForType(field.Type, active)
-			if !optional {
-				required = append(required, name)
-			}
 		}
 		schema := map[string]any{
 			"type":                 "object",
 			"properties":           properties,
 			"additionalProperties": false,
-		}
-		if len(required) > 0 {
-			schema["required"] = required
 		}
 		return schema
 	case reflect.Slice, reflect.Array:
@@ -153,6 +150,41 @@ func schemaForType(t reflect.Type, active map[reflect.Type]bool) map[string]any 
 	default:
 		return map[string]any{}
 	}
+}
+
+// requiredFieldsForTool is explicit because encoding/json accepts omitted
+// fields as zero values. Requiredness belongs to each tool's semantic
+// validator, not to the presence or absence of `omitempty` on a Go DTO.
+func requiredFieldsForTool(tool auth.Tool) []string {
+	required := map[auth.Tool][]string{
+		auth.ToolContextSubscribe:            {"subgraph_ids"},
+		auth.ToolContextUnsubscribe:          {"subscription_id"},
+		auth.ToolContextAgentRetrieve:        {"query"},
+		auth.ToolContextGetSubgraph:          {"subgraph_id"},
+		auth.ToolContextGetNode:              {"node_id"},
+		auth.ToolContextCreateNode:           {"statement", "kind", "source_refs", "subgraph_ids"},
+		auth.ToolContextUpdateNode:           {"node_id", "source_revision", "statement", "kind", "source_refs", "subgraph_ids", "status"},
+		auth.ToolContextDeleteNode:           {"node_id", "source_revision", "reason"},
+		auth.ToolContextCreateSubgraph:       {"name", "summary", "node_ids"},
+		auth.ToolContextUpdateSubgraph:       {"subgraph_id", "revision", "name", "summary", "node_ids"},
+		auth.ToolContextDeleteSubgraph:       {"subgraph_id", "revision", "reason"},
+		auth.ToolContextSubmitReview:         {"decisions"},
+		auth.ToolAgentProposeOrchestration:   {"orchestration_advice", "delivery_spec_advice", "report_spec_advice", "rationale"},
+		auth.ToolAgentSubmitRequirement:      {"text"},
+		auth.ToolAgentSubmitMemoryCandidate:  {"candidate"},
+		auth.ToolAgentSubmitPhaseOutput:      {"phase", "report_ref"},
+		auth.ToolTaskManagerSubmitDecision:   {"action", "reason"},
+		auth.ToolCoordinationReplacePending:  {"endpoints"},
+		auth.ToolContextRegisterTaskSubgraph: {"task_id"},
+		auth.ToolContextProjectTaskContext:   {"projection"},
+		auth.ToolContextFinalizeTaskMemory:   {"task_id"},
+		auth.ToolWorkspaceRead:               {"path"},
+		auth.ToolWorkspaceWritePlan:          {"path"},
+		auth.ToolWorkspaceWrite:              {"path"},
+		auth.ToolWorkspaceRun:                {"command"},
+		auth.ToolEvidenceRegister:            {"type"},
+	}
+	return append([]string(nil), required[tool]...)
 }
 
 func jsonField(field reflect.StructField) (name string, optional bool, skip bool) {

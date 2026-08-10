@@ -215,7 +215,7 @@ func (s *httpServer) handlePost(w http.ResponseWriter, r *http.Request, principa
 	if request.Method != "initialize" {
 		if version := strings.TrimSpace(r.Header.Get("MCP-Protocol-Version")); version != "" {
 			if _, ok := supportedProtocolVersions[version]; !ok {
-				writeRPCError(w, request.responseID(), -32600, "unsupported MCP protocol version", map[string]any{"supported": sortedProtocolVersions()})
+				writeRPCErrorStatus(w, http.StatusBadRequest, request.responseID(), -32600, "unsupported MCP protocol version", map[string]any{"supported": sortedProtocolVersions()})
 				return
 			}
 		}
@@ -451,9 +451,17 @@ func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, message 
 	writeRPC(w, rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message, Data: data}})
 }
 
+func writeRPCErrorStatus(w http.ResponseWriter, status int, id json.RawMessage, code int, message string, data any) {
+	writeRPCStatus(w, status, rpcResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: message, Data: data}})
+}
+
 func writeRPC(w http.ResponseWriter, response rpcResponse) {
+	writeRPCStatus(w, http.StatusOK, response)
+}
+
+func writeRPCStatus(w http.ResponseWriter, status int, response rpcResponse) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(response)
 }
 
