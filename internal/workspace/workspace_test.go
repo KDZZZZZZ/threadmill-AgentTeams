@@ -33,7 +33,14 @@ func TestGitWorktreeBindingPhaseReuseLeasesGuardWritesAndSeal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first binding: %v", err)
 	}
-	again, err := service.CreateGitWorktree(ctx, CreateRequest{TaskID: "task-1", Generation: 1, RepoPath: repo, WorktreeParent: parent})
+	again, err := service.CreateGitWorktree(ctx, CreateRequest{
+		TaskID:         "task-1",
+		Generation:     1,
+		RepoPath:       repo,
+		WorktreeParent: parent,
+		AllowedDirs:    []string{"workspace"},
+		DeclaredWrites: WriteSet{Files: []string{"workspace/app.go"}},
+	})
 	if err != nil {
 		t.Fatalf("reuse binding: %v", err)
 	}
@@ -118,8 +125,12 @@ func TestGitWorktreeBindingPhaseReuseLeasesGuardWritesAndSeal(t *testing.T) {
 	if observed.ActivePhase != PhaseVerify || observed.ActiveInvocation != "inv-verify" {
 		t.Fatalf("refresh overwrote active lease: %+v", observed)
 	}
+	completedVerify, err := service.CompletePhase(ctx, first.ID, PhaseVerify, "inv-verify", observed.Revision)
+	if err != nil {
+		t.Fatalf("complete verify: %v", err)
+	}
 
-	sealed, err := service.Seal(ctx, first.ID)
+	sealed, err := service.Seal(ctx, first.ID, completedVerify.Revision)
 	if err != nil {
 		t.Fatalf("seal binding: %v", err)
 	}
@@ -158,10 +169,11 @@ func TestCreateGitWorktreeFailsClosedAndRollsBack(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected injected create failure")
 	}
-	if _, statErr := os.Stat(filepath.Join(parent, "ws_task-rollback_001")); !os.IsNotExist(statErr) {
+	bindingID, branchName := bindingIdentity("task-rollback", 1)
+	if _, statErr := os.Stat(filepath.Join(parent, string(bindingID))); !os.IsNotExist(statErr) {
 		t.Fatalf("worktree was not rolled back, stat err = %v", statErr)
 	}
-	out, branchErr := exec.Command("git", "--git-dir", repo, "branch", "--list", "threadmill/task-rollback/001").CombinedOutput()
+	out, branchErr := exec.Command("git", "--git-dir", repo, "branch", "--list", branchName).CombinedOutput()
 	if branchErr != nil {
 		t.Fatalf("list rollback branch: %v\n%s", branchErr, out)
 	}

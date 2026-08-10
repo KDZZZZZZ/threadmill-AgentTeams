@@ -1,16 +1,16 @@
 package workspace
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
@@ -19,6 +19,9 @@ type Kind string
 
 const (
 	KindGitWorktree Kind = "git_worktree"
+	KindClone       Kind = "clone"
+	KindContainer   Kind = "container"
+	KindRemote      Kind = "remote"
 )
 
 type Phase string
@@ -46,23 +49,26 @@ type WriteSet struct {
 }
 
 type Binding struct {
-	ID               kernel.BindingRef             `json:"id"`
-	TaskID           kernel.TaskID                 `json:"task_id"`
-	Generation       int                           `json:"generation"`
-	Kind             Kind                          `json:"kind"`
-	Root             string                        `json:"root"`
-	BranchName       string                        `json:"branch_name,omitempty"`
-	ContainerID      string                        `json:"container_id,omitempty"`
-	VolumeRefs       []string                      `json:"volume_refs,omitempty"`
-	BaseRevision     string                        `json:"base_revision"`
-	CurrentRevision  string                        `json:"current_revision"`
-	AllowedDirs      []string                      `json:"allowed_dirs"`
-	DeclaredWrites   WriteSet                      `json:"declared_writes"`
-	ObservedWrites   WriteSet                      `json:"observed_writes"`
-	PhaseLeases      map[Phase]kernel.InvocationID `json:"phase_leases"`
-	ActivePhase      Phase                         `json:"active_phase,omitempty"`
-	ActiveInvocation kernel.InvocationID           `json:"active_invocation,omitempty"`
-	Status           Status                        `json:"status"`
+	ID                  kernel.BindingRef             `json:"id"`
+	Revision            kernel.Revision               `json:"binding_revision"`
+	TaskID              kernel.TaskID                 `json:"task_id"`
+	Generation          int                           `json:"generation"`
+	Kind                Kind                          `json:"kind"`
+	Root                string                        `json:"root"`
+	BranchName          string                        `json:"branch_name,omitempty"`
+	ContainerID         string                        `json:"container_id,omitempty"`
+	VolumeRefs          []string                      `json:"volume_refs,omitempty"`
+	BaseRevision        string                        `json:"base_revision"`
+	CurrentRevision     string                        `json:"current_revision"`
+	AllowedDirs         []string                      `json:"allowed_dirs"`
+	DeclaredWrites      WriteSet                      `json:"declared_writes"`
+	ObservedWrites      WriteSet                      `json:"observed_writes"`
+	PhaseLeases         map[Phase]kernel.InvocationID `json:"phase_leases"`
+	ActivePhase         Phase                         `json:"active_phase,omitempty"`
+	ActiveInvocation    kernel.InvocationID           `json:"active_invocation,omitempty"`
+	Status              Status                        `json:"status"`
+	RepositoryPath      string                        `json:"-"`
+	CreationFingerprint string                        `json:"-"`
 }
 
 type CreateRequest struct {
@@ -77,9 +83,8 @@ type CreateRequest struct {
 }
 
 type Service struct {
-	mu       sync.Mutex
-	bindings map[kernel.BindingRef]Binding
-	byRound  map[roundKey]kernel.BindingRef
+	store BindingStore
+	git   GitBackend
 }
 
 type roundKey struct {
@@ -88,10 +93,11 @@ type roundKey struct {
 }
 
 func NewService() *Service {
-	return &Service{
-		bindings: make(map[kernel.BindingRef]Binding),
-		byRound:  make(map[roundKey]kernel.BindingRef),
-	}
+	return NewServiceWithStore(NewMemoryStore(), NewLocalGitBackend())
+}
+
+func NewServiceWithStore(store BindingStore, gitBackend GitBackend) *Service {
+	return &Service{store: store, git: gitBackend}
 }
 
 func (s *Service) CreateGitWorktree(ctx context.Context, req CreateRequest) (Binding, error) {
@@ -104,196 +110,237 @@ func (s *Service) CreateGitWorktree(ctx context.Context, req CreateRequest) (Bin
 	if req.RepoPath == "" || req.WorktreeParent == "" {
 		return Binding{}, kernel.InvalidArgument("repo_path and worktree_parent are required")
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := roundKey{taskID: req.TaskID, generation: req.Generation}
-	if id, ok := s.byRound[key]; ok {
-		return cloneBinding(s.bindings[id]), nil
-	}
-
-	base := req.BaseRevision
-	if base == "" {
-		resolved, err := gitOutput(ctx, req.RepoPath, "rev-parse", "HEAD")
-		if err != nil {
-			return Binding{}, err
-		}
-		base = resolved
-	}
-	id := kernel.BindingRef(fmt.Sprintf("ws_%s_%03d", sanitizeID(string(req.TaskID)), req.Generation))
-	branch := fmt.Sprintf("threadmill/%s/%03d", sanitizeID(string(req.TaskID)), req.Generation)
-	root := filepath.Join(req.WorktreeParent, string(id))
-	if err := os.MkdirAll(req.WorktreeParent, 0o755); err != nil {
-		return Binding{}, fmt.Errorf("create worktree parent: %w", err)
-	}
-	worktreeAdded := false
-	if err := gitRun(ctx, req.RepoPath, "worktree", "add", "-b", branch, root, base); err != nil {
+	if err := s.ready(); err != nil {
 		return Binding{}, err
 	}
-	worktreeAdded = true
-	rollback := func(cause error) (Binding, error) {
-		if worktreeAdded {
-			_ = gitRun(context.Background(), req.RepoPath, "worktree", "remove", "--force", root)
-			_ = gitRun(context.Background(), req.RepoPath, "branch", "-D", branch)
-		}
-		return Binding{}, cause
-	}
-	if req.AfterWorktreeAdd != nil {
-		if err := req.AfterWorktreeAdd(); err != nil {
-			return rollback(fmt.Errorf("after worktree add: %w", err))
-		}
-	}
-	current, err := gitOutput(ctx, root, "rev-parse", "HEAD")
+	repositoryPath, err := canonicalExistingPath(req.RepoPath)
 	if err != nil {
-		return rollback(err)
+		return Binding{}, fmt.Errorf("resolve repository path: %w", err)
 	}
-	for _, dir := range []string{"plan", "workspace", "evidence"} {
-		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
-			return rollback(fmt.Errorf("create workspace dir %s: %w", dir, err))
-		}
+	worktreeParent, err := filepath.Abs(req.WorktreeParent)
+	if err != nil {
+		return Binding{}, fmt.Errorf("resolve worktree parent: %w", err)
 	}
 	allowed, err := normalizeAllowedDirs(req.AllowedDirs)
 	if err != nil {
-		return rollback(err)
-	}
-	binding := Binding{
-		ID:              id,
-		TaskID:          req.TaskID,
-		Generation:      req.Generation,
-		Kind:            KindGitWorktree,
-		Root:            root,
-		BranchName:      branch,
-		BaseRevision:    currentOr(base, current),
-		CurrentRevision: current,
-		AllowedDirs:     allowed,
-		DeclaredWrites:  cloneWriteSet(req.DeclaredWrites),
-		PhaseLeases:     make(map[Phase]kernel.InvocationID),
-		Status:          StatusPrepared,
-	}
-	s.bindings[id] = binding
-	s.byRound[key] = id
-	return cloneBinding(binding), nil
-}
-
-func (s *Service) BindPhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID) (Binding, error) {
-	if err := ctx.Err(); err != nil {
 		return Binding{}, err
 	}
+	declared, err := normalizeWriteSet(req.DeclaredWrites, allowed)
+	if err != nil {
+		return Binding{}, err
+	}
+	var result Binding
+	lockKey := roundLockKey(req.TaskID, req.Generation)
+	err = s.store.WithLock(ctx, lockKey, func(lockCtx context.Context) error {
+		existing, ok, getErr := s.store.GetByRound(lockCtx, req.TaskID, req.Generation)
+		if getErr != nil {
+			return getErr
+		}
+		if ok {
+			base := existing.BaseRevision
+			if req.BaseRevision != "" {
+				base, getErr = s.git.ResolveRevision(lockCtx, repositoryPath, req.BaseRevision)
+				if getErr != nil {
+					return getErr
+				}
+			}
+			fingerprint := createFingerprint(repositoryPath, worktreeParent, base, allowed, declared)
+			if existing.CreationFingerprint != fingerprint {
+				return kernel.IdempotencyConflict()
+			}
+			head, materializeErr := s.git.Materialize(lockCtx, existing)
+			if materializeErr != nil {
+				return materializeErr
+			}
+			if head != existing.CurrentRevision {
+				next := cloneBinding(existing)
+				next.CurrentRevision = head
+				existing, materializeErr = s.store.UpdateCAS(lockCtx, next, existing.Revision)
+				if materializeErr != nil {
+					return materializeErr
+				}
+			}
+			result = existing
+			return nil
+		}
+
+		base, resolveErr := s.git.ResolveRevision(lockCtx, repositoryPath, req.BaseRevision)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		id, branch := bindingIdentity(req.TaskID, req.Generation)
+		binding := Binding{
+			ID:                  id,
+			Revision:            1,
+			TaskID:              req.TaskID,
+			Generation:          req.Generation,
+			Kind:                KindGitWorktree,
+			Root:                filepath.Join(worktreeParent, string(id)),
+			BranchName:          branch,
+			BaseRevision:        base,
+			CurrentRevision:     base,
+			AllowedDirs:         allowed,
+			DeclaredWrites:      declared,
+			PhaseLeases:         make(map[Phase]kernel.InvocationID),
+			Status:              StatusPrepared,
+			RepositoryPath:      repositoryPath,
+			CreationFingerprint: createFingerprint(repositoryPath, worktreeParent, base, allowed, declared),
+		}
+		head, materializeErr := s.git.Materialize(lockCtx, binding)
+		if materializeErr != nil {
+			return materializeErr
+		}
+		binding.CurrentRevision = head
+		rollback := func(cause error) error {
+			_ = s.git.Remove(context.Background(), binding)
+			return cause
+		}
+		if req.AfterWorktreeAdd != nil {
+			if hookErr := req.AfterWorktreeAdd(); hookErr != nil {
+				return rollback(fmt.Errorf("after worktree add: %w", hookErr))
+			}
+		}
+		if insertErr := s.store.Insert(lockCtx, binding); insertErr != nil {
+			return rollback(insertErr)
+		}
+		result = binding
+		return nil
+	})
+	if err != nil {
+		return Binding{}, err
+	}
+	return cloneBinding(result), nil
+}
+
+func (s *Service) BindPhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID, expectedRevision ...kernel.Revision) (Binding, error) {
 	if invocationID == "" {
 		return Binding{}, kernel.InvalidArgument("invocation_id is required")
 	}
 	if !validPhase(phase) {
 		return Binding{}, kernel.InvalidArgument("invalid phase")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	binding, ok := s.bindings[id]
-	if !ok {
-		return Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
-	}
-	if binding.Status == StatusSealed {
-		return Binding{}, kernel.Forbidden("workspace binding is sealed")
-	}
-	if binding.ActiveInvocation != "" && binding.ActiveInvocation != invocationID {
-		return Binding{}, kernel.LeaseConflict("another phase holds the workspace write lease")
-	}
-	if completed := binding.PhaseLeases[phase]; completed != "" && completed != invocationID {
-		return Binding{}, kernel.LeaseConflict("phase already completed by another invocation")
-	}
-	binding.ActivePhase = phase
-	binding.ActiveInvocation = invocationID
-	s.bindings[id] = binding
-	return cloneBinding(binding), nil
+	return s.mutate(ctx, id, firstRevision(expectedRevision), func(binding *Binding) (bool, error) {
+		if binding.Status == StatusSealed {
+			return false, kernel.Forbidden("workspace binding is sealed")
+		}
+		if binding.ActivePhase == phase && binding.ActiveInvocation == invocationID {
+			return false, nil
+		}
+		if completed := binding.PhaseLeases[phase]; completed != "" {
+			if completed == invocationID {
+				return false, nil
+			}
+			return false, kernel.LeaseConflict("phase already completed by another invocation")
+		}
+		if binding.ActiveInvocation != "" {
+			return false, kernel.LeaseConflict("another phase holds the workspace write lease")
+		}
+		if !phasePrerequisitesMet(*binding, phase) {
+			return false, kernel.TransitionRejected("workspace phase prerequisites are not complete")
+		}
+		binding.ActivePhase = phase
+		binding.ActiveInvocation = invocationID
+		return true, nil
+	})
 }
 
-func (s *Service) ReleasePhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID) (Binding, error) {
-	return s.finishPhaseLease(ctx, id, phase, invocationID, false)
+func (s *Service) ReleasePhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID, expectedRevision ...kernel.Revision) (Binding, error) {
+	return s.finishPhaseLease(ctx, id, phase, invocationID, firstRevision(expectedRevision), false)
 }
 
-func (s *Service) CompletePhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID) (Binding, error) {
-	return s.finishPhaseLease(ctx, id, phase, invocationID, true)
+func (s *Service) CompletePhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID, expectedRevision ...kernel.Revision) (Binding, error) {
+	return s.finishPhaseLease(ctx, id, phase, invocationID, firstRevision(expectedRevision), true)
 }
 
-func (s *Service) finishPhaseLease(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID, complete bool) (Binding, error) {
-	if err := ctx.Err(); err != nil {
-		return Binding{}, err
-	}
+func (s *Service) finishPhaseLease(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID, expected kernel.Revision, complete bool) (Binding, error) {
 	if invocationID == "" {
 		return Binding{}, kernel.InvalidArgument("invocation_id is required")
 	}
 	if !validPhase(phase) {
 		return Binding{}, kernel.InvalidArgument("invalid phase")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	binding, ok := s.bindings[id]
-	if !ok {
-		return Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
-	}
-	if binding.ActivePhase != phase || binding.ActiveInvocation != invocationID {
-		return Binding{}, kernel.LeaseConflict("invocation does not hold active phase lease")
-	}
-	if complete {
-		binding.PhaseLeases[phase] = invocationID
-	}
-	binding.ActivePhase = ""
-	binding.ActiveInvocation = ""
-	s.bindings[id] = binding
-	return cloneBinding(binding), nil
+	return s.mutate(ctx, id, expected, func(binding *Binding) (bool, error) {
+		if complete && binding.ActiveInvocation == "" && binding.PhaseLeases[phase] == invocationID {
+			return false, nil
+		}
+		if binding.ActivePhase != phase || binding.ActiveInvocation != invocationID {
+			return false, kernel.LeaseConflict("invocation does not hold active phase lease")
+		}
+		if complete {
+			binding.PhaseLeases[phase] = invocationID
+		}
+		binding.ActivePhase = ""
+		binding.ActiveInvocation = ""
+		return true, nil
+	})
 }
 
-func (s *Service) Get(_ context.Context, id kernel.BindingRef) (Binding, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	binding, ok := s.bindings[id]
-	if !ok {
-		return Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
+func (s *Service) Get(ctx context.Context, id kernel.BindingRef) (Binding, error) {
+	if err := s.ready(); err != nil {
+		return Binding{}, err
 	}
-	return cloneBinding(binding), nil
+	return s.store.Get(ctx, id)
 }
 
-func (s *Service) Seal(ctx context.Context, id kernel.BindingRef) (Binding, error) {
-	if err := ctx.Err(); err != nil {
-		return Binding{}, err
-	}
-	s.mu.Lock()
-	binding, ok := s.bindings[id]
-	if !ok {
-		s.mu.Unlock()
-		return Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
-	}
-	binding.Status = StatusSealed
-	s.bindings[id] = binding
-	s.mu.Unlock()
-	return cloneBinding(binding), nil
+func (s *Service) Seal(ctx context.Context, id kernel.BindingRef, expectedRevision ...kernel.Revision) (Binding, error) {
+	return s.mutate(ctx, id, firstRevision(expectedRevision), func(binding *Binding) (bool, error) {
+		if binding.Status == StatusSealed {
+			return false, nil
+		}
+		if binding.ActiveInvocation != "" {
+			return false, kernel.LeaseConflict("cannot seal a workspace with an active phase lease")
+		}
+		binding.Status = StatusSealed
+		return true, nil
+	})
 }
 
-func (s *Service) RefreshObservedWrites(ctx context.Context, id kernel.BindingRef) (Binding, error) {
-	s.mu.Lock()
-	binding, ok := s.bindings[id]
-	s.mu.Unlock()
-	if !ok {
-		return Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
-	}
-	files, err := observedGitFiles(ctx, binding.Root, binding.BaseRevision)
-	if err != nil {
+func (s *Service) RefreshObservedWrites(ctx context.Context, id kernel.BindingRef, expectedRevision ...kernel.Revision) (Binding, error) {
+	return s.mutate(ctx, id, firstRevision(expectedRevision), func(binding *Binding) (bool, error) {
+		files, err := s.git.ObservedWrites(ctx, *binding)
+		if err != nil {
+			return false, err
+		}
+		current, err := s.git.CurrentRevision(ctx, *binding)
+		if err != nil {
+			return false, err
+		}
+		nextWrites := WriteSet{Files: files}
+		if writeSetsEqual(binding.ObservedWrites, nextWrites) && binding.CurrentRevision == current {
+			return false, nil
+		}
+		binding.ObservedWrites = nextWrites
+		binding.CurrentRevision = current
+		return true, nil
+	})
+}
+
+func (s *Service) Materialize(ctx context.Context, id kernel.BindingRef) (Binding, error) {
+	if err := s.ready(); err != nil {
 		return Binding{}, err
 	}
-	current, err := gitOutput(ctx, binding.Root, "rev-parse", "HEAD")
-	if err != nil {
-		return Binding{}, err
-	}
-	s.mu.Lock()
-	currentBinding, ok := s.bindings[id]
-	if !ok {
-		s.mu.Unlock()
-		return Binding{}, kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found"}
-	}
-	currentBinding.ObservedWrites = WriteSet{Files: files}
-	currentBinding.CurrentRevision = current
-	s.bindings[id] = currentBinding
-	s.mu.Unlock()
-	return cloneBinding(currentBinding), nil
+	var result Binding
+	err := s.store.WithLock(ctx, bindingLockKey(id), func(lockCtx context.Context) error {
+		binding, err := s.store.Get(lockCtx, id)
+		if err != nil {
+			return err
+		}
+		head, err := s.git.Materialize(lockCtx, binding)
+		if err != nil {
+			return err
+		}
+		if head != binding.CurrentRevision {
+			next := cloneBinding(binding)
+			next.CurrentRevision = head
+			binding, err = s.store.UpdateCAS(lockCtx, next, binding.Revision)
+			if err != nil {
+				return err
+			}
+		}
+		result = binding
+		return nil
+	})
+	return result, err
 }
 
 func ResolveWritePath(binding Binding, phase Phase, relPath string) (string, error) {
@@ -430,56 +477,6 @@ func hasPathPrefix(p, prefix string) bool {
 	return p == prefix || strings.HasPrefix(p, prefix+"/")
 }
 
-func observedGitFiles(ctx context.Context, root, base string) ([]string, error) {
-	commands := [][]string{
-		{"diff", "--name-only", base, "HEAD"},
-		{"diff", "--name-only", "--cached"},
-		{"diff", "--name-only"},
-		{"ls-files", "--others", "--exclude-standard"},
-	}
-	seen := map[string]struct{}{}
-	for _, args := range commands {
-		out, err := gitOutput(ctx, root, args...)
-		if err != nil {
-			return nil, err
-		}
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				seen[filepath.ToSlash(line)] = struct{}{}
-			}
-		}
-	}
-	files := make([]string, 0, len(seen))
-	for file := range seen {
-		files = append(files, file)
-	}
-	sort.Strings(files)
-	return files, nil
-}
-
-func gitRun(ctx context.Context, dir string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 func normalizeAllowedDirs(dirs []string) ([]string, error) {
 	if len(dirs) == 0 {
 		return []string{"workspace"}, nil
@@ -505,6 +502,229 @@ func validPhase(phase Phase) bool {
 	return phase == PhasePlan || phase == PhaseExecute || phase == PhaseVerify
 }
 
+func phasePrerequisitesMet(binding Binding, phase Phase) bool {
+	switch phase {
+	case PhasePlan:
+		return true
+	case PhaseExecute:
+		return binding.PhaseLeases[PhasePlan] != ""
+	case PhaseVerify:
+		return binding.PhaseLeases[PhaseExecute] != ""
+	default:
+		return false
+	}
+}
+
+func (s *Service) mutate(
+	ctx context.Context,
+	id kernel.BindingRef,
+	expected kernel.Revision,
+	apply func(*Binding) (bool, error),
+) (Binding, error) {
+	if err := s.ready(); err != nil {
+		return Binding{}, err
+	}
+	if id == "" {
+		return Binding{}, kernel.InvalidArgument("binding_ref is required")
+	}
+	var result Binding
+	err := s.store.WithLock(ctx, bindingLockKey(id), func(lockCtx context.Context) error {
+		binding, err := s.store.Get(lockCtx, id)
+		if err != nil {
+			return err
+		}
+		next := cloneBinding(binding)
+		changed, err := apply(&next)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			result = binding
+			return nil
+		}
+		if expected == kernel.LatestRevision {
+			expected = binding.Revision
+		}
+		if err := kernel.CheckExpectedRevision(expected, binding.Revision); err != nil {
+			return err
+		}
+		result, err = s.store.UpdateCAS(lockCtx, next, expected)
+		return err
+	})
+	if err != nil {
+		return Binding{}, err
+	}
+	return cloneBinding(result), nil
+}
+
+func firstRevision(values []kernel.Revision) kernel.Revision {
+	if len(values) == 0 {
+		return kernel.LatestRevision
+	}
+	return values[0]
+}
+
+func (s *Service) withInvocation(
+	ctx context.Context,
+	invocationID kernel.InvocationID,
+	fn func(context.Context, Binding) error,
+) error {
+	if err := s.ready(); err != nil {
+		return err
+	}
+	if invocationID == "" {
+		return kernel.InvalidArgument("invocation_id is required")
+	}
+	binding, ok, err := s.store.GetByInvocation(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.StaleBinding("invocation has no active workspace phase lease")
+	}
+	return s.store.WithLock(ctx, bindingLockKey(binding.ID), func(lockCtx context.Context) error {
+		current, active, err := s.store.GetByInvocation(lockCtx, invocationID)
+		if err != nil {
+			return err
+		}
+		if !active || current.ID != binding.ID || current.Status == StatusSealed {
+			return kernel.StaleBinding("invocation workspace phase lease is no longer active")
+		}
+		return fn(lockCtx, current)
+	})
+}
+
+func (s *Service) ready() error {
+	if s == nil || s.store == nil || s.git == nil {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "workspace service store and git backend are required", Recoverable: false}
+	}
+	return nil
+}
+
+func roundLockKey(taskID kernel.TaskID, generation int) string {
+	return fmt.Sprintf("workspace:round:%s:%d", taskID, generation)
+}
+
+func bindingLockKey(id kernel.BindingRef) string {
+	return "workspace:binding:" + string(id)
+}
+
+func bindingIdentity(taskID kernel.TaskID, generation int) (kernel.BindingRef, string) {
+	sum := sha256.Sum256([]byte(taskID))
+	hash := hex.EncodeToString(sum[:6])
+	prefix := sanitizeID(string(taskID))
+	if len(prefix) > 36 {
+		prefix = prefix[:36]
+	}
+	id := kernel.BindingRef(fmt.Sprintf("ws_%s_%s_%03d", prefix, hash, generation))
+	branch := fmt.Sprintf("threadmill/%s-%s/%03d", prefix, hash, generation)
+	return id, branch
+}
+
+func createFingerprint(repositoryPath, worktreeParent, base string, allowed []string, declared WriteSet) string {
+	payload, _ := json.Marshal(struct {
+		RepositoryPath string   `json:"repository_path"`
+		WorktreeParent string   `json:"worktree_parent"`
+		Base           string   `json:"base"`
+		Allowed        []string `json:"allowed"`
+		Declared       WriteSet `json:"declared"`
+	}{repositoryPath, filepath.Clean(worktreeParent), base, allowed, declared})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+func normalizeWriteSet(set WriteSet, allowed []string) (WriteSet, error) {
+	files := make([]string, 0, len(set.Files))
+	for _, file := range set.Files {
+		clean, err := cleanRelativePath(file)
+		if err != nil {
+			return WriteSet{}, fmt.Errorf("invalid declared write %q: %w", file, err)
+		}
+		permitted := false
+		for _, dir := range allowed {
+			if hasPathPrefix(clean, dir) {
+				permitted = true
+				break
+			}
+		}
+		if !permitted {
+			return WriteSet{}, kernel.Forbidden("declared write is outside allowed dirs")
+		}
+		files = append(files, clean)
+	}
+	return WriteSet{
+		Files:     normalizedStrings(files),
+		Modules:   normalizedStrings(set.Modules),
+		Symbols:   normalizedStrings(set.Symbols),
+		Contracts: normalizedStrings(set.Contracts),
+		Tests:     normalizedStrings(set.Tests),
+		Owners:    normalizedStrings(set.Owners),
+	}, nil
+}
+
+func normalizedStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func canonicalExistingPath(value string) (string, error) {
+	abs, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func writeSetsEqual(left, right WriteSet) bool {
+	return stringSlicesEqual(left.Files, right.Files) &&
+		stringSlicesEqual(left.Modules, right.Modules) &&
+		stringSlicesEqual(left.Symbols, right.Symbols) &&
+		stringSlicesEqual(left.Contracts, right.Contracts) &&
+		stringSlicesEqual(left.Tests, right.Tests) &&
+		stringSlicesEqual(left.Owners, right.Owners)
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func workspaceNotFound() error {
+	return kernel.Error{Code: kernel.CodeNotFound, Message: "workspace binding not found", Recoverable: false}
+}
+
+func unsupportedWorkspaceKind(kind Kind) error {
+	return kernel.Error{Code: kernel.CodeInvalidRequest, Message: "unsupported_workspace_kind: " + string(kind), Recoverable: false}
+}
+
+func kernelInvalidRepository() error {
+	return kernel.InvalidArgument("repository_path is required")
+}
+
 func sanitizeID(id string) string {
 	id = strings.ToLower(id)
 	var b strings.Builder
@@ -516,13 +736,6 @@ func sanitizeID(id string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
-}
-
-func currentOr(base, current string) string {
-	if current != "" {
-		return current
-	}
-	return base
 }
 
 func cloneBinding(binding Binding) Binding {
