@@ -65,6 +65,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CapacityState"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -132,6 +134,7 @@ paths:
       operationId: getTask
       parameters:
         - $ref: "#/components/parameters/TaskID"
+        - $ref: "#/components/parameters/ProjectID"
       responses:
         "200":
           description: Task, endpoint, delivery, and decision projection.
@@ -139,6 +142,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TaskProjection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -167,14 +172,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CoordinationSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
-        "410":
-          $ref: "#/components/responses/CursorExpired"
   /v1/coordination/endpoints/{task_id}/{endpoint_id}/inspector:
     get:
       tags: [Coordination UI]
@@ -183,6 +188,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/TaskID"
         - $ref: "#/components/parameters/EndpointID"
+        - $ref: "#/components/parameters/ProjectID"
         - name: generation
           in: query
           required: false
@@ -196,6 +202,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EndpointInspector"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -241,6 +249,7 @@ paths:
       operationId: getManagerConversation
       parameters:
         - $ref: "#/components/parameters/ConversationID"
+        - $ref: "#/components/parameters/ProjectID"
         - name: after
           in: query
           required: false
@@ -253,6 +262,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagerConversation"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -286,6 +297,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EventPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -324,6 +337,8 @@ paths:
                     id: evt_01HZX
                     event: capacity.updated
                     data: {"event_id":"evt_01HZX","cursor":"evt_01HZX","type":"capacity.updated","occurred_at":"2026-08-10T00:00:00Z","project_id":"proj_1","payload":{"revision":2,"desired_concurrency":4,"healthy_capacity":3,"active_invocations":2,"waiting_invocations":1}}
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -484,7 +499,7 @@ components:
     Error:
       type: object
       additionalProperties: false
-      required: [code, message]
+      required: [code, message, recoverable]
       properties:
         code:
           type: string
@@ -499,15 +514,22 @@ components:
             - idempotency_conflict
             - cursor_expired
             - command_conflict
+            - scope_not_pending
+            - endpoint_in_flight
+            - invalid_graph
             - stale_command
             - stale_binding
             - stale_checkpoint
             - lease_conflict
             - executor_unavailable
+            - incomplete_stop_evidence
+            - transition_rejected
             - rate_limited
             - internal_error
         message:
           type: string
+        recoverable:
+          type: boolean
         correlation_id:
           type: string
         details:
@@ -845,7 +867,7 @@ components:
           type: string
         kind:
           type: string
-          enum: [task, endpoint]
+          enum: [endpoint]
         label:
           type: string
         task_id:
@@ -860,6 +882,10 @@ components:
         run_policy:
           type: string
           enum: [enabled, held]
+        binding_ref:
+          type: string
+        latest_invocation_ref:
+          $ref: "#/components/schemas/InvocationID"
     GraphEdge:
       type: object
       additionalProperties: false
@@ -893,7 +919,7 @@ components:
     EndpointInspector:
       type: object
       additionalProperties: false
-      required: [endpoint, generation, graph_revision, invocation, subscriptions, context_slice, task_memory_buffer]
+      required: [endpoint, generation, graph_revision, subscriptions]
       properties:
         endpoint:
           $ref: "#/components/schemas/EndpointRef"
@@ -967,6 +993,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ContextNodeView"
+        frontier:
+          type: array
+          items:
+            type: string
         omitted:
           type: array
           items:
@@ -983,10 +1013,12 @@ components:
           enum: [directive, fact, hypothesis]
         statement:
           type: string
+        status:
+          type: string
         source_refs:
           type: array
           items:
-            $ref: "#/components/schemas/ArtifactRef"
+            type: string
         subgraph_ids:
           type: array
           items:
@@ -1013,6 +1045,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/TaskMemoryCandidateView"
+        omitted:
+          type: array
+          items:
+            $ref: "#/components/schemas/OmittedContext"
     TaskMemoryCandidateView:
       type: object
       additionalProperties: false
@@ -1035,7 +1071,7 @@ components:
         source_refs:
           type: array
           items:
-            $ref: "#/components/schemas/ArtifactRef"
+            type: string
         subgraph_ids:
           type: array
           description: Suggested general subgraphs only.

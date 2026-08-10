@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -10,6 +11,22 @@ import (
 
 type closeRecorder struct {
 	closed chan struct{}
+}
+
+func TestServeHTTPShutsDownAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := serveHTTP(ctx, "127.0.0.1:0", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if err != nil {
+		t.Fatalf("serveHTTP() error = %v, want nil", err)
+	}
+}
+
+func TestServeHTTPRequiresAddress(t *testing.T) {
+	err := serveHTTP(context.Background(), "", http.NotFoundHandler())
+	if err == nil {
+		t.Fatal("serveHTTP() error = nil, want address validation error")
+	}
 }
 
 func (r closeRecorder) Close(context.Context) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -19,19 +20,51 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: threadmilld serve|migrate|check")
+		writeUsage(stderr)
 		return 2
 	}
 
 	switch args[0] {
 	case "serve":
+		serveFlags := flag.NewFlagSet("serve", flag.ContinueOnError)
+		serveFlags.SetOutput(stderr)
+		fake := serveFlags.Bool("fake", false, "run the canonical in-memory acceptance host")
+		httpAddr := serveFlags.String("http-addr", "", "HTTP listen address")
+		webDist := serveFlags.String("web-dist", "", "built Web UI directory (fake mode)")
+		if err := serveFlags.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if serveFlags.NArg() != 0 {
+			fmt.Fprintf(stderr, "unexpected serve argument %q\n", serveFlags.Arg(0))
+			return 2
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if *fake {
+			if *httpAddr == "" {
+				*httpAddr = "127.0.0.1:8080"
+			}
+			if *webDist == "" {
+				*webDist = "web/dist"
+			}
+			if err := app.ServeFake(ctx, *httpAddr, *webDist); err != nil {
+				writeDiagnostic(stdout, config.Diagnostic{OK: false, Code: "serve_failed", Message: err.Error(), Recoverable: true})
+				return 1
+			}
+			return 0
+		}
+		if *webDist != "" {
+			fmt.Fprintln(stderr, "--web-dist requires --fake")
+			return 2
+		}
 		cfg, err := config.Load(nil)
 		if err != nil {
 			writeDiagnostic(stdout, diagnosticFromError(err))
 			return 2
 		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
+		if *httpAddr != "" {
+			cfg.HTTPAddr = *httpAddr
+		}
 		if err := app.Serve(ctx, cfg); err != nil {
 			writeDiagnostic(stdout, config.Diagnostic{OK: false, Code: "serve_failed", Message: err.Error(), Recoverable: true})
 			return 1
@@ -58,9 +91,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		writeDiagnostic(stdout, config.Check(cfg))
 		return 0
 	default:
-		fmt.Fprintf(stderr, "unknown command %q\nusage: threadmilld serve|migrate|check\n", args[0])
+		fmt.Fprintf(stderr, "unknown command %q\n", args[0])
+		writeUsage(stderr)
 		return 2
 	}
+}
+
+func writeUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: threadmilld serve [--fake] [--http-addr addr] [--web-dist dir] | migrate | check")
 }
 
 func diagnosticFromError(err error) config.Diagnostic {

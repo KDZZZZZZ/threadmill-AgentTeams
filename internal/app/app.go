@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/app/fakehost"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/config"
 )
 
@@ -56,6 +60,52 @@ func (a *App) HTTPAddr() string {
 
 func Serve(ctx context.Context, cfg config.Config) error {
 	return New(cfg).Run(ctx)
+}
+
+// ServeFake runs the local acceptance host through the same HTTP/SSE and Web
+// adapters used by the operator console. Fake mode replaces external
+// infrastructure only; it does not introduce another graph or context model.
+func ServeFake(ctx context.Context, httpAddr, webDistDir string) error {
+	host, err := fakehost.New(ctx, fakehost.Options{WebDistDir: webDistDir})
+	if err != nil {
+		return fmt.Errorf("create fake host: %w", err)
+	}
+	return errors.Join(serveHTTP(ctx, httpAddr, host.Handler()), host.Close())
+}
+
+func serveHTTP(ctx context.Context, addr string, handler http.Handler) error {
+	if addr == "" {
+		return fmt.Errorf("http address is required")
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	serveErr := make(chan error, 1)
+	go func() {
+		err := server.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		serveErr <- err
+	}()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shutdown http server: %w", err)
+		}
+		return <-serveErr
+	}
 }
 
 func Migrate(ctx context.Context, cfg config.Config) error {

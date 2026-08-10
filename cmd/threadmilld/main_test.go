@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -40,5 +41,27 @@ func TestCheckReportsStructuredDiagnosticWhenConfigIsMissing(t *testing.T) {
 	}
 	if len(payload.Missing) == 0 {
 		t.Fatal("diagnostic missing list is empty")
+	}
+}
+
+func TestServeRejectsWebDistOutsideFakeMode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"serve", "--web-dist", "web/dist"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run(serve) exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "--web-dist requires --fake") {
+		t.Fatalf("stderr = %q, want fake mode diagnostic", stderr.String())
+	}
+}
+
+func TestServeRejectsUnexpectedArgument(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"serve", "unexpected"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run(serve) exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "unexpected serve argument") {
+		t.Fatalf("stderr = %q, want unexpected argument diagnostic", stderr.String())
 	}
 }

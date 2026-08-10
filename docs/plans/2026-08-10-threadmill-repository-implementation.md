@@ -1,6 +1,6 @@
 # Threadmill 全仓库实现计划
 
-> **当前交付状态（2026-08-10）：** 按后续指令先实现可验收语义 Demo，代码位于 `cmd/threadmill-demo` 与 `internal/demo`。本次验收只承诺实时并发控制、Manager 唯一写图、可恢复 hold/resume、前置解锁，以及按订阅并集投影 Context Slice/TaskMemoryBuffer；PostgreSQL、MinIO、真实 AgentTeams Adapter、生产权限与故障恢复仍属于后续完整 MVP，不以 Demo 假冒完成。
+> **当前交付状态（2026-08-11）：** 已用正式核心对象和端口完成可运行的 `threadmilld serve --fake` GUI 验收链：实时并发、Manager 唯一写图、可恢复 hold/stop/resume、权限过滤的 Coordination Graph 与按 Invocation 展示的订阅/Context Slice/TaskMemoryBuffer。fake-host 只替换 PostgreSQL、MinIO 和真实 AgentTeams，不再维护独立 `/api/*` demo 模型；真实外部基座、生产持久化和崩溃恢复仍是后续交付，不能由本地验收结果冒充完成。
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
@@ -10,7 +10,7 @@
 
 **技术栈：** Go（首版以仓库当前可用的 `go1.23.3` 为基线）、PostgreSQL、S3/MinIO、HTTP/JSON、SSE、MCP、React、TypeScript、Vite、图可视化组件、Playwright、Docker Compose、GitHub Actions；生产执行宿主固定为 AgentTeams QwenPaw + TeamHarness taskflow。
 
-**计划基线：** `oops-dev@bed2af9`；根项目当前只有设计文档与 Agent Skill，尚无 `go.mod`、服务代码、迁移或根项目 CI。
+**原始计划基线：** `oops-dev@bed2af9`；后续实现仍按本文模块边界和可验收目标矩阵推进，当前代码进度以 `docs/traceability.md` 为准。
 
 ---
 

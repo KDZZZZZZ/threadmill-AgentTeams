@@ -1,193 +1,207 @@
 ---
 version: alpha
 name: Threadmill Control Room
-description: 面向任务操作者的高密度实时协调控制台。
+description: 面向多 Agent 项目操作者的实时协调控制台。
 colors:
-  bg: "#F2F5F5"
-  surface: "#FBFCFC"
-  surface-strong: "#EAF0F0"
-  ink: "#142127"
-  muted: "#5C6A73"
-  line: "#D5DEDF"
-  primary: "#0F766E"
-  primary-strong: "#0B5F59"
-  primary-soft: "#DDF0EC"
-  danger: "#B42318"
-  warning: "#8A5A00"
-  success: "#227A47"
-  focus: "#1D4ED8"
+  canvas: "#F4F6F8"
+  panel: "#FFFFFF"
+  muted: "#EEF1F5"
+  border: "#D9DEE7"
+  ink: "#121A2A"
+  secondary: "#596579"
+  primary: "#4B54B7"
+  success: "#18794E"
+  warning: "#9A5D08"
+  danger: "#B42334"
 typography:
   heading:
-    fontFamily: "Segoe UI, Microsoft YaHei, PingFang SC, sans-serif"
-    fontSize: 24px
-    fontWeight: 650
+    fontFamily: "Inter, Segoe UI, system-ui, sans-serif"
+    fontSize: 21px
+    fontWeight: 700
     lineHeight: 1.2
   title:
-    fontFamily: "Segoe UI, Microsoft YaHei, PingFang SC, sans-serif"
+    fontFamily: "Inter, Segoe UI, system-ui, sans-serif"
     fontSize: 16px
     fontWeight: 650
     lineHeight: 1.35
   body:
-    fontFamily: "Segoe UI, Microsoft YaHei, PingFang SC, sans-serif"
+    fontFamily: "Inter, Segoe UI, system-ui, sans-serif"
     fontSize: 14px
     fontWeight: 400
     lineHeight: 1.5
-  label:
-    fontFamily: "Segoe UI, Microsoft YaHei, PingFang SC, sans-serif"
-    fontSize: 12px
-    fontWeight: 600
-    lineHeight: 1.4
   data:
-    fontFamily: "Cascadia Mono, SFMono-Regular, Consolas, monospace"
+    fontFamily: "JetBrains Mono, SFMono-Regular, Consolas, monospace"
     fontSize: 12px
     fontWeight: 500
     lineHeight: 1.45
 rounded:
-  control: 6px
-  panel: 10px
+  control: 8px
+  panel: 12px
   pill: 9999px
 spacing:
   1: 4px
   2: 8px
   3: 12px
   4: 16px
-  5: 20px
   6: 24px
-  8: 32px
 components:
+  app-shell:
+    backgroundColor: "{colors.canvas}"
+    textColor: "{colors.ink}"
   button-primary:
     backgroundColor: "{colors.primary}"
-    textColor: "{colors.surface}"
-    typography: "{typography.label}"
+    textColor: "{colors.panel}"
     rounded: "{rounded.control}"
-    padding: 10px
-    height: 40px
-  button-secondary:
-    backgroundColor: "{colors.surface}"
-    textColor: "{colors.ink}"
-    typography: "{typography.label}"
-    rounded: "{rounded.control}"
-    padding: 10px
     height: 40px
   panel:
-    backgroundColor: "{colors.surface}"
+    backgroundColor: "{colors.panel}"
     textColor: "{colors.ink}"
     rounded: "{rounded.panel}"
     padding: 16px
-  endpoint-selected:
-    backgroundColor: "{colors.primary-soft}"
-    textColor: "{colors.ink}"
+  divider:
+    backgroundColor: "{colors.border}"
+    height: 1px
+  selection:
+    backgroundColor: "{colors.muted}"
+    textColor: "{colors.primary}"
     rounded: "{rounded.control}"
-    padding: 12px
+  metadata:
+    textColor: "{colors.secondary}"
+  status-success:
+    textColor: "{colors.success}"
+  status-warning:
+    textColor: "{colors.warning}"
+  status-danger:
+    textColor: "{colors.danger}"
 ---
 
-# Design
+# Threadmill GUI Design System
 
-## Overview
+## Product character
 
-### Source of truth
+Threadmill is an operator-facing orchestration console for engineers supervising multi-agent work. The interface should feel like a calm control room: dense enough to explain live state, restrained enough that graph changes, blocked work, and permission boundaries remain obvious.
 
-- Status: Active
-- Last refreshed: 2026-08-10
-- Primary product surface: embedded Threadmill acceptance Demo at `/`
-- Evidence reviewed: coordination graph, Task Manager Agent, unified design, context graph, repository implementation plan, current embedded web source, and the supplied six-skill reference image
+The GUI is a projection over authoritative server objects. It never invents a second Coordination Graph, Context Graph, Invocation, subscription, or candidate model. User actions submit documented commands or Manager messages; server snapshots and events are the only source of visible state.
 
-### Brand
+## Design principles
 
-Threadmill is an engineering control surface, not a marketing page. It should feel precise, calm, inspectable, and ready for long operator sessions. The interface uses a cool light theme, one teal interaction accent, dense information, and restrained physical feedback. Avoid glass effects, gradients, oversized headings, decorative animation, and generic card mosaics.
+1. **Authority is visible.** Show graph revision, DecisionRef, Invocation generation, binding status, and event freshness near the information they qualify.
+2. **Control and observation stay distinct.** Capacity controls and Manager messages are actions. Graph nodes, subscriptions, Context Slice, and Task Memory Buffer are read models. Never style a pending client action as completed server state.
+3. **Operational density without dashboard clutter.** Prefer a few stable regions, compact rows, and progressive disclosure. Avoid decorative KPI cards, gradients, glass effects, and oversized headings.
+4. **State is never color-only.** Every status combines a label or icon with color. Graph nodes also expose the same information in an accessible list.
+5. **One object, one vocabulary.** UI labels mirror the documented domain names. Do not rename `Phase Endpoint` to job, `Invocation` to worker, `Context Slice` to memory, or `TaskMemoryBuffer` candidates to graph nodes.
 
-### Product goals
+## Interface structure
 
-The primary job is to understand and steer one live coordination graph without changing mental context. Success means an operator can adjust concurrency, select a graph endpoint, issue a Manager instruction, and verify subscriptions and context provenance from one screen. The Demo does not attempt production administration, authentication, or destructive operations.
+Use a full-width application shell with four stable regions:
 
-### Personas and jobs
+- **Command bar:** product name, project selector, connection freshness, current graph revision, and operator menu.
+- **Capacity strip:** desired, healthy, active, and waiting Agent counts plus revision-safe decrement/increment controls.
+- **Coordination workspace:** graph canvas as the primary surface, with a keyboard-accessible grouped list available alongside it.
+- **Context rail:** switches between Manager conversation and the selected Phase Endpoint inspector. On wide screens it is persistent; on narrow screens it becomes a modal sheet.
 
-The primary user is an engineer supervising AgentTeams execution. Their work is state-first: detect capacity pressure, locate a phase endpoint, understand why it can or cannot run, change execution through Task Manager, and inspect the exact context assembled for that invocation.
+Keep the graph visually dominant. Capacity is a compact horizontal control, not a grid of statistic cards. Manager conversation and endpoint inspection share the same rail so only one secondary task competes with the graph at a time.
 
-### Information architecture
+## Visual language
 
-The coordination graph is the main canvas. Capacity controls occupy the fixed left rail. Manager conversation and recent events form the right operations rail. Selecting an endpoint opens an inspector directly below the graph with three stable views: subscription subgraphs, held project context, and the created task memory buffer.
+### Typography
 
-### Design principles
+- UI sans: `Inter`, `Segoe UI`, system sans-serif.
+- Technical identifiers: `JetBrains Mono`, `SFMono-Regular`, `Consolas`, monospace.
+- Base size: 14px desktop, 15px touch layouts.
+- Use sentence case. Page title 20-24px; section titles 14-16px; metadata 12-13px.
+- Use tabular numerals for revisions, generations, capacity, and event cursors.
 
-- State before decoration: every color, icon, and motion must explain status, ownership, selection, or feedback.
-- Graph before controls: the coordination graph receives the most space and remains the visual anchor.
-- Provenance beside content: refs, generation, lease, subscription source, and creator invocation stay near the value they qualify.
-- Dense but legible: use spacing and hairlines instead of nesting data inside repeated cards.
-- Design dials: `DESIGN_VARIANCE=4`, `MOTION_INTENSITY=3`, `VISUAL_DENSITY=8`.
+### Color
 
-### Open questions
+The default theme is a neutral, light operations surface with an optional dark equivalent. Use CSS variables rather than component-local literals.
 
-- None for the acceptance Demo. Production authorization, persistence, and multi-project navigation remain intentionally outside this design contract.
+| Token | Light intent | Usage |
+| --- | --- | --- |
+| `--surface-canvas` | cool off-white | application and graph background |
+| `--surface-panel` | white | rails, menus, node bodies |
+| `--surface-muted` | pale neutral | selected rows, code metadata |
+| `--border-subtle` | cool gray | structural dividers |
+| `--text-primary` | near-black navy | primary content |
+| `--text-secondary` | slate | metadata and explanations |
+| `--accent` | restrained indigo | focus, selected objects, primary action |
+| `--success` | green | satisfied, healthy, accepted |
+| `--warning` | amber | waiting, held, pending, degraded |
+| `--danger` | red | failed, rejected, forbidden, disconnected |
 
-## Colors
+Do not use gradients. Reserve saturated color for current status, selection, focus, and actionable feedback.
 
-The page uses one cool neutral family. `{colors.primary}` is reserved for interactive emphasis, selection, and the primary action. Success, warning, and danger colors communicate actual runtime semantics only and never act as decorative accents. Text and controls must maintain WCAG AA contrast.
+### Spacing and shape
 
-## Typography
+- Base spacing unit: 4px. Common gaps: 8, 12, 16, 24px.
+- Panels use 1px borders and 10-12px corner radii.
+- Controls use 8px radii; status chips may be fully rounded.
+- Avoid excessive nested cards. Group related content with headings, dividers, and spacing before adding another container.
+- Minimum interactive target: 40x40px; icon-only controls require accessible names and tooltips.
 
-The system UI stack prioritizes Chinese and English readability without a font download. `{typography.heading}` is limited to the application title. `{typography.title}` names operational sections and nodes. `{typography.body}` carries instructions and messages. `{typography.data}` is mandatory for revisions, counts, refs, leases, generations, timestamps, and identifiers, using tabular numerals where supported.
+## Core components
 
-## Layout
+### Capacity control
 
-Desktop uses a three-region control-room layout: a 248px capacity rail, a fluid graph workspace, and a 340px operations rail. The inspector spans the graph workspace and presents three columns. Hairlines and tonal bands group related data. At widths below 1100px the rails move below the graph; below 720px every region becomes one column, controls remain at least 40px high, and horizontal phase lanes become a vertically scrollable node list.
-
-The spacing scale follows 4px steps. Dense metadata uses 4px to 8px gaps, controls use 8px to 12px gaps, and primary regions use 16px to 24px gaps. No component may rely on viewport height for correctness.
-
-## Elevation & Depth
-
-Hierarchy comes from tonal surfaces, 1px borders, and sticky placement. Shadows are limited to the fixed application bar and selected endpoint focus, with no glow or blurred backdrop. Nested inspector data stays flat and uses separators instead of additional elevation.
-
-## Shapes
-
-Containers use `{rounded.panel}`, controls and endpoint nodes use `{rounded.control}`, and compact status tags use `{rounded.pill}`. This category rule is the only allowed radius variation. Status dots are allowed only when they represent a real live connection or execution state.
-
-## Components
+Display `desired / healthy / active / waiting` in one compact strip. The minus and plus buttons submit an idempotent request with the last seen capacity revision. While pending, keep the authoritative number unchanged and show an adjacent progress indicator. On conflict, refresh the server snapshot and announce the reason.
 
 ### Coordination graph
 
-Each Task is a horizontal execution lane with endpoint nodes grouped by waiting, active or held, and completed states. A node exposes its endpoint ID, phase, generation, lease, checkpoint, and dependency counts. Selection uses the accent border and a tonal accent background, not scale or glow.
+Task groups contain exactly the documented `plan`, `execute`, and `verify` Phase Endpoints. Nodes show phase, state, run policy, generation, and active/waiting indicator. Edges and blockers use documented kinds; layout metadata is presentation-only and never sent back as graph mutation.
 
-### Capacity controller
+Selected, keyboard-focused, running, held, waiting, satisfied, and failed states must remain distinguishable without relying on color. Selecting a node changes inspection context only.
 
-Show desired, healthy, active, and waiting together. Plus and minus buttons modify desired concurrency by one, display pending state, and keep the natural-drain explanation visible. A capacity change must not appear to mutate graph revision.
+### Manager conversation
 
-### Manager console
+The composer sends natural language plus optional selected `PhaseEndpointRef` and seen graph revision. It never emits a graph patch, transition, or pending subgraph. Messages render from structured Manager interaction events and show pending/accepted/rejected/conflict state. Accepted replies expose `ManagerInputRef`, `DecisionRef`, and resulting graph revision.
 
-Manager is the only graph-writing surface. Quick actions and free text always target the selected endpoint. The current target, expected graph revision, ManagerInputRef, DecisionRef, and result are visible near the conversation. Inline errors remain beside the composer.
+### Phase Endpoint inspector
 
-### Endpoint inspector
+The inspector header identifies Task, phase, generation, and the active or most recent Invocation. Its body has three explicit sections:
 
-The three top-level views are stable and never hidden behind tabs in the acceptance Demo: current and recent subscription subgraphs, the effective context slice, and TaskMemoryBuffer candidates. Active and historical subscriptions are distinguishable by text and state, not color alone. Created context defaults to the current invocation provenance while retaining same-task evidence in the returned view.
+1. **Subscription subgraphs:** active subscriptions, origin (`initial`, `retrieval`, `explicit`), subgraph identity, revision, and overlap/union explanation.
+2. **Context Slice:** the context actually materialized for that Invocation, including revision, frontier, omitted/redacted markers, and conflicts.
+3. **Task Memory Buffer:** candidates created by the inspected Invocation. Candidates remain visually distinct from accepted Context Graph nodes.
 
-### Interaction states
+Empty, redacted, forbidden, expired, and no-active-Invocation states each need specific copy; never collapse them into a generic empty panel.
 
-Loading uses shape-matched skeleton rows. Empty states state what is absent and the next useful action. Errors are inline and announced. Success is visible in changed data and the event log. Disabled controls explain limits through nearby copy. EventSource disconnects retain the last snapshot and announce retry state.
+## Interaction and motion
 
-### Accessibility and motion
+- Motion clarifies state transitions; it does not decorate the page.
+- Use 120-180ms opacity/transform transitions for panels, selection, and small status changes.
+- Use spring motion only for direct manipulation such as opening the inspector sheet; avoid bounce.
+- Graph node position changes may animate briefly after a server revision, but state labels and revision text update immediately.
+- Respect `prefers-reduced-motion`; remove nonessential transforms and use instant graph layout changes.
+- Never animate continuous telemetry indefinitely. Connection activity may use a subtle finite pulse only when reconnecting.
 
-Use native buttons, labels, lists, and headings. Every icon-only control has an accessible name; decorative SVGs are hidden from assistive technology. Focus rings use `{colors.focus}` and remain visible on every interactive element. Motion is limited to opacity and transform under 200ms for selection, incoming state, and press feedback. `prefers-reduced-motion` disables all non-essential transitions and pulses.
+## Responsive behavior
 
-### Iconography
+- At 1200px and wider, show graph and a 360-420px context rail.
+- Between 760px and 1199px, the rail overlays the graph and may be dismissed without clearing selection.
+- Below 760px, use the accessible endpoint list as the default coordination view; graph remains an optional secondary view. Capacity controls wrap without horizontal page scrolling.
+- Do not use fixed viewport-height layouts that trap content. Use `min-height: 100dvh` and allow the document or designated panel regions to scroll.
 
-Use one Tabler outline family sourced through Better Icons, with 2px strokes and `currentColor`. Icons support labels and never replace critical text. Emoji and hand-drawn SVG paths are not allowed.
+## Accessibility
 
-### Content voice
+- Use semantic buttons, forms, headings, lists, dialogs, tabs, and status regions.
+- Provide a visible focus style with at least 3:1 contrast.
+- Announce capacity updates, connection loss/recovery, Manager results, and graph revision changes through polite live regions.
+- Graph nodes must be reachable by keyboard and mirrored in a readable list. Arrow-key navigation may supplement but cannot replace normal tab order.
+- Every icon has an accessible name or is hidden when text already supplies the name.
+- Ensure text and status contrast meet WCAG AA; candidates and Context Graph nodes must also differ by label and structure.
 
-Use concise Chinese operator language with canonical English field names where they improve traceability. Prefer direct verbs such as 调整、暂停、恢复、完成、创建、检查. Do not use marketing claims, metaphors, decorative version strings, or unexplained abbreviations.
+## Content conventions
 
-### Implementation and acceptance
+- Prefer concise operational language: "Waiting for input", "Held by Manager decision", "Revision conflict — view refreshed".
+- Preserve domain casing in technical labels: `DecisionRef`, `BindingRef`, `Context Slice`, `TaskMemoryBuffer`.
+- Truncate opaque IDs visually only when the full value is available by focus/copy action.
+- Error messages state what remained authoritative and what action is safe next. Never imply that a rejected client request changed the graph.
 
-The Demo remains dependency-free at runtime: semantic HTML, CSS, and vanilla JavaScript are embedded by the Go server. The project-only design and icon CLIs are development tools. Acceptance requires fresh Go tests, JavaScript syntax validation, DESIGN.md lint and export, plus desktop and narrow-width browser screenshots showing all four core jobs on the real HTTP server.
+## Implementation constraints
 
-## Do's and Don'ts
-
-- Do keep the coordination graph as the largest region and preserve selected endpoint context across live updates.
-- Do show desired, healthy, active, and waiting as separate values with tabular numerals.
-- Do expose ManagerInputRef, DecisionRef, generation, lease, checkpoint, and subscription provenance.
-- Do make active, historical, held, waiting, and completed states understandable without relying only on color.
-- Do use Tabler icons retrieved through Better Icons and keep text labels for critical actions.
-- Don't expose direct graph CRUD or direct invocation hold and resume controls outside the Manager surface.
-- Don't imply that lowering desired concurrency terminates active invocations.
-- Don't use gradients, glass blur, glow, decorative motion, huge headings, nested card stacks, or multiple accent colors.
-- Don't animate layout properties or ignore reduced-motion preferences.
+- Consume only the documented HTTP query/command surfaces and SSE projection.
+- Use one reducer keyed by authoritative snapshot revision and event cursor; duplicate events are idempotent.
+- No optimistic Coordination Graph mutation. Temporary UI state is limited to selection, panel visibility, form drafts, and pending request indicators.
+- Use one icon family through the project icon tooling. Do not hand-author SVG icons or use Unicode symbols as interface icons.
+- Prefer accessible component primitives for dialogs, tabs, menus, tooltips, and sheets.
+- Keep animations in the chosen motion library or CSS transitions; do not mix competing animation systems.

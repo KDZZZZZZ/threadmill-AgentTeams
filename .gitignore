@@ -25,6 +25,7 @@ target/
 .gradle/
 
 # Compiled files
+*.tsbuildinfo
 *.pyc
 *.class
 *.o
@@ -45,6 +46,10 @@ htmlcov/
 .coverage
 *.test
 coverage.out
+
+# Browser test artifacts
+test-results/
+playwright-report/
 
 # Compressed files
 *.zip
