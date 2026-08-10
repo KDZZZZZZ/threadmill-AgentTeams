@@ -5,21 +5,26 @@ import "errors"
 type ErrorCode string
 
 const (
-	CodeUnauthorized        ErrorCode = "unauthorized"
-	CodeForbidden           ErrorCode = "forbidden"
-	CodeInvalidRequest      ErrorCode = "invalid_request"
-	CodeCSRFInvalid         ErrorCode = "csrf_invalid"
-	CodeOriginInvalid       ErrorCode = "origin_invalid"
-	CodeNotFound            ErrorCode = "not_found"
-	CodeRevisionConflict    ErrorCode = "revision_conflict"
-	CodeIdempotencyConflict ErrorCode = "idempotency_conflict"
-	CodeCommandConflict     ErrorCode = "command_conflict"
-	CodeStaleBinding        ErrorCode = "stale_binding"
-	CodeStaleCommand        ErrorCode = "stale_command"
-	CodeStaleCheckpoint     ErrorCode = "stale_checkpoint"
-	CodeLeaseConflict       ErrorCode = "lease_conflict"
-	CodeExecutorUnavailable ErrorCode = "executor_unavailable"
-	CodeInternalError       ErrorCode = "internal_error"
+	CodeUnauthorized           ErrorCode = "unauthorized"
+	CodeForbidden              ErrorCode = "forbidden"
+	CodeInvalidRequest         ErrorCode = "invalid_request"
+	CodeCSRFInvalid            ErrorCode = "csrf_invalid"
+	CodeOriginInvalid          ErrorCode = "origin_invalid"
+	CodeNotFound               ErrorCode = "not_found"
+	CodeRevisionConflict       ErrorCode = "revision_conflict"
+	CodeIdempotencyConflict    ErrorCode = "idempotency_conflict"
+	CodeCommandConflict        ErrorCode = "command_conflict"
+	CodeScopeNotPending        ErrorCode = "scope_not_pending"
+	CodeEndpointInFlight       ErrorCode = "endpoint_in_flight"
+	CodeInvalidGraph           ErrorCode = "invalid_graph"
+	CodeStaleBinding           ErrorCode = "stale_binding"
+	CodeStaleCommand           ErrorCode = "stale_command"
+	CodeStaleCheckpoint        ErrorCode = "stale_checkpoint"
+	CodeLeaseConflict          ErrorCode = "lease_conflict"
+	CodeExecutorUnavailable    ErrorCode = "executor_unavailable"
+	CodeIncompleteStopEvidence ErrorCode = "incomplete_stop_evidence"
+	CodeTransitionRejected     ErrorCode = "transition_rejected"
+	CodeInternalError          ErrorCode = "internal_error"
 )
 
 // Error is the stable module-boundary error shape used by HTTP, MCP, Runtime,
@@ -79,4 +84,24 @@ func StaleBinding(message string) error {
 
 func LeaseConflict(message string) error {
 	return Error{Code: CodeLeaseConflict, Message: message, Recoverable: true}
+}
+
+func ScopeNotPending(message string) error {
+	return Error{Code: CodeScopeNotPending, Message: message, Recoverable: true}
+}
+
+func EndpointInFlight(message string) error {
+	return Error{Code: CodeEndpointInFlight, Message: message, Recoverable: true}
+}
+
+func InvalidGraph(message string) error {
+	return Error{Code: CodeInvalidGraph, Message: message, Recoverable: false}
+}
+
+func IncompleteStopEvidence(message string) error {
+	return Error{Code: CodeIncompleteStopEvidence, Message: message, Recoverable: true}
+}
+
+func TransitionRejected(message string) error {
+	return Error{Code: CodeTransitionRejected, Message: message, Recoverable: true}
 }

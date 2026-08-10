@@ -21,6 +21,9 @@ func RequireTool(principal Principal, tool Tool, requested Scope) (BoundScope, e
 	if !roleAllowsTool(principal.Role, tool) {
 		return BoundScope{}, kernel.Forbidden("tool is outside role capability")
 	}
+	if !operationAllowsTool(principal.Role, principal.Operation, tool) {
+		return BoundScope{}, kernel.Forbidden("tool is outside invocation operation capability")
+	}
 	if !principal.HasTool(tool) {
 		return BoundScope{}, kernel.Forbidden("tool is outside invocation capability")
 	}

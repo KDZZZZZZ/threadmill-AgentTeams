@@ -22,6 +22,8 @@ Rendered System Prompt
 
 每个 Skill 的权威正文独立存放在 `docs/agent-skills/<skill-id>/SKILL.md`。本文只保留目录、依赖和 Invocation 加载包，不复制 Skill 正文。
 
+生产 Role prompt 的 canonical 资产位于 `runtime-assets/prompts/`；Runtime 必须加载其内容并记录 hash。Skill 的 canonical 正文仍位于 `docs/agent-skills/<skill-id>/SKILL.md`，缺失任一必需资产时启动失败。
+
 这些 Skill 只由 Threadmill Runtime 显式装配，不参与面向最终用户的隐式 Skill 触发。
 
 ---
@@ -44,9 +46,9 @@ Rendered System Prompt
 | Context Agent | [`context-semantic-retrieval`](./agent-skills/context-semantic-retrieval/SKILL.md) | Context Agent | 把自然语言 Query 转为机械 Search | `context.getSubgraph`、`context.getNode`、`context.search` |
 | Context Agent | [`general-context-curation`](./agent-skills/general-context-curation/SKILL.md) | Context Agent | CRUD general 节点和 general 子图 | `context.getSubgraph`、`context.getNode`、`context.createNode`、`context.updateNode`、`context.deleteNode`、`context.createSubgraph`、`context.updateSubgraph`、`context.deleteSubgraph` |
 | Context Agent | [`candidate-review`](./agent-skills/candidate-review/SKILL.md) | Context Agent | 原子审查 frozen-unreviewed 候选批次 | `context.getSubgraph`、`context.getNode`、`context.search`、`context.submitReview` |
-| 阶段交付 | [`planning-delivery`](./agent-skills/planning-delivery/SKILL.md) | Planner | 产出计划、Declared Write Set 和验证计划 | Runtime 授权的只读 Workspace 与计划产物工具 |
-| 阶段交付 | [`execution-delivery`](./agent-skills/execution-delivery/SKILL.md) | Executor | 在批准范围内实施并生成证据 | Runtime 授权的 Workspace 写入、构建和测试工具 |
-| 阶段交付 | [`verification-delivery`](./agent-skills/verification-delivery/SKILL.md) | Verifier | 独立验证候选结果并生成 evidence | Runtime 授权的只读 Workspace、测试、静态分析和 evidence 工具 |
+| 阶段交付 | [`planning-delivery`](./agent-skills/planning-delivery/SKILL.md) | Planner | 产出计划、Declared Write Set 和验证计划 | `workspace.list`、`workspace.read`、`workspace.writePlan`、`workspace.diff`、`evidence.register` |
+| 阶段交付 | [`execution-delivery`](./agent-skills/execution-delivery/SKILL.md) | Executor | 在批准范围内实施并生成证据 | `workspace.list`、`workspace.read`、`workspace.write`、`workspace.run`、`workspace.diff`、`evidence.register` |
+| 阶段交付 | [`verification-delivery`](./agent-skills/verification-delivery/SKILL.md) | Verifier | 独立验证候选结果并生成 evidence | `workspace.list`、`workspace.read`、`workspace.run`、`workspace.diff`、`evidence.register` |
 
 ### 1.2 Skill 依赖
 

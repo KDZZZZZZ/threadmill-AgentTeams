@@ -14,6 +14,15 @@ description: 在批准范围内实施计划、运行必要检查并生成可审�
 - `phase-runtime`
 - `phase-submit`
 
+## 工具
+
+- `workspace.list`
+- `workspace.read`
+- `workspace.write`
+- `workspace.run`
+- `workspace.diff`
+- `evidence.register`
+
 ## Workspace 权限
 
 只能在 Workspace Binding、AllowedDirs、Declared Write Set 和有效 lease 内写入。路径或命令被拒绝时不得绕过。

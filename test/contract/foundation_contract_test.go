@@ -107,3 +107,26 @@ func TestFoundationADRsAreAcceptedAndFreezeRequiredDefaults(t *testing.T) {
 		}
 	}
 }
+
+func TestInvocationMigrationEnforcesRuntimeModelInvariants(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "migrations", "5001_invocations.up.sql")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read invocation migration: %v", err)
+	}
+	text := strings.ToLower(string(content))
+	for _, required := range []string{
+		"check (prompt_hashes <> '{}'::jsonb)",
+		"check (skill_hashes <> '{}'::jsonb)",
+		"check (jsonb_array_length(effective_tools) > 0)",
+		"check (expires_at > created_at)",
+		"operation is not null and operation in ('retrieve', 'curate', 'review')",
+		"binding_ref is not null and lease_id is not null",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("invocation migration is missing invariant %q", required)
+		}
+	}
+}

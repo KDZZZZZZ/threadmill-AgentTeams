@@ -59,6 +59,13 @@ const (
 	ToolContextUpdateSubgraph         Tool = "context.updateSubgraph"
 	ToolContextDeleteSubgraph         Tool = "context.deleteSubgraph"
 	ToolContextSubmitReview           Tool = "context.submitReview"
+	ToolWorkspaceList                 Tool = "workspace.list"
+	ToolWorkspaceRead                 Tool = "workspace.read"
+	ToolWorkspaceWritePlan            Tool = "workspace.writePlan"
+	ToolWorkspaceWrite                Tool = "workspace.write"
+	ToolWorkspaceRun                  Tool = "workspace.run"
+	ToolWorkspaceDiff                 Tool = "workspace.diff"
+	ToolEvidenceRegister              Tool = "evidence.register"
 )
 
 type Principal struct {
@@ -66,6 +73,7 @@ type Principal struct {
 	Kind             PrincipalKind
 	ProjectID        kernel.ProjectID
 	Role             Role
+	Operation        string
 	TaskID           kernel.TaskID
 	InvocationID     kernel.InvocationID
 	Tools            map[Tool]struct{}
@@ -98,6 +106,7 @@ type Capability struct {
 	TaskID       kernel.TaskID
 	InvocationID kernel.InvocationID
 	Role         Role
+	Operation    string
 	Tools        map[Tool]struct{}
 	ExpiresAt    time.Time
 }

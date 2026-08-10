@@ -14,6 +14,14 @@ description: 独立验证候选结果、检查契约与证据并形成验证报�
 - `phase-runtime`
 - `phase-submit`
 
+## 工具
+
+- `workspace.list`
+- `workspace.read`
+- `workspace.run`
+- `workspace.diff`
+- `evidence.register`
+
 ## Workspace 权限
 
 实现只读。只使用 Runtime 授权的只读 Workspace、构建、测试、静态分析和 evidence 工具。工具若会修改实现，改用明确只读模式或拒绝调用。

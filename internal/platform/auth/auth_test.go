@@ -254,10 +254,68 @@ func TestSearchToolOnlyContextAgent(t *testing.T) {
 		ProjectID:    "project-a",
 		InvocationID: "inv-ctx",
 		Role:         RoleContext,
+		Operation:    "retrieve",
 		Tools:        ToolSet(ToolContextSearch),
 		ExpiresAt:    now.Add(time.Minute),
 	}); err != nil {
 		t.Fatalf("context search token err = %v", err)
+	}
+}
+
+func TestContextCapabilityIsBoundToOneOperation(t *testing.T) {
+	now := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
+	authenticator := NewAuthenticator(NewMemoryStore(), func() time.Time { return now })
+	tests := []struct {
+		name      string
+		operation string
+		allowed   Tool
+		forbidden Tool
+	}{
+		{name: "retrieve", operation: "retrieve", allowed: ToolContextSearch, forbidden: ToolContextCreateNode},
+		{name: "curate", operation: "curate", allowed: ToolContextCreateNode, forbidden: ToolContextSearch},
+		{name: "review", operation: "review", allowed: ToolContextSubmitReview, forbidden: ToolContextUpdateNode},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			token, err := authenticator.IssueAgentToken(context.Background(), "ctx-1", Capability{
+				ProjectID:    "project-a",
+				InvocationID: kernel.InvocationID("inv-ctx-" + test.name),
+				Role:         RoleContext,
+				Operation:    test.operation,
+				Tools:        ToolSet(test.allowed),
+				ExpiresAt:    now.Add(time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("issue %s token: %v", test.name, err)
+			}
+			principal, err := authenticator.AuthenticateAgentToken(context.Background(), token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if principal.Operation != test.operation {
+				t.Fatalf("principal operation = %q, want %q", principal.Operation, test.operation)
+			}
+			if _, err := RequireTool(principal, test.allowed, Scope{}); err != nil {
+				t.Fatalf("allowed %s tool failed: %v", test.name, err)
+			}
+
+			forged := principal
+			forged.Tools = ToolSet(test.forbidden)
+			if _, err := RequireTool(forged, test.forbidden, Scope{}); !kernel.IsCode(err, kernel.CodeForbidden) {
+				t.Fatalf("%s operation used %s: %v, want forbidden", test.name, test.forbidden, err)
+			}
+		})
+	}
+
+	if _, err := authenticator.IssueAgentToken(context.Background(), "ctx-1", Capability{
+		ProjectID:    "project-a",
+		InvocationID: "inv-ctx-cross-operation",
+		Role:         RoleContext,
+		Operation:    "retrieve",
+		Tools:        ToolSet(ToolContextSearch, ToolContextCreateNode),
+		ExpiresAt:    now.Add(time.Minute),
+	}); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("cross-operation token = %v, want forbidden", err)
 	}
 }
 

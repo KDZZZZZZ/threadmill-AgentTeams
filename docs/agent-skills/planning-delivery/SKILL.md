@@ -14,6 +14,14 @@ description: 根据 Task Contract 和输入产出计划、Declared Write Set 与
 - `phase-runtime`
 - `phase-submit`
 
+## 工具
+
+- `workspace.list`
+- `workspace.read`
+- `workspace.writePlan`
+- `workspace.diff`
+- `evidence.register`
+
 ## Workspace 权限
 
 实现只读。只使用 Runtime 授权的代码检查工具，以及计划、报告和 evidence 产物写入路径。

@@ -133,6 +133,7 @@ func (a *Authenticator) AuthenticateAgentToken(ctx context.Context, tokenSecret 
 		Kind:             PrincipalAgent,
 		ProjectID:        capability.ProjectID,
 		Role:             capability.Role,
+		Operation:        capability.Operation,
 		TaskID:           capability.TaskID,
 		InvocationID:     capability.InvocationID,
 		Tools:            cloneTools(capability.Tools),
@@ -169,12 +170,24 @@ func validateCapability(capability Capability, now time.Time) error {
 	if !isAgentRole(capability.Role) {
 		return kernel.Forbidden("unsupported agent role")
 	}
+	if capability.Role == RoleContext {
+		switch capability.Operation {
+		case "retrieve", "curate", "review":
+		default:
+			return kernel.InvalidArgument("context capability operation must be retrieve, curate, or review")
+		}
+	} else if capability.Operation != "" {
+		return kernel.InvalidArgument("operation is only valid for context capability")
+	}
 	if len(capability.Tools) == 0 {
 		return kernel.Forbidden("capability must include at least one tool")
 	}
 	for tool := range capability.Tools {
 		if !roleAllowsTool(capability.Role, tool) {
 			return kernel.Forbidden("tool is outside role capability")
+		}
+		if !operationAllowsTool(capability.Role, capability.Operation, tool) {
+			return kernel.Forbidden("tool is outside invocation operation capability")
 		}
 	}
 	if capability.Role.IsPhase() {
@@ -249,7 +262,7 @@ func roleAllowsTool(role Role, tool Tool) bool {
 			ToolContextSubmitReview:
 			return true
 		}
-	case RolePlanner, RoleExecutor, RoleVerifier:
+	case RolePlanner:
 		switch tool {
 		case ToolContextListSubgraphs,
 			ToolContextExplore,
@@ -261,7 +274,85 @@ func roleAllowsTool(role Role, tool Tool) bool {
 			ToolAgentSubmitRequirement,
 			ToolAgentListTaskMemoryCandidates,
 			ToolAgentSubmitMemoryCandidate,
-			ToolAgentSubmitPhaseOutput:
+			ToolAgentSubmitPhaseOutput,
+			ToolWorkspaceList,
+			ToolWorkspaceRead,
+			ToolWorkspaceWritePlan,
+			ToolWorkspaceDiff,
+			ToolEvidenceRegister:
+			return true
+		}
+	case RoleExecutor:
+		switch tool {
+		case ToolContextListSubgraphs,
+			ToolContextExplore,
+			ToolContextSubscribe,
+			ToolContextUnsubscribe,
+			ToolContextAgentRetrieve,
+			ToolRuntimeAwaitInputs,
+			ToolAgentProposeOrchestration,
+			ToolAgentSubmitRequirement,
+			ToolAgentListTaskMemoryCandidates,
+			ToolAgentSubmitMemoryCandidate,
+			ToolAgentSubmitPhaseOutput,
+			ToolWorkspaceList,
+			ToolWorkspaceRead,
+			ToolWorkspaceWrite,
+			ToolWorkspaceRun,
+			ToolWorkspaceDiff,
+			ToolEvidenceRegister:
+			return true
+		}
+	case RoleVerifier:
+		switch tool {
+		case ToolContextListSubgraphs,
+			ToolContextExplore,
+			ToolContextSubscribe,
+			ToolContextUnsubscribe,
+			ToolContextAgentRetrieve,
+			ToolRuntimeAwaitInputs,
+			ToolAgentProposeOrchestration,
+			ToolAgentSubmitRequirement,
+			ToolAgentListTaskMemoryCandidates,
+			ToolAgentSubmitMemoryCandidate,
+			ToolAgentSubmitPhaseOutput,
+			ToolWorkspaceList,
+			ToolWorkspaceRead,
+			ToolWorkspaceRun,
+			ToolWorkspaceDiff,
+			ToolEvidenceRegister:
+			return true
+		}
+	}
+	return false
+}
+
+// operationAllowsTool narrows the role maximum to the exact invocation
+// operation. Non-context roles have a single operation-less bundle.
+func operationAllowsTool(role Role, operation string, tool Tool) bool {
+	if role != RoleContext {
+		return operation == "" && roleAllowsTool(role, tool)
+	}
+	switch operation {
+	case "retrieve":
+		switch tool {
+		case ToolContextListSubgraphs, ToolContextExplore,
+			ToolContextGetSubgraph, ToolContextGetNode, ToolContextSearch:
+			return true
+		}
+	case "curate":
+		switch tool {
+		case ToolContextListSubgraphs, ToolContextExplore,
+			ToolContextGetSubgraph, ToolContextGetNode,
+			ToolContextCreateNode, ToolContextUpdateNode, ToolContextDeleteNode,
+			ToolContextCreateSubgraph, ToolContextUpdateSubgraph, ToolContextDeleteSubgraph:
+			return true
+		}
+	case "review":
+		switch tool {
+		case ToolContextListSubgraphs, ToolContextExplore,
+			ToolContextGetSubgraph, ToolContextGetNode, ToolContextSearch,
+			ToolContextSubmitReview:
 			return true
 		}
 	}
