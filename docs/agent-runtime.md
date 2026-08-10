@@ -230,11 +230,17 @@ Threadmill 新建 Event Log 投影：Runtime 把委派/ack/submit/取消、心�
 
 AgentTeams 没有这两块能力。Runtime 为每个 `plan / execute / verify` Invocation 注入：
 
-- `ContextGraphReader`：读取已落图的 ListSubgraphs / Explore / Subscribe；Search 仍只注入 Context Agent；
+- `ContextGraphReader`：读取已落图的 ListSubgraphs / Explore，并管理 Subscribe / Unsubscribe；Search 仍只注入 Context Agent；
 - `TaskMemoryBufferReader`：只读取 Runtime 绑定 TaskID 对应的候选缓冲，不接受调用方指定 TaskID；
-- 启动时分别装配 `ContextSliceRef` 与 `TaskMemoryBufferRef`。前者建立子图订阅，后者只是 append-only 缓冲快照。
+- 启动时分别装配 `ContextSliceRef` 与 `TaskMemoryBufferRef`。前者先建立初始子图订阅，再按当前 Invocation 的有效订阅子图并集物化；后者只是 append-only 缓冲快照。
+
+Task Manager Invocation 获得同一组 `ContextGraphReader` 工具，包括 `Unsubscribe`，但不获得 `TaskMemoryBufferReader`；其 task 投影和终审触发仍走各自授权 seam。
 
 候选追加不改变 graph revision、不触发 ContextDelta；同 Task 后续阶段可见，跨 Task 不可见。
+
+Runtime 上下文装配以当前 `ConsumerInvocationID` 为隔离键：把初始切片自动订阅、Context Agent 检索自动订阅和 Agent 显式订阅的 `SubgraphIDs` 取去重并集，再交给 Context Service 做权限、revision、recipient 与预算过滤。这里的 Runtime 是承载 Agent 的 **Agent Runtime**，不是负责 Phase 调度与 start/stop/resume 的 `GraphRuntime`。订阅或取消订阅成功后，Agent Runtime 在下一次模型调用、等待重承载或 resume 装配前重算；不跨 Agent、Task 或 Invocation 合并，也不以最近一次订阅覆盖此前仍有效的订阅。
+
+`context.unsubscribe(subscriptionId)` 只能取消 Runtime 绑定的当前 consumer 自己的订阅。Context Service 原子标记取消并记录审计后，Agent Runtime 不再注入该订阅独占的子图，并在 Delta 投递前重验 active 状态；若同一子图仍被其他有效订阅覆盖，则继续保留。已经送入当前模型调用的内容不能追溯删除。
 
 ### 6.2 结构化输出
 
