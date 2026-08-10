@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -244,6 +245,14 @@ func (t *AgentTools) Run(ctx context.Context, invocationID kernel.InvocationID, 
 		return result, err
 	}
 	err := t.withBinding(ctx, invocationID, func(lockCtx context.Context, binding Binding) error {
+		if err := validateWorkspaceSymlinks(binding.Root); err != nil {
+			return err
+		}
+		commandEnv, cleanupEnv, err := newWorkspaceCommandEnvironment()
+		if err != nil {
+			return err
+		}
+		defer cleanupEnv()
 		workDir, cleanWorkDir, err := resolveReadPath(binding, req.WorkDir, true)
 		if err != nil {
 			return err
@@ -251,23 +260,22 @@ func (t *AgentTools) Run(ctx context.Context, invocationID kernel.InvocationID, 
 		readOnlyPhase := binding.ActivePhase != PhaseExecute
 		cleanup := func() {}
 		if readOnlyPhase {
+			copyRoot, copyErr := copyWorkspaceForReadOnlyRun(binding)
+			if copyErr != nil {
+				return copyErr
+			}
+			cleanup = func() { _ = os.RemoveAll(copyRoot) }
+			workDir = filepath.Join(copyRoot, filepath.FromSlash(cleanWorkDir))
 			if normalizeExecutable(req.Command[0]) == "git" {
-				if !readOnlyGitSubcommand(req.Command) {
-					return kernel.Forbidden("read-only phase may only run non-mutating git commands")
+				if initErr := initializeReadOnlyGitCopy(lockCtx, copyRoot, commandEnv); initErr != nil {
+					return initErr
 				}
-			} else {
-				copyRoot, copyErr := copyWorkspaceForReadOnlyRun(binding)
-				if copyErr != nil {
-					return copyErr
-				}
-				cleanup = func() { _ = os.RemoveAll(copyRoot) }
-				workDir = filepath.Join(copyRoot, filepath.FromSlash(cleanWorkDir))
 			}
 		}
 		defer cleanup()
 		cmd := exec.CommandContext(lockCtx, req.Command[0], req.Command[1:]...)
 		cmd.Dir = workDir
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
+		cmd.Env = commandEnv
 		stdout := &limitedBuffer{limit: maxCommandOutputBytes}
 		stderr := &limitedBuffer{limit: maxCommandOutputBytes}
 		cmd.Stdout = stdout
@@ -284,6 +292,9 @@ func (t *AgentTools) Run(ctx context.Context, invocationID kernel.InvocationID, 
 		}
 		updated := binding
 		if binding.ActivePhase == PhaseExecute {
+			if err := validateWorkspaceSymlinks(binding.Root); err != nil {
+				return err
+			}
 			var refreshErr error
 			updated, refreshErr = t.service.refreshLocked(lockCtx, binding)
 			if refreshErr != nil {
@@ -433,18 +444,6 @@ func normalizeExecutable(command string) string {
 	return strings.TrimSuffix(command, ".exe")
 }
 
-func readOnlyGitSubcommand(command []string) bool {
-	if len(command) < 2 {
-		return false
-	}
-	switch command[1] {
-	case "status", "diff", "rev-parse", "ls-files", "show":
-		return true
-	default:
-		return false
-	}
-}
-
 func copyWorkspaceForReadOnlyRun(binding Binding) (string, error) {
 	copyRoot, err := os.MkdirTemp("", "threadmill-workspace-run-*")
 	if err != nil {
@@ -541,6 +540,96 @@ func copyRegularFile(source, destination string, mode os.FileMode) error {
 		return copyErr
 	}
 	return closeErr
+}
+
+func initializeReadOnlyGitCopy(ctx context.Context, root string, env []string) error {
+	commands := [][]string{
+		{"init", "--quiet"},
+		{"add", "--all"},
+		{"-c", "user.name=Threadmill", "-c", "user.email=threadmill@invalid", "commit", "--quiet", "--allow-empty", "-m", "read-only phase snapshot"},
+	}
+	for _, args := range commands {
+		if err := gitRunWithEnvironment(ctx, root, env, args...); err != nil {
+			return fmt.Errorf("initialize isolated git workspace: %w", err)
+		}
+	}
+	return nil
+}
+
+func gitRunWithEnvironment(ctx context.Context, root string, env []string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = root
+	cmd.Env = env
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func newWorkspaceCommandEnvironment() ([]string, func(), error) {
+	runRoot, err := os.MkdirTemp("", "threadmill-command-env-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create workspace command environment: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(runRoot) }
+	hooks := filepath.Join(runRoot, "empty-hooks")
+	if err := os.MkdirAll(hooks, 0o700); err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("create empty git hooks directory: %w", err)
+	}
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=" + os.DevNull,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=" + hooks,
+		"TEMP=" + runRoot,
+		"TMP=" + runRoot,
+		"TMPDIR=" + runRoot,
+		"GOCACHE=" + filepath.Join(runRoot, "go-cache"),
+		"GOMODCACHE=" + filepath.Join(runRoot, "go-mod-cache"),
+		"NO_COLOR=1",
+	}
+	if runtime.GOOS == "windows" {
+		env = appendNonEmptyEnvironment(env,
+			"SystemRoot", os.Getenv("SystemRoot"),
+			"WINDIR", os.Getenv("WINDIR"),
+			"SystemDrive", os.Getenv("SystemDrive"),
+			"PATHEXT", os.Getenv("PATHEXT"),
+		)
+		userProfile := filepath.Join(runRoot, "profile")
+		appData := filepath.Join(userProfile, "AppData", "Roaming")
+		localAppData := filepath.Join(userProfile, "AppData", "Local")
+		if err := os.MkdirAll(appData, 0o700); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		if err := os.MkdirAll(localAppData, 0o700); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		env = append(env, "USERPROFILE="+userProfile, "APPDATA="+appData, "LOCALAPPDATA="+localAppData)
+	} else {
+		home := filepath.Join(runRoot, "home")
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		env = append(env, "HOME="+home)
+	}
+	return env, cleanup, nil
+}
+
+func appendNonEmptyEnvironment(env []string, pairs ...string) []string {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if pairs[i+1] != "" {
+			env = append(env, pairs[i]+"="+pairs[i+1])
+		}
+	}
+	return env
 }
 
 func validateObservedForPhase(binding Binding, phase Phase) error {

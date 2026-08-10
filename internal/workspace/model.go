@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -148,13 +149,13 @@ func (s *Service) CreateGitWorktree(ctx context.Context, req CreateRequest) (Bin
 			if existing.CreationFingerprint != fingerprint {
 				return kernel.IdempotencyConflict()
 			}
-			head, materializeErr := s.git.Materialize(lockCtx, existing)
+			materialized, materializeErr := s.git.Materialize(lockCtx, existing)
 			if materializeErr != nil {
 				return materializeErr
 			}
-			if head != existing.CurrentRevision {
+			if materialized.Head != existing.CurrentRevision {
 				next := cloneBinding(existing)
-				next.CurrentRevision = head
+				next.CurrentRevision = materialized.Head
 				existing, materializeErr = s.store.UpdateCAS(lockCtx, next, existing.Revision)
 				if materializeErr != nil {
 					return materializeErr
@@ -186,13 +187,15 @@ func (s *Service) CreateGitWorktree(ctx context.Context, req CreateRequest) (Bin
 			RepositoryPath:      repositoryPath,
 			CreationFingerprint: createFingerprint(repositoryPath, worktreeParent, base, allowed, declared),
 		}
-		head, materializeErr := s.git.Materialize(lockCtx, binding)
+		materialized, materializeErr := s.git.Materialize(lockCtx, binding)
 		if materializeErr != nil {
 			return materializeErr
 		}
-		binding.CurrentRevision = head
+		binding.CurrentRevision = materialized.Head
 		rollback := func(cause error) error {
-			_ = s.git.Remove(context.Background(), binding)
+			if rollbackErr := s.git.Remove(context.Background(), binding, materialized); rollbackErr != nil {
+				return errors.Join(cause, fmt.Errorf("rollback workspace materialization: %w", rollbackErr))
+			}
 			return cause
 		}
 		if req.AfterWorktreeAdd != nil {
@@ -325,13 +328,13 @@ func (s *Service) Materialize(ctx context.Context, id kernel.BindingRef) (Bindin
 		if err != nil {
 			return err
 		}
-		head, err := s.git.Materialize(lockCtx, binding)
+		materialized, err := s.git.Materialize(lockCtx, binding)
 		if err != nil {
 			return err
 		}
-		if head != binding.CurrentRevision {
+		if materialized.Head != binding.CurrentRevision {
 			next := cloneBinding(binding)
-			next.CurrentRevision = head
+			next.CurrentRevision = materialized.Head
 			binding, err = s.store.UpdateCAS(lockCtx, next, binding.Revision)
 			if err != nil {
 				return err

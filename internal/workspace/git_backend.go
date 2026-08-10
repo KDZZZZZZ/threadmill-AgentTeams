@@ -17,14 +17,20 @@ import (
 // materialize the same persisted Binding again after a restart.
 type GitBackend interface {
 	ResolveRevision(context.Context, string, string) (string, error)
-	Materialize(context.Context, Binding) (string, error)
-	Remove(context.Context, Binding) error
+	Materialize(context.Context, Binding) (Materialization, error)
+	Remove(context.Context, Binding, Materialization) error
 	CurrentRevision(context.Context, Binding) (string, error)
 	ObservedWrites(context.Context, Binding) ([]string, error)
 	Diff(context.Context, Binding, string) (string, error)
 }
 
 type LocalGitBackend struct{}
+
+type Materialization struct {
+	Head            string
+	WorktreeCreated bool
+	BranchCreated   bool
+}
 
 func NewLocalGitBackend() *LocalGitBackend { return &LocalGitBackend{} }
 
@@ -38,47 +44,54 @@ func (LocalGitBackend) ResolveRevision(ctx context.Context, repositoryPath, revi
 	return gitOutput(ctx, repositoryPath, "rev-parse", "--verify", revision+"^{commit}")
 }
 
-func (LocalGitBackend) Materialize(ctx context.Context, binding Binding) (string, error) {
+func (backend LocalGitBackend) Materialize(ctx context.Context, binding Binding) (Materialization, error) {
 	if binding.Kind != KindGitWorktree {
-		return "", unsupportedWorkspaceKind(binding.Kind)
+		return Materialization{}, unsupportedWorkspaceKind(binding.Kind)
 	}
 	if strings.TrimSpace(binding.RepositoryPath) == "" || strings.TrimSpace(binding.Root) == "" || strings.TrimSpace(binding.BranchName) == "" {
-		return "", fmt.Errorf("materialize workspace: repository path, root, and branch are required")
+		return Materialization{}, fmt.Errorf("materialize workspace: repository path, root, and branch are required")
 	}
 	if err := ensureMaterializationRoot(binding.Root); err != nil {
-		return "", err
+		return Materialization{}, err
 	}
 	repositoryAbs, err := filepath.Abs(binding.RepositoryPath)
 	if err != nil {
-		return "", fmt.Errorf("resolve repository path: %w", err)
+		return Materialization{}, fmt.Errorf("resolve repository path: %w", err)
 	}
 	if _, err := gitOutput(ctx, repositoryAbs, "rev-parse", "--git-dir"); err != nil {
-		return "", fmt.Errorf("validate git repository: %w", err)
+		return Materialization{}, fmt.Errorf("validate git repository: %w", err)
 	}
 
 	if info, statErr := os.Stat(binding.Root); statErr == nil {
 		if !info.IsDir() {
-			return "", fmt.Errorf("workspace root is not a directory")
+			return Materialization{}, fmt.Errorf("workspace root is not a directory")
 		}
 		head, validErr := validateExistingWorktree(ctx, repositoryAbs, binding)
 		if validErr == nil {
-			return head, ensureWorkspaceDirectories(binding.Root)
+			if err := ensureWorkspaceDirectories(binding.Root); err != nil {
+				return Materialization{}, err
+			}
+			if err := validateWorkspaceSymlinks(binding.Root); err != nil {
+				return Materialization{}, err
+			}
+			return Materialization{Head: head}, nil
 		}
 		entries, readErr := os.ReadDir(binding.Root)
 		if readErr != nil {
-			return "", fmt.Errorf("inspect workspace root: %w", readErr)
+			return Materialization{}, fmt.Errorf("inspect workspace root: %w", readErr)
 		}
 		if len(entries) != 0 {
-			return "", fmt.Errorf("workspace root already exists but is not the requested worktree: %w", validErr)
+			return Materialization{}, fmt.Errorf("workspace root already exists but is not the requested worktree: %w", validErr)
 		}
 	} else if !os.IsNotExist(statErr) {
-		return "", fmt.Errorf("inspect workspace root: %w", statErr)
+		return Materialization{}, fmt.Errorf("inspect workspace root: %w", statErr)
 	}
 
 	branchExists, err := gitRefExists(ctx, repositoryAbs, "refs/heads/"+binding.BranchName)
 	if err != nil {
-		return "", err
+		return Materialization{}, err
 	}
+	materialized := Materialization{WorktreeCreated: true, BranchCreated: !branchExists}
 	args := []string{"worktree", "add"}
 	if branchExists {
 		args = append(args, binding.Root, binding.BranchName)
@@ -90,28 +103,43 @@ func (LocalGitBackend) Materialize(ctx context.Context, binding Binding) (string
 		// safe here because Git only removes stale administrative entries.
 		_ = gitRun(ctx, repositoryAbs, "worktree", "prune")
 		if retryErr := gitRun(ctx, repositoryAbs, args...); retryErr != nil {
-			return "", err
+			_ = backend.Remove(context.Background(), binding, materialized)
+			return Materialization{}, retryErr
 		}
 	}
 	if err := ensureWorkspaceDirectories(binding.Root); err != nil {
-		return "", err
+		_ = backend.Remove(context.Background(), binding, materialized)
+		return Materialization{}, err
 	}
-	return validateExistingWorktree(ctx, repositoryAbs, binding)
+	if err := validateWorkspaceSymlinks(binding.Root); err != nil {
+		_ = backend.Remove(context.Background(), binding, materialized)
+		return Materialization{}, err
+	}
+	materialized.Head, err = validateExistingWorktree(ctx, repositoryAbs, binding)
+	if err != nil {
+		_ = backend.Remove(context.Background(), binding, materialized)
+		return Materialization{}, err
+	}
+	return materialized, nil
 }
 
-func (LocalGitBackend) Remove(ctx context.Context, binding Binding) error {
+func (LocalGitBackend) Remove(ctx context.Context, binding Binding, materialized Materialization) error {
 	if strings.TrimSpace(binding.RepositoryPath) == "" {
 		return nil
 	}
 	var errs []error
-	if err := gitRun(ctx, binding.RepositoryPath, "worktree", "remove", "--force", binding.Root); err != nil && !os.IsNotExist(err) {
-		errs = append(errs, err)
-	}
-	if err := gitRun(ctx, binding.RepositoryPath, "branch", "-D", binding.BranchName); err != nil {
-		// The branch may not have been created if materialization failed early.
-		exists, existsErr := gitRefExists(ctx, binding.RepositoryPath, "refs/heads/"+binding.BranchName)
-		if existsErr != nil || exists {
+	if materialized.WorktreeCreated {
+		if err := gitRun(ctx, binding.RepositoryPath, "worktree", "remove", "--force", binding.Root); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
+		}
+	}
+	if materialized.BranchCreated {
+		if err := gitRun(ctx, binding.RepositoryPath, "branch", "-D", binding.BranchName); err != nil {
+			// The branch may not have been created if materialization failed early.
+			exists, existsErr := gitRefExists(ctx, binding.RepositoryPath, "refs/heads/"+binding.BranchName)
+			if existsErr != nil || exists {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -208,6 +236,21 @@ func ensureWorkspaceDirectories(root string) error {
 		}
 	}
 	return nil
+}
+
+func validateWorkspaceSymlinks(root string) error {
+	return filepath.WalkDir(root, func(current string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+		if err := ensureNoSymlinkEscape(root, current); err != nil {
+			return fmt.Errorf("workspace contains an escaping symbolic link at %s: %w", filepath.ToSlash(current), err)
+		}
+		return nil
+	})
 }
 
 func gitRefExists(ctx context.Context, repositoryPath, ref string) (bool, error) {

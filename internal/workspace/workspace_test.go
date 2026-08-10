@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -179,6 +180,37 @@ func TestCreateGitWorktreeFailsClosedAndRollsBack(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Fatalf("branch was not rolled back: %s", out)
+	}
+}
+
+func TestCreateRollbackPreservesPreexistingDeterministicBranch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := seedBareRepo(t)
+	parent := t.TempDir()
+	_, branch := bindingIdentity("task-existing-branch", 1)
+	git(t, repo, "branch", branch, "HEAD")
+	service := NewService()
+
+	_, err := service.CreateGitWorktree(ctx, CreateRequest{
+		TaskID:         "task-existing-branch",
+		Generation:     1,
+		RepoPath:       repo,
+		WorktreeParent: parent,
+		AfterWorktreeAdd: func() error {
+			return errInjected
+		},
+	})
+	if err == nil {
+		t.Fatal("expected injected create failure")
+	}
+	out, branchErr := exec.Command("git", "--git-dir", repo, "branch", "--list", branch).CombinedOutput()
+	if branchErr != nil {
+		t.Fatalf("list preexisting branch: %v\n%s", branchErr, out)
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatal("rollback deleted a branch it did not create")
 	}
 }
 

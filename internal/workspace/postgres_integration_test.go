@@ -159,11 +159,36 @@ func TestPostgresWorkspaceRealLifecycleConcurrencyRestartAndAgentTools(t *testin
 	if err != nil || !strings.Contains(diff.Patch, "workspace/app.go") || len(diff.ObservedWrites.Files) != 1 {
 		t.Fatalf("real git diff = %+v err %v", diff, err)
 	}
+	secret := "workspace-secret-must-not-leak"
+	t.Setenv("THREADMILL_WORKSPACE_TEST_SECRET", secret)
+	hookPath := filepath.Join(repository, "hooks", "pre-commit")
+	writeFile(t, hookPath, "#!/bin/sh\necho $THREADMILL_WORKSPACE_TEST_SECRET >&2\necho hook-ran > workspace/hook-ran\n")
+	if err := os.Chmod(hookPath, 0o755); err != nil {
+		t.Fatalf("chmod pre-commit hook: %v", err)
+	}
+	git(t, binding.Root, "config", "user.name", "Threadmill Test")
+	git(t, binding.Root, "config", "user.email", "threadmill-test@invalid")
+	if added, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "add", "workspace/app.go"}}); err != nil || added.ExitCode != 0 {
+		t.Fatalf("git add with scrubbed environment = %+v err %v", added, err)
+	}
+	committed, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "commit", "-m", "candidate"}})
+	if err != nil || committed.ExitCode != 0 {
+		t.Fatalf("git commit with hooks disabled = %+v err %v", committed, err)
+	}
+	if strings.Contains(committed.Stdout, secret) || strings.Contains(committed.Stderr, secret) {
+		t.Fatalf("workspace command leaked parent environment secret: %+v", committed)
+	}
+	if _, statErr := os.Stat(filepath.Join(binding.Root, "workspace", "hook-ran")); !os.IsNotExist(statErr) {
+		t.Fatalf("workspace command executed repository hook, stat err = %v", statErr)
+	}
 
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(binding.Root, "workspace", "escape")); err == nil {
 		if _, err := tools.Write(ctx, "inv-execute-real", WriteRequest{Path: "workspace/escape/out.txt", Content: "no"}); !kernel.IsCode(err, kernel.CodeForbidden) {
 			t.Fatalf("symlink escape write error = %v, want forbidden", err)
+		}
+		if _, err := tools.Run(ctx, "inv-execute-real", RunRequest{Command: []string{"git", "status", "--short"}}); !kernel.IsCode(err, kernel.CodeForbidden) {
+			t.Fatalf("run with escaping symlink error = %v, want forbidden", err)
 		}
 		if err := os.Remove(filepath.Join(binding.Root, "workspace", "escape")); err != nil {
 			t.Fatalf("remove symlink fixture: %v", err)
@@ -189,6 +214,13 @@ func TestPostgresWorkspaceRealLifecycleConcurrencyRestartAndAgentTools(t *testin
 	verifyRun, err := tools.Run(ctx, "inv-verify-real", RunRequest{Command: []string{"git", "status", "--short"}})
 	if err != nil || verifyRun.ExitCode != 0 {
 		t.Fatalf("verify read-only git run = %+v err %v", verifyRun, err)
+	}
+	isolatedGitWrite, err := tools.Run(ctx, "inv-verify-real", RunRequest{Command: []string{"git", "diff", "--output=workspace/pwn"}})
+	if err != nil || isolatedGitWrite.ExitCode != 0 {
+		t.Fatalf("verify isolated git output = %+v err %v", isolatedGitWrite, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(binding.Root, "workspace", "pwn")); !os.IsNotExist(statErr) {
+		t.Fatalf("read-only git command wrote authoritative workspace, stat err = %v", statErr)
 	}
 	copyRun, err := tools.Run(ctx, "inv-verify-real", RunRequest{Command: []string{"go", "mod", "init", "example.com/read-only-check"}})
 	if err != nil || copyRun.ExitCode != 0 {
