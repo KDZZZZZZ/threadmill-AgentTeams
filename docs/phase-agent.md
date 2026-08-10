@@ -189,15 +189,18 @@ type InputWaitResult struct {
 
 ## 5. Context Interface
 
-Runtime 通过 `threadmill-ctx` MCP server 向 AgentTeams 宿主注入以下只读工具。`context.listSubgraphs`、`context.explore`、`context.subscribe` 是 [context-graph.md](./context-graph.md) §6.1 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe）的 MCP adapter，工具名与行为不变。Phase Agent 不持有机械检索工具：`ContextGraphSearcher.Search` 只注入 Context Agent，是 Context Agent 访问 Graph 的底层检索 seam；Phase Agent 列表/探索不足时调用独立接口 `contextAgent.retrieve(...)`，由 Context Agent 内部转换为 Keywords / Scope / AnchorRefs 后调用 Search，**不属于 Graph reader**。调用身份、角色、权限快照、预算与 Context Graph revision 由 Runtime 调用上下文附加，不进入每个 request；Graph 读工具的请求/响应结构与 `ContextGraphReader` 定义以 context-graph.md §6.1 为权威。它们共享当前 Invocation，不改变 `PhaseInputSet`。
+Runtime 通过 `threadmill-ctx` MCP server 向 AgentTeams 宿主注入以下 Context 工具。`context.listSubgraphs`、`context.explore`、`context.subscribe`、`context.unsubscribe` 是 [context-graph.md](./context-graph.md) §6.1 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe / Unsubscribe）的 MCP adapter，工具名与行为不变。Phase Agent 不持有机械检索工具：`ContextGraphSearcher.Search` 只注入 Context Agent，是 Context Agent 访问 Graph 的底层检索 seam；Phase Agent 列表/探索不足时调用独立接口 `contextAgent.retrieve(...)`，由 Context Agent 内部转换为 Keywords / Scope / AnchorRefs 后调用 Search，**不属于 Graph reader**。调用身份、角色、权限快照、预算与 Context Graph revision 由 Runtime 调用上下文附加，不进入每个 request；Graph 工具的请求/响应结构与 `ContextGraphReader` 定义以 context-graph.md §6.1 为权威。它们共享当前 Invocation，不改变 `PhaseInputSet` 或 Coordination Graph。
 
 | 工具 | 用途 | 结果 |
 | --- | --- | --- |
 | `context.listSubgraphs(filter?)` | 列出可见 Context Subgraph（权限过滤后的返回集合） | `ContextSubgraph[]` |
 | `context.explore({ anchor, depth? })` | 从当前切片、frontier 或子图渐进展开 | `ContextSliceDelta` |
 | `context.subscribe({ subgraphIds, eventKinds? })` | 订阅可见子图后续更新 | `ContextSubscription` |
+| `context.unsubscribe({ subscriptionId })` | 取消当前 Phase Invocation 自己的一条订阅 | 成功无返回；未知或非本 Invocation ID 返回 `subscription_not_found` |
 
-本节涉及的语义裁决方正式名为 **Context Agent**（即此前 Ctx Manager Agent / 图中 ctx agent）。`context.listSubgraphs`、`context.explore`、`context.subscribe` 由 Context Service / Graph 操作面直接处理，不调用 Context Agent，也不做 LLM 语义判断。Search 命中子图的自动订阅绑定**原请求方** Invocation（不是 Context Agent 自己）：可信 consumer binding 由 Runtime 在 Context Agent 调用 Search 时附加，不放入 SearchRequest；订阅在 Invocation 结束时过期。普通探索和 Delta 不是 Task 依赖交付，不能替代 `PhaseInputSet`。
+本节涉及的语义裁决方正式名为 **Context Agent**（即此前 Ctx Manager Agent / 图中 ctx agent）。四个 `context.*` 工具都由 Context Service / Graph 操作面直接处理，不调用 Context Agent，也不做 LLM 语义判断。Search 命中子图的自动订阅绑定**原请求方** Invocation（不是 Context Agent 自己）：可信 consumer binding 由 Runtime 在 Context Agent 调用 Search 时附加，不放入 SearchRequest；初始 `ContextSlice.SubscriptionIDs`、`context.subscribe` 返回的 `ContextSubscription.ID` 与 `contextAgent.retrieve` 返回的 `SubscriptionIDs` 都可交给 `context.unsubscribe`。订阅在 Invocation 结束时过期，也可由 Phase Agent 提前取消。普通探索和 Delta 不是 Task 依赖交付，不能替代 `PhaseInputSet`。
+
+Runtime 不按“最后一次订阅”覆盖 Phase Agent 上下文。它对当前 `ConsumerInvocationID` 的所有有效订阅取 `SubgraphIDs` 去重并集，再经当前权限、graph revision、recipient 匹配和 token 预算裁剪后提供上下文；初始、检索自动订阅和显式订阅都进入同一并集，但不会与其他 Agent、Task 或 Invocation 合并。取消一条订阅后 Runtime 立即更新控制状态，并在下一次模型调用、`runtime.awaitInputs` 重承载或 `runtime.resumePhase` 装配前重算并集；同一子图仍被另一条有效订阅覆盖时继续保留。已经送入当前模型调用的内容不能追溯删除，但取消成功后不再注入、刷新或推送仅由该订阅覆盖的内容。
 
 ### 5.1 `runtime.onContextDelta`（Runtime 回调）
 
@@ -211,7 +214,7 @@ type ContextDelta struct {
 }
 ```
 
-`ContextDelta` 是订阅输出事件，不是接口方法：`ContextGraphReader` 不提供 Delta 读取或拉取方法，`Subscribe` 的结果是 `ContextSubscription`。推送由 Context Graph 主动触发：节点/边事务提交并递增受影响 subgraph revision 后，Context Graph 的内部订阅执行器匹配已存在订阅并生成 ContextDelta，Runtime 只负责送达活动 Invocation；Context Agent 不推送，也不需要 Agent 轮询。Delta 必须可合并、可重放，且没有订阅外旁路推送。若 Delta 证明计划或编排失效，Agent 使用 `agent.proposeOrchestration`，不直接改图。Task 工作期间的 `agent.submitMemoryCandidate` 只写候选缓冲，不产生节点提交，因此不触发推送；候选审查落图（Task done 后）才产生 Delta（见 §6.4）。
+`ContextDelta` 是订阅输出事件，不是接口方法：`ContextGraphReader` 不提供 Delta 读取或拉取方法，`Subscribe` 的结果是 `ContextSubscription`。推送由 Context Graph 主动触发：节点/边事务提交并递增受影响 subgraph revision 后，Context Graph 的内部订阅执行器匹配有效订阅并生成 ContextDelta，Runtime 在送达活动 Invocation 前再次校验订阅仍有效；Context Agent 不推送，也不需要 Agent 轮询。Delta 必须可合并、可重放，且没有订阅外旁路推送。若 Delta 证明计划或编排失效，Agent 使用 `agent.proposeOrchestration`，不直接改图。Task 工作期间的 `agent.submitMemoryCandidate` 只写候选缓冲，不产生节点提交，因此不触发推送；候选审查落图（Task done 后）才产生 Delta（见 §6.4）。
 
 ### 5.2 `runtime.onInputsChanged`（Runtime 回调）
 
@@ -363,7 +366,7 @@ Phase Agent 不提供：
 Phase Agent 的上下文管理与运行内部配置需要结合具体宿主能力进一步研究，本文不冻结：
 
 - **上下文装配**：ContextSlice 的构建、seed subgraph 选择、frontier 预算、按 role/purpose 的注入重排与正文注入量；
-- **订阅生命周期**：订阅绑定逻辑 Invocation、过期与清理时机、Delta 合并与重放策略；
+- **订阅实现策略**：订阅绑定当前 consumer Invocation、可显式取消、Runtime 按有效订阅子图并集装配等语义已由 §5 固定；仅物理清理时机、Delta 合并窗口与重放存储策略待定；
 - **输入等待**：`InputWaitResult` 的持久化、join 等待令牌、截止时间与重试策略；
 - **预算与门控**：token/时间预算、工具白名单、重试与超时参数。
 

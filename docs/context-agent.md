@@ -83,12 +83,13 @@ type ContextRetrieveRequest struct {
 }
 
 type ContextRetrieveResult struct {
-    Slice       ContextSliceDelta `json:"slice"`
-    Explanation string            `json:"explanation"`
+    Slice           ContextSliceDelta `json:"slice"`
+    SubscriptionIDs []string          `json:"subscription_ids"` // 为原请求方建立的自动订阅句柄
+    Explanation     string            `json:"explanation"`
 }
 ```
 
-Context Agent 将 Query 转换为 SearchRequest 后调用 `context.search`。Runtime 将 Search 自动订阅绑定到原请求方 Invocation，不绑定 Context Agent。返回内容必须来自可见检索结果，不得凭模型记忆补写项目事实。
+Context Agent 将 Query 转换为 SearchRequest 后调用 `context.search`。Runtime 将 Search 自动订阅绑定到原请求方 Invocation，不绑定 Context Agent，并把 `ContextSearchResult.SubscriptionIDs` 原样返回原请求方，使 Phase Agent 或 Task Manager Agent 可以通过 `context.unsubscribe` 取消。返回内容必须来自可见检索结果，不得凭模型记忆补写项目事实。
 
 ---
 

@@ -1,6 +1,6 @@
 # Task Manager Agent 定义与工具
 
-版本：v0.1
+版本：v0.2
 状态：Draft
 定位：本文只定义 Task Manager Agent、裁决协议及其所需工具。Coordination Graph 对象与接口以 [coordination-graph.md](./coordination-graph.md) 为准；Phase Agent 的 Requirement、OrchestrationProposal 和 PhaseOutput 以 [phase-agent.md](./phase-agent.md) 为准；Context 读写 seams 以 [context-graph.md](./context-graph.md) 为准。
 
@@ -17,7 +17,7 @@ Task Manager Agent 可以：
 3. 审批 OrchestrationProposal，在接受或改写后替换尚未执行的子图，并明确运行中 endpoint 的 hold/stop/release 顺序；
 4. 根据 Verify、Merge、Human Decision 或 ContextDelta 证据失效旧结果、重开 generation 或结束 Task；
 5. 经 Context Service 注册 task 子图、投影已生效的 directive/fact，并在权威 `done` 后触发 Task Memory 终审；
-6. 与 Phase Agent 使用相同的 Context 列表、探索、订阅和自然语言检索路径。
+6. 与 Phase Agent 使用相同的 Context 列表、探索、订阅、取消订阅和自然语言检索路径。
 
 Task Manager Agent 是临时 Agent Invocation，不拥有图存储、Scheduler 或 Runtime 状态。Runtime 每次只派发一个已持久化 `inputRef`，并注入身份、capability、预算、可见 evidence、Context Slice 和当前 decision scope。Task Manager 的跨 Invocation 连续性来自 Coordination Graph、DecisionRef、Event Log 和 Context Graph，不来自模型会话。
 
@@ -46,6 +46,7 @@ Task Manager 使用的 Graph 对象、请求/响应字段和校验规则由权�
 | `context.listSubgraphs` | `ContextGraphReader.ListSubgraphs` | 与 Phase Agent 相同的可见子图列表 |
 | `context.explore` | `ContextGraphReader.Explore` | 与 Phase Agent 相同的受控图探索 |
 | `context.subscribe` | `ContextGraphReader.Subscribe` | 建立绑定当前 Task Manager Invocation 的订阅 |
+| `context.unsubscribe` | `ContextGraphReader.Unsubscribe` | 按 SubscriptionID 取消当前 Task Manager Invocation 自己的订阅 |
 | `contextAgent.retrieve` | `ContextAgent.Retrieve` | 列表/探索不足时请求 Context Agent 做自然语言语义检索 |
 | `context.registerTaskSubgraph` | `TaskContextWriter.RegisterTaskSubgraph` | Task 创建成功后显式注册唯一 task 子图绑定 |
 | `context.projectTaskContext` | `TaskContextWriter.ProjectTaskContext` | 投影已写入权威来源的 directive/fact，不复制易变运行状态 |
@@ -55,6 +56,8 @@ Task Manager 使用的 Graph 对象、请求/响应字段和校验规则由权�
 
 - 不重命名 Graph 字段、不补业务默认值、不把多次图 mutation 合并成隐藏工作流；
 - Runtime 只附加可信身份、inputRef、DecisionRef、capability 和调用审计；这些值不允许 Agent 自报；
+- Runtime 提供的上下文范围始终来自当前 Task Manager Invocation 全部有效订阅的 `SubgraphIDs` 去重并集；初始、检索与显式订阅共同参与，但不跨 Agent、Task 或 Invocation 合并；
+- `context.unsubscribe` 只接受初始 `ContextSlice.SubscriptionIDs`、`context.subscribe` 或 `contextAgent.retrieve` 返回给当前 consumer 的 ID。取消后 Runtime 重算并集；重叠订阅仍覆盖的子图不会被移除；
 - `taskManager.submitDecision` 是结构化业务输出，不是 Agent 直写 Event Log；Runtime 自动捕获提交、图写结果和最终 disposition；
 - 每次 Coordination Graph 写入前必须先提交一份 decision；同一 DecisionRef 最多关联一次 `ReplacePending` 或一次 `Transition`，不能同时驱动两种 mutation；
 - revision 冲突、scope 校验失败或 transition 拒绝原样返回。Agent 必须重新 `Snapshot` 并形成新 decision，不得自动套用旧决定；
@@ -66,7 +69,7 @@ Task Manager 使用的 Graph 对象、请求/响应字段和校验规则由权�
 - 读取图：`coordination.snapshot`；
 - 新建 Task、调整尚未执行子图、接受拆分/重排建议：`taskManager.submitDecision` → `coordination.replacePending`；
 - submitted/satisfied/rejected/reopened/held/released/stopped、Blocker 和 Task 终态：`taskManager.submitDecision` → `coordination.transition`；
-- Context 普通读：`context.listSubgraphs`、`context.explore`、`context.subscribe`；
+- Context 普通读与订阅生命周期：`context.listSubgraphs`、`context.explore`、`context.subscribe`、`context.unsubscribe`；
 - 自然语言语义检索：`contextAgent.retrieve`；Task Manager 不持有 `ContextGraphSearcher.Search`；
 - Task 定向投影：`context.registerTaskSubgraph`、`context.projectTaskContext`；
 - done 后候选终审：`context.finalizeTaskMemory`。
@@ -145,6 +148,7 @@ inputRef
 - **done 成功、候选终审失败**：Task 保持 done，`FinalizeTaskMemory` 对同一冻结批次幂等重试。
 - **证据不足或来源过期**：使用 `defer` 或 `reject`，不能从 transcript、聊天文本或模型记忆补写事实。
 - **权限或 capability 失效**：停止本次 Invocation；Adapter 不缓存可脱离 Task Manager 身份复用的图写凭据。
+- **取消订阅竞态**：Context Service 成功取消后，Runtime 丢弃该订阅尚未送达的 Delta，并在下一次模型调用前按有效订阅子图并集重新装配；已送入当前模型调用的内容不做追溯删除。
 
 ---
 
@@ -160,6 +164,7 @@ taskManager.submitDecision
 context.listSubgraphs
 context.explore
 context.subscribe
+context.unsubscribe
 contextAgent.retrieve
 context.registerTaskSubgraph
 context.projectTaskContext

@@ -42,7 +42,7 @@ Event Log 不是由 agent 显式写日志，而是 Runtime 在以下边界自动
 | Task Manager 裁决 | TaskManagerDecisionSubmitted / TaskManagerDecisionFinalized | Runtime 将 DecisionRef 绑定 inputRef、expected graph revision、Graph mutation 结果与最终 disposition；Agent 不直接写日志 |
 | MemoryCandidate | `MemoryCandidateBuffered` / `MemoryCandidateRejected`、`CandidateBufferFrozen`、`CandidateReviewAccepted` / `CandidateReviewRejected` | 入缓冲后对同 Task plan/execute/verify 可读，跨 Task 不可见；不代表 ContextNode。done 后冻结、终审并原子落图 |
 | Context Graph 写入 | ContextGraphCommitted | 节点/边变更与 graph/subgraph revision 的原子提交 |
-| 订阅与推送 | ContextSubscriptionCreated / Expired、ContextDeltaDelivered / Consumed | Runtime 记录订阅关系与 Delta 是否被 Agent 消费 |
+| 订阅与推送 | ContextSubscriptionCreated / Cancelled / Expired、ContextDeltaDelivered / Consumed | `Cancelled` 记录 consumer 显式取消，`Expired` 记录 Invocation 结束失效；Runtime 记录订阅关系与 Delta 是否被 Agent 消费 |
 | 验证与合并 | VerifyPassed / VerifyFailed、MergeCandidateQueued / Merged | merge event 附 commit/diff/test evidence |
 | 人工决定 | HumanDecisionRequested / HumanDecisionRecorded | 显式记录，含理由与 revision |
 | 结果失效 | PhaseResultInvalidated | Task Contract、依赖结果、代码基线、Workspace Head 或高影响上下文变化后由 Task Manager 按影响范围触发 |
@@ -231,7 +231,7 @@ UIPanelProjection:
 5. Human decision 必须显式记录。
 6. Process transcript 是 Artifact（`agent_transcript`），但运行时私有：Task Manager 只读结构化边界输出（PhaseOutput / OrchestrationProposal / 已完成 endpoint 的 report、delivery、evidence），不读未提交过程上下文。
 7. Context Graph 的高影响节点必须有 Event 或 Artifact 证据（SourceRefs），只经候选缓冲准入后落图。
-8. 订阅与 Delta 的记录（创建、过期、投递、消费）必须进入 Event Log；Delta 增量、可合并、可重放。
+8. 订阅与 Delta 的记录（创建、显式取消、Invocation 过期、投递、消费）必须进入 Event Log；Runtime 按当前 consumer 的有效订阅子图并集提供上下文，Delta 增量、可合并、可重放。
 9. 图变更历史由 Event Log 审计，但审计机制不限制 Coordination Graph 的运行时热修改。
 10. 系统状态应尽可能能从 Event Log 重放；事件顺序由 EventLogAdapter 保证，不复用 filesync 水位或 Matrix 时间线作游标。
 11. 每 Task 一份候选缓冲，固定的 plan/execute/verify 三阶段共享，跨 Task 隔离；缓冲不属于 Context Graph。done 后冻结终审，成功落图后才触发图 revision 与推送。

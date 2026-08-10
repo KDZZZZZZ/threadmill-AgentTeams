@@ -1,6 +1,6 @@
 # Context Graph 节点创建与关系模型
 
-版本：v0.1
+版本：v0.2
 状态：Draft
 定位：定义 Context Graph 在 Agent 创建记忆节点时的写入契约与关键数据结构，重点说明“创建者连续记忆”和“订阅子图推导来源”两类关系。本文不展开检索、切片排序、缓存或 AgentTeams 存储适配。
 
@@ -40,13 +40,13 @@
 | --- | --- | --- |
 | Candidate 内容 | 创建 Agent | 陈述、类型、证据与 general 归属建议（`MemoryCandidate` 四字段，§3.3） |
 | 候选缓冲 | Context Service | 每个 Task 一份 append-only 缓冲；同一 Task 的 plan/execute/verify 经 `TaskMemoryBufferReader` 只读，跨 Task 不可见；记录不是 ContextNode，不进入图读接口或订阅 |
-| 当前订阅快照 | Context Service | 从有效 Invocation 订阅中读取，不信任 Agent 自报 |
+| 当前订阅子图并集 | Context Service | 按当前 ConsumerInvocationID 从有效订阅中去重汇总，不信任 Agent 自报，不跨 Invocation 合并 |
 | 创建者近期节点索引 | Context Graph Store | 按稳定 Agent identity 查询最近创建的可见节点 |
 | 候选入口机械校验（Hard Gate） | Context Service | 同步、无 LLM：字段结构合法；`Statement` 非空；`Kind` 只能是 directive/fact/hypothesis；`SourceRefs` 非空且调用者可读；不含密钥或越权内容；`SubgraphIDs` 只含调用者可写的 general 子图。失败返回 error、记录 `MemoryCandidateRejected`，不进入缓冲 |
 | 缓冲冻结与审查触发 | Task Manager | 按 DeliveryPolicy 得出权威 `done` 后经 `TaskMemoryFinalizer.FinalizeTaskMemory` 冻结 Task 缓冲并触发审查；canceled/failed/reopened 不触发 |
 | `general` 节点与子图语义管理 | Context Agent 经 Context Service | `ContextGraphCurator`（§6.1.3）定义 CRUD 接口与字段；Context Agent 只持有对应工具包装 |
 | Search 检索 | Context Service（Graph 操作面） | 按 `Keywords / Scope / AnchorRefs` 机械匹配；只向 Context Agent 暴露 |
-| 普通列表 / 探索 / 订阅 | Context Service（Graph 操作面） | 所有普通 Agent 可用，不调用 Context Agent |
+| 普通列表 / 探索 / 订阅 / 取消订阅 | Context Service（Graph 操作面） | 所有 Agent 可列表/探索；订阅生命周期工具只注入 Phase Agent 与 Task Manager Agent；不调用 Context Agent |
 | Context Agent 自然语言检索 | [context-agent.md](./context-agent.md) 定义 | Context Agent 将 Query 转换为 SearchRequest；结果只能来自可见图 |
 | 持久化 mutation | Context Service | 唯一执行节点/边/子图 mutation；Context Agent 不直连存储 |
 | 自动边生成 | 写入事务 | 根据受信创建快照生成；与节点原子提交 |
@@ -252,7 +252,7 @@ Task 定向投影（§8.2）在同一事务原子规则上追加：
 
 | Seam | 调用方 | 方向 | 方法 |
 | --- | --- | --- | --- |
-| `ContextGraphReader`（§6.1.1） | 所有 Agent | 图读/订阅 | `ListSubgraphs` / `Explore` / `Subscribe` |
+| `ContextGraphReader`（§6.1.1） | 所有 Agent；订阅生命周期仅 Phase Agent、Task Manager Agent | 图读/订阅 | `ListSubgraphs` / `Explore` / `Subscribe` / `Unsubscribe` |
 | `ContextGraphSearcher`（§6.1.2） | 仅 Context Agent | 机械检索 | `Search` |
 | `ContextGraphCurator`（§6.1.3） | 仅 Context Agent | general 图读写 | `GetSubgraph` / `GetNode` / `CreateNode` / `UpdateNode` / `DeleteNode` / `CreateSubgraph` / `UpdateSubgraph` / `DeleteSubgraph` |
 | `ContextCandidateReviewer`（§6.1.4） | 仅 Context Agent | 冻结候选审查 | `SubmitReview` |
@@ -265,21 +265,23 @@ seam 路由：所有方法由 Context Service 执行。普通 Agent 只获得 Re
 
 ### 6.1 读 seams：ContextGraphReader 与 ContextGraphSearcher
 
-`ContextGraphReader` 是所有 Agent（Phase Agent、Task Manager 等）共用的读/订阅 seam，只含 `ListSubgraphs` / `Explore` / `Subscribe`，不含 Search。`ContextGraphSearcher` 是 Context Agent 访问 Graph 的底层机械检索 seam，只含 `Search`，唯一调用方是 Context Agent；普通 Agent 的读 surface 看不到 Search。两者都由 Context Service（Graph 操作面）直接处理，不调用 Context Agent；Search 只按显式字段机械匹配，不接受自然语言意图。列表/探索不足时，普通 Agent 只能经独立模块接口 `contextAgent.retrieve(...)` 请求 Context Agent，由 Context Agent 内部把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 后调用 `ContextGraphSearcher.Search`。
+`ContextGraphReader` 是所有 Agent 共用的读 seam，其中 `Subscribe` / `Unsubscribe` 工具只注入实际消费订阅的 Phase Agent 与 Task Manager Agent；它不含 Search。Context Agent 只包装 `ListSubgraphs` / `Explore`，检索自动订阅绑定原请求方，不绑定 Context Agent。`ContextGraphSearcher` 是 Context Agent 访问 Graph 的底层机械检索 seam，只含 `Search`，唯一调用方是 Context Agent；普通 Agent 的读 surface 看不到 Search。两者都由 Context Service（Graph 操作面）直接处理，不调用 Context Agent；Search 只按显式字段机械匹配，不接受自然语言意图。列表/探索不足时，普通 Agent 只能经独立模块接口 `contextAgent.retrieve(...)` 请求 Context Agent，由 Context Agent 内部把自然语言请求转换为 `Keywords` / `Scope` / `AnchorRefs` 后调用 `ContextGraphSearcher.Search`。
 
-#### 6.1.1 ContextGraphReader：列表 / 探索 / 订阅（所有 Agent）
+#### 6.1.1 ContextGraphReader：列表 / 探索 / 订阅生命周期
 
 ```go
 type ContextGraphReader interface {
     ListSubgraphs(ctx context.Context, req ListSubgraphsRequest) ([]ContextSubgraph, error)
     Explore(ctx context.Context, req ExploreRequest) (ContextSliceDelta, error)
     Subscribe(ctx context.Context, req SubscribeRequest) (ContextSubscription, error)
+    Unsubscribe(ctx context.Context, subscriptionID string) error
 }
 ```
 
-- 这是统一设计 §11 与 phase-agent §5 引用的同一读 surface；方法与字段只在本节定义。所有普通 Agent 使用相同的列表、探索和订阅接口，不含 Search。
-- 列表、探索与订阅都是权限约束的读/订阅操作，由 Context Service（Graph 操作面）直接处理，不需要 Context Agent 参与。
-- 订阅结果 `ContextSubscription` 的字段集以本节为权威；订阅绑定当前 Invocation，随其结束过期，无显式退订接口（§6.6）。
+- 这是统一设计 §11、phase-agent §5、task-manager-agent §2 与 context-agent §2 引用的同一 surface；方法与字段只在本节定义。Context Agent 只获得列表/探索工具；Phase Agent 与 Task Manager Agent 使用相同的四个工具；都不经本 seam 获得 Search。
+- 列表、探索与订阅生命周期操作都受权限和当前 Invocation 约束，由 Context Service（Graph 操作面）直接处理，不需要 Context Agent 参与；`Unsubscribe` 只改变订阅控制状态，不修改 Context Graph 节点、边或 revision。
+- `Subscribe` 返回 `ContextSubscription`；`Unsubscribe` 只接受该结果、初始 `ContextSlice.SubscriptionIDs` 或 `contextAgent.retrieve` 返回的、属于当前 `ConsumerInvocationID` 的 ID。Runtime 注入 consumer binding，Agent 不能替其他 Invocation 取消订阅。
+- 取消订阅按 ID 幂等：当前 Invocation 已取消或已过期的 ID 返回成功；未知 ID 与其他 Invocation 的 ID 统一返回 `subscription_not_found`，不得泄露其是否存在或归属。Context Service 必须先原子标记取消并记录事件，再返回成功；Runtime 在装配和投递前重验 active 状态，丢弃取消后尚未送达的 Delta。
 - **主动推送**：节点/边事务提交并递增受影响 subgraph revision 后，Context Graph 主动触发其内部订阅执行器，匹配已存在订阅的子图、事件类型、权限与新鲜度，按 subgraph revision 合并生成 `ContextDelta`；Runtime 只负责把它送达活动 Invocation（`runtime.onContextDelta`，统一设计 §14.2；结构以 phase-agent §5.1 为权威）。`ContextDelta` 是**输出事件**，不是本 seam 的方法；推送不是 Context Agent 行为，也不是 `ContextGraphReader` / `ContextGraphSearcher` 方法，不需要 Agent 轮询拉取；主动仅限已订阅子图，订阅之外无旁路推送。
 
 ```go
@@ -318,6 +320,19 @@ type ContextSubscription struct {
     PermissionSnapshot   string   `json:"permission_snapshot"`    // 创建时权限快照；推送时重验，禁止权限扩张
 }
 ```
+
+Runtime 提供给 Agent 的上下文范围由当前 consumer Invocation 的有效订阅子图并集决定：
+
+```text
+EffectiveSubgraphs(invocation) =
+  distinct union(subscription.SubgraphIDs)
+  for every active subscription owned by invocation
+
+RuntimeContext(invocation) =
+  materialize(EffectiveSubgraphs(invocation), current permissions, graph revision, budget)
+```
+
+并集同时包含初始切片自动订阅、`contextAgent.retrieve` 检索自动订阅和 Agent 显式 `Subscribe`；`EventKinds` 只过滤后续 Delta，不缩小当前上下文的子图并集。并集严格按 `ConsumerInvocationID` 隔离，不跨 Agent、Task 或 Invocation 合并。多个订阅覆盖同一子图时只计算一次；取消其中一个订阅后，若仍有其他有效订阅覆盖该子图，Runtime 继续提供该子图上下文。订阅变化后，Runtime 在下一次模型调用、等待重承载或 resume 装配前重算并集；已送入当前模型调用的内容无法追溯删除，但取消后不得再注入、刷新或推送仅由该订阅覆盖的内容。
 
 字段取舍：
 
@@ -539,9 +554,9 @@ type TaskContextWriter interface {
 
 - **CRUD 只向 Context Agent 受控开放**：`ContextGraphCurator`（§6.1.3）定义 general 节点与 general 子图 CRUD；Context Service 必须拒绝任何涉及 task 子图或属于 task 子图节点的 CRUD。普通 Agent 不持有对应工具，也不提供原始 Store/QueryRawGraph 访问。
 - **无公开启动装配 seam**：初始 Context Slice 由 Context Service 在 Runtime 启动 endpoint 时作为内部启动步骤装配（§8.3），不提供 `StartContextAssembler` / `AssembleInitialSlice` 等公开接口或 request 类型。
-- **Search 不可见于普通 Agent**：`Search` 不属于 `ContextGraphReader`，Phase Agent、Task Manager 等普通 Agent 的读 surface 只含 `ListSubgraphs` / `Explore` / `Subscribe`；`ContextGraphSearcher` 仅向 Context Agent 暴露，普通 Agent 不能直接查图，列表/探索不足时只能经独立工具 `contextAgent.retrieve(...)` 请求 Context Agent（§6.1.2）。
+- **Search 不可见于普通 Agent**：`Search` 不属于 `ContextGraphReader`，Phase Agent 与 Task Manager Agent 的 surface 只含 `ListSubgraphs` / `Explore` / `Subscribe` / `Unsubscribe`；`ContextGraphSearcher` 仅向 Context Agent 暴露，普通 Agent 不能直接查图，列表/探索不足时只能经独立工具 `contextAgent.retrieve(...)` 请求 Context Agent（§6.1.2）。
 - 节点与子图有三条受控写路径：Context Agent 经 Context Service CRUD general 对象；general 候选在 Task 权威 `done` 后终审落图；task 投影经 Task Manager 授权路径写入。`TaskMemoryBufferReader` 只读取当前 Task 工作记忆，不创建节点或边。
-- 无订阅外旁路推送：`ContextDelta` 只能由已存在的订阅触发（§6.1）；订阅随 Invocation 结束过期，无显式退订接口。
+- 无订阅外旁路推送：`ContextDelta` 只能由当前有效订阅触发（§6.1）；订阅随 Invocation 结束过期，也可由其 consumer 提前调用 `Unsubscribe` 取消。除此之外不提供强制替换订阅集或跨 Invocation 清理接口。
 - **分页、排序 DSL、缓存控制**：不设计分页游标、排序表达式或缓存控制字段；响应按 token 预算与可见性裁剪，`Frontier` 表达继续探索方向。
 - **物理存储**：节点、边、Recipient bindings、候选缓冲记录、订阅与审计的物理存储方式不在本节设计（§11 待定项）。
 - 每次读调用不创建持久 SearchJob：`Explore` / `Search` 是即时受控响应，与 Invocation 绑定（统一设计 §11）。
@@ -552,6 +567,7 @@ type TaskContextWriter interface {
 - **按创建者召回**：创建者链只召回已落图节点；缓冲候选不参与。
 - **按子图推导召回**：Explore/Search 只召回已落图节点；缓冲候选不参与。
 - **主动推送**：缓冲追加不改变 graph revision，也不产生 ContextDelta；Context Agent general CRUD、审查落图或 task 投影事务成功并递增受影响子图 revision 后才触发订阅推送。
+- **Runtime 上下文**：Runtime 不以最近一次 Subscribe 结果覆盖上下文，也不跨 Agent 合并；它始终按当前 Invocation 的有效订阅 `SubgraphIDs` 并集，经权限、revision 与预算过滤后提供上下文。订阅或取消订阅成功后在下一次上下文装配点重算。
 - **孤立节点治理**：没有 `SubgraphIDs` 且没有订阅来源的已落图节点仍可通过创建者链和 Search 找到。
 
 ## 8. Task 启动信息与 Manager 决定的归属
@@ -651,7 +667,7 @@ type TaskContextProjection struct {
 
 ### 8.3 定向装配与确定性匹配
 
-定向 task 节点与 Task 候选缓冲由 **Context Service** 在启动时分别装配：前者进入 `ContextSliceRef`，后者生成 `TaskMemoryBufferRef`。Runtime 只提供已有 start binding（`InvocationID / TaskID / EndpointRef`）；Context Service 按 TaskID 读取当前缓冲，不接受 Agent 自报 TaskID。两者都是内部启动步骤，不新增公开 assembler seam，也不能覆盖 `ContractRef / Inputs`。
+定向 task 节点与 Task 候选缓冲由 **Context Service** 在启动时分别装配：前者先建立初始订阅，再从当前 Invocation 的订阅子图并集物化为 `ContextSliceRef`；后者生成 `TaskMemoryBufferRef`。Runtime 只提供已有 start binding（`InvocationID / TaskID / EndpointRef`）；Context Service 按 TaskID 读取当前缓冲，不接受 Agent 自报 TaskID。两者都是内部启动步骤，不新增公开 assembler seam，也不能覆盖 `ContractRef / Inputs`。
 
 确定性 match：对待启动 endpoint `E`：
 
@@ -670,10 +686,11 @@ match(node, E) =
 装配顺序：
 
 1. 从 Runtime start binding 取得 `InvocationID / TaskID / EndpointRef`。
-2. 精确匹配 `task` 子图 Recipient bindings，合并 general 上下文，校验权限与来源 revision。
-3. 保存 Context Slice 并为其中子图建立 Invocation 订阅，返回 `ContextSliceRef`。
-4. 读取同一 Task 的 append-only 候选缓冲，保存只读 `TaskMemoryBufferView` 快照；缓冲为空也返回有效空快照引用。
-5. Runtime 将 `ContextSliceRef` 与 `TaskMemoryBufferRef` 写入 `StartPhaseInput`，再启动 `plan / execute / verify` 中的当前阶段。
+2. 精确匹配 `task` 子图 Recipient bindings，并选择 general seed 子图，校验权限与来源 revision。
+3. 为选中的子图建立初始 Invocation 订阅；Context Service 读取该 Invocation 全部有效订阅，按 `SubgraphIDs` 并集去重。
+4. 从并集物化 Context Slice，保存初始订阅 ID 到 `ContextSlice.SubscriptionIDs` 并返回 `ContextSliceRef`；节点仍按权限、recipient、revision 与预算裁剪。
+5. 读取同一 Task 的 append-only 候选缓冲，保存只读 `TaskMemoryBufferView` 快照；缓冲为空也返回有效空快照引用。
+6. Runtime 将 `ContextSliceRef` 与 `TaskMemoryBufferRef` 写入 `StartPhaseInput`，再启动 `plan / execute / verify` 中的当前阶段。
 
 `InvocationID` 不参与 Task 缓冲归属；TaskID 是唯一隔离键。`TaskMemoryBufferRef` 不参与 Recipient 匹配、graph revision 或订阅。
 `InvocationID` 不参与接收者匹配；匹配键只有稳定的 `TaskID + EndpointRef`。自动匹配失败不能退化成“让 Agent 自己搜索 task 子图”：这会把 Context Service 的确定性责任泄漏到 Phase Agent，并使恢复、替换和重试得到不同输入。
@@ -692,6 +709,8 @@ match(node, E) =
 | Task Manager 绕过 general 审查写 general 子图 | 拒绝，只留审计；Task Manager 的图写入只有 `TaskContextWriter`（task 投影）与 `TaskMemoryFinalizer`（审查触发） |
 | 最近节点不可见或已过时 | 跳过自动 `logical_adjacent`，不回退遍历整个历史 |
 | 订阅在提交前过期 | 不生成 `derives_from_subgraph`；审计记录丢弃原因 |
+| 取消未知订阅或其他 Invocation 的订阅 | 统一返回 `subscription_not_found`；不泄露存在性或 consumer 身份 |
+| 取消订阅与 Delta 投递并发 | Context Service 先原子标记取消；Runtime 投递前重验并丢弃尚未送达 Delta，已经送达的上下文不做追溯删除 |
 | 子图在准入期间升版 | 在事务前重验 revision |
 | Agent 身份无法稳定解析 | 不创建自动创建者链 |
 | Candidate 重复或被拒绝 | 不重复入缓冲；审查拒绝的候选不落图，只留审计 |
@@ -726,6 +745,7 @@ match(node, E) =
 18. `Search` 只经 `ContextGraphSearcher` 暴露给 Context Agent；Phase Agent、Task Manager 等普通 Agent 的 `ContextGraphReader` 不含 Search，列表/探索不足时只能经独立工具 `contextAgent.retrieve(...)` 请求 Context Agent。
 19. Search 自动订阅绑定原始请求方 Invocation（由 Runtime 在 Context Agent 调用 `Search` 时附加 consumer binding），不绑定 Context Agent 自己的 Invocation。
 20. Context Agent 可用 ListSubgraphs / GetSubgraph / GetNode / Explore / Search 探索，并经 Context Service 对 general 节点和 general 子图执行受控 CRUD；任何涉及 task 子图或属于 task 子图的节点必须拒绝。
+21. Runtime 提供上下文时只计算当前 `ConsumerInvocationID` 的有效订阅子图并集；权限过滤始终优先，并集不跨 Agent、Task 或 Invocation。取消一个重叠订阅不能移除仍被其他有效订阅覆盖的子图。
 
 ## 11. 待定项
 

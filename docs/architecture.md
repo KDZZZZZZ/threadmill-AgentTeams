@@ -39,8 +39,8 @@ flowchart TB
   CA -->|"经 ContextGraphSearcher.Search 机械检索 Context Graph（关键词+scope+anchorRefs，只读不写；Searcher 仅 Context Agent 可用）"| CX
   CX -->|"主动推送 Context Delta（revision 提交后内部订阅执行器生成，经 Runtime 送达；仅限已订阅子图）"| PA
 
-  %% 上下文闭环：Phase → Context Graph 列表 / 探索 / 订阅
-  PA -->|"列表、探索、订阅子图（Reader 不含 Search）；积累记忆：工作中只入 Task 缓冲（不落图），Task 权威 done 后 Context Agent 批量裁决、Context Service 落图"| CX
+  %% 上下文闭环：Phase → Context Graph 列表 / 探索 / 订阅生命周期
+  PA -->|"列表、探索、订阅/取消订阅子图（Reader 不含 Search）；Runtime 按当前 Invocation 的有效订阅子图并集提供上下文；积累记忆仍只入 Task 缓冲"| CX
 
   %% 协调链
   TM -->|"编排（唯一写入口；审批 Proposal 并热修改图）"| CG
@@ -48,7 +48,7 @@ flowchart TB
 
   %% Task Manager 与 phase agent 相同的 Context 操作
   TM -.->|"请求 Context Agent 自然语言检索（与 phase agent 相同，独立模块接口）"| CA
-  TM -.->|"经 ContextGraphReader 列表/探索/订阅 Context Graph 并接收主动推送的 Delta（与 phase agent 相同；Search 需经 Context Agent）"| CX
+  TM -.->|"经 ContextGraphReader 列表/探索/订阅/取消订阅 Context Graph；Runtime 按当前 Invocation 的有效订阅子图并集提供上下文（与 phase agent 相同）"| CX
 ```
 
 节点身份对照与边注释：
@@ -267,13 +267,13 @@ verify 失败（契约不满足、计划过时、缺前置）→ verifier 提交
 1. 所有 Agent Invocation 都经 Agent Runtime。
 2. Coordination Graph 只有 Task Manager 能写；Context Graph 持久化 mutation 只有 Context Service 能执行。Context Agent 可经 Context Service CRUD general 节点和 general 子图；`task` 子图只接受 Task Manager 经 `TaskContextWriter` 的受控投影；main 只有 Merge Queue 能写。
 3. Phase Agent 不直接写任一图；Task 工作期候选只停留缓冲、不落图不推送；Task Manager 不能绕过 `TaskContextWriter`，Context Agent 不能操作 task 子图或直连图存储。
-4. 不存在 Agent mailbox；外部记忆只来自 Context Slice、图探索、检索、订阅与自动 Context Delta。
-5. 不存在持久 Agent 身份：Agent 是临时计算资源，订阅随 Invocation 过期。
+4. 不存在 Agent mailbox；外部记忆只来自 Context Slice、图探索、检索、有效订阅并集与自动 Context Delta。
+5. 不存在持久 Agent 身份：Agent 是临时计算资源，订阅绑定当前 consumer Invocation，可提前取消并在 Invocation 结束时过期。
 6. Context Agent 只在检索、候选审查或显式图管理 Invocation 中受控探索和 CRUD；不主动提示、不操作 task 子图、不直连图存储、不执行订阅/推送。
 7. Coordination Graph 不主动执行："控制"经 Scheduler 选择与 Runtime 启动落地；Scheduler 只读图。
 8. 同一 Task 同一轮次内 plan、execute、verify 共享同一 Workspace Binding；任何阶段只有一个有效写 lease。
 9. Task 未通过 verify 不得进入 Merge Queue；verify passed 不等于 done（done 由 DeliveryPolicy 决定）。
-10. Task Manager 与 phase agent 使用同一 Context 读接口（`ContextGraphReader`，见 [context-graph.md](./context-graph.md) §6.1；只含列表/探索/订阅，不含 Search）；`Search` 经 `ContextGraphSearcher` 仅 Context Agent 可用；Context Agent 不依赖 Scheduler。
+10. Task Manager 与 phase agent 使用同一 Context 读/订阅生命周期接口（`ContextGraphReader`，见 [context-graph.md](./context-graph.md) §6.1；只含列表/探索/订阅/取消订阅，不含 Search）；Agent Runtime 按当前 consumer Invocation 的有效订阅子图并集提供上下文；`Search` 经 `ContextGraphSearcher` 仅 Context Agent 可用；Context Agent 不依赖 Scheduler。
 11. 跨模块数据只使用 Task Contract、PhaseOutput、OrchestrationProposal、ArtifactRef、ContextSlice 与受控 service request。
 12. AgentTeams 是归档基座：只复用已证实能力，编排与记忆语义全部落在 Threadmill 控制面。
 

@@ -363,7 +363,7 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 | Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上机械检查并合入 | Task Contract、Approved Plan、Workspace、evidence | Verifier 修改实现；Merge Queue 修冲突或直接改 Coordination/Context Graph |
 | Phase Agent | 完成当前 phase；在已知 completion 输入上自主等待或汇总；提交 PhaseOutput 或编排建议；使用可见 Context Graph | Task Contract、endpoint 契约、自己的 Context Slice/Delta、子图列表与描述、PhaseInputSet | 直接改图、直接通信、改 main、宣布 done |
 
-依赖约束：Task Manager 与 phase agent 使用相同 Context 读接口（`ContextGraphReader`：ListSubgraphs / Explore / Subscribe；机械检索 `ContextGraphSearcher.Search` 只注入 Context Agent）。phase agent 不能直接写 Context Graph；Task Manager 只能经 Context Service 向 `task` 子图投影上下文节点——`directive`（Task Contract 与 endpoint DeliverySpec/ReportSpec、用户 Requirement 的上下文投影，权威来源是 Coordination Graph 与 Requirement provenance）、`fact`（已接受/验证的 PhaseOutput、交付物、报告和证据的上下文投影，权威载荷在 Artifact Store/PhaseOutput）——`hypothesis` 不得承载任务或用户要求。节点引用权威来源、不复制易变 runnable/blocked 状态，不能访问图存储；Task Manager 的定向投影只写 `task` 子图，Phase Agent 候选只建议 `general` 子图，两条路径目标不相交，不存在逐目标混合鉴权。Context Agent 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。
+依赖约束：Task Manager 与 phase agent 使用相同 Context 读/订阅生命周期接口（`ContextGraphReader`：ListSubgraphs / Explore / Subscribe / Unsubscribe；机械检索 `ContextGraphSearcher.Search` 只注入 Context Agent）。phase agent 不能直接写 Context Graph；Task Manager 只能经 Context Service 向 `task` 子图投影上下文节点——`directive`（Task Contract 与 endpoint DeliverySpec/ReportSpec、用户 Requirement 的上下文投影，权威来源是 Coordination Graph 与 Requirement provenance）、`fact`（已接受/验证的 PhaseOutput、交付物、报告和证据的上下文投影，权威载荷在 Artifact Store/PhaseOutput）——`hypothesis` 不得承载任务或用户要求。节点引用权威来源、不复制易变 runnable/blocked 状态，不能访问图存储；Task Manager 的定向投影只写 `task` 子图，Phase Agent 候选只建议 `general` 子图，两条路径目标不相交，不存在逐目标混合鉴权。Context Agent 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。
  
 
 ## 7. Scheduler 与 Manager
@@ -544,7 +544,7 @@ MVP 至少支持：
 
 ## 10. Agent 创建时的 Context Subgraph 切片
 
-每个 Agent Invocation 创建前，Context service 都按调用者的 role、purpose 和权限生成初始切片；phase agent、Task Manager、verifier 等使用同一机制。装配是 Context Service 在 Runtime 启动 endpoint 时的内部启动步骤：按 Runtime 已有 start binding（InvocationID、TaskID、EndpointRef 与调用上下文）装配 Context Slice、建立自动订阅并返回 `ContextSliceRef`，不是外部接口；Context Agent 不需要理解调用者的业务决定，只按调用绑定执行选择和权限策略。
+每个 Agent Invocation 创建前，Context service 都按调用者的 role、purpose 和权限选择初始子图；phase agent、Task Manager、verifier 等使用同一机制。装配是 Context Service 在 Runtime 启动 endpoint 时的内部启动步骤：按 Runtime 已有 start binding（InvocationID、TaskID、EndpointRef 与调用上下文）建立初始自动订阅，再从该 Invocation 的有效订阅子图并集物化 Context Slice 并返回 `ContextSliceRef`，不是外部接口；Context Agent 不需要理解调用者的业务决定，只按调用绑定执行选择和权限策略。
 
 选择输入不来自 Agent 侧的第二套请求：Context Service 从 `EndpointRef` 解析 Coordination Graph / Runtime 的权威绑定（Task Contract、`WorkspaceRef`、`InputRevision` 等从 endpoint 当前权威绑定读取，不重复进装配输入）；role / purpose / 权限快照 / 预算 / graph revision 由 Runtime 调用上下文附加，不进入装配输入；`TaskID + EndpointRef` 是唯一匹配键，`InvocationID` 不参与匹配。
 
@@ -552,13 +552,14 @@ Context Slice 是绑定一次 Invocation 的只读快照：
 
 ```go
 type ContextSlice struct {
-    ID            string            `json:"id"`
-    Subgraphs     []ContextSubgraph `json:"subgraphs"`
-    Nodes         []ContextNode     `json:"nodes"`
-    Frontier      []ContextFrontier `json:"frontier"`
-    Omitted       []string          `json:"omitted"`
-    Conflicts     []ContextConflict `json:"conflicts"`
-    GraphRevision int64             `json:"graph_revision"`
+    ID              string            `json:"id"`
+    SubscriptionIDs []string          `json:"subscription_ids"` // 初始自动订阅句柄；允许当前 consumer 显式取消
+    Subgraphs       []ContextSubgraph `json:"subgraphs"`
+    Nodes           []ContextNode     `json:"nodes"`
+    Frontier        []ContextFrontier `json:"frontier"`
+    Omitted         []string          `json:"omitted"`
+    Conflicts       []ContextConflict `json:"conflicts"`
+    GraphRevision   int64             `json:"graph_revision"`
 }
 ```
 
@@ -573,17 +574,17 @@ type ContextSlice struct {
 5. 显式保留矛盾候选；
 6. 在预算内注入节点正文、可见子图列表与描述；
 7. 把未注入但可能有用的邻接方向放入 `Frontier`，供渐进探索；
-8. 对切片实际包含的子图自动建立与 Invocation 同寿命的订阅。
+8. 对选中的子图建立与 Invocation 同寿命的初始订阅，按当前 Invocation 全部有效订阅的 `SubgraphIDs` 并集物化切片，并把初始订阅句柄写入 `SubscriptionIDs`。
 
-切片不是复制出来的新知识库，而是绑定一次 Invocation 的只读快照。Graph revision、input revision 或权限变化后必须重新选择。初始切片及其自动订阅属于 Context service 的受控响应，不代表 Context Agent 主动观察或提示 Agent。
+切片不是复制出来的新知识库，而是绑定一次 Invocation 的只读初始快照。`ContextSliceRef` 始终保留该启动基线，不因后续订阅变化原地改写；Agent Runtime 当前可提供的动态上下文范围则按有效订阅子图并集重算。Graph revision、input revision 或权限变化后必须重新选择。初始切片及其自动订阅属于 Context service 的受控响应，不代表 Context Agent 主动观察或提示 Agent。
 
 ---
 
 ## 11. 所有 Agent 的 Context Graph 使用方式
 
-所有 Agent——包括 Task Manager、planner、executor 和 verifier——使用相同的 Context 读接口：[context-graph.md](./context-graph.md) §6.1 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe），本文不重复定义方法签名或请求/响应结构。它们都能查看权限内的 Context Subgraph 列表和描述、直接探索可见图，以及订阅子图；三个方法都由 Context Service / Graph 操作面直接处理，不调用 Context Agent，也不做 LLM 语义判断。**普通 Agent 不持有机械检索（`ContextGraphSearcher.Search`）**：列表/探索不足时经独立接口 `contextAgent.retrieve` 请求语义检索（转换与 Search 调用见 §11.2）。`Subscribe` 的结果是 `ContextSubscription`，修订提交后由订阅执行器经 Runtime 输出 `ContextDelta` 事件，不新增方法。
+Task Manager、planner、executor 和 verifier 使用相同的 Context 读/订阅生命周期接口：[context-graph.md](./context-graph.md) §6.1 的 `ContextGraphReader`（ListSubgraphs / Explore / Subscribe / Unsubscribe），本文不重复定义方法签名或请求/响应结构。它们都能查看权限内的 Context Subgraph 列表和描述、直接探索可见图、订阅子图，以及按订阅 ID 取消自己的订阅；四个方法都由 Context Service / Graph 操作面直接处理，不调用 Context Agent，也不做 LLM 语义判断。**普通 Agent 不持有机械检索（`ContextGraphSearcher.Search`）**：列表/探索不足时经独立接口 `contextAgent.retrieve` 请求语义检索（转换与 Search 调用见 §11.2）。`Subscribe` 返回 `ContextSubscription`；`Unsubscribe` 只改变当前 consumer 的订阅状态，不修改图 revision。
 
-三项读操作共享 Invocation、role/purpose、权限快照、Graph revision 和预算绑定（由 Runtime 调用上下文附加，不进入每个 request），不为调用创建持久 SearchJob。请求、结果、所消费节点和订阅关系由 Runtime/Context Graph 记录。
+四项操作共享 Invocation、role/purpose、权限快照、Graph revision 和预算绑定（由 Runtime 调用上下文附加，不进入每个 request），不为调用创建持久 SearchJob。请求、结果、所消费节点和订阅关系由 Runtime/Context Graph 记录。
 
 ### 11.1 列表与探索 `ListSubgraphs / Explore`
 
@@ -723,7 +724,9 @@ MVP 只保留两级缓存：
 
 ### 14.1 自动订阅与主动订阅
 
-订阅入口只有两类：初始/检索切片自动订阅，以及 Agent 主动订阅。最小持久对象只保存 `ID / ConsumerInvocationID / SubgraphIDs / EventKinds / PermissionSnapshot`；role、purpose 从 Invocation 重建，来源写入 `ContextSubscriptionCreated` 审计事件，生命周期随 Invocation 结束。检索自动订阅绑定原请求方 Invocation，不绑定 Context Agent。
+订阅入口只有两类：初始/检索切片自动订阅，以及 Agent 主动订阅。最小持久对象只保存 `ID / ConsumerInvocationID / SubgraphIDs / EventKinds / PermissionSnapshot`；role、purpose 从 Invocation 重建，来源写入 `ContextSubscriptionCreated` 审计事件，生命周期随 Invocation 结束，也可由同一 consumer 通过 `context.unsubscribe(subscriptionId)` 提前取消。检索自动订阅绑定原请求方 Invocation，不绑定 Context Agent；检索包装必须把新建的 `SubscriptionIDs` 返回原请求方，以便其取消。
+
+Runtime 提供给某一 Agent Invocation 的上下文资格范围，始终是该 `ConsumerInvocationID` 全部有效订阅的 `SubgraphIDs` 去重并集。初始、检索与显式订阅共同参与并集；多个订阅覆盖同一子图时，取消一条不会移除仍被其他订阅覆盖的子图。并集不跨 Agent、Task 或 Invocation，最终内容仍必须经过当前权限、graph revision、recipient 匹配和 token 预算过滤。`EventKinds` 只过滤 Delta，不改变上下文并集。
 
 ### 14.2 自动推送流程
 
@@ -731,15 +734,17 @@ MVP 只保留两级缓存：
 Context Graph 提交节点/边变更并递增 subgraph revision
   -> automated subscription executor matches subgraph, event kind, permission and freshness
   -> executor coalesces updates by subgraph revision
+  -> Runtime revalidates that the subscription is still active
   -> Runtime emits Context Delta to each subscribed Agent Invocation
   -> Runtime records whether the Agent consumed it
 ```
 
-推送是基础设施自动执行，不调用 Context Agent 做逐条判断。它必须由已存在的订阅触发，并且增量、可合并、可重放；系统不提供订阅之外的旁路推送。Task 工作期间的候选只入缓冲，不落图、不产生订阅推送；只有 Task done 后审查落图的节点变更才被推送（见 12.4）。
+推送是基础设施自动执行，不调用 Context Agent 做逐条判断。它必须由仍有效的订阅触发，并且增量、可合并、可重放；取消成功后尚未送达的 Delta 必须丢弃，已送入当前模型调用的上下文不做追溯删除。系统不提供订阅之外的旁路推送。Task 工作期间的候选只入缓冲，不落图、不产生订阅推送；只有 Task done 后审查落图的节点变更才被推送（见 12.4）。
 
 ### 14.3 推送与协调边的边界
 
 - 已订阅子图发生匹配更新：自动 Context Delta push，Task Manager 与 phase agent 语义相同。
+- Agent 取消一条订阅：Runtime 重算当前 Invocation 的订阅子图并集；只有不再被任何有效订阅覆盖的子图才退出后续上下文装配与 Delta 推送。
 - target phase 必须等待 source 结果：Coordination Edge，只引用 source endpoint 的 `PhaseOutput`。
 - Delta 证明当前编排或计划失效：收到 Delta 的 Agent 提交 `OrchestrationProposal`，由 Task Manager 裁决并热修改图。
 - Agent 没有一次性问答、mailbox 或订阅外推送通道；外部记忆只来自切片、图探索、订阅、自动 Delta，以及列表/探索不足时经 `contextAgent.retrieve` 请求的语义检索。
