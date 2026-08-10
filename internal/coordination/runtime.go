@@ -10,13 +10,27 @@ import (
 
 type graphRuntime struct {
 	projectID               kernel.ProjectID
-	store                   *MemoryStore
+	store                   graphRuntimeStore
 	phaseController         PhaseController
 	selectionRuntime        RuntimeSelectionRuntime
 	schedulingStateProvider RuntimeSchedulingStateProvider
 }
 
-func newGraphRuntime(projectID kernel.ProjectID, store *MemoryStore, controller PhaseController) *graphRuntime {
+type graphRuntimeStore interface {
+	loadRuntimeView(context.Context, kernel.ProjectID) (runtimeView, error)
+	markCommandObserved(context.Context, kernel.ProjectID, phaseObservation) error
+	completeCommandAndReleaseLease(context.Context, kernel.ProjectID, phaseObservation) error
+	releaseOrphanLease(context.Context, kernel.ProjectID, kernel.LeaseID) error
+	getOrCreateStopCommand(context.Context, kernel.ProjectID, kernel.Revision, phaseLease) (PhaseCommand, bool, error)
+	claimLeaseAndAppendCommand(context.Context, kernel.ProjectID, kernel.Revision, PhaseEndpoint, CommandAction, string) (PhaseCommand, bool, error)
+	markCommandAccepted(context.Context, kernel.ProjectID, string)
+	scheduleRetry(context.Context, kernel.ProjectID, string)
+	quarantineCommand(context.Context, kernel.ProjectID, string)
+	rejectCommand(context.Context, kernel.ProjectID, PhaseCommand, error)
+	recordEndpointDispatchRejection(context.Context, kernel.ProjectID, PhaseEndpointRef, int, kernel.BindingRef, error)
+}
+
+func newGraphRuntime(projectID kernel.ProjectID, store graphRuntimeStore, controller PhaseController) *graphRuntime {
 	return &graphRuntime{
 		projectID:               projectID,
 		store:                   store,

@@ -23,6 +23,10 @@ type runtimeView struct {
 
 func newRuntimeView(project *projectState) runtimeView {
 	snapshot := project.current.snapshot(project.latest)
+	return newRuntimeViewFrom(snapshot, project.runtime)
+}
+
+func newRuntimeViewFrom(snapshot GraphSnapshot, state memoryRuntimeState) runtimeView {
 	view := runtimeView{
 		revision:      snapshot.Revision,
 		tasks:         make(map[kernel.TaskID]Task, len(snapshot.Tasks)),
@@ -31,10 +35,10 @@ func newRuntimeView(project *projectState) runtimeView {
 		edges:         cloneEdges(snapshot.Edges),
 		blockers:      append([]Blocker(nil), snapshot.Blockers...),
 		results:       append([]PhaseResult(nil), snapshot.Results...),
-		commands:      make(map[string]commandRecord, len(project.runtime.commands)),
-		leases:        make(map[kernel.LeaseID]phaseLease, len(project.runtime.leases)),
-		observations:  append([]phaseObservation(nil), project.runtime.observations...),
-		bindings:      make(map[kernel.BindingRef]bindingRuntimeInfo, len(project.runtime.bindings)),
+		commands:      make(map[string]commandRecord, len(state.commands)),
+		leases:        make(map[kernel.LeaseID]phaseLease, len(state.leases)),
+		observations:  append([]phaseObservation(nil), state.observations...),
+		bindings:      make(map[kernel.BindingRef]bindingRuntimeInfo, len(state.bindings)),
 		suppressed:    make(map[string]struct{}),
 	}
 	for _, task := range snapshot.Tasks {
@@ -43,13 +47,13 @@ func newRuntimeView(project *projectState) runtimeView {
 	for _, endpoint := range snapshot.Endpoints {
 		view.endpointByRef[endpoint.Ref] = endpoint
 	}
-	for id, record := range project.runtime.commands {
+	for id, record := range state.commands {
 		view.commands[id] = record
 	}
-	for id, lease := range project.runtime.leases {
+	for id, lease := range state.leases {
 		view.leases[id] = lease
 	}
-	for ref, info := range project.runtime.bindings {
+	for ref, info := range state.bindings {
 		view.bindings[ref] = info
 	}
 	return view
