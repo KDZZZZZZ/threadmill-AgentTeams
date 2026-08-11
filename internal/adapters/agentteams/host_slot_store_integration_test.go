@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
@@ -126,7 +127,10 @@ WHERE agentteams_task_id = $1`, winnerTask).Scan(&storedKey, &storedHash, &store
 	if storedKey != winnerKey || storedIdentifier == "plain-token-a" || storedIdentifier == "plain-token-b" || len(storedHash) != 32 {
 		t.Fatalf("stored slot metadata key=%q identifier=%q hash_len=%d", storedKey, storedIdentifier, len(storedHash))
 	}
-	if err := slots.MarkRevoked(ctx, "worker-a", winnerInvocation); err != nil {
+	if err := slots.Release(ctx, winnerTask, "worker-a"); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("release before revoke error = %v, want forbidden", err)
+	}
+	if err := slots.MarkRevoked(ctx, winnerTask, "worker-a"); err != nil {
 		t.Fatalf("MarkRevoked() error = %v", err)
 	}
 	var revoked bool
@@ -139,8 +143,25 @@ WHERE agentteams_task_id = $1`, winnerTask).Scan(&storedKey, &storedHash, &store
 	if err := slots.Release(ctx, winnerTask, "worker-a"); err != nil {
 		t.Fatalf("Release() error = %v", err)
 	}
-	if err := slots.Claim(ctx, "worker-a", "inv-slot-b", "mcp-b", auth.HashOpaqueSecret("plain-token-b"), "token-b"); err != nil {
+	loserInvocation, loserKey, loserToken := first.Execution.InvocationID, "mcp-a", "token-a"
+	if successes["first"] {
+		loserInvocation, loserKey, loserToken = second.Execution.InvocationID, "mcp-b", "token-b"
+	}
+	if err := slots.Claim(ctx, "worker-a", winnerInvocation, winnerKey, auth.HashOpaqueSecret("plain-token-winner"), "token-winner"); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("released attempt reclaim error = %v, want not_found", err)
+	}
+	if err := slots.Claim(ctx, "worker-a", loserInvocation, loserKey, auth.HashOpaqueSecret("plain-"+loserToken), loserToken); err != nil {
 		t.Fatalf("Claim after release error = %v", err)
+	}
+	if err := slots.MarkHostFenced(ctx, "worker-a"); err != nil {
+		t.Fatalf("MarkHostFenced() error = %v", err)
+	}
+	loserClaim, ok, err := slots.ByInvocation(ctx, "worker-a", loserInvocation)
+	if err != nil || !ok || loserClaim.RevokedAt.IsZero() {
+		t.Fatalf("fenced loser claim = %#v, %v, found=%v", loserClaim, err, ok)
+	}
+	if err := slots.Claim(ctx, "worker-a", loserInvocation, loserKey, auth.HashOpaqueSecret("plain-"+loserToken), loserToken); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("fenced active claim reuse error = %v, want stale_command", err)
 	}
 }
 

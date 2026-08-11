@@ -90,6 +90,9 @@ FOR UPDATE`, hostRef))
 		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "AgentTeams host slot is already claimed", Recoverable: true}
 	}
 	if ok {
+		if !existing.RevokedAt.IsZero() {
+			return kernel.Error{Code: kernel.CodeStaleCommand, Message: "AgentTeams host slot is fenced and must be released before reuse", Recoverable: true}
+		}
 		if existing.MCPClientKey != mcpClientKey || existing.TokenIdentifier != tokenIdentifier ||
 			!bytes.Equal(existing.TokenHash, tokenHash) {
 			return kernel.IdempotencyConflict()
@@ -127,6 +130,21 @@ func (s *HostSlotStore) Release(ctx context.Context, taskID string, hostRef stri
 		return err
 	}
 	defer tx.Rollback()
+	claim, ok, err := scanHostSlotClaim(tx.QueryRowContext(ctx, `
+SELECT invocation_id, agentteams_task_id, host_ref, COALESCE(mcp_client_key, ''), mcp_token_hash,
+       COALESCE(mcp_token_identifier, ''), host_slot_claimed_at, host_slot_released_at, mcp_revoked_at
+FROM agentteams_execution_refs
+WHERE agentteams_task_id = $1 AND host_ref = $2
+FOR UPDATE`, taskID, hostRef))
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams host slot not found"}
+	}
+	if claim.RevokedAt.IsZero() {
+		return kernel.Forbidden("AgentTeams host slot cannot be released before invocation MCP revocation or host fencing")
+	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE agentteams_execution_refs
 SET host_slot_released_at = COALESCE(host_slot_released_at, now()),
@@ -141,9 +159,9 @@ WHERE agentteams_task_id = $1 AND host_ref = $2`, taskID, hostRef)
 	return tx.Commit()
 }
 
-func (s *HostSlotStore) MarkRevoked(ctx context.Context, hostRef string, invocationID kernel.InvocationID) error {
-	if hostRef == "" || invocationID == "" {
-		return kernel.InvalidArgument("MCP revocation requires host_ref and invocation_id")
+func (s *HostSlotStore) MarkRevoked(ctx context.Context, taskID string, hostRef string) error {
+	if taskID == "" || hostRef == "" {
+		return kernel.InvalidArgument("MCP revocation requires task_id and host_ref")
 	}
 	tx, err := s.begin(ctx, false)
 	if err != nil {
@@ -154,12 +172,43 @@ func (s *HostSlotStore) MarkRevoked(ctx context.Context, hostRef string, invocat
 UPDATE agentteams_execution_refs
 SET mcp_revoked_at = COALESCE(mcp_revoked_at, now()),
     updated_at = now()
-WHERE invocation_id = $1 AND host_ref = $2 AND host_slot_released_at IS NULL`, invocationID, hostRef)
+WHERE agentteams_task_id = $1
+  AND host_ref = $2
+  AND host_slot_released_at IS NULL
+  AND state IN ('reserved', 'dispatched')`, taskID, hostRef)
 	if err != nil {
 		return err
 	}
 	if affected, err := result.RowsAffected(); err == nil && affected != 1 {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams invocation MCP slot not found"}
+	}
+	return tx.Commit()
+}
+
+// MarkHostFenced records that stopping the entire host made every invocation
+// MCP on that host unreachable. The host advisory lock serializes the fence
+// with new claims, so capacity cannot be released while a new claim slips in.
+func (s *HostSlotStore) MarkHostFenced(ctx context.Context, hostRef string) error {
+	if hostRef == "" {
+		return kernel.InvalidArgument("host fence requires host_ref")
+	}
+	tx, err := s.begin(ctx, false)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "agentteams-host-slot:"+hostRef); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+UPDATE agentteams_execution_refs
+SET mcp_revoked_at = COALESCE(mcp_revoked_at, now()),
+    updated_at = now()
+WHERE host_ref = $1
+  AND host_slot_claimed_at IS NOT NULL
+  AND host_slot_released_at IS NULL
+  AND state IN ('reserved', 'dispatched')`, hostRef); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

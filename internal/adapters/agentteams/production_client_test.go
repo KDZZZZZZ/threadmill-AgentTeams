@@ -147,7 +147,12 @@ func (s *fakeHostSlotStore) Release(context.Context, string, string) error {
 	return nil
 }
 
-func (s *fakeHostSlotStore) MarkRevoked(context.Context, string, kernel.InvocationID) error {
+func (s *fakeHostSlotStore) MarkRevoked(context.Context, string, string) error {
+	s.revoked = true
+	return nil
+}
+
+func (s *fakeHostSlotStore) MarkHostFenced(context.Context, string) error {
 	s.revoked = true
 	return nil
 }

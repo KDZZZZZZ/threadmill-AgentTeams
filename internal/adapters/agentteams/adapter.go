@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"strings"
@@ -395,8 +396,8 @@ func (a *Adapter) dispatchReserved(ctx context.Context, invocationRef string) (A
 		return AgentTeamsExecutionRef{}, err
 	}
 	if task.TaskID != record.Execution.AgentTeamsTaskID || task.HostRef != record.Execution.HostRef {
-		_ = a.client.ReleaseHostSlot(context.Background(), record.Execution.AgentTeamsTaskID, record.Execution.HostRef)
-		return AgentTeamsExecutionRef{}, kernel.Error{Code: kernel.CodeInternalError, Message: "AgentTeams returned a mismatched execution identity"}
+		identityErr := kernel.Error{Code: kernel.CodeInternalError, Message: "AgentTeams returned a mismatched execution identity"}
+		return AgentTeamsExecutionRef{}, errors.Join(identityErr, a.fenceAndRelease(context.Background(), record.Execution))
 	}
 	if err := a.store.MarkDispatched(ctx, record.Execution.AgentTeamsTaskID); err != nil {
 		return AgentTeamsExecutionRef{}, err
@@ -423,9 +424,12 @@ func (a *Adapter) Terminate(ctx context.Context, execution AgentTeamsExecutionRe
 		return kernel.IdempotencyConflict()
 	}
 	if err := a.client.RevokeInvocation(ctx, execution.HostRef, execution.InvocationID); err != nil {
-		_ = a.client.ForceStopHost(ctx, execution.HostRef)
-		_ = a.client.ReleaseHostSlot(context.Background(), execution.AgentTeamsTaskID, execution.HostRef)
-		return err
+		forceErr := a.client.ForceStopHost(ctx, execution.HostRef)
+		var releaseErr error
+		if forceErr == nil {
+			releaseErr = a.client.ReleaseHostSlot(context.Background(), execution.AgentTeamsTaskID, execution.HostRef)
+		}
+		return errors.Join(err, forceErr, releaseErr)
 	}
 	if err := a.client.CancelTask(ctx, execution.AgentTeamsTaskID, terminationReason(mode)); err != nil {
 		return err
@@ -453,7 +457,7 @@ func (a *Adapter) Collect(ctx context.Context, execution AgentTeamsExecutionRef)
 		return UntrustedExecutionResult{}, err
 	}
 	if isTerminalTaskStatus(check.Task.Status) {
-		if err := a.client.ReleaseHostSlot(ctx, execution.AgentTeamsTaskID, execution.HostRef); err != nil {
+		if err := a.fenceAndRelease(ctx, execution); err != nil {
 			return UntrustedExecutionResult{}, err
 		}
 	}
@@ -471,6 +475,15 @@ func (a *Adapter) Collect(ctx context.Context, execution AgentTeamsExecutionRef)
 		Effective:        check.Effective,
 		ValidationErrors: append([]string(nil), check.ValidationErrors...),
 	}, nil
+}
+
+func (a *Adapter) fenceAndRelease(ctx context.Context, execution AgentTeamsExecutionRef) error {
+	if err := a.client.RevokeInvocation(ctx, execution.HostRef, execution.InvocationID); err != nil {
+		if forceErr := a.client.ForceStopHost(ctx, execution.HostRef); forceErr != nil {
+			return errors.Join(err, forceErr)
+		}
+	}
+	return a.client.ReleaseHostSlot(ctx, execution.AgentTeamsTaskID, execution.HostRef)
 }
 
 func (a *Adapter) Observe(ctx context.Context, cursor string) ([]ExecutionObservation, error) {

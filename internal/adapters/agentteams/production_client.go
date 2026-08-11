@@ -2,6 +2,7 @@ package agentteams
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -40,7 +41,8 @@ type hostSlotStore interface {
 	ActiveCounts(context.Context) (map[string]int, error)
 	Claim(context.Context, string, kernel.InvocationID, string, []byte, string) error
 	Release(context.Context, string, string) error
-	MarkRevoked(context.Context, string, kernel.InvocationID) error
+	MarkRevoked(context.Context, string, string) error
+	MarkHostFenced(context.Context, string) error
 	ByInvocation(context.Context, string, kernel.InvocationID) (HostSlotClaim, bool, error)
 	ByTaskID(context.Context, string) (HostSlotClaim, bool, error)
 }
@@ -133,18 +135,14 @@ func (c *ProductionClient) PrepareHost(ctx context.Context, prep HostPreparation
 	}
 	qwenPaw, err := c.qwenPaw.ForHost(ctx, prep.HostRef)
 	if err != nil {
-		_ = c.releaseByInvocation(context.Background(), prep.HostRef, prep.InvocationID)
-		return err
+		return errors.Join(err, c.cleanupPreparationFailure(context.Background(), prep.HostRef, prep.InvocationID, nil))
 	}
 	if err := qwenPaw.InstallInvocationMCP(ctx, desired); err != nil {
-		_ = c.releaseByInvocation(context.Background(), prep.HostRef, prep.InvocationID)
-		return err
+		return errors.Join(err, c.cleanupPreparationFailure(context.Background(), prep.HostRef, prep.InvocationID, qwenPaw))
 	}
 	if prep.Role != auth.RoleTaskManager && prep.Role != auth.RoleContext {
 		if err := c.controller.EnsureWorkerReady(ctx, prep.HostRef); err != nil {
-			_ = qwenPaw.RevokeInvocationMCP(context.Background(), key)
-			_ = c.releaseByInvocation(context.Background(), prep.HostRef, prep.InvocationID)
-			return err
+			return errors.Join(err, c.cleanupPreparationFailure(context.Background(), prep.HostRef, prep.InvocationID, qwenPaw))
 		}
 	}
 	return nil
@@ -184,6 +182,9 @@ func (c *ProductionClient) RevokeInvocation(ctx context.Context, hostRef string,
 	if !ok {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams invocation MCP slot not found"}
 	}
+	if !claim.RevokedAt.IsZero() {
+		return nil
+	}
 	qwenPaw, err := c.qwenPaw.ForHost(ctx, hostRef)
 	if err != nil {
 		return err
@@ -191,7 +192,7 @@ func (c *ProductionClient) RevokeInvocation(ctx context.Context, hostRef string,
 	if err := qwenPaw.RevokeInvocationMCP(ctx, claim.MCPClientKey); err != nil {
 		return err
 	}
-	return c.slots.MarkRevoked(ctx, hostRef, invocationID)
+	return c.slots.MarkRevoked(ctx, claim.TaskID, hostRef)
 }
 
 func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) error {
@@ -204,9 +205,15 @@ func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) er
 			continue
 		}
 		if host.Kind == HostManager {
-			return c.controller.StopManager(ctx, hostRef)
+			if err := c.controller.StopManager(ctx, hostRef); err != nil {
+				return err
+			}
+			return c.slots.MarkHostFenced(ctx, hostRef)
 		}
-		return c.controller.StopWorker(ctx, hostRef)
+		if err := c.controller.StopWorker(ctx, hostRef); err != nil {
+			return err
+		}
+		return c.slots.MarkHostFenced(ctx, hostRef)
 	}
 	return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams host not found"}
 }
@@ -260,9 +267,20 @@ func (c *ProductionClient) ReadObservations(ctx context.Context, cursor string) 
 	return c.observations.ReadRawObservations(ctx, cursor)
 }
 
-func (c *ProductionClient) releaseByInvocation(ctx context.Context, hostRef string, invocationID kernel.InvocationID) error {
+func (c *ProductionClient) cleanupPreparationFailure(ctx context.Context, hostRef string, invocationID kernel.InvocationID, qwenPaw *QwenPawAPI) error {
 	claim, ok, err := c.slots.ByInvocation(ctx, hostRef, invocationID)
 	if err != nil || !ok {
+		return err
+	}
+	if qwenPaw != nil {
+		if revokeErr := qwenPaw.RevokeInvocationMCP(ctx, claim.MCPClientKey); revokeErr == nil {
+			if err := c.slots.MarkRevoked(ctx, claim.TaskID, hostRef); err != nil {
+				return err
+			}
+			return c.slots.Release(ctx, claim.TaskID, hostRef)
+		}
+	}
+	if err := c.ForceStopHost(ctx, hostRef); err != nil {
 		return err
 	}
 	return c.slots.Release(ctx, claim.TaskID, hostRef)

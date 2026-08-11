@@ -451,6 +451,12 @@ func TestCollectKeepsSuccessAndSpoofedBindingUntrusted(t *testing.T) {
 	if host.ActiveExecutions("worker-a") != 0 {
 		t.Fatalf("active executions after terminal Collect = %d, want 0", host.ActiveExecutions("worker-a"))
 	}
+	calls := host.Calls()
+	revoke := indexWithPrefix(calls, "revoke:")
+	release := indexWithPrefix(calls, "release:")
+	if revoke < 0 || release < 0 || revoke >= release {
+		t.Fatalf("terminal Collect fencing/release order = %v", calls)
+	}
 	typ := reflect.TypeOf(result)
 	for _, forbidden := range []string{"BindingRef", "Generation", "LeaseRef", "Verdict"} {
 		if _, ok := typ.FieldByName(forbidden); ok {
