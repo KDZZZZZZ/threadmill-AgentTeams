@@ -88,16 +88,20 @@ type PhaseOutput struct {
 }
 
 type OutputReceipt struct {
-	Output         PhaseOutput         `json:"output"`
-	InvocationID   kernel.InvocationID `json:"invocation_id"`
-	Endpoint       PhaseEndpointRef    `json:"endpoint"`
-	Generation     int                 `json:"generation"`
-	BindingRef     kernel.BindingRef   `json:"binding_ref"`
-	LeaseRef       kernel.LeaseID      `json:"lease_ref"`
-	InputRevision  string              `json:"input_revision"`
-	WorkspaceRef   string              `json:"workspace_ref"`
-	WorkspaceHead  string              `json:"workspace_head"`
-	SubmittedAtUTC time.Time           `json:"submitted_at_utc"`
+	Output            PhaseOutput                `json:"output"`
+	InvocationID      kernel.InvocationID        `json:"invocation_id"`
+	CommandID         string                     `json:"command_id,omitempty"`
+	CommandAction     coordination.CommandAction `json:"command_action,omitempty"`
+	CauseRef          string                     `json:"cause_ref,omitempty"`
+	Endpoint          PhaseEndpointRef           `json:"endpoint"`
+	Generation        int                        `json:"generation"`
+	BindingRef        kernel.BindingRef          `json:"binding_ref"`
+	LeaseRef          kernel.LeaseID             `json:"lease_ref"`
+	InputRevision     string                     `json:"input_revision"`
+	WorkspaceRef      string                     `json:"workspace_ref"`
+	WorkspaceHead     string                     `json:"workspace_head"`
+	OutputFingerprint string                     `json:"output_fingerprint,omitempty"`
+	SubmittedAtUTC    time.Time                  `json:"submitted_at_utc"`
 }
 
 type BindingSnapshot struct {
@@ -181,6 +185,8 @@ type Host interface {
 type RecoveryStore interface {
 	RecordActiveInvocation(context.Context, ActiveInvocation) error
 	RecoverActiveInvocation(context.Context, PhaseCommand, BindingSnapshot) (ActiveInvocation, bool, error)
+	RecordOutputReceipt(context.Context, ActiveInvocation, OutputReceipt) error
+	GetOutputReceipt(context.Context, kernel.InvocationID, string) (OutputReceipt, bool, error)
 	RecordStopEvidence(context.Context, ActiveInvocation, PhaseCommand, StopResult) error
 	GetStopEvidence(context.Context, kernel.InvocationID, string) (StopResult, bool, error)
 	ClearActiveInvocation(context.Context, kernel.InvocationID) error
@@ -222,6 +228,7 @@ type Controller struct {
 	receipts  map[kernel.InvocationID]OutputReceipt
 	pending   map[kernel.InvocationID]OutputReceipt
 	byCommand map[string]kernel.InvocationID
+	termLocks map[kernel.InvocationID]bool
 }
 
 type commandRecord struct {
@@ -262,6 +269,7 @@ func NewController(cfg Config) *Controller {
 		receipts:  make(map[kernel.InvocationID]OutputReceipt),
 		pending:   make(map[kernel.InvocationID]OutputReceipt),
 		byCommand: make(map[string]kernel.InvocationID),
+		termLocks: make(map[kernel.InvocationID]bool),
 	}
 	c.cond = sync.NewCond(&c.mu)
 	return c
@@ -349,6 +357,18 @@ func (c *Controller) OnContextDelta(ctx context.Context, invocationID kernel.Inv
 func (c *Controller) SubmitPhaseOutput(ctx context.Context, invocationID kernel.InvocationID, output PhaseOutput) (OutputReceipt, error) {
 	active, err := c.activeInvocation(invocationID)
 	if err != nil {
+		if kernel.IsCode(err, kernel.CodeStaleCommand) {
+			return c.completedOutputReceipt(ctx, invocationID, output)
+		}
+		return OutputReceipt{}, err
+	}
+	unlock := c.lockTerminal(invocationID)
+	defer unlock()
+	active, err = c.activeInvocation(invocationID)
+	if err != nil {
+		if kernel.IsCode(err, kernel.CodeStaleCommand) {
+			return c.completedOutputReceipt(ctx, invocationID, output)
+		}
 		return OutputReceipt{}, err
 	}
 	refreshed, err := c.bindings.Refresh(ctx, active)
@@ -365,6 +385,11 @@ func (c *Controller) SubmitPhaseOutput(ctx context.Context, invocationID kernel.
 	receipt, err := c.pendingOrRouteReceipt(ctx, active, output)
 	if err != nil {
 		return OutputReceipt{}, err
+	}
+	if c.recovery != nil {
+		if err := c.recovery.RecordOutputReceipt(ctx, active, receipt); err != nil {
+			return OutputReceipt{}, err
+		}
 	}
 	if err := c.host.Revoke(ctx, invocationID); err != nil {
 		return OutputReceipt{}, err
@@ -417,6 +442,84 @@ func (c *Controller) OutputByCommand(ctx context.Context, commandID string) (Out
 	return receipt, ok, nil
 }
 
+func (c *Controller) completedOutputReceipt(ctx context.Context, invocationID kernel.InvocationID, output PhaseOutput) (OutputReceipt, error) {
+	if c.recovery == nil {
+		return OutputReceipt{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "output recovery store is required", Recoverable: true}
+	}
+	invocation, ok, err := c.store.Get(ctx, invocationID)
+	if err != nil {
+		return OutputReceipt{}, err
+	}
+	if !ok || invocation.Status != baseruntime.InvocationCompleted {
+		return OutputReceipt{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation is no longer active", Recoverable: true}
+	}
+	receipt, ok, err := c.recovery.GetOutputReceipt(ctx, invocationID, "")
+	if err != nil {
+		return OutputReceipt{}, err
+	}
+	if !ok {
+		return OutputReceipt{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "completed invocation has no persisted output receipt", Recoverable: true}
+	}
+	outputFingerprint, err := hashJSON(output)
+	if err != nil {
+		return OutputReceipt{}, err
+	}
+	if receipt.OutputFingerprint != "" && receipt.OutputFingerprint != outputFingerprint {
+		return OutputReceipt{}, kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "phase output payload differs from persisted receipt", Recoverable: false}
+	}
+	command, err := commandFromOutputReceipt(receipt)
+	if err != nil {
+		return OutputReceipt{}, err
+	}
+	active := ActiveInvocation{
+		Invocation: invocation,
+		Command:    command,
+		Binding: BindingSnapshot{
+			ProjectID:         invocation.ProjectID,
+			ActorPrincipalID:  invocation.ActorPrincipalID,
+			TaskID:            receipt.Endpoint.TaskID,
+			EndpointID:        receipt.Endpoint.EndpointID,
+			Generation:        receipt.Generation,
+			BindingRef:        receipt.BindingRef,
+			LeaseRef:          receipt.LeaseRef,
+			WorkspaceRef:      receipt.WorkspaceRef,
+			WorkspaceRevision: receipt.WorkspaceHead,
+		},
+	}
+	if err := c.recordOutputSubmitted(ctx, active); err != nil {
+		return OutputReceipt{}, err
+	}
+	if err := c.recovery.ClearActiveInvocation(ctx, invocationID); err != nil {
+		return OutputReceipt{}, err
+	}
+	c.mu.Lock()
+	c.receipts[invocationID] = receipt
+	c.byCommand[command.ID] = invocationID
+	delete(c.pending, invocationID)
+	delete(c.active, invocationID)
+	delete(c.byLease, command.LeaseRef)
+	c.mu.Unlock()
+	return receipt, nil
+}
+
+func commandFromOutputReceipt(receipt OutputReceipt) (PhaseCommand, error) {
+	if receipt.CommandID == "" || receipt.CommandAction == "" || receipt.Endpoint.TaskID == "" || receipt.Endpoint.EndpointID == "" || receipt.Generation <= 0 || receipt.BindingRef == "" || receipt.LeaseRef == "" {
+		return PhaseCommand{}, kernel.Error{Code: kernel.CodeInternalError, Message: "persisted output receipt is missing command identity", Recoverable: true}
+	}
+	if receipt.CommandAction != coordination.CommandStart && receipt.CommandAction != coordination.CommandResume {
+		return PhaseCommand{}, kernel.Error{Code: kernel.CodeInternalError, Message: "persisted output receipt has invalid command action", Recoverable: true}
+	}
+	return PhaseCommand{
+		ID:         receipt.CommandID,
+		Endpoint:   receipt.Endpoint,
+		Generation: receipt.Generation,
+		BindingRef: receipt.BindingRef,
+		LeaseRef:   receipt.LeaseRef,
+		Action:     receipt.CommandAction,
+		CauseRef:   receipt.CauseRef,
+	}, nil
+}
+
 func (c *Controller) transitionToWaiting(ctx context.Context, invocationID kernel.InvocationID) error {
 	invocation, ok, err := c.store.Get(ctx, invocationID)
 	if err != nil {
@@ -436,9 +539,16 @@ func (c *Controller) transitionToWaiting(ctx context.Context, invocationID kerne
 }
 
 func (c *Controller) pendingOrRouteReceipt(ctx context.Context, active ActiveInvocation, output PhaseOutput) (OutputReceipt, error) {
+	outputFingerprint, err := hashJSON(output)
+	if err != nil {
+		return OutputReceipt{}, err
+	}
 	c.mu.Lock()
 	if receipt, ok := c.pending[active.Invocation.ID]; ok {
 		c.mu.Unlock()
+		if receipt.OutputFingerprint != "" && receipt.OutputFingerprint != outputFingerprint {
+			return OutputReceipt{}, kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "phase output payload differs from pending receipt", Recoverable: false}
+		}
 		return receipt, nil
 	}
 	c.mu.Unlock()
@@ -463,20 +573,27 @@ func (c *Controller) pendingOrRouteReceipt(ctx context.Context, active ActiveInv
 		output.EvidenceRefs[i] = routed
 	}
 	receipt := OutputReceipt{
-		Output:         clonePhaseOutput(output),
-		InvocationID:   active.Invocation.ID,
-		Endpoint:       active.Command.Endpoint,
-		Generation:     active.Command.Generation,
-		BindingRef:     active.Command.BindingRef,
-		LeaseRef:       active.Command.LeaseRef,
-		InputRevision:  active.Inputs.InputRevision,
-		WorkspaceRef:   active.Binding.WorkspaceRef,
-		WorkspaceHead:  active.Binding.WorkspaceRevision,
-		SubmittedAtUTC: c.now().UTC(),
+		Output:            clonePhaseOutput(output),
+		InvocationID:      active.Invocation.ID,
+		CommandID:         active.Command.ID,
+		CommandAction:     active.Command.Action,
+		CauseRef:          active.Command.CauseRef,
+		Endpoint:          active.Command.Endpoint,
+		Generation:        active.Command.Generation,
+		BindingRef:        active.Command.BindingRef,
+		LeaseRef:          active.Command.LeaseRef,
+		InputRevision:     active.Inputs.InputRevision,
+		WorkspaceRef:      active.Binding.WorkspaceRef,
+		WorkspaceHead:     active.Binding.WorkspaceRevision,
+		OutputFingerprint: outputFingerprint,
+		SubmittedAtUTC:    c.now().UTC(),
 	}
 	c.mu.Lock()
 	if existing, ok := c.pending[active.Invocation.ID]; ok {
 		c.mu.Unlock()
+		if existing.OutputFingerprint != "" && existing.OutputFingerprint != outputFingerprint {
+			return OutputReceipt{}, kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "phase output payload differs from pending receipt", Recoverable: false}
+		}
 		return existing, nil
 	}
 	c.pending[active.Invocation.ID] = receipt
@@ -546,6 +663,15 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 				Inputs:     clonePhaseInputSet(binding.Inputs),
 			}
 			return c.finishStarted(ctx, active)
+		}
+		if existing.Status == baseruntime.InvocationCompleted {
+			active := ActiveInvocation{
+				Invocation: existing,
+				Command:    command,
+				Binding:    cloneBindingSnapshot(binding),
+				Inputs:     clonePhaseInputSet(binding.Inputs),
+			}
+			return c.finishPersistedOutput(ctx, active)
 		}
 		if existing.Status != baseruntime.InvocationPrepared {
 			c.cleanupResolvedInvocation(ctx, invocation)
@@ -631,6 +757,38 @@ func (c *Controller) finishStarted(ctx context.Context, active ActiveInvocation)
 	return nil
 }
 
+func (c *Controller) finishPersistedOutput(ctx context.Context, active ActiveInvocation) error {
+	if c.recovery == nil {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "output recovery store is required", Recoverable: true}
+	}
+	receipt, ok, err := c.recovery.GetOutputReceipt(ctx, active.Invocation.ID, active.Command.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "completed invocation has no persisted output receipt", Recoverable: true}
+	}
+	if receipt.InvocationID != active.Invocation.ID || receipt.CommandID != active.Command.ID || receipt.CommandAction != active.Command.Action || receipt.Endpoint != active.Command.Endpoint || receipt.Generation != active.Command.Generation || receipt.BindingRef != active.Command.BindingRef || receipt.LeaseRef != active.Command.LeaseRef {
+		return kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "persisted output receipt does not match command", Recoverable: false}
+	}
+	if err := c.recordOutputSubmitted(ctx, active); err != nil {
+		return err
+	}
+	if err := c.lifecycle.Complete(ctx, active.Invocation); err != nil {
+		return err
+	}
+	if err := c.recovery.ClearActiveInvocation(ctx, active.Invocation.ID); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.receipts[active.Invocation.ID] = receipt
+	c.byCommand[active.Command.ID] = active.Invocation.ID
+	delete(c.active, active.Invocation.ID)
+	delete(c.byLease, active.Command.LeaseRef)
+	c.mu.Unlock()
+	return nil
+}
+
 func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error {
 	binding, err := c.bindings.Resolve(ctx, command)
 	if err != nil {
@@ -658,27 +816,36 @@ func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error 
 	if active.Command.BindingRef != command.BindingRef || active.Command.Generation != command.Generation {
 		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "stop command does not match active invocation", Recoverable: true}
 	}
-	if active.Invocation.Status == baseruntime.InvocationStopped {
-		if c.recovery != nil {
-			result, ok, err := c.recovery.GetStopEvidence(ctx, active.Invocation.ID, command.ID)
-			if err != nil {
-				return err
-			}
-			if ok {
-				if err := validateStopResult(result); err != nil {
-					return err
-				}
-				if err := c.recordInvocationStopped(ctx, active, command, result); err != nil {
-					return err
-				}
-			}
-		}
+	unlock := c.lockTerminal(active.Invocation.ID)
+	defer unlock()
+	invocation, ok, err := c.store.Get(ctx, active.Invocation.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "invocation not found"}
+	}
+	active.Invocation = invocation
+	switch invocation.Status {
+	case baseruntime.InvocationCompleted, baseruntime.InvocationFailed:
 		if c.recovery != nil {
 			if err := c.recovery.ClearActiveInvocation(ctx, active.Invocation.ID); err != nil {
 				return err
 			}
 		}
-		return nil
+		c.mu.Lock()
+		delete(c.active, active.Invocation.ID)
+		delete(c.byLease, command.LeaseRef)
+		c.mu.Unlock()
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation already reached a terminal output state", Recoverable: true}
+	case baseruntime.InvocationStopped:
+	default:
+		refreshed, err := c.activeByLease(command.LeaseRef)
+		if err != nil {
+			return err
+		}
+		active = refreshed
+		active.Invocation = invocation
 	}
 	if c.recovery == nil {
 		return kernel.IncompleteStopEvidence("stop evidence store is required")
@@ -791,14 +958,11 @@ func (c *Controller) recoverActiveByLease(ctx context.Context, command PhaseComm
 	active.Invocation = invocation
 	switch invocation.Status {
 	case baseruntime.InvocationCompleted, baseruntime.InvocationFailed:
-		if err := c.recovery.ClearActiveInvocation(ctx, invocation.ID); err != nil {
+		if err := c.recovery.ClearActiveInvocation(ctx, active.Invocation.ID); err != nil {
 			return ActiveInvocation{}, false, err
 		}
 		return ActiveInvocation{}, false, nil
 	case baseruntime.InvocationStopped:
-		if err := c.recovery.ClearActiveInvocation(ctx, invocation.ID); err != nil {
-			return ActiveInvocation{}, false, err
-		}
 		return active, true, nil
 	}
 	c.mu.Lock()
@@ -975,6 +1139,21 @@ func (c *Controller) activeByLease(lease kernel.LeaseID) (ActiveInvocation, erro
 		return ActiveInvocation{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation is no longer active", Recoverable: true}
 	}
 	return cloneActiveInvocation(active), nil
+}
+
+func (c *Controller) lockTerminal(invocationID kernel.InvocationID) func() {
+	c.mu.Lock()
+	for c.termLocks[invocationID] {
+		c.cond.Wait()
+	}
+	c.termLocks[invocationID] = true
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		delete(c.termLocks, invocationID)
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}
 }
 
 func validateCommand(command PhaseCommand) error {

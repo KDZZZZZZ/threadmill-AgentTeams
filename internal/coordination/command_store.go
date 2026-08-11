@@ -396,7 +396,7 @@ func (s *MemoryStore) appendObservation(ctx context.Context, projectID kernel.Pr
 		if existing.ID != observation.ID {
 			continue
 		}
-		if existing == observation {
+		if samePhaseObservationPayload(existing, observation) {
 			return nil
 		}
 		return kernel.IdempotencyConflict()

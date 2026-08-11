@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextgraph"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	baseruntime "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
@@ -22,6 +23,7 @@ type BindingResolveRequest struct {
 type BaseBindingSource interface {
 	ResolvePhaseBinding(context.Context, BindingResolveRequest) (BindingSnapshot, []string, error)
 	RefreshPhaseBinding(context.Context, ActiveInvocation) (BindingSnapshot, []string, error)
+	AbortResolvedPhaseBinding(context.Context, BindingResolveRequest, BindingSnapshot) error
 }
 
 type ContextRuntime interface {
@@ -69,9 +71,13 @@ func (r *ContextBindingResolver) ResolveForInvocation(ctx context.Context, req B
 		return BindingSnapshot{}, err
 	}
 	if err := validateBindingForCommand(binding, req.Command); err != nil {
+		_ = r.Base.AbortResolvedPhaseBinding(ctx, req, binding)
 		return BindingSnapshot{}, err
 	}
-	return r.bindContext(ctx, req.Command, req.InvocationID, binding, initialSubgraphIDs)
+	if req.Command.Action == coordination.CommandStop {
+		return binding, nil
+	}
+	return r.bindContextWithAbort(ctx, req, binding, initialSubgraphIDs)
 }
 
 func (r *ContextBindingResolver) Refresh(ctx context.Context, active ActiveInvocation) (BindingSnapshot, error) {
@@ -92,52 +98,66 @@ func (r *ContextBindingResolver) Refresh(ctx context.Context, active ActiveInvoc
 		return BindingSnapshot{}, err
 	}
 	if err := validateBindingForActive(binding, active); err != nil {
+		_ = r.Base.AbortResolvedPhaseBinding(ctx, BindingResolveRequest{Command: active.Command, InvocationID: active.Invocation.ID}, binding)
 		return BindingSnapshot{}, err
 	}
 	if binding.ActorPrincipalID != active.Invocation.ActorPrincipalID {
+		_ = r.Base.AbortResolvedPhaseBinding(ctx, BindingResolveRequest{Command: active.Command, InvocationID: active.Invocation.ID}, binding)
 		return BindingSnapshot{}, kernel.StaleBinding("binding actor principal does not match active invocation")
 	}
-	return r.bindContext(ctx, active.Command, active.Invocation.ID, binding, initialSubgraphIDs)
+	return r.bindContextWithAbort(ctx, BindingResolveRequest{Command: active.Command, InvocationID: active.Invocation.ID}, binding, initialSubgraphIDs)
 }
 
 func (r *ContextBindingResolver) bindContext(ctx context.Context, command PhaseCommand, invocationID kernel.InvocationID, binding BindingSnapshot, initialSubgraphIDs []string) (BindingSnapshot, error) {
+	return r.bindContextWithAbort(ctx, BindingResolveRequest{Command: command, InvocationID: invocationID}, binding, initialSubgraphIDs)
+}
+
+func (r *ContextBindingResolver) bindContextWithAbort(ctx context.Context, req BindingResolveRequest, binding BindingSnapshot, initialSubgraphIDs []string) (BindingSnapshot, error) {
 	if r.Contexts == nil {
+		_ = r.Base.AbortResolvedPhaseBinding(ctx, req, binding)
 		return BindingSnapshot{}, kernel.InvalidArgument("context runtime is required")
 	}
-	principal, err := phaseContextPrincipal(command, invocationID, binding)
+	principal, err := phaseContextPrincipal(req.Command, req.InvocationID, binding)
 	if err != nil {
+		_ = r.Base.AbortResolvedPhaseBinding(ctx, req, binding)
 		return BindingSnapshot{}, err
 	}
-	subscriptions, err := r.Contexts.InspectSubscriptions(ctx, principal, invocationID)
+	subscriptions, err := r.Contexts.InspectSubscriptions(ctx, principal, req.InvocationID)
 	if err != nil {
-		return BindingSnapshot{}, err
+		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 	}
 	if !hasActiveSubscription(subscriptions) && len(initialSubgraphIDs) > 0 {
 		if _, err := r.ensureInitialSlice(ctx, principal, initialSubgraphIDs); err != nil {
-			return BindingSnapshot{}, err
+			return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 		}
 	}
 	slice, err := r.Contexts.MaterializeRuntimeContext(ctx, principal)
 	if err != nil {
-		return BindingSnapshot{}, err
+		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 	}
 	memory, err := r.Contexts.ListTaskCandidates(ctx, principal)
 	if err != nil {
-		return BindingSnapshot{}, err
+		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 	}
 	sliceJSON, err := stableJSON(slice)
 	if err != nil {
-		return BindingSnapshot{}, err
+		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 	}
 	memoryJSON, err := stableJSON(memory)
 	if err != nil {
-		return BindingSnapshot{}, err
+		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 	}
 	binding.ContextSlice = string(sliceJSON)
-	binding.ContextSliceRef = stableBindingRef("context-slice", binding.ProjectID, command.Endpoint.TaskID, invocationID, sliceJSON)
+	binding.ContextSliceRef = stableBindingRef("context-slice", binding.ProjectID, req.Command.Endpoint.TaskID, req.InvocationID, sliceJSON)
 	binding.TaskMemoryBuffer = string(memoryJSON)
-	binding.TaskMemoryBufferRef = stableBindingRef("task-memory-buffer", binding.ProjectID, command.Endpoint.TaskID, invocationID, memoryJSON)
+	binding.TaskMemoryBufferRef = stableBindingRef("task-memory-buffer", binding.ProjectID, req.Command.Endpoint.TaskID, req.InvocationID, memoryJSON)
 	return binding, nil
+}
+
+func (r *ContextBindingResolver) abortResolvedBinding(ctx context.Context, req BindingResolveRequest, binding BindingSnapshot, principal auth.Principal, cause error) error {
+	_ = r.Contexts.EndInvocation(ctx, principal, req.InvocationID)
+	_ = r.Base.AbortResolvedPhaseBinding(ctx, req, binding)
+	return cause
 }
 
 type ContextBindingLifecycle struct {

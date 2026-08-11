@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -24,6 +25,9 @@ func TestPhaseObservationWriterAppendsOnlyAllowedKindsAndIsIdempotent(t *testing
 	}
 	if err := runtime.reconcile(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.RecordPhaseInvocationStarted(context.Background(), projectID, start); err != nil {
+		t.Fatalf("folded started replay should remain idempotent: %v", err)
 	}
 
 	registerTransition(t, decisions, "hold-for-observation-writer", GraphTransition{
@@ -48,6 +52,23 @@ func TestPhaseObservationWriterAppendsOnlyAllowedKindsAndIsIdempotent(t *testing
 	}
 	if err := store.RecordPhaseInvocationStopped(context.Background(), projectID, stop, "checkpoint://task-a/plan/1", false); err != nil {
 		t.Fatalf("idempotent stopped: %v", err)
+	}
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.RecordPhaseInvocationStopped(context.Background(), projectID, stop, "checkpoint://task-a/plan/1", false)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent idempotent stopped: %v", err)
+		}
 	}
 	if err := store.RecordPhaseInvocationStopped(context.Background(), projectID, stop, "checkpoint://task-a/plan/other", false); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("conflicting stopped observation = %v, want idempotency_conflict", err)

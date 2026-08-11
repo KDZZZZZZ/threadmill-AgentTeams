@@ -202,11 +202,15 @@ func TestContextBindingLifecycleEndsInvocationSubscriptions(t *testing.T) {
 }
 
 func TestContextBindingResolverDoesNotSwallowContextErrors(t *testing.T) {
-	resolver := NewContextBindingResolver(&fakeBaseBindingSource{initial: []string{"sg-a"}}, failingContextRuntime{err: errors.New("boom")})
+	source := &fakeBaseBindingSource{initial: []string{"sg-a"}}
+	resolver := NewContextBindingResolver(source, failingContextRuntime{err: errors.New("boom")})
 	cmd := contextBindingCommand("run-a", "task-a", "execute")
 	_, err := resolver.ResolveForInvocation(context.Background(), BindingResolveRequest{Command: cmd, InvocationID: invocationIDForCommand(cmd)})
 	if err == nil || err.Error() != "boom" {
 		t.Fatalf("err = %v, want boom", err)
+	}
+	if source.abortCalls != 1 {
+		t.Fatalf("abort calls = %d, want 1", source.abortCalls)
 	}
 }
 
@@ -267,7 +271,77 @@ func TestContextBindingResolverValidatesBeforeContextSideEffects(t *testing.T) {
 			if runtime.ensureCalls != 0 || runtime.inspectCalls != 0 || runtime.materializeCalls != 0 || runtime.memoryCalls != 0 {
 				t.Fatalf("context side effects happened: ensure=%d inspect=%d materialize=%d memory=%d", runtime.ensureCalls, runtime.inspectCalls, runtime.materializeCalls, runtime.memoryCalls)
 			}
+			if source.abortCalls != 1 {
+				t.Fatalf("abort calls = %d, want 1", source.abortCalls)
+			}
 		})
+	}
+}
+
+func TestContextBindingResolverStopDoesNotCreateInvocationSubscription(t *testing.T) {
+	ctx := context.Background()
+	store := contextgraph.NewMemoryStore(fixedNow)
+	sgA := createContextSubgraph(t, store, "project-a", "alpha")
+	createContextNode(t, store, "project-a", sgA.ID, "alpha node")
+	source := &fakeBaseBindingSource{initial: []string{sgA.ID}}
+	runtime := newTestContextRuntime(store)
+	resolver := NewContextBindingResolver(source, runtime)
+	cmd := contextBindingCommand("run-a", "task-a", "execute")
+	stopCommand := cmd
+	stopCommand.ID = "stop-a"
+	stopCommand.Action = coordination.CommandStop
+	stopInvocationID := invocationIDForCommand(stopCommand)
+
+	binding, err := resolver.ResolveForInvocation(ctx, BindingResolveRequest{Command: stopCommand, InvocationID: stopInvocationID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.ContextSliceRef != "" || binding.TaskMemoryBufferRef != "" {
+		t.Fatalf("stop binding should not materialize context refs: %#v", binding)
+	}
+	if runtime.ensureCalls != 0 || runtime.inspectCalls != 0 || runtime.materializeCalls != 0 || runtime.memoryCalls != 0 {
+		t.Fatalf("stop created context side effects: ensure=%d inspect=%d materialize=%d memory=%d", runtime.ensureCalls, runtime.inspectCalls, runtime.materializeCalls, runtime.memoryCalls)
+	}
+	subs, err := runtime.InspectSubscriptions(ctx, phasePrincipal("project-a", "task-a", "execute", stopInvocationID), stopInvocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeSubscriptions(subs)) != 0 {
+		t.Fatalf("stop created active subscriptions: %#v", subs)
+	}
+	if source.abortCalls != 0 {
+		t.Fatalf("abort calls = %d, want 0", source.abortCalls)
+	}
+}
+
+func TestContextBindingResolverAbortsResolvedBindingAfterContextFailure(t *testing.T) {
+	ctx := context.Background()
+	store := contextgraph.NewMemoryStore(fixedNow)
+	sgA := createContextSubgraph(t, store, "project-a", "alpha")
+	createContextNode(t, store, "project-a", sgA.ID, "alpha node")
+	source := &fakeBaseBindingSource{initial: []string{sgA.ID}}
+	runtime := newTestContextRuntime(store)
+	runtime.materializeErr = errors.New("materialize failed")
+	resolver := NewContextBindingResolver(source, runtime)
+	cmd := contextBindingCommand("run-a", "task-a", "execute")
+	invocationID := invocationIDForCommand(cmd)
+
+	_, err := resolver.ResolveForInvocation(ctx, BindingResolveRequest{Command: cmd, InvocationID: invocationID})
+	if err == nil || err.Error() != "materialize failed" {
+		t.Fatalf("err = %v, want materialize failed", err)
+	}
+	if source.abortCalls != 1 {
+		t.Fatalf("abort calls = %d, want 1", source.abortCalls)
+	}
+	if runtime.endCalls != 1 {
+		t.Fatalf("end invocation calls = %d, want 1", runtime.endCalls)
+	}
+	subs, err := store.InspectSubscriptions(ctx, phasePrincipal("project-a", "task-a", "execute", invocationID), invocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeSubscriptions(subs)) != 0 {
+		t.Fatalf("active subscriptions after abort = %#v", subs)
 	}
 }
 
@@ -304,6 +378,7 @@ func TestContextBindingResolverSingleflightsConcurrentInitialSlice(t *testing.T)
 	}
 	close(start)
 	runtime.waitEnsureStarted(t)
+	runtime.waitInspectCalls(t, 2)
 	close(runtime.blockEnsure)
 	for i := 0; i < 2; i++ {
 		if err := <-errs; err != nil {
@@ -322,6 +397,7 @@ type fakeBaseBindingSource struct {
 	missingActor  bool
 	resolveCalls  int
 	refreshCalls  int
+	abortCalls    int
 }
 
 type testContextRuntime struct {
@@ -332,9 +408,15 @@ type testContextRuntime struct {
 	inspectCalls      int
 	materializeCalls  int
 	memoryCalls       int
+	endCalls          int
 	blockEnsure       chan struct{}
 	ensureStarted     chan struct{}
 	ensureStartedOnce sync.Once
+	inspectErr        error
+	ensureErr         error
+	materializeErr    error
+	memoryErr         error
+	endErr            error
 }
 
 func newTestContextRuntime(store *contextgraph.MemoryStore) *testContextRuntime {
@@ -354,6 +436,9 @@ func (r *testContextRuntime) EnsureInitialSlice(ctx context.Context, principal a
 			return contextgraph.ContextSlice{}, ctx.Err()
 		}
 	}
+	if r.ensureErr != nil {
+		return contextgraph.ContextSlice{}, r.ensureErr
+	}
 	subscriptions, err := r.store.InspectSubscriptions(ctx, principal, principal.InvocationID)
 	if err != nil {
 		return contextgraph.ContextSlice{}, err
@@ -367,25 +452,44 @@ func (r *testContextRuntime) EnsureInitialSlice(ctx context.Context, principal a
 func (r *testContextRuntime) InspectSubscriptions(ctx context.Context, principal auth.Principal, invocationID kernel.InvocationID) ([]contextgraph.SubscriptionInspection, error) {
 	r.mu.Lock()
 	r.inspectCalls++
+	err := r.inspectErr
 	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return r.store.InspectSubscriptions(ctx, principal, invocationID)
 }
 
 func (r *testContextRuntime) MaterializeRuntimeContext(ctx context.Context, principal auth.Principal) (contextgraph.ContextSlice, error) {
 	r.mu.Lock()
 	r.materializeCalls++
+	err := r.materializeErr
 	r.mu.Unlock()
+	if err != nil {
+		return contextgraph.ContextSlice{}, err
+	}
 	return r.store.MaterializeRuntimeContext(ctx, principal)
 }
 
 func (r *testContextRuntime) ListTaskCandidates(ctx context.Context, principal auth.Principal) (contextgraph.TaskMemoryBufferView, error) {
 	r.mu.Lock()
 	r.memoryCalls++
+	err := r.memoryErr
 	r.mu.Unlock()
+	if err != nil {
+		return contextgraph.TaskMemoryBufferView{}, err
+	}
 	return r.store.ListTaskCandidates(ctx, principal)
 }
 
 func (r *testContextRuntime) EndInvocation(ctx context.Context, principal auth.Principal, invocationID kernel.InvocationID) error {
+	r.mu.Lock()
+	r.endCalls++
+	err := r.endErr
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	return r.store.EndInvocation(ctx, principal, invocationID)
 }
 
@@ -395,6 +499,25 @@ func (r *testContextRuntime) waitEnsureStarted(t *testing.T) {
 	case <-r.ensureStarted:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for EnsureInitialSlice")
+	}
+}
+
+func (r *testContextRuntime) waitInspectCalls(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		r.mu.Lock()
+		got := r.inspectCalls
+		r.mu.Unlock()
+		if got >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for inspect calls: got %d want %d", got, want)
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
@@ -428,6 +551,11 @@ func (s *fakeBaseBindingSource) RefreshPhaseBinding(_ context.Context, active Ac
 		binding.ActorPrincipalID = ""
 	}
 	return binding, initial, nil
+}
+
+func (s *fakeBaseBindingSource) AbortResolvedPhaseBinding(context.Context, BindingResolveRequest, BindingSnapshot) error {
+	s.abortCalls++
+	return nil
 }
 
 type failingContextRuntime struct {

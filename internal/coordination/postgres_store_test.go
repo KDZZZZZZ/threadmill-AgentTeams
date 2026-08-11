@@ -184,6 +184,28 @@ func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
 	if err := store.RecordPhaseInvocationStarted(ctx, projectID, commands[0]); err != nil {
 		t.Fatalf("idempotent started observation: %v", err)
 	}
+	errs = make(chan error, workers)
+	wg = sync.WaitGroup{}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.RecordPhaseInvocationStarted(ctx, projectID, commands[0])
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent idempotent started observation: %v", err)
+		}
+	}
+	if err := runtime.reconcile(ctx); err != nil {
+		t.Fatalf("fold started observation: %v", err)
+	}
+	if err := store.RecordPhaseInvocationStarted(ctx, projectID, commands[0]); err != nil {
+		t.Fatalf("folded started replay should remain idempotent: %v", err)
+	}
 	if active := countPostgresActiveLeases(ctx, store, projectID); active != 1 {
 		t.Fatalf("active leases = %d, want 1", active)
 	}
@@ -214,6 +236,22 @@ func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
 	}
 	if err := store.RecordPhaseInvocationStopped(ctx, projectID, stop, "checkpoint://pg-task-a/plan/1", false); err != nil {
 		t.Fatalf("idempotent stopped observation: %v", err)
+	}
+	errs = make(chan error, workers)
+	wg = sync.WaitGroup{}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.RecordPhaseInvocationStopped(ctx, projectID, stop, "checkpoint://pg-task-a/plan/1", false)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent idempotent stopped observation: %v", err)
+		}
 	}
 	if err := store.RecordPhaseInvocationStopped(ctx, projectID, stop, "checkpoint://pg-task-a/plan/other", false); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("conflicting stopped observation = %v, want idempotency_conflict", err)

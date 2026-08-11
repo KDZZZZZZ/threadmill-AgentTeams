@@ -3,6 +3,7 @@ package phase
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -428,6 +429,92 @@ func TestSubmitPhaseOutputEndsInvocationLifecycle(t *testing.T) {
 	}
 }
 
+func TestSubmitPhaseOutputCompletedObservationFailureRestartsFromRecoveryReceipt(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.observations.failOutputOnce = kernel.Error{Code: kernel.CodeRevisionConflict, Message: "observation unavailable", Recoverable: true}
+	controller := harness.controller()
+	cmd := validCommand("cmd-output-observation-restart", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("submit with observation failure = %v, want revision_conflict", err)
+	}
+	completed, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || completed.Status != baseruntime.InvocationCompleted {
+		t.Fatalf("invocation after observation failure = %#v %v %v, want completed", completed, ok, err)
+	}
+	routed := harness.artifacts.next
+	rebuilt := harness.controller()
+	receipt, err := rebuilt.SubmitPhaseOutput(ctx, invocationID, validOutput())
+	if err != nil {
+		t.Fatalf("retry completed submit from recovery: %v", err)
+	}
+	if harness.artifacts.next != routed {
+		t.Fatalf("completed retry rerouted artifacts: got %d want %d", harness.artifacts.next, routed)
+	}
+	if receipt.InvocationID != invocationID || receipt.CommandID != cmd.ID {
+		t.Fatalf("receipt = %#v, want persisted command receipt", receipt)
+	}
+	if got := len(harness.observations.outputs); got != 1 || harness.observations.outputs[0] != cmd {
+		t.Fatalf("output observations = %#v, want one replay", harness.observations.outputs)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("successful output observation replay kept active recovery obligation")
+	}
+
+	if _, err := rebuilt.SubmitPhaseOutput(ctx, invocationID, PhaseOutput{Phase: "execute", ReportRef: "different"}); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
+		t.Fatalf("completed retry with different payload = %v, want idempotency_conflict", err)
+	}
+}
+
+func TestApplyStartCompletedOutputReplayCompletesResolvedResourcesBeforeClearing(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.observations.failOutputOnce = kernel.Error{Code: kernel.CodeRevisionConflict, Message: "observation unavailable", Recoverable: true}
+	controller := harness.controller()
+	cmd := validCommand("cmd-output-replay-complete-resources", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("submit with observation failure = %v, want revision_conflict", err)
+	}
+	if got := harness.lifecycle.completeCalls[invocationID]; got != 1 {
+		t.Fatalf("initial lifecycle complete calls = %d, want 1", got)
+	}
+
+	harness.lifecycle.errOnce = errors.New("release unavailable")
+	if err := harness.controller().Apply(ctx, cmd); err == nil || err.Error() != "release unavailable" {
+		t.Fatalf("completed replay with release failure = %v, want release unavailable", err)
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("release failure cleared active recovery obligation")
+	}
+	if got := harness.lifecycle.completeCalls[invocationID]; got != 2 {
+		t.Fatalf("failed replay lifecycle complete calls = %d, want 2", got)
+	}
+
+	if err := harness.controller().Apply(ctx, cmd); err != nil {
+		t.Fatalf("retry completed replay: %v", err)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("successful replay kept active recovery obligation")
+	}
+	if got := harness.lifecycle.completeCalls[invocationID]; got != 3 {
+		t.Fatalf("successful replay lifecycle complete calls = %d, want 3", got)
+	}
+}
+
 func TestSubmitPhaseOutputClearActiveFailureCanRetryCompletedCleanup(t *testing.T) {
 	ctx := context.Background()
 	harness := newHarness(t)
@@ -457,6 +544,64 @@ func TestSubmitPhaseOutputClearActiveFailureCanRetryCompletedCleanup(t *testing.
 	}
 	if _, ok := harness.recovery.active[invocationID]; ok {
 		t.Fatal("retry left completed active recovery obligation")
+	}
+}
+
+func TestStopAndSubmitPhaseOutputConcurrentOnlyOneTerminalObservation(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	cmd := validCommand("cmd-terminal-race", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	stop := validCommand("cmd-terminal-race-stop", coordination.CommandStop, "binding-1", "lease-1", 1)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput())
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		errs <- controller.Apply(ctx, stop)
+	}()
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var success, stale int
+	for err := range errs {
+		switch {
+		case err == nil:
+			success++
+		case kernel.IsCode(err, kernel.CodeStaleCommand), kernel.IsCode(err, kernel.CodeRevisionConflict):
+			stale++
+		default:
+			t.Fatalf("terminal race error = %v, want nil or stale/transition error", err)
+		}
+	}
+	if success != 1 || stale != 1 {
+		t.Fatalf("terminal race results: success=%d stale=%d, want one winner and one loser", success, stale)
+	}
+	if got := len(harness.observations.outputs) + len(harness.observations.stopped); got != 1 {
+		t.Fatalf("terminal observations output=%#v stopped=%#v, want exactly one", harness.observations.outputs, harness.observations.stopped)
+	}
+	if len(harness.observations.outputs) == 1 && len(harness.recovery.stops) != 0 {
+		t.Fatalf("output winner also persisted stop evidence: %#v", harness.recovery.stops)
+	}
+	if len(harness.observations.stopped) == 1 && len(harness.recovery.outputs) != 0 {
+		t.Fatalf("stop winner also persisted output receipt: %#v", harness.recovery.outputs)
 	}
 }
 
@@ -751,6 +896,42 @@ func TestStopObservationFailureRetriesWithoutCallingHostStopAgain(t *testing.T) 
 	}
 	if _, ok := harness.recovery.active[invocationID]; ok {
 		t.Fatal("retry kept active recovery obligation")
+	}
+}
+
+func TestStopObservationFailureAfterRestartDoesNotClearActiveBeforeReplay(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.observations.failStoppedCount = 2
+	harness.observations.failStoppedErr = kernel.Error{Code: kernel.CodeRevisionConflict, Message: "observation unavailable", Recoverable: true}
+	first := harness.controller()
+	if err := first.Apply(ctx, validCommand("cmd-start-stop-observation-twice", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	stop := validCommand("cmd-stop-observation-twice", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := first.Apply(ctx, stop); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("first stop observation failure = %v, want revision_conflict", err)
+	}
+	second := harness.controller()
+	if err := second.Apply(ctx, stop); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("second stop observation failure = %v, want revision_conflict", err)
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("active recovery obligation was cleared before stopped observation succeeded")
+	}
+	third := harness.controller()
+	if err := third.Apply(ctx, stop); err != nil {
+		t.Fatalf("third stop observation replay: %v", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("host stop calls = %d, want 1", got)
+	}
+	if got := len(harness.observations.stopped); got != 1 || harness.observations.stopped[0].command != stop {
+		t.Fatalf("stopped observations = %#v, want one successful replay", harness.observations.stopped)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("active recovery obligation survived successful stopped observation")
 	}
 }
 
@@ -1222,14 +1403,16 @@ type fakeStopObservation struct {
 }
 
 type fakeObservationWriter struct {
-	failStartedOnce error
-	failOutputOnce  error
-	failFailedOnce  error
-	failStoppedOnce error
-	started         []PhaseCommand
-	outputs         []PhaseCommand
-	failed          []PhaseCommand
-	stopped         []fakeStopObservation
+	failStartedOnce  error
+	failOutputOnce   error
+	failFailedOnce   error
+	failStoppedOnce  error
+	failStoppedCount int
+	failStoppedErr   error
+	started          []PhaseCommand
+	outputs          []PhaseCommand
+	failed           []PhaseCommand
+	stopped          []fakeStopObservation
 }
 
 func (w *fakeObservationWriter) RecordPhaseInvocationStarted(_ context.Context, _ kernel.ProjectID, command coordination.PhaseCommand) error {
@@ -1263,6 +1446,13 @@ func (w *fakeObservationWriter) RecordPhaseInvocationFailed(_ context.Context, _
 }
 
 func (w *fakeObservationWriter) RecordPhaseInvocationStopped(_ context.Context, _ kernel.ProjectID, command coordination.PhaseCommand, checkpointRef string, nonResumable bool) error {
+	if w.failStoppedCount > 0 {
+		w.failStoppedCount--
+		if w.failStoppedErr != nil {
+			return w.failStoppedErr
+		}
+		return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "observation unavailable", Recoverable: true}
+	}
 	if w.failStoppedOnce != nil {
 		err := w.failStoppedOnce
 		w.failStoppedOnce = nil
@@ -1274,6 +1464,7 @@ func (w *fakeObservationWriter) RecordPhaseInvocationStopped(_ context.Context, 
 
 type fakeRecoveryStore struct {
 	active        map[kernel.InvocationID]ActiveInvocation
+	outputs       map[string]OutputReceipt
 	stops         map[string]StopResult
 	recordErrOnce error
 	clearErrOnce  error
@@ -1281,8 +1472,9 @@ type fakeRecoveryStore struct {
 
 func newFakeRecoveryStore() *fakeRecoveryStore {
 	return &fakeRecoveryStore{
-		active: map[kernel.InvocationID]ActiveInvocation{},
-		stops:  map[string]StopResult{},
+		active:  map[kernel.InvocationID]ActiveInvocation{},
+		outputs: map[string]OutputReceipt{},
+		stops:   map[string]StopResult{},
 	}
 }
 
@@ -1298,6 +1490,31 @@ func (s *fakeRecoveryStore) RecoverActiveInvocation(_ context.Context, command P
 		}
 	}
 	return ActiveInvocation{}, false, nil
+}
+
+func (s *fakeRecoveryStore) RecordOutputReceipt(_ context.Context, active ActiveInvocation, receipt OutputReceipt) error {
+	key := outputReceiptKey(active.Invocation.ID, active.Command.ID)
+	if existing, ok := s.outputs[key]; ok {
+		if outputReceiptsEqual(existing, receipt) {
+			return nil
+		}
+		return kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "output receipt already exists with different payload", Recoverable: false}
+	}
+	s.outputs[key] = receipt
+	return nil
+}
+
+func (s *fakeRecoveryStore) GetOutputReceipt(_ context.Context, invocationID kernel.InvocationID, commandID string) (OutputReceipt, bool, error) {
+	if commandID != "" {
+		receipt, ok := s.outputs[outputReceiptKey(invocationID, commandID)]
+		return receipt, ok, nil
+	}
+	for key, receipt := range s.outputs {
+		if strings.HasPrefix(key, string(invocationID)+"/") {
+			return receipt, true, nil
+		}
+	}
+	return OutputReceipt{}, false, nil
 }
 
 func (s *fakeRecoveryStore) RecordStopEvidence(_ context.Context, active ActiveInvocation, command PhaseCommand, result StopResult) error {
@@ -1342,5 +1559,9 @@ func containsTool(tools map[auth.Tool]struct{}, target auth.Tool) bool {
 }
 
 func stopEvidenceKey(invocationID kernel.InvocationID, commandID string) string {
+	return string(invocationID) + "/" + commandID
+}
+
+func outputReceiptKey(invocationID kernel.InvocationID, commandID string) string {
 	return string(invocationID) + "/" + commandID
 }

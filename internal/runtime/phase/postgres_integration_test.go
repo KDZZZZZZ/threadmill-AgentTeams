@@ -99,16 +99,72 @@ func TestPostgresRuntimeStoresAgainstRealDatabase(t *testing.T) {
 	if err := firstRecovery.RecordActiveInvocation(ctx, active); err != nil {
 		t.Fatalf("record active: %v", err)
 	}
+	outputFingerprint, err := hashJSON(validOutput())
+	if err != nil {
+		t.Fatalf("hash output: %v", err)
+	}
+	outputReceipt := OutputReceipt{
+		Output:            validOutput(),
+		InvocationID:      invocation.ID,
+		CommandID:         start.ID,
+		CommandAction:     start.Action,
+		CauseRef:          start.CauseRef,
+		Endpoint:          start.Endpoint,
+		Generation:        start.Generation,
+		BindingRef:        start.BindingRef,
+		LeaseRef:          start.LeaseRef,
+		InputRevision:     binding.Inputs.InputRevision,
+		WorkspaceRef:      binding.WorkspaceRef,
+		WorkspaceHead:     binding.WorkspaceRevision,
+		OutputFingerprint: outputFingerprint,
+		SubmittedAtUTC:    time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC),
+	}
+	if err := firstRecovery.RecordOutputReceipt(ctx, active, outputReceipt); err != nil {
+		t.Fatalf("record output receipt: %v", err)
+	}
+	if err := firstRecovery.RecordOutputReceipt(ctx, active, outputReceipt); err != nil {
+		t.Fatalf("idempotent output receipt: %v", err)
+	}
+	conflictingReceipt := outputReceipt
+	conflictingReceipt.Output.ReportRef = "artifact://different"
+	if err := firstRecovery.RecordOutputReceipt(ctx, active, conflictingReceipt); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
+		t.Fatalf("conflicting output receipt = %v, want idempotency_conflict", err)
+	}
+	loadedReceipt, ok, err := NewPostgresRecoveryStoreFromSQL(db, invocations).GetOutputReceipt(ctx, invocation.ID, "")
+	if err != nil || !ok {
+		t.Fatalf("get output receipt after rebuild = %#v %v %v, want receipt", loadedReceipt, ok, err)
+	}
+	if !outputReceiptsEqual(loadedReceipt, outputReceipt) {
+		t.Fatalf("loaded output receipt = %#v, want %#v", loadedReceipt, outputReceipt)
+	}
 	stop := validCommand("cmd-real-stop", coordination.CommandStop, "binding-real-1", "lease-real-1", 1)
 	rebuiltRecovery := NewPostgresRecoveryStoreFromSQL(db, invocations)
-	recovered, ok, err := rebuiltRecovery.RecoverActiveInvocation(ctx, stop, binding)
-	if err != nil || !ok {
-		t.Fatalf("recover active after rebuild = %#v %v %v, want active", recovered, ok, err)
-	}
-	if recovered.Invocation.ID != invocation.ID || recovered.Command.ID != stop.ID {
-		t.Fatalf("recovered active = %#v, want invocation plus stop command", recovered)
+	if recovered, ok, err := rebuiltRecovery.RecoverActiveInvocation(ctx, stop, binding); err != nil || ok {
+		t.Fatalf("recover active after output receipt = %#v %v %v, want no active", recovered, ok, err)
 	}
 	stopResult := StopResult{ResumeStateRef: "resume-real-1", CheckpointRef: "checkpoint-real-1", WorkspaceRevision: "main-real-stop"}
+	if err := rebuiltRecovery.RecordStopEvidence(ctx, active, stop, stopResult); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("stop evidence after output receipt = %v, want stale_command", err)
+	}
+
+	stopStart := validCommand("cmd-real-stop-start", coordination.CommandStart, "binding-real-stop-1", "lease-real-stop-1", 1)
+	stopBinding := realPostgresBinding("binding-real-stop-1", "lease-real-stop-1", 1)
+	stopInvocation := realPostgresInvocation(stopStart, stopBinding)
+	if err := invocations.Create(ctx, stopInvocation); err != nil {
+		t.Fatalf("create stop invocation: %v", err)
+	}
+	stopActive := ActiveInvocation{Invocation: stopInvocation, Command: stopStart, Binding: stopBinding, Inputs: stopBinding.Inputs}
+	if err := rebuiltRecovery.RecordActiveInvocation(ctx, stopActive); err != nil {
+		t.Fatalf("record stop active: %v", err)
+	}
+	stop = validCommand("cmd-real-stop", coordination.CommandStop, "binding-real-stop-1", "lease-real-stop-1", 1)
+	recovered, ok, err := rebuiltRecovery.RecoverActiveInvocation(ctx, stop, stopBinding)
+	if err != nil || !ok {
+		t.Fatalf("recover stop active after rebuild = %#v %v %v, want active", recovered, ok, err)
+	}
+	if recovered.Invocation.ID != stopInvocation.ID || recovered.Command.ID != stop.ID {
+		t.Fatalf("recovered active = %#v, want invocation plus stop command", recovered)
+	}
 	if err := rebuiltRecovery.RecordStopEvidence(ctx, recovered, stop, stopResult); err != nil {
 		t.Fatalf("record stop evidence: %v", err)
 	}
@@ -120,7 +176,7 @@ func TestPostgresRuntimeStoresAgainstRealDatabase(t *testing.T) {
 	if err := rebuiltRecovery.RecordStopEvidence(ctx, recovered, stop, conflictingStop); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("duplicate conflicting stop evidence = %v, want idempotency_conflict", err)
 	}
-	persisted, ok, err := NewPostgresRecoveryStoreFromSQL(db, invocations).GetStopEvidence(ctx, invocation.ID, stop.ID)
+	persisted, ok, err := NewPostgresRecoveryStoreFromSQL(db, invocations).GetStopEvidence(ctx, stopInvocation.ID, stop.ID)
 	if err != nil || !ok {
 		t.Fatalf("get stop evidence after rebuild = %#v %v %v, want evidence", persisted, ok, err)
 	}
@@ -161,10 +217,74 @@ func TestPostgresRuntimeStoresAgainstRealDatabase(t *testing.T) {
 	if err := rebuiltRecovery.ValidateResume(ctx, resume, resumeBinding); !kernel.IsCode(err, kernel.CodeStaleCheckpoint) {
 		t.Fatalf("cross-project checkpoint = %v, want stale_checkpoint", err)
 	}
+	raceStart := validCommand("cmd-real-terminal-race", coordination.CommandStart, "binding-real-race-1", "lease-real-race-1", 1)
+	raceBinding := realPostgresBinding("binding-real-race-1", "lease-real-race-1", 1)
+	raceInvocation := realPostgresInvocation(raceStart, raceBinding)
+	if err := invocations.Create(ctx, raceInvocation); err != nil {
+		t.Fatalf("create race invocation: %v", err)
+	}
+	raceActive := ActiveInvocation{Invocation: raceInvocation, Command: raceStart, Binding: raceBinding, Inputs: raceBinding.Inputs}
+	if err := NewPostgresRecoveryStoreFromSQL(db, invocations).RecordActiveInvocation(ctx, raceActive); err != nil {
+		t.Fatalf("record race active: %v", err)
+	}
+	raceOutput := outputReceipt
+	raceOutput.InvocationID = raceInvocation.ID
+	raceOutput.CommandID = raceStart.ID
+	raceOutput.CommandAction = raceStart.Action
+	raceOutput.CauseRef = raceStart.CauseRef
+	raceOutput.Endpoint = raceStart.Endpoint
+	raceOutput.Generation = raceStart.Generation
+	raceOutput.BindingRef = raceStart.BindingRef
+	raceOutput.LeaseRef = raceStart.LeaseRef
+	raceOutput.InputRevision = raceBinding.Inputs.InputRevision
+	raceOutput.WorkspaceRef = raceBinding.WorkspaceRef
+	raceOutput.WorkspaceHead = raceBinding.WorkspaceRevision
+	raceStop := validCommand("cmd-real-terminal-race-stop", coordination.CommandStop, "binding-real-race-1", "lease-real-race-1", 1)
+	raceStopResult := StopResult{ResumeStateRef: "resume-race", CheckpointRef: "checkpoint-race", WorkspaceRevision: "main-real-race-stop"}
+	raceErrs := make(chan error, 2)
+	raceReady := make(chan struct{})
+	go func() {
+		<-raceReady
+		raceErrs <- NewPostgresRecoveryStoreFromSQL(db, invocations).RecordOutputReceipt(ctx, raceActive, raceOutput)
+	}()
+	go func() {
+		<-raceReady
+		raceErrs <- NewPostgresRecoveryStoreFromSQL(db, invocations).RecordStopEvidence(ctx, raceActive, raceStop, raceStopResult)
+	}()
+	close(raceReady)
+	firstErr := <-raceErrs
+	secondErr := <-raceErrs
+	successes := 0
+	for _, raceErr := range []error{firstErr, secondErr} {
+		switch {
+		case raceErr == nil:
+			successes++
+		case kernel.IsCode(raceErr, kernel.CodeStaleCommand), kernel.IsCode(raceErr, kernel.CodeRevisionConflict):
+		default:
+			t.Fatalf("terminal evidence race error = %v, want nil/stale/revision", raceErr)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("terminal evidence race successes = %d, want exactly one; errs=%v / %v", successes, firstErr, secondErr)
+	}
+	_, outputOK, err := NewPostgresRecoveryStoreFromSQL(db, invocations).GetOutputReceipt(ctx, raceInvocation.ID, raceStart.ID)
+	if err != nil {
+		t.Fatalf("get race output receipt: %v", err)
+	}
+	_, stopOK, err := NewPostgresRecoveryStoreFromSQL(db, invocations).GetStopEvidence(ctx, raceInvocation.ID, raceStop.ID)
+	if err != nil {
+		t.Fatalf("get race stop evidence: %v", err)
+	}
+	if outputOK == stopOK {
+		t.Fatalf("terminal evidence race outputOK=%v stopOK=%v, want exactly one", outputOK, stopOK)
+	}
 	if err := rebuiltRecovery.ClearActiveInvocation(ctx, invocation.ID); err != nil {
 		t.Fatalf("clear active: %v", err)
 	}
-	if _, ok, err := NewPostgresRecoveryStoreFromSQL(db, invocations).RecoverActiveInvocation(ctx, stop, binding); err != nil || ok {
+	if err := rebuiltRecovery.ClearActiveInvocation(ctx, stopInvocation.ID); err != nil {
+		t.Fatalf("clear stop active: %v", err)
+	}
+	if _, ok, err := NewPostgresRecoveryStoreFromSQL(db, invocations).RecoverActiveInvocation(ctx, stop, stopBinding); err != nil || ok {
 		t.Fatalf("recover after clear ok=%v err=%v, want no active", ok, err)
 	}
 }

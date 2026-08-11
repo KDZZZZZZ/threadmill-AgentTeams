@@ -42,6 +42,71 @@ func TestPostgresRecoveryStoreRecoversActiveStopEvidenceClearAndResume(t *testin
 		t.Fatalf("recovered active = %#v, want invocation with stop command authority", recovered)
 	}
 	result := StopResult{ResumeStateRef: "resume-state-1", CheckpointRef: "checkpoint-1", WorkspaceRevision: "main-rev-stop"}
+	receipt := OutputReceipt{
+		Output:            PhaseOutput{Phase: "execute", DeliveryRefs: []string{"artifact-1"}, ReportRef: "artifact-2"},
+		InvocationID:      invocation.ID,
+		CommandID:         start.ID,
+		CommandAction:     start.Action,
+		CauseRef:          start.CauseRef,
+		Endpoint:          start.Endpoint,
+		Generation:        start.Generation,
+		BindingRef:        start.BindingRef,
+		LeaseRef:          start.LeaseRef,
+		InputRevision:     "inputs-1",
+		WorkspaceRef:      binding.WorkspaceRef,
+		WorkspaceHead:     binding.WorkspaceRevision,
+		OutputFingerprint: "output-fingerprint",
+		SubmittedAtUTC:    time.Date(2026, 8, 11, 1, 0, 0, 0, time.UTC),
+	}
+	if err := store.RecordOutputReceipt(ctx, active, receipt); err != nil {
+		t.Fatalf("record output: %v", err)
+	}
+	if err := store.RecordOutputReceipt(ctx, active, receipt); err != nil {
+		t.Fatalf("idempotent output: %v", err)
+	}
+	conflictReceipt := receipt
+	conflictReceipt.WorkspaceHead = "other-head"
+	if err := store.RecordOutputReceipt(ctx, active, conflictReceipt); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
+		t.Fatalf("duplicate output conflict = %v, want idempotency_conflict", err)
+	}
+	gotReceipt, ok, err := store.GetOutputReceipt(ctx, invocation.ID, start.ID)
+	if err != nil || !ok {
+		t.Fatalf("get output receipt = %#v %v %v, want receipt", gotReceipt, ok, err)
+	}
+	if !outputReceiptsEqual(gotReceipt, receipt) {
+		t.Fatalf("output receipt = %#v, want %#v", gotReceipt, receipt)
+	}
+	gotReceipt, ok, err = store.GetOutputReceipt(ctx, invocation.ID, "")
+	if err != nil || !ok || gotReceipt.CommandID != start.ID {
+		t.Fatalf("get output receipt by invocation = %#v %v %v, want receipt", gotReceipt, ok, err)
+	}
+	if _, ok, err := store.RecoverActiveInvocation(ctx, stop, binding); err != nil || ok {
+		t.Fatalf("recover after output receipt ok=%v err=%v, want no active", ok, err)
+	}
+	if err := store.RecordStopEvidence(ctx, recovered, stop, result); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("record stop after output receipt = %v, want stale_command", err)
+	}
+
+	stopStart := validCommand("cmd-pg-stop-start", coordination.CommandStart, "binding-stop-1", "lease-stop-1", 1)
+	stopBinding := binding
+	stopBinding.BindingRef = "binding-stop-1"
+	stopBinding.LeaseRef = "lease-stop-1"
+	stopInvocation := postgresRecoveryInvocation(stopStart, stopBinding)
+	if err := invocations.Create(ctx, stopInvocation); err != nil {
+		t.Fatalf("create stop invocation: %v", err)
+	}
+	if err := invocations.Transition(ctx, stopInvocation.ID, baseruntime.InvocationPrepared, baseruntime.InvocationRunning); err != nil {
+		t.Fatalf("mark stop invocation running: %v", err)
+	}
+	stopActive := ActiveInvocation{Invocation: stopInvocation, Command: stopStart, Binding: stopBinding, Inputs: stopBinding.Inputs}
+	if err := store.RecordActiveInvocation(ctx, stopActive); err != nil {
+		t.Fatalf("record stop active: %v", err)
+	}
+	stop = validCommand("cmd-pg-stop", coordination.CommandStop, "binding-stop-1", "lease-stop-1", 1)
+	recovered, ok, err = store.RecoverActiveInvocation(ctx, stop, stopBinding)
+	if err != nil || !ok {
+		t.Fatalf("recover stop active = %#v %v %v, want active", recovered, ok, err)
+	}
 	if err := store.RecordStopEvidence(ctx, recovered, stop, result); err != nil {
 		t.Fatalf("record stop: %v", err)
 	}
@@ -53,7 +118,7 @@ func TestPostgresRecoveryStoreRecoversActiveStopEvidenceClearAndResume(t *testin
 	if err := store.RecordStopEvidence(ctx, recovered, stop, conflict); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("duplicate stop conflict = %v, want idempotency_conflict", err)
 	}
-	got, ok, err := store.GetStopEvidence(ctx, invocation.ID, stop.ID)
+	got, ok, err := store.GetStopEvidence(ctx, stopInvocation.ID, stop.ID)
 	if err != nil || !ok {
 		t.Fatalf("get stop evidence = %#v %v %v, want result", got, ok, err)
 	}
@@ -76,7 +141,10 @@ func TestPostgresRecoveryStoreRecoversActiveStopEvidenceClearAndResume(t *testin
 	if err := store.ClearActiveInvocation(ctx, invocation.ID); err != nil {
 		t.Fatalf("clear active: %v", err)
 	}
-	if _, ok, err := store.RecoverActiveInvocation(ctx, stop, binding); err != nil || ok {
+	if err := store.ClearActiveInvocation(ctx, stopInvocation.ID); err != nil {
+		t.Fatalf("clear stop active: %v", err)
+	}
+	if _, ok, err := store.RecoverActiveInvocation(ctx, stop, stopBinding); err != nil || ok {
 		t.Fatalf("recover after clear ok=%v err=%v, want no active", ok, err)
 	}
 }
@@ -140,9 +208,11 @@ type fakeRecoveryDB struct {
 }
 
 type fakeRecoveryRecord struct {
-	active        bool
-	stopCommandID string
-	stopResult    []byte
+	active          bool
+	outputCommandID string
+	outputReceipt   []byte
+	stopCommandID   string
+	stopResult      []byte
 }
 
 func newFakeRecoveryDB() *fakeRecoveryDB {
@@ -154,7 +224,7 @@ func (db *fakeRecoveryDB) ExecContext(_ context.Context, query string, args ...a
 	case strings.Contains(query, "INSERT INTO phase_recovery_obligations"):
 		runCommandID := args[0].(string)
 		row := db.rows[runCommandID]
-		if row.stopCommandID == "" {
+		if row.stopCommandID == "" && row.outputCommandID == "" {
 			row.active = true
 		}
 		db.rows[runCommandID] = row
@@ -162,11 +232,21 @@ func (db *fakeRecoveryDB) ExecContext(_ context.Context, query string, args ...a
 	case strings.Contains(query, "SET stop_command_id"):
 		runCommandID := args[0].(string)
 		row, ok := db.rows[runCommandID]
-		if !ok || !row.active || row.stopCommandID != "" || row.stopResult != nil {
+		if !ok || !row.active || row.stopCommandID != "" || row.stopResult != nil || row.outputCommandID != "" || row.outputReceipt != nil {
 			return fakePhaseResult(0), nil
 		}
 		row.stopCommandID = args[1].(string)
 		row.stopResult = []byte(args[2].(string))
+		db.rows[runCommandID] = row
+		return fakePhaseResult(1), nil
+	case strings.Contains(query, "SET output_command_id"):
+		runCommandID := args[0].(string)
+		row, ok := db.rows[runCommandID]
+		if !ok || !row.active || row.outputCommandID != "" || row.outputReceipt != nil || row.stopCommandID != "" || row.stopResult != nil {
+			return fakePhaseResult(0), nil
+		}
+		row.outputCommandID = args[1].(string)
+		row.outputReceipt = []byte(args[2].(string))
 		db.rows[runCommandID] = row
 		return fakePhaseResult(1), nil
 	case strings.Contains(query, "SET active = FALSE"):
@@ -185,7 +265,7 @@ func (db *fakeRecoveryDB) QueryContext(_ context.Context, query string, _ ...any
 	switch {
 	case strings.Contains(query, "WHERE active = TRUE"):
 		for runCommandID, row := range db.rows {
-			if row.active {
+			if row.active && row.outputCommandID == "" && row.outputReceipt == nil {
 				rows = append(rows, []any{runCommandID})
 			}
 		}
@@ -214,6 +294,21 @@ func (db *fakeRecoveryDB) QueryRowContext(_ context.Context, query string, args 
 			return fakePhaseRow{err: sql.ErrNoRows}
 		}
 		return fakePhaseRow{values: []any{row.stopCommandID, row.stopResult}}
+	}
+	if strings.Contains(query, "COALESCE(output_command_id") {
+		if row.outputCommandID == "" || row.outputReceipt == nil {
+			return fakePhaseRow{err: sql.ErrNoRows}
+		}
+		return fakePhaseRow{values: []any{row.outputCommandID, row.outputReceipt}}
+	}
+	if strings.Contains(query, "SELECT output_receipt") {
+		if row.outputReceipt == nil {
+			return fakePhaseRow{err: sql.ErrNoRows}
+		}
+		if len(args) > 1 && row.outputCommandID != args[1].(string) {
+			return fakePhaseRow{err: sql.ErrNoRows}
+		}
+		return fakePhaseRow{values: []any{row.outputReceipt}}
 	}
 	if strings.Contains(query, "WHERE run_command_id = $1 AND stop_command_id = $2") {
 		commandID := args[1].(string)

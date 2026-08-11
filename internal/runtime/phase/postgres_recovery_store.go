@@ -38,7 +38,8 @@ INSERT INTO phase_recovery_obligations (run_command_id, active)
 VALUES ($1, TRUE)
 ON CONFLICT (run_command_id) DO UPDATE
 SET active = CASE
-    WHEN phase_recovery_obligations.stop_command_id IS NULL THEN TRUE
+    WHEN phase_recovery_obligations.stop_command_id IS NULL
+      AND phase_recovery_obligations.output_command_id IS NULL THEN TRUE
     ELSE phase_recovery_obligations.active
   END`,
 		active.Command.ID,
@@ -67,6 +68,8 @@ func (s *PostgresRecoveryStore) RecoverActiveInvocation(ctx context.Context, com
 SELECT run_command_id
 FROM phase_recovery_obligations
 WHERE active = TRUE
+  AND output_command_id IS NULL
+  AND output_receipt IS NULL
 ORDER BY run_command_id`)
 	if err != nil {
 		return ActiveInvocation{}, false, err
@@ -122,13 +125,20 @@ func (s *PostgresRecoveryStore) RecordStopEvidence(ctx context.Context, active A
 		}
 		return kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "stop evidence already exists with different payload", Recoverable: false}
 	}
+	if _, found, err := s.outputReceiptForRun(ctx, runCommandID); err != nil {
+		return err
+	} else if found {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "output receipt already won terminal recovery", Recoverable: true}
+	}
 	sqlResult, err := s.db.ExecContext(ctx, `
 UPDATE phase_recovery_obligations
 SET stop_command_id = $2, stop_result = $3::jsonb
 WHERE run_command_id = $1
   AND active = TRUE
   AND stop_command_id IS NULL
-  AND stop_result IS NULL`,
+  AND stop_result IS NULL
+  AND output_command_id IS NULL
+  AND output_receipt IS NULL`,
 		runCommandID,
 		command.ID,
 		string(payload),
@@ -146,7 +156,111 @@ WHERE run_command_id = $1
 	if found && existing.CommandID == command.ID && sameStopResultPayload(existing.Payload, result) {
 		return nil
 	}
+	if _, found, err := s.outputReceiptForRun(ctx, runCommandID); err != nil {
+		return err
+	} else if found {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "output receipt already won terminal recovery", Recoverable: true}
+	}
 	return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "stop evidence was not recorded", Recoverable: true}
+}
+
+func (s *PostgresRecoveryStore) RecordOutputReceipt(ctx context.Context, active ActiveInvocation, receipt OutputReceipt) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if receipt.InvocationID != active.Invocation.ID || receipt.Endpoint != active.Command.Endpoint || receipt.Generation != active.Command.Generation || receipt.BindingRef != active.Command.BindingRef || receipt.LeaseRef != active.Command.LeaseRef {
+		return kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "output receipt does not match active invocation", Recoverable: false}
+	}
+	runCommandID, ok, err := s.runCommandIDForInvocation(ctx, active.Invocation.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "active recovery obligation not found", Recoverable: true}
+	}
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "output receipt cannot be encoded", Recoverable: false}
+	}
+	existing, found, err := s.outputReceiptForRun(ctx, runCommandID)
+	if err != nil {
+		return err
+	}
+	if found {
+		if existing.CommandID == active.Command.ID && sameOutputReceiptPayload(existing.Payload, receipt) {
+			return nil
+		}
+		return kernel.Error{Code: kernel.CodeIdempotencyConflict, Message: "output receipt already exists with different payload", Recoverable: false}
+	}
+	if _, found, err := s.stopEvidenceForRun(ctx, runCommandID); err != nil {
+		return err
+	} else if found {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "stop evidence already won terminal recovery", Recoverable: true}
+	}
+	sqlResult, err := s.db.ExecContext(ctx, `
+UPDATE phase_recovery_obligations
+SET output_command_id = $2, output_receipt = $3::jsonb
+WHERE run_command_id = $1
+  AND active = TRUE
+  AND output_command_id IS NULL
+  AND output_receipt IS NULL
+  AND stop_command_id IS NULL
+  AND stop_result IS NULL`,
+		runCommandID,
+		active.Command.ID,
+		string(payload),
+	)
+	if err != nil {
+		return err
+	}
+	if affected, err := sqlResult.RowsAffected(); err == nil && affected == 1 {
+		return nil
+	}
+	existing, found, err = s.outputReceiptForRun(ctx, runCommandID)
+	if err != nil {
+		return err
+	}
+	if found && existing.CommandID == active.Command.ID && sameOutputReceiptPayload(existing.Payload, receipt) {
+		return nil
+	}
+	if _, found, err := s.stopEvidenceForRun(ctx, runCommandID); err != nil {
+		return err
+	} else if found {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "stop evidence already won terminal recovery", Recoverable: true}
+	}
+	return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "output receipt was not recorded", Recoverable: true}
+}
+
+func (s *PostgresRecoveryStore) GetOutputReceipt(ctx context.Context, invocationID kernel.InvocationID, commandID string) (OutputReceipt, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return OutputReceipt{}, false, err
+	}
+	runCommandID, ok, err := s.runCommandIDForInvocation(ctx, invocationID)
+	if err != nil || !ok {
+		return OutputReceipt{}, ok, err
+	}
+	var payload []byte
+	query := `
+SELECT output_receipt
+FROM phase_recovery_obligations
+WHERE run_command_id = $1 AND output_receipt IS NOT NULL`
+	args := []any{runCommandID}
+	if commandID != "" {
+		query += ` AND output_command_id = $2`
+		args = append(args, commandID)
+	}
+	err = s.db.QueryRowContext(ctx, query, args...).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return OutputReceipt{}, false, nil
+	}
+	if err != nil {
+		return OutputReceipt{}, false, err
+	}
+	var receipt OutputReceipt
+	if err := json.Unmarshal(payload, &receipt); err != nil {
+		return OutputReceipt{}, false, err
+	}
+	return receipt, true, nil
 }
 
 func (s *PostgresRecoveryStore) GetStopEvidence(ctx context.Context, invocationID kernel.InvocationID, commandID string) (StopResult, bool, error) {
@@ -270,6 +384,28 @@ type persistedStopEvidence struct {
 	Payload   []byte
 }
 
+type persistedOutputReceipt struct {
+	CommandID string
+	Payload   []byte
+}
+
+func (s *PostgresRecoveryStore) outputReceiptForRun(ctx context.Context, runCommandID string) (persistedOutputReceipt, bool, error) {
+	var receipt persistedOutputReceipt
+	err := s.db.QueryRowContext(ctx, `
+SELECT COALESCE(output_command_id, ''), COALESCE(output_receipt, '{}'::jsonb)
+FROM phase_recovery_obligations
+WHERE run_command_id = $1 AND output_command_id IS NOT NULL AND output_receipt IS NOT NULL`,
+		runCommandID,
+	).Scan(&receipt.CommandID, &receipt.Payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return persistedOutputReceipt{}, false, nil
+	}
+	if err != nil {
+		return persistedOutputReceipt{}, false, err
+	}
+	return receipt, true, nil
+}
+
 func (s *PostgresRecoveryStore) stopEvidenceForRun(ctx context.Context, runCommandID string) (persistedStopEvidence, bool, error) {
 	var evidence persistedStopEvidence
 	err := s.db.QueryRowContext(ctx, `
@@ -314,6 +450,45 @@ ORDER BY run_command_id`)
 func sameStopResultPayload(payload []byte, expected StopResult) bool {
 	var actual StopResult
 	return json.Unmarshal(payload, &actual) == nil && actual == expected
+}
+
+func sameOutputReceiptPayload(payload []byte, expected OutputReceipt) bool {
+	var actual OutputReceipt
+	return json.Unmarshal(payload, &actual) == nil && outputReceiptsEqual(actual, expected)
+}
+
+func outputReceiptsEqual(left, right OutputReceipt) bool {
+	if left.InvocationID != right.InvocationID ||
+		left.CommandID != right.CommandID ||
+		left.CommandAction != right.CommandAction ||
+		left.CauseRef != right.CauseRef ||
+		left.Endpoint != right.Endpoint ||
+		left.Generation != right.Generation ||
+		left.BindingRef != right.BindingRef ||
+		left.LeaseRef != right.LeaseRef ||
+		left.InputRevision != right.InputRevision ||
+		left.WorkspaceRef != right.WorkspaceRef ||
+		left.WorkspaceHead != right.WorkspaceHead ||
+		left.OutputFingerprint != right.OutputFingerprint ||
+		!left.SubmittedAtUTC.Equal(right.SubmittedAtUTC) ||
+		left.Output.Phase != right.Output.Phase ||
+		left.Output.ReportRef != right.Output.ReportRef {
+		return false
+	}
+	return stringSlicesEqual(left.Output.DeliveryRefs, right.Output.DeliveryRefs) &&
+		stringSlicesEqual(left.Output.EvidenceRefs, right.Output.EvidenceRefs)
+}
+
+func stringSlicesEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 var _ RecoveryStore = (*PostgresRecoveryStore)(nil)

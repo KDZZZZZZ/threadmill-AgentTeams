@@ -399,7 +399,7 @@ func (s *PostgresStore) rejectCommand(ctx context.Context, projectID kernel.Proj
 	if isRunCommand(command) && record.ObservedEventRef == "" {
 		_, _ = tx.ExecContext(ctx, `UPDATE coordination_phase_leases SET state = 'released', released_at = now() WHERE project_id = $1 AND lease_ref = $2 AND state = 'active'`, projectID, command.LeaseRef)
 	}
-	_ = insertObservation(ctx, tx, projectID, phaseObservation{
+	_, _ = insertObservation(ctx, tx, projectID, phaseObservation{
 		ID:             eventID,
 		Kind:           "DispatchRejected",
 		CommandID:      command.ID,
@@ -421,7 +421,7 @@ func (s *PostgresStore) recordEndpointDispatchRejection(ctx context.Context, pro
 		return
 	}
 	defer tx.Rollback()
-	_ = insertObservation(ctx, tx, projectID, phaseObservation{
+	_, _ = insertObservation(ctx, tx, projectID, phaseObservation{
 		ID:             eventID,
 		Kind:           "DispatchRejected",
 		Endpoint:       endpoint,
@@ -457,20 +457,21 @@ func (s *PostgresStore) appendObservation(ctx context.Context, projectID kernel.
 			return err
 		}
 	}
+	inserted, err := insertObservation(ctx, tx, projectID, observation)
+	if err != nil {
+		return err
+	}
+	if inserted {
+		return tx.Commit()
+	}
 	existing, ok, err := loadObservation(ctx, tx, projectID, observation.ID)
 	if err != nil {
 		return err
 	}
-	if ok {
-		if existing == observation {
-			return tx.Commit()
-		}
-		return kernel.IdempotencyConflict()
+	if ok && samePhaseObservationPayload(existing, observation) {
+		return tx.Commit()
 	}
-	if err := insertObservation(ctx, tx, projectID, observation); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return kernel.IdempotencyConflict()
 }
 
 func (s *PostgresStore) expireLease(ctx context.Context, projectID kernel.ProjectID, leaseRef kernel.LeaseID) error {
@@ -828,10 +829,14 @@ func insertCommand(ctx context.Context, q postgresDBTX, projectID kernel.Project
 	return mapPostgresError(err)
 }
 
-func insertObservation(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, observation phaseObservation) error {
-	_, err := q.ExecContext(ctx, `INSERT INTO coordination_runtime_observations(project_id, event_id, command_id, lease_ref, task_id, endpoint_id, generation, binding_ref, kind, checkpoint_ref, non_resumable, folded)
-VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12)`, projectID, observation.ID, observation.CommandID, observation.LeaseRef, observation.Endpoint.TaskID, observation.Endpoint.EndpointID, observation.Generation, observation.BindingRef, observation.Kind, observation.CheckpointRef, observation.NonResumable, observation.Folded)
-	return mapPostgresError(err)
+func insertObservation(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, observation phaseObservation) (bool, error) {
+	result, err := q.ExecContext(ctx, `INSERT INTO coordination_runtime_observations(project_id, event_id, command_id, lease_ref, task_id, endpoint_id, generation, binding_ref, kind, checkpoint_ref, non_resumable, folded)
+VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12)
+ON CONFLICT (project_id, event_id) DO NOTHING`, projectID, observation.ID, observation.CommandID, observation.LeaseRef, observation.Endpoint.TaskID, observation.Endpoint.EndpointID, observation.Generation, observation.BindingRef, observation.Kind, observation.CheckpointRef, observation.NonResumable, observation.Folded)
+	if err != nil {
+		return false, mapPostgresError(err)
+	}
+	return affected(result) == 1, nil
 }
 
 func loadObservation(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, eventID string) (phaseObservation, bool, error) {
@@ -840,7 +845,7 @@ func loadObservation(ctx context.Context, q postgresDBTX, projectID kernel.Proje
 	err := q.QueryRowContext(ctx, `SELECT event_id, command_id, lease_ref, task_id, endpoint_id, generation, binding_ref, kind, checkpoint_ref, non_resumable, folded
 FROM coordination_runtime_observations
 WHERE project_id = $1 AND event_id = $2
-FOR UPDATE`, projectID, eventID).Scan(&observation.ID, &commandID, &leaseRef, &observation.Endpoint.TaskID, &observation.Endpoint.EndpointID, &observation.Generation, &observation.BindingRef, &observation.Kind, &checkpointRef, &observation.NonResumable, &observation.Folded)
+`, projectID, eventID).Scan(&observation.ID, &commandID, &leaseRef, &observation.Endpoint.TaskID, &observation.Endpoint.EndpointID, &observation.Generation, &observation.BindingRef, &observation.Kind, &checkpointRef, &observation.NonResumable, &observation.Folded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return phaseObservation{}, false, nil
 	}
