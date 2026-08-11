@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { MotionConfig } from "motion/react";
 import {
   MessageSquareText,
@@ -28,6 +35,7 @@ export function App() {
   );
   const [state, dispatch] = useReducer(consoleReducer, initialConsoleState);
   const [loadError, setLoadError] = useState<string>();
+  const requirementInputRef = useRef<HTMLTextAreaElement>(null);
 
   const refreshSnapshot = useCallback(async () => {
     if (!projectID) return;
@@ -140,6 +148,7 @@ export function App() {
             graphRevision={state.snapshot.revision}
             hasTasks={state.snapshot.tasks.length > 0}
             onAccepted={refreshSnapshot}
+            inputRef={requirementInputRef}
           />
         ) : null}
 
@@ -181,6 +190,9 @@ export function App() {
                 snapshot={state.snapshot}
                 selectedEndpoint={state.selectedEndpoint}
                 onSelectEndpoint={selectEndpoint}
+                onRequestRequirement={() =>
+                  requirementInputRef.current?.focus()
+                }
               />
             ) : (
               <div className="loading-state" role="status">

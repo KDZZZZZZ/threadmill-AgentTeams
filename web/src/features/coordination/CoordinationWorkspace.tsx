@@ -20,6 +20,7 @@ interface Props {
   snapshot: CoordinationSnapshot;
   selectedEndpoint?: EndpointRef;
   onSelectEndpoint: (endpoint: EndpointRef, generation: number) => void;
+  onRequestRequirement: () => void;
 }
 
 const phaseOrder = { plan: 0, execute: 1, verify: 2 } as const;
@@ -40,6 +41,7 @@ export function CoordinationWorkspace({
   snapshot,
   selectedEndpoint,
   onSelectEndpoint,
+  onRequestRequirement,
 }: Props) {
   const [view, setView] = useState<"graph" | "list">(() =>
     window.matchMedia?.("(max-width: 759px)").matches ? "list" : "graph",
@@ -159,9 +161,7 @@ export function CoordinationWorkspace({
             <button
               className="primary-button"
               type="button"
-              onClick={() =>
-                document.getElementById("requirement-body")?.focus()
-              }
+              onClick={onRequestRequirement}
             >
               提交首个需求
             </button>

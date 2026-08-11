@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, type RefObject, useState } from "react";
 import { motion } from "motion/react";
 import { CircleCheck, ListChecks, Send, Workflow } from "lucide-react";
 import { submitRequirement } from "../../api/client";
@@ -10,6 +10,7 @@ interface Props {
   graphRevision: number;
   hasTasks: boolean;
   onAccepted: () => Promise<void>;
+  inputRef?: RefObject<HTMLTextAreaElement | null>;
 }
 
 function lines(value: string): string[] | undefined {
@@ -26,6 +27,7 @@ export function RequirementComposer({
   graphRevision,
   hasTasks,
   onAccepted,
+  inputRef,
 }: Props) {
   const [body, setBody] = useState("");
   const [motivation, setMotivation] = useState("");
@@ -92,6 +94,7 @@ export function RequirementComposer({
         <div className="requirement-primary-field">
           <label htmlFor="requirement-body">任务目标</label>
           <textarea
+            ref={inputRef}
             id="requirement-body"
             value={body}
             onChange={(event) => setBody(event.target.value)}

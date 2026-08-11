@@ -73,4 +73,22 @@ describe("consoleReducer", () => {
 
     expect(result).toBe(loaded);
   });
+
+  it("does not replace an equal graph revision with an older event cursor", () => {
+    const loaded = consoleReducer(initialConsoleState, {
+      type: "snapshot.loaded",
+      snapshot: { ...snapshot, cursor: "12" },
+    });
+
+    const result = consoleReducer(loaded, {
+      type: "snapshot.loaded",
+      snapshot: {
+        ...snapshot,
+        cursor: "9",
+        capacity: { ...snapshot.capacity, revision: 1 },
+      },
+    });
+
+    expect(result).toBe(loaded);
+  });
 });

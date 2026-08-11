@@ -35,18 +35,34 @@ export const initialConsoleState: ConsoleState = {
 
 const maximumRememberedEvents = 256;
 
+function cursorValue(cursor: string): bigint | undefined {
+  return /^\d+$/.test(cursor) ? BigInt(cursor) : undefined;
+}
+
 export function consoleReducer(
   state: ConsoleState,
   action: ConsoleAction,
 ): ConsoleState {
   switch (action.type) {
     case "snapshot.loaded":
-      if (
-        state.snapshot &&
-        (action.snapshot.project_id !== state.snapshot.project_id ||
-          action.snapshot.revision < state.snapshot.revision)
-      ) {
-        return state;
+      if (state.snapshot) {
+        const incomingCursor = cursorValue(action.snapshot.cursor);
+        const currentCursor = cursorValue(state.snapshot.cursor);
+        const olderCursor =
+          incomingCursor !== undefined &&
+          currentCursor !== undefined &&
+          incomingCursor < currentCursor;
+        const sameCursorWithOlderCapacity =
+          action.snapshot.cursor === state.snapshot.cursor &&
+          action.snapshot.capacity.revision < state.snapshot.capacity.revision;
+        if (
+          action.snapshot.project_id !== state.snapshot.project_id ||
+          action.snapshot.revision < state.snapshot.revision ||
+          (action.snapshot.revision === state.snapshot.revision &&
+            (olderCursor || sameCursorWithOlderCapacity))
+        ) {
+          return state;
+        }
       }
       return {
         ...state,
