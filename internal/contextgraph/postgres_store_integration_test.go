@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -389,6 +390,82 @@ func TestPostgresEnsureInitialSliceIsAtomicAcrossStores(t *testing.T) {
 	}
 }
 
+func TestMigration7003MergesHistoricalDuplicateInitialSubscriptions(t *testing.T) {
+	ctx := context.Background()
+	db := openContextGraphTestDB(t, ctx)
+	defer db.Close()
+	loaded, err := postgres.LoadMigrations(os.DirFS("../../"), "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrator := postgres.NewMigrator(db)
+	if err := migrator.Rollback(ctx, loaded, "7003"); err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		id        string
+		subgraphs string
+		events    string
+		createdAt string
+	}{
+		{id: "hist-keep", subgraphs: `["sg-a","sg-b"]`, events: `["evt-a"]`, createdAt: "2026-08-11T10:00:00Z"},
+		{id: "hist-dup-a", subgraphs: `["sg-b","sg-c"]`, events: `["evt-b"]`, createdAt: "2026-08-11T10:01:00Z"},
+		{id: "hist-dup-b", subgraphs: `["sg-a"]`, events: `["evt-a","evt-b"]`, createdAt: "2026-08-11T10:02:00Z"},
+	}
+	for _, row := range rows {
+		if _, err := db.ExecContext(ctx, `INSERT INTO context_subscriptions(id, project_id, consumer_invocation_id, subgraph_ids, event_kinds, permission_snapshot, source, active, created_at, task_id, role) VALUES ($1, 'project-hist', 'inv-hist', $2::jsonb, $3::jsonb, 'project-hist:task-hist:executor', 'initial_slice', true, $4::timestamptz, 'task-hist', 'executor')`, row.id, row.subgraphs, row.events, row.createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := migrator.Apply(ctx, loaded); err != nil {
+		t.Fatal(err)
+	}
+	records, err := historicalInitialSubscriptionRows(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("records = %#v", records)
+	}
+	if records[0].id != "hist-keep" || !records[0].active || records[0].expired {
+		t.Fatalf("keeper state = %#v", records[0])
+	}
+	if !reflect.DeepEqual(records[0].subgraphs, []string{"sg-a", "sg-b", "sg-c"}) {
+		t.Fatalf("merged subgraphs = %#v", records[0].subgraphs)
+	}
+	if !reflect.DeepEqual(records[0].events, []string{"evt-a", "evt-b"}) {
+		t.Fatalf("merged events = %#v", records[0].events)
+	}
+	for _, record := range records[1:] {
+		if record.active || !record.expired {
+			t.Fatalf("duplicate was not expired: %#v", record)
+		}
+	}
+	var indexName sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('context_subscriptions_active_initial_once_idx')::text`).Scan(&indexName); err != nil {
+		t.Fatal(err)
+	}
+	if !indexName.Valid || indexName.String != "context_subscriptions_active_initial_once_idx" {
+		t.Fatalf("index = %#v", indexName)
+	}
+	if err := migrator.Rollback(ctx, loaded, "7003"); err != nil {
+		t.Fatal(err)
+	}
+	recordsAfterDown, err := historicalInitialSubscriptionRows(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recordsAfterDown, records) {
+		t.Fatalf("down should only drop index, before=%#v after=%#v", records, recordsAfterDown)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT to_regclass('context_subscriptions_active_initial_once_idx')::text`).Scan(&indexName); err != nil {
+		t.Fatal(err)
+	}
+	if indexName.Valid {
+		t.Fatalf("index still exists after down: %#v", indexName)
+	}
+}
+
 func TestPostgresStoreSearchHonorsAnchorRefs(t *testing.T) {
 	ctx := context.Background()
 	db := openContextGraphTestDB(t, ctx)
@@ -548,6 +625,38 @@ func runContextGraphRace(t *testing.T, fn func(int) error) {
 			t.Fatal(err)
 		}
 	}
+}
+
+type historicalInitialSubscriptionRow struct {
+	id        string
+	subgraphs []string
+	events    []string
+	active    bool
+	expired   bool
+}
+
+func historicalInitialSubscriptionRows(ctx context.Context, db *sql.DB) ([]historicalInitialSubscriptionRow, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id, subgraph_ids::text, event_kinds::text, active, expired_at IS NOT NULL FROM context_subscriptions WHERE project_id = 'project-hist' AND consumer_invocation_id = 'inv-hist' ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []historicalInitialSubscriptionRow
+	for rows.Next() {
+		var row historicalInitialSubscriptionRow
+		var rawSubgraphs, rawEvents string
+		if err := rows.Scan(&row.id, &rawSubgraphs, &rawEvents, &row.active, &row.expired); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(rawSubgraphs), &row.subgraphs); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(rawEvents), &row.events); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func openContextGraphTestDB(t *testing.T, ctx context.Context) *sql.DB {
