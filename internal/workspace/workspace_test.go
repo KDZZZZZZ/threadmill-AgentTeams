@@ -140,6 +140,25 @@ func TestGitWorktreeBindingPhaseReuseLeasesGuardWritesAndSeal(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeSupportsNonBareRepository(t *testing.T) {
+	t.Parallel()
+
+	repo := seedWorkingRepo(t)
+	service := NewService()
+	binding, err := service.CreateGitWorktree(context.Background(), CreateRequest{
+		TaskID:         "task-non-bare",
+		Generation:     1,
+		RepoPath:       repo,
+		WorktreeParent: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("create worktree from non-bare repository: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(binding.Root, "README.md")); err != nil {
+		t.Fatalf("non-bare worktree missing README: %v", err)
+	}
+}
+
 func TestCreateGitWorktreeFailsClosedAndRollsBack(t *testing.T) {
 	t.Parallel()
 
@@ -255,6 +274,14 @@ func assertDenied(t *testing.T, binding Binding, phase Phase, rel string) {
 
 func seedBareRepo(t *testing.T) string {
 	t.Helper()
+	work := seedWorkingRepo(t)
+	bare := filepath.Join(t.TempDir(), "repo.git")
+	git(t, work, "clone", "--bare", work, bare)
+	return bare
+}
+
+func seedWorkingRepo(t *testing.T) string {
+	t.Helper()
 	work := filepath.Join(t.TempDir(), "seed")
 	if err := os.MkdirAll(work, 0o755); err != nil {
 		t.Fatalf("mkdir seed: %v", err)
@@ -263,9 +290,7 @@ func seedBareRepo(t *testing.T) string {
 	writeFile(t, filepath.Join(work, "README.md"), "seed\n")
 	git(t, work, "add", "README.md")
 	git(t, work, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed")
-	bare := filepath.Join(t.TempDir(), "repo.git")
-	git(t, work, "clone", "--bare", work, bare)
-	return bare
+	return work
 }
 
 func writeFile(t *testing.T, path, body string) {

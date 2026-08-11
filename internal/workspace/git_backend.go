@@ -201,7 +201,15 @@ func validateExistingWorktree(ctx context.Context, repositoryAbs string, binding
 	if err != nil {
 		return "", err
 	}
-	if !samePath(repositoryAbs, commonAbs) {
+	repositoryCommonDir, err := gitOutput(ctx, repositoryAbs, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	repositoryCommonAbs, err := filepath.Abs(repositoryCommonDir)
+	if err != nil {
+		return "", err
+	}
+	if !samePath(repositoryCommonAbs, commonAbs) {
 		return "", fmt.Errorf("workspace belongs to a different git repository")
 	}
 	return gitOutput(ctx, binding.Root, "rev-parse", "HEAD")
