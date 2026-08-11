@@ -225,6 +225,16 @@ func (p *productionIngress) persistAndDispatch(ctx context.Context, input produc
 	return stored, nil
 }
 
+func (p *productionIngress) DispatchTaskManagerFollowup(ctx context.Context, input productionInput) (persistedProductionInput, error) {
+	if input.Kind != "phase_orchestration" || (input.TargetKind != "phase_evaluation" && input.TargetKind != "stop_release") {
+		return persistedProductionInput{}, kernel.InvalidArgument("Task Manager follow-up must be phase_evaluation or stop_release")
+	}
+	if input.RequestID == "" || input.ConversationID == "" || input.SeenRevision <= 0 || input.SelectedEndpoint == nil || input.TargetRef == "" || len(input.Payload) == 0 {
+		return persistedProductionInput{}, kernel.InvalidArgument("Task Manager follow-up identity and payload are required")
+	}
+	return p.persistAndDispatch(ctx, input)
+}
+
 func (p *productionIngress) prepare(input productionInput) (agentteams.PreparedInvocation, runtimepkg.Invocation, string, error) {
 	payloadHash := hashProductionBytes(input.Payload)
 	suffix := stableProductionSuffix(p.projectID, input.Kind, input.RequestID)
@@ -239,7 +249,8 @@ func (p *productionIngress) prepare(input productionInput) (agentteams.PreparedI
 		SelectedEndpoint *coordination.PhaseEndpointRef `json:"selected_endpoint,omitempty"`
 		TargetKind       string                         `json:"target_kind,omitempty"`
 		TargetRef        string                         `json:"target_ref,omitempty"`
-	}{inputRef, input.Kind, input.ConversationID, input.Body, input.SeenRevision, input.SelectedEndpoint, input.TargetKind, input.TargetRef})
+		Payload          json.RawMessage                `json:"payload"`
+	}{inputRef, input.Kind, input.ConversationID, input.Body, input.SeenRevision, input.SelectedEndpoint, input.TargetKind, input.TargetRef, json.RawMessage(input.Payload)})
 	if err != nil {
 		return agentteams.PreparedInvocation{}, runtimepkg.Invocation{}, "", err
 	}
@@ -395,3 +406,4 @@ var _ httpapi.RequirementCommandPort = (*productionIngress)(nil)
 var _ httpapi.HumanDecisionPort = (*productionIngress)(nil)
 var _ httpapi.ManagerPort = (*productionIngress)(nil)
 var _ agentteams.InvocationSource = (*productionIngress)(nil)
+var _ productionTaskManagerFollowupDispatcher = (*productionIngress)(nil)
