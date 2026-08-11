@@ -241,7 +241,9 @@ func (c *ProductionClient) DelegateTask(ctx context.Context, req DelegateTaskReq
 	if err != nil {
 		return TaskSnapshot{}, err
 	}
-	if result.Task.HostRef == c.providerHost(req.HostRef) {
+	providerHost := c.providerHost(req.HostRef)
+	providerMatrixID, _ := matrixUserIDForWorker(req.RoomID, providerHost)
+	if result.Task.HostRef == providerHost || result.Task.HostRef == providerMatrixID {
 		result.Task.HostRef = req.HostRef
 	}
 	return result.Task, nil

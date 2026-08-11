@@ -162,6 +162,13 @@ func (c *QwenPawDockerTaskflow) Call(ctx context.Context, container string, call
 	if !safeContainerName(container) {
 		return TaskflowCallResult{}, kernel.InvalidArgument("QwenPaw container name is invalid")
 	}
+	if call.Action == "delegate_task" {
+		assignedTo, err := matrixUserIDForWorker(call.RoomID, call.AssignedTo)
+		if err != nil {
+			return TaskflowCallResult{}, err
+		}
+		call.AssignedTo = assignedTo
+	}
 	arguments, err := taskflowArguments(call)
 	if err != nil {
 		return TaskflowCallResult{}, err
@@ -193,9 +200,9 @@ func (c *QwenPawDockerTaskflow) Call(ctx context.Context, container string, call
 }
 
 func (c *QwenPawDockerTaskflow) ensureTaskRoom(ctx context.Context, container string, call TaskflowCall, carrierID string) (string, error) {
-	invitee, err := matrixUserIDForWorker(call.RoomID, call.AssignedTo)
-	if err != nil {
-		return "", err
+	invitee := strings.TrimSpace(call.AssignedTo)
+	if !validMatrixUserID(invitee) {
+		return "", kernel.InvalidArgument("assigned worker Matrix user ID is invalid")
 	}
 	raw, err := c.executeMCP(ctx, container, "roomflow", map[string]any{
 		"action":       "create_task_room",
@@ -247,6 +254,14 @@ func validMatrixRoomID(roomID string) bool {
 	}
 	separator := strings.IndexByte(roomID, ':')
 	return separator > 1 && separator < len(roomID)-1
+}
+
+func validMatrixUserID(userID string) bool {
+	if len(userID) < 4 || len(userID) > 512 || userID[0] != '@' {
+		return false
+	}
+	separator := strings.IndexByte(userID, ':')
+	return separator > 1 && separator < len(userID)-1
 }
 
 func (c *QwenPawDockerTaskflow) executeMCP(
