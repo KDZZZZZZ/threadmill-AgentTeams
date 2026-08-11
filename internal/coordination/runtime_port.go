@@ -2,7 +2,55 @@ package coordination
 
 import (
 	"context"
+	"fmt"
+
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
+
+// RuntimeRunner is the process-internal wake-up seam used by the application
+// host. It deliberately exposes only reconciliation: graph reads and writes
+// remain on TaskManagerGraph, and no HTTP or MCP adapter receives this value.
+type RuntimeRunner interface {
+	Reconcile(context.Context) error
+}
+
+// RuntimeOptions wires the internal GraphRuntime without publishing its
+// implementation or its recovery stores as an external management API.
+type RuntimeOptions struct {
+	ProjectID       kernel.ProjectID
+	Store           Store
+	PhaseController PhaseController
+	Selection       RuntimeSelectionRuntime
+	Scheduling      RuntimeSchedulingStateProvider
+}
+
+// NewRuntime constructs the single process-internal GraphRuntime for a
+// project. Store must be the authoritative Coordination store; Runtime never
+// owns a second graph representation.
+func NewRuntime(options RuntimeOptions) (RuntimeRunner, error) {
+	if err := kernel.RequireID("project_id", options.ProjectID); err != nil {
+		return nil, err
+	}
+	store, ok := options.Store.(graphRuntimeStore)
+	if !ok || store == nil {
+		return nil, fmt.Errorf("coordination runtime requires an authoritative runtime-capable store")
+	}
+	if options.PhaseController == nil {
+		return nil, fmt.Errorf("coordination runtime requires a phase controller")
+	}
+	runtime := newGraphRuntime(options.ProjectID, store, options.PhaseController)
+	if options.Selection != nil {
+		runtime.selectionRuntime = options.Selection
+	}
+	if options.Scheduling != nil {
+		runtime.schedulingStateProvider = options.Scheduling
+	}
+	return runtime, nil
+}
+
+func (r *graphRuntime) Reconcile(ctx context.Context) error {
+	return r.reconcile(ctx)
+}
 
 type RuntimeSelectionRuntime interface {
 	SelectRunnable(ctx context.Context, request RuntimeSelectionRequest) ([]PhaseEndpoint, error)
