@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
@@ -19,6 +20,7 @@ type InvocationMCPMaterial struct {
 
 type InvocationMCPResolver interface {
 	ResolveInvocationMCP(context.Context, HostPreparation) (InvocationMCPMaterial, error)
+	RevokeInvocationMCP(context.Context, kernel.InvocationID) error
 }
 
 type QwenPawProvider interface {
@@ -43,9 +45,15 @@ type hostSlotStore interface {
 	Release(context.Context, string, string) error
 	MarkRevoked(context.Context, string, string) error
 	MarkHostFenced(context.Context, string) error
+	BeginHostFence(context.Context, string) ([]HostSlotClaim, error)
+	CompleteHostFence(context.Context, string, []HostSlotClaim) error
+	ClearHostFenceIfReusable(context.Context, string) (bool, error)
 	ByInvocation(context.Context, string, kernel.InvocationID) (HostSlotClaim, bool, error)
 	ByTaskID(context.Context, string) (HostSlotClaim, bool, error)
+	ActiveByHost(context.Context, string) ([]HostSlotClaim, error)
 }
+
+const productionCleanupTimeout = 5 * time.Second
 
 type ProductionClientOptions struct {
 	Controller   *AgentTeamsControllerClient
@@ -124,25 +132,48 @@ func (c *ProductionClient) PrepareHost(ctx context.Context, prep HostPreparation
 		ExpectedTools: material.ExpectedTools,
 	}
 	if err := validateInvocationMCP(desired); err != nil {
-		return err
+		cleanupCtx, cancel := boundedCleanupContext(ctx)
+		defer cancel()
+		return errors.Join(err, c.mcpResolver.RevokeInvocationMCP(cleanupCtx, prep.InvocationID))
 	}
 	tokenIdentifier := strings.TrimSpace(material.TokenIdentifier)
 	if tokenIdentifier == "" {
 		tokenIdentifier = key
 	}
 	if err := c.slots.Claim(ctx, prep.HostRef, prep.InvocationID, key, auth.HashOpaqueSecret(desired.BearerToken), tokenIdentifier); err != nil {
-		return err
+		if kernel.IsCode(err, kernel.CodeExecutorUnavailable) {
+			if clearErr := c.clearReusableFenceForClaim(ctx, prep.HostRef); clearErr != nil {
+				cleanupCtx, cancel := boundedCleanupContext(ctx)
+				defer cancel()
+				return errors.Join(err, clearErr, c.mcpResolver.RevokeInvocationMCP(cleanupCtx, prep.InvocationID))
+			}
+			if retryErr := c.slots.Claim(ctx, prep.HostRef, prep.InvocationID, key, auth.HashOpaqueSecret(desired.BearerToken), tokenIdentifier); retryErr == nil {
+				goto claimed
+			} else {
+				err = errors.Join(err, retryErr)
+			}
+		}
+		cleanupCtx, cancel := boundedCleanupContext(ctx)
+		defer cancel()
+		return errors.Join(err, c.mcpResolver.RevokeInvocationMCP(cleanupCtx, prep.InvocationID))
 	}
+claimed:
 	qwenPaw, err := c.qwenPaw.ForHost(ctx, prep.HostRef)
 	if err != nil {
-		return errors.Join(err, c.cleanupPreparationFailure(context.Background(), prep.HostRef, prep.InvocationID, nil))
+		cleanupCtx, cancel := boundedCleanupContext(ctx)
+		defer cancel()
+		return errors.Join(err, c.cleanupPreparationFailure(cleanupCtx, prep.HostRef, prep.InvocationID, nil))
 	}
 	if err := qwenPaw.InstallInvocationMCP(ctx, desired); err != nil {
-		return errors.Join(err, c.cleanupPreparationFailure(context.Background(), prep.HostRef, prep.InvocationID, qwenPaw))
+		cleanupCtx, cancel := boundedCleanupContext(ctx)
+		defer cancel()
+		return errors.Join(err, c.cleanupPreparationFailure(cleanupCtx, prep.HostRef, prep.InvocationID, qwenPaw))
 	}
 	if prep.Role != auth.RoleTaskManager && prep.Role != auth.RoleContext {
 		if err := c.controller.EnsureWorkerReady(ctx, prep.HostRef); err != nil {
-			return errors.Join(err, c.cleanupPreparationFailure(context.Background(), prep.HostRef, prep.InvocationID, qwenPaw))
+			cleanupCtx, cancel := boundedCleanupContext(ctx)
+			defer cancel()
+			return errors.Join(err, c.cleanupPreparationFailure(cleanupCtx, prep.HostRef, prep.InvocationID, qwenPaw))
 		}
 	}
 	return nil
@@ -182,6 +213,9 @@ func (c *ProductionClient) RevokeInvocation(ctx context.Context, hostRef string,
 	if !ok {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams invocation MCP slot not found"}
 	}
+	if err := c.mcpResolver.RevokeInvocationMCP(ctx, invocationID); err != nil {
+		return err
+	}
 	if !claim.RevokedAt.IsZero() {
 		return nil
 	}
@@ -196,6 +230,10 @@ func (c *ProductionClient) RevokeInvocation(ctx context.Context, hostRef string,
 }
 
 func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) error {
+	claims, err := c.slots.BeginHostFence(ctx, hostRef)
+	if err != nil {
+		return err
+	}
 	hosts, err := c.controller.ListHosts(ctx)
 	if err != nil {
 		return err
@@ -208,12 +246,19 @@ func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) er
 			if err := c.controller.StopManager(ctx, hostRef); err != nil {
 				return err
 			}
-			return c.slots.MarkHostFenced(ctx, hostRef)
-		}
-		if err := c.controller.StopWorker(ctx, hostRef); err != nil {
+		} else if err := c.controller.StopWorker(ctx, hostRef); err != nil {
 			return err
 		}
-		return c.slots.MarkHostFenced(ctx, hostRef)
+		cleanupCtx, cancel := boundedCleanupContext(ctx)
+		defer cancel()
+		var revokeErr error
+		for _, claim := range claims {
+			revokeErr = errors.Join(revokeErr, c.mcpResolver.RevokeInvocationMCP(cleanupCtx, claim.InvocationID))
+		}
+		if revokeErr != nil {
+			return revokeErr
+		}
+		return c.slots.CompleteHostFence(cleanupCtx, hostRef, claims)
 	}
 	return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams host not found"}
 }
@@ -272,7 +317,8 @@ func (c *ProductionClient) cleanupPreparationFailure(ctx context.Context, hostRe
 	if err != nil || !ok {
 		return err
 	}
-	if qwenPaw != nil {
+	tokenErr := c.mcpResolver.RevokeInvocationMCP(ctx, invocationID)
+	if qwenPaw != nil && tokenErr == nil {
 		if revokeErr := qwenPaw.RevokeInvocationMCP(ctx, claim.MCPClientKey); revokeErr == nil {
 			if err := c.slots.MarkRevoked(ctx, claim.TaskID, hostRef); err != nil {
 				return err
@@ -281,9 +327,36 @@ func (c *ProductionClient) cleanupPreparationFailure(ctx context.Context, hostRe
 		}
 	}
 	if err := c.ForceStopHost(ctx, hostRef); err != nil {
-		return err
+		return errors.Join(tokenErr, err)
 	}
 	return c.slots.Release(ctx, claim.TaskID, hostRef)
+}
+
+func (c *ProductionClient) clearReusableFenceForClaim(ctx context.Context, hostRef string) error {
+	hosts, err := c.controller.ListHosts(ctx)
+	if err != nil {
+		return err
+	}
+	for _, host := range hosts {
+		if host.Ref != hostRef {
+			continue
+		}
+		if !hostObservedReadyOrRunning(host) {
+			return nil
+		}
+		_, err := c.slots.ClearHostFenceIfReusable(ctx, hostRef)
+		return err
+	}
+	return nil
+}
+
+func hostObservedReadyOrRunning(host HostStatus) bool {
+	phase := strings.ToLower(strings.TrimSpace(host.Phase))
+	return phase == "ready" || phase == "running"
+}
+
+func boundedCleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), productionCleanupTimeout)
 }
 
 func validateHostPreparation(prep HostPreparation) error {
