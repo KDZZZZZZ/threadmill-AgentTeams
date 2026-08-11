@@ -1,302 +1,377 @@
 # Threadmill Phase Agent 与 AgentTeams 适配设计
 
-> 状态：设计稿  
-> 日期：2026-08-09  
-> 范围：以 Threadmill 的 `phase-agent.md`、`threadmill-unified-design.md`，以及 AgentTeams 的 TeamHarness、WorkerFlow、QwenPaw 代码为依据。本文不把未在 AgentTeams 代码中出现的能力视为已存在。
+> 状态：重写设计稿（不含实现）  
+> 基线：Threadmill `dev` @ `d807e5dd`；AgentTeams `main`（2026-08-11 读取）  
+> 语义优先级：`threadmill-unified-design.md`；Phase 生命周期与 Agent-facing interface 以 `phase-agent.md` 为准；Context DTO/reader 以 `context-graph.md` 为准。
 
-## 0. 结论与标记约定
+## 0. 结论、术语和标记
 
-推荐把 **Threadmill 作为控制面和领域模型的唯一 owner**，把 **AgentTeams 作为受控执行承载层**。适配器应位于 Threadmill Agent Runtime 的 provider/host adapter 层，而不是放入 Task Manager、Coordination Graph 或 Phase Agent 内。
+Threadmill 是**控制面、领域事实和安全边界**的唯一 owner；AgentTeams 是可替换的**执行承载**。Phase Agent Core、Runner 和 Task Manager 均不得 import 或理解 TeamHarness task ID、Matrix room、WorkerFlow run 或 QwenPaw session。
 
-首个 MVP 只采用 TeamHarness `taskflow` 承载一个 Phase Invocation；WorkerFlow 只作为一个 Phase 内部、短生命周期的可选并行实现，不能承担 Threadmill 的阶段调度、等待恢复或任务完成判定。
-
-本文使用四种明确标记：
+本文统一使用以下标记，未证实的能力绝不归入“已存在”。
 
 | 标记 | 含义 |
 | --- | --- |
-| **已存在** | 所列 AgentTeams 源码中已可见、可直接调用的能力。 |
-| **需要 Adapter** | 已有能力可使用，但字段、生命周期或权限语义必须由 Threadmill 进行转换和约束。 |
-| **需要新增** | AgentTeams 未提供，须由 Threadmill（或其集成插件）实现。 |
-| **暂不实现** | 不进入 MVP；也不能以“可能有”替代实现。 |
+| **已存在** | 已在本次读取的 AgentTeams main 源码或技能中确认。 |
+| **需要 Threadmill Adapter** | 可复用承载能力，但需转换、鉴权、关联或审计。 |
+| **Threadmill 新建** | AgentTeams 没有相应的领域能力，必须由 Threadmill 实现。 |
+| **暂不实现** | 不进入当前 MVP，也不能当作现有能力。 |
 
-## 1. 已核对的事实基础
-
-| 系统 | 已确认能力 | 不能据此推导的能力 |
-| --- | --- | --- |
-| TeamHarness | **已存在**：`taskflow` 具有 `delegate_task`、`ack_task`、`submit_task`、`check_task`、`cancel_task`；Worker 的任务目录包含 `spec.md`、`workspace/`、`progress/`、`result.md`；提交状态为 `SUCCESS`、`SUCCESS_WITH_NOTES`、`REVISION_NEEDED`、`BLOCKED`。 | **需要新增**：Task Contract、Phase Endpoint、PhaseInputSet、PhaseOutput、输入 revision、输出新鲜度、phase lease、DeliveryPolicy。 |
-| TeamHarness | **已存在**：`filesync`、`artifact`、Matrix 房间/消息和项目/任务文件发布机制。 | **需要新增**：内容寻址 Artifact Store、ArtifactRef、跨阶段来源/哈希/权限校验、Threadmill 的正式输入边。 |
-| WorkerFlow | **已存在**：`worker_agentflow.workflow_run` 可创建临时 QwenPaw agents、共享 run 目录、可选 DAG 节点；当前 Worker 负责收到结果后调用 `workflow_update` 并继续下游。 | **需要新增**：持久 Phase Endpoint 调度、等待输入后释放并恢复 Invocation、跨 run 的 Contract/Output 语义。 |
-| QwenPaw API | **已存在**：MCP 客户端的创建/更新、工具列表和 policy 配置；Agent 配置与启停；插件与技能刷新。 | **需要新增**：已验证的“按 Phase Invocation 动态工具/目录/预算/lease 强制”语义。源码不能证明该 API 已提供这种粒度。 |
-
-依据：[Phase Agent interface](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/dev/docs/phase-agent.md)、[Threadmill unified design](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/dev/docs/threadmill-unified-design.md)、[TeamHarness MCP](https://github.com/agentscope-ai/AgentTeams/blob/main/plugins/teamharness/mcp/server.py)、[Task execution skill](https://github.com/agentscope-ai/AgentTeams/blob/main/plugins/teamharness/skills/team/task-execution/SKILL.md)、[WorkerFlow skill](https://github.com/agentscope-ai/AgentTeams/blob/main/plugins/workerflow/skills/agent/worker-internal-workflow/SKILL.md)、[QwenPaw API client](https://github.com/agentscope-ai/AgentTeams/blob/main/qwenpaw/src/qwenpaw_worker/api.py)。
-
-## 2. 职责边界
-
-| 领域 | Threadmill | AgentTeams | 适配规则 |
-| --- | --- | --- | --- |
-| Requirement / Task Contract | **需要新增**：规整需求、稳定契约、DeliverySpec、ReportSpec、DeliveryPolicy。 | 不承担。TeamHarness 的 task `spec.md` 是执行说明，不是 Contract。 | Adapter 将 Contract 的只读投影写入任务 spec。 |
-| 编排 | **需要新增**：Task Manager 唯一写 Coordination Graph，以 Phase Endpoint 和输入边决定 runnable。 | TeamHarness 可委派离散任务；WorkerFlow 可在一个 Worker 内推进临时 DAG。 | 禁止将 `projectflow` 或 `workflow_run` DAG 当作 Coordination Graph。 |
-| 生命周期 | **需要新增**：Invocation、round、input revision、lease、取消、等待/恢复、失效。 | **已存在**：taskflow 的委派/确认/提交/取消和临时 agent 清理。 | Adapter 维护二者的关联与幂等。 |
-| 计算执行 | 选择角色、组装输入、授权工具/目录/预算，记录事件。 | **已存在**：Worker 执行任务；**已存在**：WorkerFlow 临时 agent。 | **需要 Adapter**：生成可执行任务和收集结果。 |
-| Workspace | **需要新增**：Workspace Binding、轮次、基线、write set 和单写 lease。 | **已存在**：任务 workspace 与 WorkerFlow shared run 目录，但语义不同。 | MVP 将 Threadmill workspace 映射为受控目录；不把共享目录本身当作 Binding。 |
-| Context | **需要新增**：Context Graph、Context Slice、检索、订阅、Delta 与 Memory Candidate 准入。 | 无对应 Context Graph。 | 通过 Threadmill MCP 注入只读上下文工具/快照。 |
-| Artifact / evidence | **需要新增**：注册、hash、权限、ArtifactRef、来源链和交付校验。 | **已存在**：文件同步/发布。 | Adapter 只把受控路径注册后返回 ArtifactRef。 |
-| 通过与 done | **需要新增**：授权方判定 endpoint satisfied、invalidated、Task done/merge。 | `submit_task` 仅记录 Worker 提交；`check_task` 不能替代 Threadmill DeliveryPolicy。 | AgentTeams 的成功状态绝不直接等于 Phase 通过或 Task done。 |
-
-## 3. Adapter 的落点
+推荐方案为 **B 的受控变体**：Agent Runtime 内选择 `PhaseExecutor`，其中一个 provider 实现是 `AgentTeamsHostAdapter`；它再调用 TeamHarness taskflow。也就是：
 
 ```text
-Task Manager / Coordination Graph          Context Service
-              |                                  |
-              +------ Threadmill Agent Runtime --+
-                         |
-             AgentTeamsHostAdapter  <--- 唯一适配层
-                    |                   |
-       TeamHarnessTaskflowAdapter   WorkerFlowAdapter（可选）
-                    |                   |
-             AgentTeams MCP / QwenPaw runtime
+Runner -> PhaseExecutor (provider-neutral port)
+       -> AgentTeamsHostAdapter (one provider implementation)
+       -> TeamHarness taskflow / QwenPaw worker
 ```
 
-| 位置 | 决策 | 标记 | 原因 |
+这不同于 A（把 Adapter 直接塞进 Core），也不同于 C（让 Runner 认识 taskflow）。优点是 Provider 选择、凭据、Host 生命周期和故障翻译留在 Runtime 边界，Runner 仍只依赖 `PhaseExecutor.Execute(ExecutionContext)`。
+
+## 1. 已重新核对的事实
+
+| AgentTeams 面 | 已证实事实 | 不能推导出的能力 | 分类 |
 | --- | --- | --- | --- |
-| Threadmill Agent Runtime 下 | 放置 `AgentTeamsHostAdapter`。 | **需要新增** | Runtime 已是 Invocation、权限、Workspace、结果路由的执行边界。 |
-| Task Manager 内 | 不放 adapter。 | **暂不实现** | 否则 Task Manager 会耦合 AgentTeams 任务 ID、房间和 Worker 状态，破坏唯一写图边界。 |
-| Phase Agent prompt/skill 内 | 不放 adapter。 | **暂不实现** | Agent 只能调用 `awaitInputs`、提交 output/proposal；不得自行 delegate、改图或决定完成。 |
-| AgentTeams TeamHarness 插件内 | 不修改其领域模型。可在部署侧注册一个 `threadmill-phase` MCP。 | **需要 Adapter** | 保持 AgentTeams 可独立演进，Threadmill contract 由自己的 MCP/Runtime 持有。 |
+| TeamHarness taskflow | Worker 技能要求读取 `shared/tasks/{task-id}/spec.md`，调用 `ack_task`，完成后以 `submit_task` 提交 `SUCCESS`、`SUCCESS_WITH_NOTES`、`REVISION_NEEDED` 或 `BLOCKED`；worker 拥有 `workspace/`、`progress/`、`result.md`。 | Task Contract、Phase Endpoint、PhaseInputSet、BindingRef、PhaseOutput、revision 或 endpoint acceptance。 | **已存在**承载；领域语义为**Threadmill 新建**。 |
+| TeamHarness 沟通/项目流 | MCP 暴露 `message`、`roomflow`、`projectflow`、`taskflow` 等；源码有 `MESSAGE_TOOL_BLOCKED_ROLES={worker,remote-member}`。 | Taskflow/projectflow 不是 Coordination Graph，`accept_task_result` 不是 Threadmill 的 acceptance。 | **已存在**，普通 Phase Agent 必须**Adapter 禁用**。 |
+| WorkerFlow | `worker_agentflow.workflow_run/update/finish/fail`、临时 `tmp-` agent、run 级 shared 目录与 DAG；由当前 Worker 驱动和合并。 | 持久 endpoint 调度、跨执行等待、checkpoint、PhaseOutput。 | **已存在** phase 内并行；默认编排为**暂不实现**。 |
+| QwenPaw | API client 有 MCP client 的 create/update/delete、工具列举、MCP policy GET/PUT，以及 agent 配置/启停。 | 已验证的 invocation 级 token 注入、目录 ACL、工具实时重配、暂停/恢复、模型 session checkpoint 或 worker callback。 | MCP 安装为**已存在**；安全语义须**Adapter + Threadmill 新建**并测试。 |
+| 文件/同步/Matrix | TeamHarness 任务文件与 deliverables、MinIO 同步和 Matrix artifact 发布存在。 | 内容寻址 Artifact Store、Event Log、ArtifactRef/权限/来源链、workspace merge。 | 文件承载**已存在**；权威事实为**Threadmill 新建**。 |
 
-## 4. 生命周期映射
+本次源码中没有发现 taskflow 或 QwenPaw 的 `suspend`、`resume`、`checkpoint` API，也没有证明运行中 worker 能可靠接收 Threadmill 的 ContextDelta/InputsChanged 回调。因此不得把它们设计成 AgentTeams 原生能力。
 
-| Threadmill 生命周期 | AgentTeams 映射 | 标记 | 关键约束 |
+## 2. 分层与职责边界
+
+| 层/组件 | 职责 | 分类 | 禁止承担 |
 | --- | --- | --- | --- |
-| Scheduler 选中 runnable endpoint | Adapter 创建 `agentteams_task_id`，调用 `delegate_task`。 | **需要 Adapter** | task ID 与 `invocation_id` 一对多：一次恢复可产生新 task ID。 |
-| `runtime.startPhase(StartPhaseInput)` | 将输入投影写为 `spec.md` + `phase-envelope.json`，Worker 收到 `TASK_ASSIGNED`。 | **需要 Adapter** | spec 是载体，不是 Threadmill Contract 的权威副本。 |
-| Worker 开始 | Worker 调用 `ack_task`。 | **已存在** | Adapter 记录为 `running`；不能据此改变 endpoint 状态。 |
-| Phase 工作中 | Worker 使用 Threadmill 注入 MCP：context 只读、artifact register、proposal、requirement、memory candidate。 | **需要新增** | 这些工具不属于 TeamHarness/WorkerFlow。 |
-| 已知 completion input 不足 | 结束/回收当前 AgentTeams 执行；Threadmill Invocation 标为 `waiting`，释放 capacity。 | **需要新增** | AgentTeams 没有与 `runtime.awaitInputs` 等价的持久、无占用等待/恢复。输入到达后由 Adapter 创建新的受控 task 重新启动。 |
-| 正式完成 | Worker 写 `result.md`，调用 `submit_task`。Adapter 读取受控结果后调用 Threadmill 验证。 | **需要 Adapter** | `submit_task` 成功不等于 `PhaseOutput` 被接受。 |
-| 输出被接受 | Runtime 产生/保存 PhaseOutput，Task Manager 再判定 satisfied/rejected/invalidated。 | **需要新增** | 不调用 AgentTeams project acceptance 作为权威。 |
-| 取消/超时/lease 失效 | Runtime 停止执行并调用 `cancel_task`（可用时），撤销 token/写 lease。 | **需要 Adapter + 需要新增** | `cancel_task` 已有；lease 与强制停止语义未在 AgentTeams 中确认。 |
-| Phase 内部并行（非 MVP） | 当前 Worker 调用 `workflow_run`，自行 `workflow_update`、合并和清理 tmp agents。 | **需要 Adapter** | 其子 agent 只产生 phase 内辅助材料；最终仍由父 Worker 提交一次 PhaseOutput。 |
+| Phase Agent Core | `StartPhaseInput`、生命周期 DTO、输入/输出、Context seams、Runtime outbound port、能力模型。 | **Threadmill 新建**（已完成核心契约）。 | provider、MCP transport、图/存储实现、AgentTeams。 |
+| Runner | 由 endpoint 推导 Role/Capabilities，创建 transient `ExecutionContext`，调用一个 `PhaseExecutor`。 | **Threadmill 新建**。 | taskflow、worker 选择、GraphRuntime、Task Manager。 |
+| PhaseExecutor | provider-neutral 单次执行 port；返回执行健康，不返回 `PhaseOutput`。 | **Threadmill 新建**（接口）。 | endpoint acceptance、Task done。 |
+| Agent Runtime | 解析 BindingRef、装配 workspace/context/memory、取 lease、注入受信身份/权限、选择 Host、验证结构化提交、记录事件。 | **Threadmill 新建**。 | 业务编排和知识判断。 |
+| AgentTeamsHostAdapter | `PhaseExecutor` 的 AgentTeams provider 实现；生成 host task、配置 QwenPaw/MCP、观察 taskflow、翻译宿主状态。 | **需要 Threadmill Adapter**。 | 写 Coordination Graph、解释 BindingRef、把 result.md 当 PhaseOutput。 |
+| TeamHarness taskflow | 委派、ack、worker 任务目录、submit/cancel 等承载协议。 | **已存在**。 | Threadmill 生命周期、等待、checkpoint、验收。 |
+| WorkerFlow | 当前 phase worker 内的短期辅助 fan-out。 | **已存在**。 | 默认阶段载体、跨 Invocation 持久状态。 |
+| QwenPaw | 模型 worker/agent 与 MCP plugin 配置宿主。 | **已存在**。 | Task Contract、Context Graph、可靠 checkpoint。 |
 
-## 5. 必须新增的接口
+Task Manager 仅写 Coordination Graph；它不调用 Adapter。GraphRuntime/PhaseController 决定 start/stop/resume，Adapter 从不绕过该路径。
 
-### 5.1 Threadmill Phase Runtime MCP（Phase Agent 可见）
+## 3. 当前领域映射
 
-以下接口均为 **需要新增**，并由 Runtime 校验 Invocation token、角色、输入 revision、权限和 lease：
+### 3.1 Start 与 ExecutionContext
 
-```text
-runtime.awaitInputs({ inputIds? }) -> InputWaitResult
-agent.submitPhaseOutput({ phase, deliveryRefs, reportRef, evidenceRefs }) -> Accepted
-agent.proposeOrchestration({ proposalId, clientRef, ..., advice, evidenceRefs }) -> Accepted
-agent.submitRequirement({ text, goal?, constraints?, evidenceRefs? }) -> Accepted
-agent.submitMemoryCandidate({ statement, kind, sourceRefs, whyReusable }) -> Accepted
-artifact.register({ controlledPath, kind, mediaType? }) -> ArtifactRef
-context.listSubgraphs / explore / retrieve / subscribe -> Threadmill context responses
+`StartPhaseInput` 的唯一输入形状为：
+
+```go
+{ InvocationID, Endpoint, Generation, BindingRef, Inputs }
 ```
 
-`agent.submitPhaseOutput` 的 binding（TaskID、ContractRef、WorkspaceRef、InputRevision、ContextSliceRef、WorkspaceHead）必须由 Runtime 补入，不能让 Worker 填写。
+`BindingRef` 由 Runtime 解析，绝不交给 AgentTeams、worker 或模型自行解释。映射如下：
 
-### 5.2 Runtime 内部接口
-
-| 接口 | 标记 | 用途 |
-| --- | --- | --- |
-| `AgentTeamsHostAdapter.dispatch(invocation)` | **需要新增** | 将一个 runnable Invocation 变为 TeamHarness task。 |
-| `collectResult(agentteamsTaskID)` | **需要 Adapter** | 读取 `result.md`、受控 deliverables 和 taskflow meta，返回未信任的 `AgentTeamsResult`。 |
-| `cancel(invocation, reason)` | **需要 Adapter** | 转换为 taskflow cancel 并执行 Threadmill 本地清理。 |
-| `resumeWaitingInvocation(invocation)` | **需要新增** | 输入 revision 改变后创建新的 AgentTeams execution task。 |
-| `PolicyEnforcer.issue/revoke` | **需要新增** | 签发短期 MCP token、工具 allowlist、目录许可和写 lease。 |
-| `ArtifactStore.register/resolve` | **需要新增** | 将受控路径转换为可审计 ArtifactRef。 |
-
-## 6. StartPhaseInput 到 AgentTeams task 的转换
-
-**推荐载体：TeamHarness taskflow（MVP）。** 不直接把 StartPhaseInput 映射为 TeamHarness 项目计划或 WorkerFlow DAG。
-
-| StartPhaseInput 字段 | AgentTeams task 字段/文件 | 标记 | 规则 |
+| 信息 | 进入哪里 | 可见性 | 分类 |
 | --- | --- | --- | --- |
-| `InvocationID` | `phase-envelope.json.invocationId`、关联表 | **需要 Adapter** | 不使用 task ID 替代 Invocation ID。 |
-| `EndpointRef`, `TaskID`, `Phase` | `spec.md` 标头、envelope | **需要 Adapter** | 只读；Worker 无权改写。 |
-| `ContractRef` | `contract_snapshot_ref`（或摘要 + URI） | **需要 Adapter** | Contract 正本留在 Threadmill。 |
-| `WorkspaceRef` | Runtime 已绑定的 workspace root/挂载 + envelope | **需要 Adapter** | 按 phase 发放只读或允许写目录。 |
-| `ContextSliceRef` | envelope + 初始 slice 摘要；MCP token | **需要新增** | AgentTeams 无 ContextSlice。 |
-| `Inputs.Required/Delivered/Pending` | envelope 的 `inputs` 只读 JSON；已交付 artifact 为 ArtifactRef/受控只读挂载 | **需要新增** | 不暴露 source 的未提交 workspace 或过程上下文。 |
-| token、deadline、allowlist、lease | 私有 runtime envelope / MCP policy | **需要新增** | QwenPaw 有 MCP policy API，但未证实此组合可按 Invocation 强制执行。 |
+| Task Contract、DeliverySpec、ReportSpec、批准计划摘要、输入投影 | `spec.md` 的只读执行说明。 | Worker 可读；不是权威副本。 | **需要 Threadmill Adapter** |
+| `InvocationID`、endpoint、generation、lease ID、MCP audience/token、host task ID | private phase envelope / Adapter 持久关联。 | 模型不见 token 和内部 ID。 | **需要 Threadmill Adapter** |
+| Context slice、当前有效订阅并集、Task Memory view | 由 Runtime 装配进每次模型调用/await rehydration 的 host context。 | 仅已授权内容。 | **Threadmill 新建** |
+| Workspace Root、AllowedDirs、只读/写 mount | Host mount、文件系统 ACL/容器隔离。 | worker 只见允许路径。 | **需要 Threadmill Adapter** |
+| `PhaseCapabilities` | MCP allow policy、宿主启动约束、文件系统策略。 | 可见的工具清单及 prompt。 | **需要 Adapter**；强制机制为**Threadmill 新建** |
+| BindingRef、Graph revision、permission snapshot、原始 ContextSliceRef、TaskMemoryBufferRef | Runtime/Artifact/Event records。 | 不暴露。 | **Threadmill 新建** |
 
-建议的任务目录：
+`ExecutionContext` 只在 Threadmill 进程内存在。Adapter 消费已经解析、受限后的 surface，不序列化 `Runtime`、`ContextReader` 或 `ContextAgent` 接口本身。
 
-```text
-shared/tasks/{agentteams-task-id}/
-  spec.md                         # 给 Worker 的可读任务说明
-  threadmill/phase-envelope.json  # Runtime 生成，只读
-  workspace/                      # 映射的受控 Workspace Binding
-  progress/                        # Worker 临时记录；不作跨阶段输入
-  result.md                        # Worker 的人类可读报告
-  deliverables/                    # 仅受控可写产物
-```
+### 3.2 PhaseCapabilities 到 Host policy
 
-`spec.md` 必须明确：不得编辑 `phase-envelope.json`；不得使用 TeamHarness `projectflow` 或自行 `delegate_task`；只可通过 Threadmill MCP 提交 PhaseOutput/提案；路径先注册才能成为交付引用。
-
-## 7. AgentTeams result 到 PhaseOutput 的转换
-
-| AgentTeams 结果 | Threadmill 转换 | 标记 |
-| --- | --- | --- |
-| `submit_task.status=SUCCESS` 或 `SUCCESS_WITH_NOTES` | 仅作为“Worker 已提交”的候选信号。 | **需要 Adapter** |
-| `result.md` | 注册为 report artifact，并检查当前 endpoint `ReportSpec`。 | **需要新增** |
-| `deliverables[]` | 验证处于受控目录、注册 hash/媒体类型/来源后转为 `DeliveryRefs`。 | **需要新增** |
-| 运行日志、测试输出、diff | 由 Runtime 捕获/注册为 `EvidenceRefs`，不能把任意路径直接信任为 evidence。 | **需要新增** |
-| `REVISION_NEEDED` / `BLOCKED` | 转为结构化失败/阻塞证据；必要时要求 Worker 提交 Proposal。 | **需要 Adapter** |
-| `PhaseOutput` | Runtime 以权威 binding 补齐字段，校验 completion inputs、InputRevision、DeliverySpec、ReportSpec 和 lease，再提交。 | **需要新增** |
-
-转换伪代码：
-
-```text
-result = adapter.collectResult(agentteamsTaskId)
-assert result.belongsTo(invocation) && result.submitted
-report = artifactStore.register(result.resultMd)
-deliveries = result.deliverables.map(registerAndValidateControlledPath)
-evidence = runtime.captureAndRegister(result)
-
-candidate = { phase, deliveryRefs: deliveries, reportRef: report, evidenceRefs: evidence }
-runtime.acceptPhaseOutput(invocation, candidate)  # 补 binding；不采信 Worker 自报 binding
-```
-
-若缺 report、未满足 `DeliverySpec`、completion input 仍 pending、输入已过期或写 lease 已失效，则拒绝转换；不将 AgentTeams 的“SUCCESS”升级为 Phase 成功。
-
-## 8. Context / Input / Artifact 接入
-
-| 面 | 实施方案 | 标记 |
-| --- | --- | --- |
-| Context 初始注入 | Runtime 选择 Context Slice，把小摘要放入 spec/envelope；完整探索与检索经 `threadmill-ctx` MCP。 | **需要新增** |
-| Context 更新 | Context subscription executor 向有效 Invocation 推送 Delta；若处于 waiting，下次恢复时重新装配 slice。 | **需要新增** |
-| 正式 Input | Coordination Graph 生成 `PhaseInputSet`。已交付内容只能以 `PhaseOutputRef + ArtifactRef` 投影到 envelope/read-only mount。 | **需要新增** |
-| 已知输入等待 | 调用 `runtime.awaitInputs` 后结束本次 AgentTeams task；Runtime 保留 waiting 记录，不保留 Worker 线程。 | **需要新增** |
-| 未知前置 | `agent.proposeOrchestration(advice=dependency)`；只有 Task Manager 改图后才形成新 Input。 | **需要新增** |
-| 产物生成 | Worker 写入受控目录；TeamHarness 文件共享可作为运输通道。 | **已存在 + 需要 Adapter** |
-| 产物正式化 | Runtime 路径验证、hash、存储、权限和 ArtifactRef 注册。 | **需要新增** |
-
-## 9. 可直接复用、不可复用和缺口
-
-### 可直接复用
-
-- **已存在**：TeamHarness `delegate_task` / `ack_task` / `submit_task` / `cancel_task` 的任务执行握手。
-- **已存在**：Worker-owned `result.md`、`workspace/`、`progress/` 和提交 deliverables 的文件约定。
-- **已存在**：TeamHarness 文件同步与 Artifact 发布能力，可用于传输或人工可见性。
-- **已存在**：WorkerFlow 的临时 QwenPaw agent、run 级共享目录、DAG ready/unblock、结束清理。
-- **已存在**：QwenPaw 的 MCP 管理、MCP tool 列表/policy 配置、Agent 配置和启停 API。
-
-### Threadmill 必须补充
-
-- **需要新增**：Task Contract、Requirement 规整、Task/round、Phase Endpoint、Coordination Graph 和唯一写图的 Task Manager。
-- **需要新增**：StartPhaseInput、PhaseInputSet、InputWaitResult、PhaseOutput 和 result binding/revision 校验。
-- **需要新增**：Runtime 的等待/恢复、lease、预算、取消、可观测和 provider-neutral host abstraction。
-- **需要新增**：Workspace Binding、基线/轮次隔离、AllowedDirs、Declared/Observed WriteSet。
-- **需要新增**：Artifact Store 与 DeliverySpec/ReportSpec 校验。
-- **需要新增**：Context Graph、Context Slice、读接口、订阅 Delta、Memory Candidate 准入。
-- **暂不实现**：把 TeamHarness Matrix 消息作为 Phase Agent 间 mailbox；Threadmill 明确禁止该旁路通信。
-- **暂不实现**：把 WorkerFlow 的 DAG 持久化为 Threadmill Coordination Graph；它是当前 Worker 内部实现细节。
-- **暂不实现**：MVP 的复杂 Context Graph 缓存、读侧整理和完整推送策略；先支持初始 slice 与显式检索即可。
-
-## 10. 分阶段开发计划
-
-| 阶段 | 范围 | 交付 | 标记 |
+| Phase | MCP allow policy | FS / lease | 允许的 Threadmill 工具 | 强制分类 |
 | --- | --- | --- | --- |
-| P0：契约骨架 | 定义 Threadmill domain types、SQLite/事件存储、ArtifactRef、Invocation↔AgentTeams task 关联。 | 可持久化 StartPhaseInput / PhaseOutput binding；无真正调度。 | **需要新增** |
-| P1：MVP 执行 | 一个 endpoint → 一个 TeamHarness taskflow worker；生成 spec/envelope，`ack`/`submit`，受控 result 转换。 | `plan -> execute -> verify` 串行 happy path；人工批准 plan/verify。 | **需要 Adapter + 需要新增** |
-| P2：输入与 Workspace | Coordination Edge 投影为 PhaseInputSet；Artifact register；Workspace Binding、AllowedDirs、基础 revision 校验。 | 跨 phase 正式 artifact 输入，拒绝越权路径/过期输入。 | **需要新增** |
-| P3：暂停恢复与失败 | `awaitInputs`、等待记录、输入到达后新 invocation；proposal/requirement；cancel/retry。 | 不占 Worker capacity 的 join；Task Manager 裁决。 | **需要新增** |
-| P4：Context | Context Slice、`list/explore/retrieve`、MemoryCandidate；先不做 Delta 推送。 | 每次 phase 有受控上下文读面。 | **需要新增** |
-| P5：完整控制 | Context subscriptions/Delta、lease 强制、预算、写集审计、Merge Queue 与 DeliveryPolicy。 | 完整 Threadmill 生命周期。 | **需要新增** |
-| P6：WorkerFlow 加速 | 在 execute/verify 内允许临时 subagents；父 Worker 统一合并。 | 可选 fan-out，失败也不影响 PhaseOutput 单一边界。 | **需要 Adapter** |
+| PLAN | 仅 Phase 工具、Context reader/retrieve、memory、await、proposal/requirement、output；不注入项目/图/消息工具。 | 源码只读；只可写 `plan/` 的结构化 artifact；无 implementation write lease。 | submit plan output、候选记忆、proposal。 | **Adapter + Threadmill 新建** |
+| EXECUTE | 同上，加经审批的执行/检查工具。 | 只在 Approved Plan/Declared Write Set 的 AllowedDirs 取得唯一写 lease。 | deliverable/evidence/output。 | **Adapter + Threadmill 新建** |
+| VERIFY | 仅检查/证据工具与 Phase MCP；不可见实现编辑器/写工具。 | 候选实现只读，可写 `evidence/`；无 implementation write lease。 | evidence/output/proposal。 | **Adapter + Threadmill 新建** |
 
-## 11. 时序图（MVP + 等待恢复）
+所有普通 Phase Agent 都必须隐藏/拒绝 `plan_dag`、`accept_task_result`、`projectflow`、Coordination Graph write、Agent mailbox/message、Context Search 和项目级 orchestration。TeamHarness 虽已有其中若干工具，**其存在不等于授权**。
+
+## 4. Fresh start 与正常输出
 
 ```mermaid
 sequenceDiagram
-  participant TM as "Task Manager"
-  participant CG as "Coordination Graph"
-  participant RT as "Threadmill Runtime"
-  participant AD as "AgentTeams Adapter"
-  participant TH as "TeamHarness taskflow"
-  participant W as "AgentTeams Worker"
-  participant AS as "Artifact Store"
+  participant GR as GraphRuntime
+  participant PC as PhaseController
+  participant AR as Agent Runtime
+  participant WS as Workspace Service
+  participant CS as Context/Memory Service
+  participant R as Runner
+  participant A as AgentTeamsHostAdapter
+  participant T as TeamHarness taskflow
+  participant W as QwenPaw Worker
+  participant MCP as Threadmill MCP
+  participant ES as Event/Artifact Store
 
-  TM->>CG: "create endpoint, contract, input edges"
-  CG-->>RT: "runnable endpoint + input projection"
-  RT->>RT: "assemble StartPhaseInput and policy envelope"
-  RT->>AD: "dispatch(invocation)"
-  AD->>TH: "delegate_task(spec.md, taskId)"
-  TH-->>W: "TASK_ASSIGNED"
-  W->>TH: "ack_task(taskId)"
-  W->>RT: "Threadmill MCP: context/artifact/proposal"
-  alt "completion input is pending"
-    W->>RT: "awaitInputs(inputIds)"
-    RT->>AD: "finish/release execution task"
-    RT->>RT: "mark invocation waiting"
-    Note over RT,CG: "Input arrives; inputRevision changes"
-    CG-->>RT: "updated input projection"
-    RT->>AD: "dispatch(new execution task)"
-  end
-  W->>TH: "submit_task(result.md, deliverables)"
-  TH-->>AD: "submitted task result"
-  AD->>AS: "validate and register controlled files"
-  AD->>RT: "untrusted AgentTeamsResult"
-  RT->>RT: "validate input revision and output specs"
-  RT-->>TM: "accepted PhaseOutput or rejection"
-  TM->>CG: "satisfy, reject, invalidate, or replan endpoint"
+  GR->>PC: Apply(PhaseCommand.start)
+  PC->>AR: StartPhase(StartPhaseInput)
+  AR->>AR: resolve BindingRef; validate Inputs
+  AR->>WS: assemble binding, AllowedDirs, phase lease
+  AR->>CS: assemble Context + Task Memory view
+  AR->>AR: enforce PhaseCapabilities
+  AR->>R: RunStart(ExecutionContext)
+  R->>A: PhaseExecutor.Execute(ctx, execution)
+  A->>T: delegate_task(private envelope + spec.md)
+  T->>W: TASK_ASSIGNED
+  W->>T: ack_task
+  W->>MCP: model/tool work; agent.submitPhaseOutput
+  MCP->>AR: trusted token binds invocation/task/role
+  AR->>ES: validate/register output facts
+  AR-->>MCP: accepted or rejected
+  W->>T: submit_task(result.md + evidence paths)
+  A-->>R: host execution finished (nil)
+  AR->>ES: append PhaseOutputSubmitted
 ```
 
-## 12. 目录结构建议
+`Execute` 创建一个 host task，选择满足 provider/model/region/能力标签的 worker，写只读 `spec.md`，安装 role prompt 与受限 Threadmill MCP，并等待宿主的 terminal observation。
 
-建议在 Threadmill 代码库中新建以下边界清晰的模块；不修改 AgentTeams 上游的核心领域模型。
+`Execute` 返回 `nil` 仅表示该 host execution 已正常结束，或已由 Runtime 明确终止为 waiting/stopped；它**不表示** endpoint satisfied、Task done 或 PhaseOutput 已提交。下列情况返回 error：delegate/ack/transport/host 崩溃、无法装配/配置 host、未经 Runtime 认可的终止，或 host 最终失败且没有被 Runtime 转化为受控 waiting/stopped。Worker 的 `submit_task SUCCESS` 仅是 evidence；`agent.submitPhaseOutput` 仍是正式边界动作。
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant MCP as Threadmill MCP
+  participant AR as Runtime
+  participant AS as Artifact Store
+  participant EL as Event Log
+  participant TM as Task Manager
+  W->>AS: write report/deliverable in allowed workspace
+  W->>MCP: agent.submitPhaseOutput(PhaseOutput refs)
+  MCP->>AR: authenticate invocation and validate binding/input/lease
+  AR->>AS: verify and register referenced artifacts
+  AR->>EL: append PhaseOutputSubmitted
+  AR-->>W: idempotent accepted receipt
+  Note over TM: Later and separately
+  TM->>EL: decide satisfied/rejected/invalidated
+```
+
+### result.md 选择
+
+选择 **C：MCP 是权威提交，result.md 是回退证据和人类可读报告**。
+
+| 方案 | 结论 |
+| --- | --- |
+| A：仅实时 MCP | 语义最清晰，但崩溃后需要从 Event Log/Artifact Store 恢复；仍应保存可读报告。 |
+| B：从 result.md 解析 PhaseOutput | 拒绝。文件无受信 identity，`submit_task` 又会结束 task；解析会把非权威文本提升为领域事实。 |
+| C：MCP 权威 + result.md 证据 | **推荐**。MCP 作幂等的 `agent.submitPhaseOutput`，Runtime 写 Event Log；result.md 和 deliverables 注册为 Artifact evidence。崩溃时扫描 host evidence 只可诊断/重投，不自动把文本变成 Output。 |
+
+`PhaseOutputSubmitted` 是独立 Event/Artifact 事实，不能成为 InvocationState；随后才由 Task Manager/政策判定 endpoint satisfied/rejected/invalidated。
+
+## 5. awaitInputs：同一逻辑 Invocation 的重新承载
+
+AgentTeams taskflow 的 `submit_task` 会结束任务，当前代码没有 suspend/re-enter API。因此 waiting 不能映射为 taskflow resume。
+
+```mermaid
+sequenceDiagram
+  participant PA as Phase Agent
+  participant AR as Threadmill Runtime
+  participant AT as AgentTeams Adapter
+  participant TF as taskflow/QwenPaw host
+  participant CG as Coordination Graph
+  PA->>AR: runtime.awaitInputs(request)
+  AR->>CG: verify declared completion input; mark logical Invocation waiting
+  AR->>AT: stop/release current host capacity if possible
+  AT->>TF: terminate or let bounded worker invocation exit; do not submit completion
+  Note over AR: InvocationID and Generation are retained
+  CG-->>AR: declared input arrives/invalidates; new InputRevision
+  AR->>AR: reassemble binding, context, memory and latest PhaseInputSet
+  AR->>AT: create fresh host task for same InvocationID/Generation
+  AT-->>PA: continue execution with latest inputs
+```
+
+**需要 Threadmill Adapter** 的模拟是：保存 only explicit continuation data allowed by the phase runtime (not hidden reasoning/session), finish/reclaim current host, then create a new AgentTeams task bound to the same logical InvocationID and Generation. “重新承载”不能调用 `PhaseCommand.resume`，不能使用 CheckpointRef，不能复用 QwenPaw/model session。若 Agent 无可安全显式 continuation，则重新以最新装配的 spec/context 启动，并让 worker 从已持久的 Workspace/artifacts 继续。
+
+M4 前不实现此能力；MVP 对 await 请求返回明确 unsupported/controlled failure，而不是伪装成 taskflow suspend。
+
+## 6. stop / checkpoint / resume：新的 Invocation
+
+```mermaid
+sequenceDiagram
+  participant PC as PhaseController
+  participant AR as Agent Runtime
+  participant PA as Phase Agent
+  participant AS as Artifact Store
+  participant AT as AgentTeams Adapter
+  PC->>AR: PhaseCommand.stop
+  AR->>AT: revoke MCP token/tool access; stop host
+  AR->>PA: StopPhaseInput
+  PA-->>AR: StopPhaseAck(ResumeStateRef)
+  AR->>AS: register structured ResumeState -> CheckpointRef
+  AR->>AR: terminate old Invocation; release lease
+  PC->>AR: PhaseCommand.resume(new InvocationID, Generation, BindingRef, CheckpointRef)
+  AR->>AS: load/validate checkpoint
+  AR->>AT: new host task, new lease, current binding
+  AT->>PA: RunResume with explicit ResumeState
+```
+
+`ResumeState` 只可包含 `CompletedWork`、`PendingWork`、`ConsumedInputIDs`、`NextSafeStep` 等显式、安全的进度；CheckpointRef/ResumeStateRef 都是不透明引用。**Threadmill 新建**结构化 checkpoint 注册、兼容性校验、旧 Invocation 终止和 lease 释放。AgentTeams/QwenPaw 不提供可复用 session checkpoint，故明确不复用旧模型 session、worker memory、QwenPaw session、hidden reasoning 或旧 InvocationID。
+
+普通工具须先撤销，再请求停止；Adapter 只能执行宿主终止/清理，不能自行产生 checkpoint。该完整流为 M5，非 MVP。
+
+## 7. Context 与 Task Memory
+
+### 7.1 Context surface
+
+Phase Agent 只见以下 Threadmill MCP 工具：
 
 ```text
-threadmill/
-  domain/
-    contracts.py                 # Requirement, TaskContract, Delivery/ReportSpec
-    coordination.py              # Task, PhaseEndpoint, CoordinationEdge
-    phase_types.py               # StartPhaseInput, PhaseInputSet, PhaseOutput
-    workspace.py                 # WorkspaceBinding, WriteSet, Lease
-  runtime/
-    invocation_service.py        # start/stop/wait/resume
-    policy_enforcer.py           # token, tools, dirs, budgets
-    output_validator.py
-    event_log.py
-  artifact/
-    store.py
-    registry.py
-  context/
-    slice_service.py             # P4
-    graph_service.py             # P4/P5
-    subscription_service.py      # P5
-  adapters/
-    agentteams/
-      host_adapter.py            # provider-neutral facade implementation
-      taskflow_adapter.py        # delegate/ack/submit/cancel mapping
-      workerflow_adapter.py      # P6 only
-      result_parser.py
-      task_spec_renderer.py
-      qwenpaw_policy_adapter.py
-      correlation_store.py
-  mcp/
-    phase_runtime_server.py      # injected agent-facing Threadmill tools
-  tests/
-    contract/
-    integration/agentteams/
-
-deploy/
-  agentteams/
-    threadmill-phase-mcp.yaml    # deployment registration, not domain contract
-    worker-phase-skill.md        # worker operating instructions
+context.listSubgraphs  context.explore  context.subscribe  context.unsubscribe
+contextAgent.retrieve
 ```
 
-`adapters/agentteams/` 只能依赖 `domain/` 的公开类型与 `runtime/` 端口；`domain/` 绝不能导入 TeamHarness、QwenPaw、Matrix 或 WorkerFlow。这样日后替换 AgentTeams 承载时不会改变 Threadmill 的 Task Contract、图、Context 或 Phase 接口。
+`context.search` 仅装给 Context Agent，绝不装给普通 Phase Agent。QwenPaw 可配置 MCP client 和 policy 是**已存在**的安装基础；Threadmill MCP server、token audience、调用鉴权和 Context Service 都是**Threadmill 新建**。
 
-## 13. 验收门槛
+每次 MCP request 的可信 token 由 Runtime 签发/传递，服务器从 token/host connection 取得 `InvocationID`、TaskID、endpoint role、Generation、permission snapshot 与 `ConsumerInvocationID`。这些字段不出现在 Agent 可填写的请求 DTO 中。`Subscribe` 返回的 subscription 绑定该 consumer invocation；Runtime 在下一 model turn、await rehydration 或 resume 装配前重算订阅并集。取消只影响该 subscription，已注入当前模型调用的内容不可追溯删除。
 
-MVP 上线前至少验证：
+```mermaid
+sequenceDiagram
+  participant W as Phase worker
+  participant MCP as Threadmill MCP
+  participant AR as Runtime
+  participant CA as Context Agent
+  participant CS as Context Service
+  W->>MCP: contextAgent.retrieve({query})
+  MCP->>AR: authenticate original Invocation
+  AR->>CA: Retrieve(Query) with trusted original consumer binding
+  CA->>CS: mechanical Search (internal only)
+  CS-->>CA: Slice + auto subscription IDs bound to original worker
+  CA-->>W: ContextRetrieveResult
+```
 
-1. Worker 不能通过篡改 `spec.md`/envelope 把输入 revision、ContractRef 或 Phase 改成其他值。
-2. `SUCCESS` 但没有合规 report/delivery 的结果被 Runtime 拒绝。
-3. waiting 后旧 AgentTeams task 无法继续写入；恢复后的新 execution task 使用最新 InputRevision。
-4. 上游未提交 workspace 文件不能作为下游输入；只有注册后的 ArtifactRef 可见。
-5. WorkerFlow 子 agent 的输出只能先归入父 phase 的受控目录，不能直接提交或满足 Threadmill endpoint。
-6. Task Manager 是唯一能使 endpoint satisfied、重排或标记 Task done 的组件。
+### 7.2 Task Memory
+
+```mermaid
+sequenceDiagram
+  participant W as Phase worker
+  participant MCP as Threadmill MCP
+  participant AR as Runtime
+  participant TB as Task Memory Buffer
+  W->>MCP: agent.listTaskMemoryCandidates()
+  MCP->>AR: trusted task binding
+  AR->>TB: ListTaskCandidates(current Task)
+  TB-->>W: TaskMemoryBufferView
+  W->>MCP: agent.submitMemoryCandidate(candidate)
+  MCP->>AR: trusted task/invocation binding
+  AR->>TB: append-only SubmitCandidate
+  TB-->>W: CandidateBufferedReceipt
+```
+
+TaskID 不由 agent 指定。`submitMemoryCandidate` **不等于 Context Graph write**：它只入当前 Task 的 append-only buffer，Task done 后才由 Context Agent 批量审查。此 buffer 与 Context Graph、订阅和 graph revision 无关。
+
+### 7.3 ContextDelta 与 InputsChanged
+
+```mermaid
+sequenceDiagram
+  participant CS as Context subscription executor
+  participant AR as Runtime
+  participant AT as AgentTeams Adapter
+  participant W as Worker
+  CS->>AR: ContextDelta(subscription-bound)
+  AR->>AT: optional active-host update
+  Note over AT,W: No reliable AgentTeams callback proved
+  AT-->>AR: cache for next model turn / rehydration, or restart host
+  AR->>AT: InputsChanged(complete latest PhaseInputSet)
+  Note over AR: InputsChanged replaces formal inputs; Delta never does
+```
+
+M6 的默认策略是 **下一 model turn 注入**；若 host 不支持安全 turn boundary，则在 await rehydration 重新装配，最后才是受控 execution restart。实时 callback 是**暂不实现**，除非 QwenPaw 实测证明其可回压、可鉴权、可排序。ContextDelta 是订阅知识更新，不能改 `PhaseInputSet`；InputsChanged 传完整最新 InputSet 和 InputRevision。
+
+```mermaid
+sequenceDiagram
+  participant CG as Coordination Graph
+  participant AR as Runtime
+  participant AT as Adapter
+  participant W as Worker
+  CG-->>AR: declared input changes
+  AR->>AR: construct complete latest PhaseInputSet + InputRevision
+  AR->>AT: InputsChanged
+  AT-->>W: inject at next safe model turn, or retain for rehydration
+  Note over W: Replaces formal input view only; not a ContextDelta
+```
+
+## 8. 宿主结果、事件与错误
+
+| AgentTeams 原始事实 | Threadmill 处理 | 分类 |
+| --- | --- | --- |
+| task meta、ack、submit status、heartbeat、trace、Matrix event | 注册为 execution evidence/event attributes，可用于诊断、重试和审计。 | **需要 Adapter** |
+| `result.md`、deliverables | 受控路径读取、hash/权限/来源校验后注册 ArtifactRef；不解析为 PhaseOutput。 | **需要 Adapter + Threadmill 新建 Store** |
+| Phase MCP 的 output/proposal/requirement/memory 调用 | Runtime 做 input/lease/role/shape/幂等验证，写相应 Event/Store。 | **Threadmill 新建** |
+| AgentTeams SUCCESS / BLOCKED / REVISION_NEEDED | 只映射 host terminal evidence 或 candidate phase failure；绝不直接 endpoint satisfied/Task done。 | **需要 Adapter** |
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant AT as Adapter
+  participant AR as Runtime
+  participant EL as Event Log
+  W->>AT: transport error / task terminal status
+  AT->>AR: HostExecutionObservation
+  alt cancellation requested
+    AR->>EL: InvocationCancelled/host evidence
+  else transport or host error
+    AR->>EL: InvocationFailed/host evidence
+  else ordinary submit
+    W->>AR: agent.submitPhaseOutput
+    AR->>EL: PhaseOutputSubmitted
+  end
+```
+
+Cancellation/error is not PhaseOutput. A worker may submit an explicit blocked/failure PhaseOutput only when the endpoint contract permits one; otherwise Adapter reports host failure and Runtime/Task Manager decides the next graph action.
+
+## 9. MVP 与阶段计划
+
+MVP 保持 TeamHarness taskflow 为**每个 Phase Invocation 的默认承载**，因为它已有 worker task directory、ack 和 structured submit；WorkerFlow 只做 phase 内短生命周期并行，因为其技能明确把它定义为当前 Worker 的 internal workflow，且由 parent worker 调度/合并。
+
+| Milestone | 范围 | 分类/验收 |
+| --- | --- | --- |
+| M0 Adapter contracts | HostExecutionObservation、task-ID association、private envelope、错误分类；不调用 AgentTeams。 | **Threadmill 新建** |
+| M1 Fresh invocation | AgentTeams `PhaseExecutor`、delegate/ack/terminal polling、workspace mount、taskflow evidence。 | **Adapter**；不判定 output。 |
+| M2 Tool/MCP injection | invocation-bound Threadmill MCP、Context/Memory/Proposal/Requirement/Output tools与 allow policy。 | **Adapter + Threadmill 新建** |
+| M3 Output/result mapping | MCP 幂等 PhaseOutput submit、Artifact registration、result.md evidence、Event Log。 | **Threadmill 新建** |
+| M4 Await rehydration | same InvocationID/Generation 的 host teardown/recreate 和完整 InputSet 装配。 | **Threadmill 新建 + Adapter** |
+| M5 Stop/checkpoint/resume | structured ResumeState、CheckpointRef、新 Invocation/new lease/new host。 | **Threadmill 新建 + Adapter** |
+| M6 Context updates | next-turn/rehydration injection；实时 callback 仅经证明后试点。 | **暂不实现**实时回调 |
+| M7 Permission hardening | MCP allowlist、mount/AllowedDirs、lease revocation、taskflow/projectflow blacklist、审计测试。 | **Threadmill 新建 + Adapter** |
+| M8 Integration tests | fresh start → execute → MCP → PhaseOutput → finish；再覆盖 crash、idempotency、await、resume、verify write rejection。 | **Threadmill 新建** |
+
+MVP 的最小链路是：fresh start → execute host → Threadmill MCP → `agent.submitPhaseOutput` → host finish。它不包含 await、checkpoint resume、ContextDelta realtime push、WorkerFlow、merge queue 或 Task Manager acceptance。
+
+## 10. 建议目录
+
+当前仓库仅有 `phaseagent/` core；不要把 AgentTeams code 放入该包。建议随 M0 起按职责建立：
+
+```text
+phaseagent/                    # 已有纯领域模型、Runner、ports
+internal/
+  runtime/                     # binding resolver, invocation service, validation
+  agenthost/
+    host.go                     # provider-neutral host registry/observation
+    agentteams/
+      executor.go               # PhaseExecutor implementation
+      taskflow.go               # TeamHarness command/client adapter
+      qwenpaw.go                # MCP/worker configuration adapter
+      envelope.go                # private envelope; no domain authority
+      mapper.go                  # evidence/error conversion
+  mcp/
+    phase/                      # Threadmill MCP transport/auth only
+  workspace/
+  artifacts/
+  eventlog/
+  context/
+docs/
+  threadmill-agentteams-adapter-design.md
+```
+
+`internal/agenthost/agentteams` may depend inward on `phaseagent` ports, never the reverse. `TaskManager` stays outside this subtree.
+
+## 11. 删除/修正的旧设计与未决项
+
+本重写删除了旧文档中把 `ContractRef`、`WorkspaceRef`、`ContextSliceRef` 直接放进 StartPhaseInput 的映射；删除“result.md 等于 PhaseOutput”、把 AgentTeams success 当 endpoint completion、把 WorkerFlow 当 Task 编排器、以及把 await 当 checkpoint resume 的表述。所有已被当前设计替代的 Task Contract/Context Graph/PhaseOutput 假设均改为 Threadmill 新建。
+
+尚未解决、不得自行假定的问题：
+
+1. QwenPaw MCP policy 对 per-invocation tool revoke、AllowedDirs 与 running turn 的实际强制粒度，需 M2/M7 实验验证。
+2. TeamHarness taskflow 的完整取消/终止观察 API 与 ack timeout 重试语义，需在 M1 前以源码和集成环境核实。
+3. Host task 重建时如何把显式 continuation 交给模型而不泄露 hidden reasoning，需在 M4 定义 artifact schema。
+4. 实时 worker 回调的顺序、回压和安全性未证实；M6 前一律采用 next-turn/rehydration。
+5. Workspace Service/Artifact Store/Event Log 的物理后端及 retention 尚未由本设计决定。
