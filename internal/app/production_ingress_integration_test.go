@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextgraph"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -481,6 +482,140 @@ WHERE project_id=$1 AND decision->>'action' IN ('submitted','satisfied')`, "proj
 	if semanticDecisions != 2 {
 		t.Fatalf("submitted/satisfied decision input count = %d, want 2", semanticDecisions)
 	}
+}
+
+func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	admin, err := postgres.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer admin.Close(context.Background())
+	schema := fmt.Sprintf("tm_production_context_%d", time.Now().UnixNano())
+	if _, err := admin.SQL().ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.SQL().ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+	})
+	scopedURL, err := productionTestDatabaseURLWithSearchPath(databaseURL, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := postgres.Open(ctx, scopedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewMigrator(db.SQL()).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	available := make(map[auth.Tool]struct{})
+	for _, tool := range auth.CanonicalTools() {
+		available[tool] = struct{}{}
+	}
+	catalog, err := promptcatalog.Load(filepath.Join("..", ".."), available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assembler, err := runtimepkg.NewAssembler(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := coordination.NewPostgresStore(db.SQL())
+	eventStore := evidence.NewPostgresEventStore(db.SQL(), 1<<20)
+	now := time.Date(2026, time.August, 11, 18, 0, 0, 0, time.UTC)
+	ingress, err := newProductionIngress(db.SQL(), "project-real", "room-real", assembler, graph, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ingress.setDispatcher(&recordingProductionDispatcher{}); err != nil {
+		t.Fatal(err)
+	}
+	contexts := contextgraph.NewPostgresStore(db.SQL(), func() time.Time { return now.Add(2 * time.Minute) })
+	contexts.SetTaskEndpointResolver(productionTaskEndpointResolver{projectID: "project-real", graph: graph})
+	realContextProjector := &productionPhaseBindingSource{
+		db: db.SQL(), projectID: "project-real", graph: graph, contracts: taskmanager.NewPostgresStore(db.SQL(), "project-real", graph),
+		contexts: contexts, now: func() time.Time { return now.Add(2 * time.Minute) },
+	}
+	managerRuntime, err := newProductionTaskManagerRuntime(db.SQL(), "project-real", graph, func() time.Time { return now.Add(time.Minute) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managerRuntime.setProductionEventStore(eventStore); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerRuntime.setProductionDependencies(newRecordingTaskResources(), realContextProjector, ingress); err != nil {
+		t.Fatal(err)
+	}
+	operator := auth.Principal{ActorPrincipalID: "operator-real", Kind: auth.PrincipalOperator, ProjectID: "project-real", Role: auth.RoleOperator}
+	requirement, err := ingress.SubmitRequirement(ctx, operator, httpapi.RequirementCreateRequest{
+		RequestID: "requirement-context", ProjectID: "project-real", ConversationID: "conversation-context",
+		Body: "create a task with real context projection", Motivation: "exercise trusted invocation propagation",
+		Constraints: []string{"project task context"}, Acceptance: []string{"projection is persisted"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerPrincipal := productionTestTaskManagerPrincipal(requirement.InvocationRef)
+	managerScope := auth.BoundScope{ProjectID: "project-real", InvocationID: requirement.InvocationRef}
+	if _, err := managerRuntime.SubmitTaskManagerDecision(ctx, managerPrincipal, managerScope, taskmanager.TaskManagerDecision{Action: "replace_pending", Reason: "create context-backed task"}); err != nil {
+		t.Fatal(err)
+	}
+	intent := mcpapi.PendingSubgraphIntent{
+		Tasks: []coordination.Task{{ID: "task-context", ContractRef: "contract-context"}},
+		Endpoints: []coordination.PhaseEndpoint{
+			productionForgedEndpoint("task-context", coordination.EndpointPlan, "spec-plan"),
+			productionForgedEndpoint("task-context", coordination.EndpointExecute, "spec-execute"),
+			productionForgedEndpoint("task-context", coordination.EndpointVerify, "spec-verify"),
+		},
+	}
+	revision, err := managerRuntime.ReplacePending(ctx, managerPrincipal, managerScope, intent)
+	if err != nil {
+		t.Fatalf("ReplacePending() with real context projection error = %v", err)
+	}
+	if revision != 2 {
+		t.Fatalf("ReplacePending() revision = %d, want 2", revision)
+	}
+	var mutationApplied bool
+	var appliedRevision kernel.Revision
+	if err := db.SQL().QueryRowContext(ctx, `SELECT mutation_applied, applied_graph_revision FROM production_taskmanager_bindings WHERE invocation_id=$1`, requirement.InvocationRef).Scan(&mutationApplied, &appliedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if !mutationApplied || appliedRevision != 2 {
+		t.Fatalf("binding mutation_applied=%v applied_revision=%d, want true/2", mutationApplied, appliedRevision)
+	}
+	var status string
+	if err := db.SQL().QueryRowContext(ctx, `SELECT status FROM runtime_invocations WHERE invocation_id=$1`, requirement.InvocationRef).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(runtimepkg.InvocationCompleted) {
+		t.Fatalf("runtime status = %q, want completed", status)
+	}
+	var projectionRows, taskSubgraphs int
+	if err := db.SQL().QueryRowContext(ctx, `SELECT count(*) FROM context_task_projections WHERE project_id=$1`, "project-real").Scan(&projectionRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL().QueryRowContext(ctx, `SELECT count(*) FROM context_task_subgraph_bindings WHERE project_id=$1 AND task_id=$2`, "project-real", "task-context").Scan(&taskSubgraphs); err != nil {
+		t.Fatal(err)
+	}
+	if projectionRows != 1 || taskSubgraphs != 1 {
+		t.Fatalf("context projection rows=%d task subgraphs=%d, want 1/1", projectionRows, taskSubgraphs)
+	}
+	events := uiprojection.NewEventLogQuery(eventStore, allowProjectPermission{projectID: "project-real"})
+	assertProductionUIEvents(t, ctx, events, operator, "project-real", map[string]int{
+		"manager.interaction": 1,
+		"endpoint.updated":    3,
+		"graph.revision":      1,
+	})
 }
 
 func TestProductionTaskManagerExecutionCleanupReleasesCompletedSlotsAgainstPostgres(t *testing.T) {

@@ -60,6 +60,7 @@ type productionTaskWorkspaceRequest struct {
 }
 
 type productionTaskContextRequest struct {
+	InvocationID  kernel.InvocationID
 	InputRef      string
 	TaskID        kernel.TaskID
 	GraphRevision kernel.Revision
@@ -263,7 +264,7 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 		if err := p.verifyAppliedPending(ctx, recoveredRevision, plan.Subgraph); err != nil {
 			return 0, fmt.Errorf("verify recovered pending subgraph: %w", err)
 		}
-		if err := p.ensurePendingContext(ctx, recoveredRevision, plan); err != nil {
+		if err := p.ensurePendingContext(ctx, binding, recoveredRevision, plan); err != nil {
 			return 0, fmt.Errorf("ensure recovered pending context: %w", err)
 		}
 		if !binding.MutationApplied {
@@ -282,7 +283,7 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 	if err != nil {
 		return 0, err
 	}
-	if err := p.ensurePendingContext(ctx, revision, plan); err != nil {
+	if err := p.ensurePendingContext(ctx, binding, revision, plan); err != nil {
 		return 0, fmt.Errorf("ensure pending context: %w", err)
 	}
 	if err := p.complete(ctx, caller.InvocationID, binding.DecisionRef, revision); err != nil {
@@ -497,13 +498,13 @@ func (p *productionTaskManagerRuntime) ensurePendingPrerequisites(ctx context.Co
 	return nil
 }
 
-func (p *productionTaskManagerRuntime) ensurePendingContext(ctx context.Context, revision kernel.Revision, plan productionPendingPlan) error {
+func (p *productionTaskManagerRuntime) ensurePendingContext(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision, plan productionPendingPlan) error {
 	if p.contexts == nil {
 		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Task Manager context projection is not configured", Recoverable: true}
 	}
 	for _, resource := range plan.Resources {
 		if err := p.contexts.EnsureTaskContext(ctx, productionTaskContextRequest{
-			InputRef: resource.Input.InputRef, TaskID: resource.Contract.TaskID, GraphRevision: revision,
+			InvocationID: binding.InvocationID, InputRef: resource.Input.InputRef, TaskID: resource.Contract.TaskID, GraphRevision: revision,
 			Requirement: resource.Input.Requirement, Contract: resource.Contract,
 		}); err != nil {
 			return err

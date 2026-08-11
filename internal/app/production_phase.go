@@ -271,12 +271,17 @@ func (s *productionPhaseBindingSource) EnsureTaskWorkspace(ctx context.Context, 
 }
 
 func (s *productionPhaseBindingSource) EnsureTaskContext(ctx context.Context, req productionTaskContextRequest) error {
+	if err := kernel.RequireID("invocation_id", req.InvocationID); err != nil {
+		return err
+	}
 	if err := kernel.RequireID("task_id", req.TaskID); err != nil {
 		return err
 	}
 	principal := auth.Principal{
 		ActorPrincipalID: kernel.ActorPrincipalID("production-task-manager:" + string(s.projectID)),
+		Kind:             auth.PrincipalAgent,
 		ProjectID:        s.projectID,
+		InvocationID:     req.InvocationID,
 		Role:             auth.RoleTaskManager,
 		TaskID:           req.TaskID,
 		Tools:            auth.ToolSet(auth.ToolContextRegisterTaskSubgraph, auth.ToolContextProjectTaskContext),
