@@ -65,3 +65,25 @@ func TestServeRejectsUnexpectedArgument(t *testing.T) {
 		t.Fatalf("stderr = %q, want unexpected argument diagnostic", stderr.String())
 	}
 }
+
+func TestBootstrapOperatorRequiresExplicitActor(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"bootstrap-operator"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run(bootstrap-operator) exit code = %d, want 2", code)
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires --actor") {
+		t.Fatalf("stdout=%q stderr=%q, want explicit actor diagnostic", stdout.String(), stderr.String())
+	}
+}
+
+func TestBootstrapOperatorRejectsInvalidTTLBeforeLoadingConfig(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"bootstrap-operator", "--actor", "operator://alice", "--ttl", "forever"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("run(bootstrap-operator) exit code = %d, want 2", code)
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "invalid value") {
+		t.Fatalf("stdout=%q stderr=%q, want flag diagnostic", stdout.String(), stderr.String())
+	}
+}

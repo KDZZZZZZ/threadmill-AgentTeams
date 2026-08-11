@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -31,10 +32,11 @@ import (
 )
 
 type productionHost struct {
-	db  *postgres.DB
-	api http.Handler
-	mcp http.Handler
-	web http.Handler
+	db         *postgres.DB
+	background Component
+	api        http.Handler
+	mcp        http.Handler
+	web        http.Handler
 }
 
 // productionRuntimeDependencies is the explicit seam between the production
@@ -42,21 +44,45 @@ type productionHost struct {
 // replaced with disabled ports: production startup fails closed until the
 // AgentTeams-backed runtime supplies every authoritative command path.
 type productionRuntimeDependencies struct {
-	requirements  httpapi.RequirementCommandPort
-	human         httpapi.HumanDecisionPort
-	manager       httpapi.ManagerPort
-	phase         mcpapi.PhaseRuntime
-	requirement   mcpapi.RequirementSubmitter
-	orchestration mcpapi.OrchestrationProposalRuntime
-	taskManager   mcpapi.TaskManagerAgentRuntime
-	workspace     workspace.AgentToolPort
-	objectStore   productionReadinessProbe
-	agentTeams    productionReadinessProbe
-	runtime       productionReadinessProbe
+	requirements      httpapi.RequirementCommandPort
+	human             httpapi.HumanDecisionPort
+	manager           httpapi.ManagerPort
+	phase             mcpapi.PhaseRuntime
+	requirement       mcpapi.RequirementSubmitter
+	orchestration     mcpapi.OrchestrationProposalRuntime
+	taskManager       mcpapi.TaskManagerAgentRuntime
+	workspace         workspace.AgentToolPort
+	phaseController   coordination.PhaseController
+	objectStoreDriver objectstore.Store
+	objectStore       productionReadinessProbe
+	agentTeams        productionReadinessProbe
+	runtime           productionReadinessProbe
+	background        Component
 }
 
 func newProductionHost(ctx context.Context, cfg config.Config) (*productionHost, error) {
-	return newProductionHostWithDependencies(ctx, cfg, productionRuntimeDependencies{})
+	if err := runMigrations(ctx, cfg); err != nil {
+		return nil, err
+	}
+	db, err := postgres.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	deps, err := buildProductionRuntimeDependencies(ctx, cfg, db, productionPhaseSeams{})
+	if err != nil {
+		_ = db.Close(context.Background())
+		return nil, err
+	}
+	host, err := buildProductionHostWithDependencies(ctx, cfg, db, deps)
+	if err != nil {
+		if deps.background != nil {
+			_ = deps.background.Close(context.Background())
+		}
+		_ = db.Close(context.Background())
+		return nil, err
+	}
+	host.background = deps.background
+	return host, nil
 }
 
 func newProductionHostWithDependencies(ctx context.Context, cfg config.Config, deps productionRuntimeDependencies) (*productionHost, error) {
@@ -79,7 +105,19 @@ func newProductionHostWithDependencies(ctx context.Context, cfg config.Config, d
 }
 
 func buildProductionHost(ctx context.Context, cfg config.Config, db *postgres.DB) (*productionHost, error) {
-	return buildProductionHostWithDependencies(ctx, cfg, db, productionRuntimeDependencies{})
+	deps, err := buildProductionRuntimeDependencies(ctx, cfg, db, productionPhaseSeams{})
+	if err != nil {
+		return nil, err
+	}
+	host, err := buildProductionHostWithDependencies(ctx, cfg, db, deps)
+	if err != nil {
+		if deps.background != nil {
+			_ = deps.background.Close(context.Background())
+		}
+		return nil, err
+	}
+	host.background = deps.background
+	return host, nil
 }
 
 func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config, db *postgres.DB, deps productionRuntimeDependencies) (*productionHost, error) {
@@ -99,15 +137,16 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 		return nil, err
 	}
 
-	objectStore, err := objectstore.NewMinIOStore(objectstore.MinIOConfig{
-		Endpoint:  cfg.ObjectStoreEndpoint,
-		AccessKey: cfg.ObjectStoreAccessKey,
-		SecretKey: cfg.ObjectStoreSecretKey,
-		Bucket:    cfg.ObjectStoreBucket,
-		Secure:    cfg.ObjectStoreSecure,
-	})
-	if err != nil {
-		return nil, err
+	objectStore := deps.objectStoreDriver
+	if objectStore == nil {
+		var err error
+		objectStore, err = objectstore.NewMinIOStore(objectstore.MinIOConfig{
+			Endpoint: cfg.ObjectStoreEndpoint, AccessKey: cfg.ObjectStoreAccessKey,
+			SecretKey: cfg.ObjectStoreSecretKey, Bucket: cfg.ObjectStoreBucket, Secure: cfg.ObjectStoreSecure,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	artifactRegistry := evidence.NewPostgresArtifactRegistry(sqlDB, objectStore, cfg.ObjectStoreBucket)
 	eventStore := evidence.NewPostgresEventStore(sqlDB, 1<<20)
@@ -163,7 +202,7 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 		return nil, err
 	}
 	_ = invocations
-	return &productionHost{db: db, api: api, mcp: mcp, web: web.Handler()}, nil
+	return &productionHost{db: db, background: deps.background, api: api, mcp: mcp, web: web.Handler()}, nil
 }
 
 func (h *productionHost) Handler() http.Handler {
@@ -171,10 +210,17 @@ func (h *productionHost) Handler() http.Handler {
 }
 
 func (h *productionHost) Close(ctx context.Context) error {
-	if h == nil || h.db == nil {
+	if h == nil {
 		return nil
 	}
-	return h.db.Close(ctx)
+	var backgroundErr, dbErr error
+	if h.background != nil {
+		backgroundErr = h.background.Close(ctx)
+	}
+	if h.db != nil {
+		dbErr = h.db.Close(ctx)
+	}
+	return errors.Join(backgroundErr, dbErr)
 }
 
 func routeProductionHTTP(api, mcp, web http.Handler) http.Handler {
@@ -480,6 +526,7 @@ func validateProductionRuntimeDependencies(deps productionRuntimeDependencies) e
 		{name: "orchestration_runtime", value: deps.orchestration},
 		{name: "task_manager_runtime", value: deps.taskManager},
 		{name: "workspace", value: deps.workspace},
+		{name: "phase_controller", value: deps.phaseController},
 		{name: "object_store_readiness", value: deps.objectStore},
 		{name: "agentteams_readiness", value: deps.agentTeams},
 		{name: "runtime_readiness", value: deps.runtime},

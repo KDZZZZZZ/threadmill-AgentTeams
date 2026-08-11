@@ -1,134 +1,126 @@
 package config
 
 import (
+	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
 func TestLoadReportsMissingRequiredConfiguration(t *testing.T) {
-	t.Setenv("THREADMILL_DATABASE_URL", "")
-	t.Setenv("THREADMILL_OBJECT_STORE_ENDPOINT", "")
-	t.Setenv("THREADMILL_ALLOWED_ORIGINS", "")
-
-	_, err := Load(Environment{})
+	env := productionConfigEnv()
+	for key := range env {
+		env[key] = ""
+	}
+	_, err := Load(env)
 	if err == nil {
 		t.Fatal("Load() error = nil, want missing configuration error")
 	}
-
 	diag, ok := AsDiagnostic(err)
-	if !ok {
-		t.Fatalf("Load() error type = %T, want DiagnosticError", err)
+	if !ok || diag.Code != "configuration_missing" {
+		t.Fatalf("Load() diagnostic = %#v, %t, want configuration_missing", diag, ok)
 	}
-	if diag.Code != "configuration_missing" {
-		t.Fatalf("diagnostic code = %q, want configuration_missing", diag.Code)
-	}
-	if len(diag.Missing) != 6 {
-		t.Fatalf("missing keys = %v, want database, object store, and browser origin configuration", diag.Missing)
+	if len(diag.Missing) != 16 {
+		t.Fatalf("missing keys = %v, want all 16 production secrets/endpoints", diag.Missing)
 	}
 }
 
-func TestLoadAppliesDefaultsWhenRequiredConfigurationExists(t *testing.T) {
-	t.Setenv("THREADMILL_DATABASE_URL", "postgres://threadmill:threadmill@localhost:5432/threadmill")
-	t.Setenv("THREADMILL_OBJECT_STORE_ENDPOINT", "localhost:9000")
-	t.Setenv("THREADMILL_OBJECT_STORE_ACCESS_KEY", "threadmill")
-	t.Setenv("THREADMILL_OBJECT_STORE_SECRET_KEY", "super-secret")
-	t.Setenv("THREADMILL_OBJECT_STORE_BUCKET", "artifacts")
-	t.Setenv("THREADMILL_ALLOWED_ORIGINS", "https://threadmill.example")
-
-	cfg, err := Load(Environment{})
+func TestLoadAppliesDefaultsAndParsesProductionWiring(t *testing.T) {
+	cfg, err := Load(productionConfigEnv())
 	if err != nil {
 		t.Fatalf("Load() error = %v, want nil", err)
 	}
-	if cfg.HTTPAddr != ":8080" {
-		t.Fatalf("HTTPAddr = %q, want :8080", cfg.HTTPAddr)
-	}
-	if cfg.ProjectID != "default-project" {
-		t.Fatalf("ProjectID = %q, want default-project", cfg.ProjectID)
-	}
-	if cfg.WebDistDir != "web/dist" {
-		t.Fatalf("WebDistDir = %q, want web/dist", cfg.WebDistDir)
+	if cfg.HTTPAddr != ":8080" || cfg.ProjectID != "default-project" || cfg.WebDistDir != "web/dist" {
+		t.Fatalf("defaults = addr %q project %q web %q", cfg.HTTPAddr, cfg.ProjectID, cfg.WebDistDir)
 	}
 	if !cfg.ObjectStoreSecure {
 		t.Fatal("ObjectStoreSecure = false, want default true")
 	}
+	if cfg.AgentTeamsContainers["manager-a"] != "qwen-manager-a" || len(cfg.RuntimeTokenKey) != 32 {
+		t.Fatalf("production wiring = containers %#v key bytes %d", cfg.AgentTeamsContainers, len(cfg.RuntimeTokenKey))
+	}
 }
 
-func TestLoadParsesObjectStoreSecureFlag(t *testing.T) {
-	cfg, err := Load(Environment{
-		"THREADMILL_DATABASE_URL":            "postgres://threadmill:threadmill@localhost:5432/threadmill",
-		"THREADMILL_OBJECT_STORE_ENDPOINT":   "localhost:9000",
-		"THREADMILL_OBJECT_STORE_ACCESS_KEY": "threadmill",
-		"THREADMILL_OBJECT_STORE_SECRET_KEY": "super-secret",
-		"THREADMILL_OBJECT_STORE_BUCKET":     "artifacts",
-		"THREADMILL_OBJECT_STORE_SECURE":     "false",
-		"THREADMILL_ALLOWED_ORIGINS":         "http://127.0.0.1:8080",
-	})
+func TestLoadParsesObjectStoreSecureAndDeduplicatesOrigins(t *testing.T) {
+	env := productionConfigEnv()
+	env[envObjectStoreSecure] = "false"
+	env[envAllowedOrigins] = " https://threadmill.example, http://127.0.0.1:8080,https://threadmill.example "
+	cfg, err := Load(env)
 	if err != nil {
 		t.Fatalf("Load() error = %v, want nil", err)
 	}
-	if cfg.ObjectStoreSecure {
-		t.Fatal("ObjectStoreSecure = true, want false")
+	if cfg.ObjectStoreSecure || len(cfg.AllowedOrigins) != 2 {
+		t.Fatalf("secure=%t origins=%v", cfg.ObjectStoreSecure, cfg.AllowedOrigins)
 	}
 }
 
-func TestLoadParsesAndDeduplicatesAllowedOrigins(t *testing.T) {
-	cfg, err := Load(Environment{
-		"THREADMILL_DATABASE_URL":            "postgres://threadmill:threadmill@localhost:5432/threadmill",
-		"THREADMILL_OBJECT_STORE_ENDPOINT":   "localhost:9000",
-		"THREADMILL_OBJECT_STORE_ACCESS_KEY": "threadmill",
-		"THREADMILL_OBJECT_STORE_SECRET_KEY": "super-secret",
-		"THREADMILL_OBJECT_STORE_BUCKET":     "artifacts",
-		"THREADMILL_ALLOWED_ORIGINS":         " https://threadmill.example, http://127.0.0.1:8080,https://threadmill.example ",
-	})
+func TestLoadRejectsUnsafeProductionConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "origin path", key: envAllowedOrigins, value: "https://threadmill.example/app"},
+		{name: "controller userinfo", key: envAgentTeamsControllerURL, value: "https://secret@example.test"},
+		{name: "controller bearer whitespace", key: envAgentTeamsControllerBearer, value: "secret token"},
+		{name: "container mapping", key: envAgentTeamsContainers, value: "manager-a=qwen-a,manager-a=qwen-b"},
+		{name: "container alias", key: envAgentTeamsContainers, value: "manager-a=qwen-a,worker-a=qwen-a"},
+		{name: "container shell separator", key: envAgentTeamsContainers, value: "manager-a=qwen:a"},
+		{name: "container MCP path", key: envContainerMCPURL, value: "http://host.docker.internal:8080/not-mcp"},
+		{name: "room whitespace", key: envAgentTeamsRoomID, value: "!threadmill room:example.test"},
+		{name: "runtime key", key: envRuntimeTokenKey, value: base64.StdEncoding.EncodeToString([]byte("too-short"))},
+		{name: "shared prefix traversal", key: envAgentTeamsSharedPrefix, value: "runtime/../escape"},
+		{name: "relative repo", key: envRepositoryPath, value: "./repo"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := productionConfigEnv()
+			env[test.key] = test.value
+			_, err := Load(env)
+			if err == nil {
+				t.Fatal("Load() error = nil, want invalid configuration")
+			}
+			diag, ok := AsDiagnostic(err)
+			if !ok || diag.Code != "configuration_invalid" || strings.Contains(diag.Message, test.value) {
+				t.Fatalf("diagnostic = %#v, %t; value must not be echoed", diag, ok)
+			}
+		})
+	}
+}
+
+func TestCheckDoesNotExposeSecrets(t *testing.T) {
+	cfg, err := Load(productionConfigEnv())
 	if err != nil {
-		t.Fatalf("Load() error = %v, want nil", err)
-	}
-	want := []string{"https://threadmill.example", "http://127.0.0.1:8080"}
-	if len(cfg.AllowedOrigins) != len(want) {
-		t.Fatalf("AllowedOrigins = %v, want %v", cfg.AllowedOrigins, want)
-	}
-	for i := range want {
-		if cfg.AllowedOrigins[i] != want[i] {
-			t.Fatalf("AllowedOrigins = %v, want %v", cfg.AllowedOrigins, want)
-		}
-	}
-}
-
-func TestLoadRejectsAllowedOriginWithPath(t *testing.T) {
-	_, err := Load(Environment{
-		"THREADMILL_DATABASE_URL":            "postgres://threadmill:threadmill@localhost:5432/threadmill",
-		"THREADMILL_OBJECT_STORE_ENDPOINT":   "localhost:9000",
-		"THREADMILL_OBJECT_STORE_ACCESS_KEY": "threadmill",
-		"THREADMILL_OBJECT_STORE_SECRET_KEY": "super-secret",
-		"THREADMILL_OBJECT_STORE_BUCKET":     "artifacts",
-		"THREADMILL_ALLOWED_ORIGINS":         "https://threadmill.example/app",
-	})
-	if err == nil {
-		t.Fatal("Load() error = nil, want invalid origin error")
-	}
-	diag, ok := AsDiagnostic(err)
-	if !ok || diag.Code != "configuration_invalid" {
-		t.Fatalf("Load() diagnostic = %#v, %t, want configuration_invalid", diag, ok)
-	}
-}
-
-func TestCheckDoesNotExposeObjectStoreSecret(t *testing.T) {
-	cfg := Config{
-		DatabaseURL:          "postgres://user:password@example/db",
-		ObjectStoreEndpoint:  "localhost:9000",
-		ObjectStoreAccessKey: "access-key",
-		ObjectStoreSecretKey: "do-not-leak",
-		ObjectStoreBucket:    "artifacts",
-		ObjectStoreSecure:    false,
-		HTTPAddr:             ":8080",
-		AllowedOrigins:       []string{"https://threadmill.example"},
+		t.Fatal(err)
 	}
 	diag := Check(cfg)
 	if diag.Message == "" {
 		t.Fatal("diagnostic message is empty")
 	}
-	if containsAny(diag.Message, []string{"do-not-leak", "access-key", "password"}) {
+	if containsAny(diag.Message, []string{cfg.ObjectStoreAccessKey, cfg.ObjectStoreSecretKey, cfg.AgentTeamsControllerBearer, base64.StdEncoding.EncodeToString(cfg.RuntimeTokenKey), "password"}) {
 		t.Fatalf("diagnostic leaked secret material: %q", diag.Message)
+	}
+}
+
+func productionConfigEnv() Environment {
+	return Environment{
+		envDatabaseURL:                "postgres://threadmill:password@localhost:5432/threadmill",
+		envObjectStoreEndpoint:        "localhost:9000",
+		envObjectStoreAccessKey:       "threadmill-access",
+		envObjectStoreSecretKey:       "object-secret",
+		envObjectStoreBucket:          "artifacts",
+		envAllowedOrigins:             "https://threadmill.example",
+		envAgentTeamsControllerURL:    "http://127.0.0.1:8091",
+		envAgentTeamsControllerBearer: "controller-secret",
+		envContainerMCPURL:            "http://host.docker.internal:8080/mcp",
+		envAgentTeamsRoomID:           "!threadmill:example.test",
+		envAgentTeamsContainers:       "manager-a=qwen-manager-a,worker-a=qwen-worker-a",
+		envAgentTeamsSharedBucket:     "artifacts",
+		envAgentTeamsSharedPrefix:     "agentteams/runtime",
+		envRepositoryPath:             filepath.Join(os.TempDir(), "threadmill-repository"),
+		envWorktreeParent:             filepath.Join(os.TempDir(), "threadmill-worktrees"),
+		envRuntimeTokenKey:            base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),
 	}
 }
 

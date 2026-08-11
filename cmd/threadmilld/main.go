@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/app"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/config"
 )
 
@@ -82,6 +84,35 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		writeDiagnostic(stdout, config.Diagnostic{OK: true, Code: "ok", Message: "migrations are up to date", Recoverable: true})
 		return 0
+	case "bootstrap-operator":
+		bootstrapFlags := flag.NewFlagSet("bootstrap-operator", flag.ContinueOnError)
+		bootstrapFlags.SetOutput(stderr)
+		actor := bootstrapFlags.String("actor", "", "operator principal ID")
+		ttl := bootstrapFlags.Duration("ttl", 8*time.Hour, "session lifetime (maximum 24h)")
+		if err := bootstrapFlags.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if bootstrapFlags.NArg() != 0 || *actor == "" {
+			fmt.Fprintln(stderr, "bootstrap-operator requires --actor and accepts no positional arguments")
+			return 2
+		}
+		cfg, err := config.Load(nil)
+		if err != nil {
+			writeDiagnostic(stdout, diagnosticFromError(err))
+			return 2
+		}
+		credential, err := app.BootstrapOperator(context.Background(), cfg, kernel.ActorPrincipalID(*actor), *ttl)
+		if err != nil {
+			writeDiagnostic(stdout, config.Diagnostic{OK: false, Code: "operator_bootstrap_failed", Message: err.Error(), Recoverable: true})
+			return 1
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(credential); err != nil {
+			fmt.Fprintln(stderr, "write operator bootstrap output failed")
+			return 1
+		}
+		return 0
 	case "check":
 		cfg, err := config.Load(nil)
 		if err != nil {
@@ -98,7 +129,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func writeUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: threadmilld serve [--fake] [--http-addr addr] [--web-dist dir] | migrate | check")
+	fmt.Fprintln(w, "usage: threadmilld serve [--fake] [--http-addr addr] [--web-dist dir] | migrate | check | bootstrap-operator --actor id [--ttl 8h]")
 }
 
 func diagnosticFromError(err error) config.Diagnostic {

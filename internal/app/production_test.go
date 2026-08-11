@@ -80,12 +80,12 @@ func TestProductionWritesRejectInvalidOriginAndCSRF(t *testing.T) {
 	}
 }
 
-func TestProductionHostFailsClosedWhenRuntimeDependenciesAreMissing(t *testing.T) {
-	_, err := newProductionHost(context.Background(), config.Config{})
+func TestInjectedProductionHostFailsClosedWhenRuntimeDependenciesAreMissing(t *testing.T) {
+	err := validateProductionRuntimeDependencies(productionRuntimeDependencies{})
 	if err == nil {
-		t.Fatal("newProductionHost() error = nil, want missing runtime dependency error")
+		t.Fatal("validateProductionRuntimeDependencies() error = nil, want missing runtime dependency error")
 	}
-	for _, dependency := range []string{"manager", "phase_runtime", "workspace", "agentteams_readiness"} {
+	for _, dependency := range []string{"manager", "phase_runtime", "phase_controller", "workspace", "agentteams_readiness"} {
 		if !strings.Contains(err.Error(), dependency) {
 			t.Fatalf("newProductionHost() error = %q, want missing dependency %q", err, dependency)
 		}
