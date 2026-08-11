@@ -80,6 +80,13 @@ func TestPostgresSchedulerLedgersAgainstRealDatabase(t *testing.T) {
 	if capacity != (Capacity{Desired: 5, Healthy: 2, Active: 0, Revision: 1}) {
 		t.Fatalf("initial capacity = %#v", capacity)
 	}
+	capacity, err = capacityLedger.Observe(ctx, 2, 0)
+	if err != nil {
+		t.Fatalf("repeat initial capacity observation: %v", err)
+	}
+	if capacity.Revision != 1 {
+		t.Fatalf("no-op capacity observation revision = %d, want 1", capacity.Revision)
+	}
 
 	capacity, err = capacityLedger.Observe(ctx, 2, 2)
 	if err != nil {
@@ -257,7 +264,7 @@ func exerciseConcurrentCapacityObservation(t *testing.T, ctx context.Context, le
 	if err != nil {
 		t.Fatalf("snapshot after concurrent observations: %v", err)
 	}
-	if after.Revision != before.Revision+writers || after.Desired != before.Desired {
+	if after.Revision <= before.Revision || after.Revision > before.Revision+writers || after.Desired != before.Desired {
 		t.Fatalf("capacity after concurrent observations = %#v, before %#v", after, before)
 	}
 	if _, ok := observations[observation{healthy: after.Healthy, active: after.Active}]; !ok {

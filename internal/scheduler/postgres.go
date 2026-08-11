@@ -125,11 +125,12 @@ SET healthy_capacity = $2,
     revision = revision + 1,
     updated_at = now()
 WHERE project_id = $1
+  AND (healthy_capacity, active_invocations) IS DISTINCT FROM ($2, $3)
 RETURNING desired_concurrency, healthy_capacity, active_invocations, revision`,
 		l.projectID, healthy, active,
 	).Scan(&next.Desired, &next.Healthy, &next.Active, &next.Revision)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Capacity{}, schedulerLedgerNotFound("capacity", l.projectID)
+		return snapshotPostgresCapacity(ctx, l.db, l.projectID)
 	}
 	if err != nil {
 		return Capacity{}, fmt.Errorf("observe scheduler capacity: %w", err)

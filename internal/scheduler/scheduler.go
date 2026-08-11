@@ -94,6 +94,9 @@ func (l *CapacityLedger) Observe(_ context.Context, healthy, active int) (Capaci
 	if healthy < 0 || active < 0 || active > healthy {
 		return l.capacity, kernel.InvalidArgument("observed capacity requires 0 <= active <= healthy")
 	}
+	if l.capacity.Healthy == healthy && l.capacity.Active == active {
+		return l.capacity, nil
+	}
 	l.capacity.Healthy = healthy
 	l.capacity.Active = active
 	l.capacity.Revision++

@@ -46,6 +46,34 @@ func TestCapacityLedgerCASAndDecreaseDoesNotCancelActive(t *testing.T) {
 	}
 }
 
+func TestCapacityLedgerNoopObservationKeepsRevision(t *testing.T) {
+	ledger := NewCapacityLedger(4, 3)
+
+	current, err := ledger.Observe(context.Background(), 4, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Revision != 1 {
+		t.Fatalf("no-op observation revision = %d, want 1", current.Revision)
+	}
+
+	current, err = ledger.Observe(context.Background(), 4, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Revision != 2 {
+		t.Fatalf("changed observation revision = %d, want 2", current.Revision)
+	}
+
+	current, err = ledger.Observe(context.Background(), 4, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Revision != 2 {
+		t.Fatalf("repeated observation revision = %d, want 2", current.Revision)
+	}
+}
+
 func TestCapacityLedgerKeepsDesiredSeparateFromHealthy(t *testing.T) {
 	ledger := NewCapacityLedger(2, 5)
 	current := ledger.Snapshot()
