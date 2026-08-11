@@ -17,6 +17,7 @@ import (
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/config"
@@ -81,6 +82,9 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	}
 	taskManagerRuntime, err := newProductionTaskManagerRuntime(sqlDB, projectID, coordStore, time.Now)
 	if err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	if err := taskManagerRuntime.setProductionEventStore(evidence.NewPostgresEventStore(sqlDB, 1<<20)); err != nil {
 		return productionRuntimeDependencies{}, err
 	}
 	invocationStore := runtimepkg.NewPostgresInvocationStoreFromSQL(sqlDB)

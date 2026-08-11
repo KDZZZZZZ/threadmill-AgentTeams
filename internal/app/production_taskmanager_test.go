@@ -1,15 +1,20 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	phasepkg "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/taskmanager"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/httpapi"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/mcpapi"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/uiprojection"
 )
 
 func TestTrustedDecisionMutationUsesRuntimeSelectedEndpoint(t *testing.T) {
@@ -163,5 +168,40 @@ func TestStableProductionSuffixSeparatesIngressNamespaces(t *testing.T) {
 	b := stableProductionSuffix("project-a", "human", "request-1")
 	if a == "" || a == b || a != stableProductionSuffix("project-a", "manager", "request-1") {
 		t.Fatalf("stable production IDs are not deterministic and namespaced: %q %q", a, b)
+	}
+}
+
+func TestProductionTaskManagerEventsAreIdempotentAndQueryable(t *testing.T) {
+	ctx := context.Background()
+	log := evidence.NewEventLog(64 * 1024)
+	runtime := &productionTaskManagerRuntime{projectID: "project-a", events: log}
+	binding := productionTaskManagerBinding{
+		InputRef: "manager-input-1", ConversationID: "conversation-1", SeenRevision: 1,
+		DecisionRef: "decision-1",
+	}
+	endpoint := coordination.PhaseEndpoint{
+		Ref:        coordination.PhaseEndpointRef{TaskID: "task-a", EndpointID: coordination.EndpointExecute},
+		Generation: 1, State: coordination.EndpointPending,
+	}
+	if err := runtime.appendDecisionAcceptedEvent(ctx, binding, "decision-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.appendGraphRevisionEvents(ctx, binding, 2, []coordination.PhaseEndpoint{endpoint}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.appendDecisionAcceptedEvent(ctx, binding, "decision-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.appendGraphRevisionEvents(ctx, binding, 2, []coordination.PhaseEndpoint{endpoint}); err != nil {
+		t.Fatal(err)
+	}
+
+	query := uiprojection.NewEventLogQuery(log, allowProjectPermission{projectID: "project-a"})
+	page, err := query.ListEvents(ctx, auth.Principal{ActorPrincipalID: "operator-a", Kind: auth.PrincipalOperator, ProjectID: "project-a", Role: auth.RoleOperator, AuthenticatedAt: time.Now()}, "project-a", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 3 || !productionUIEventsContain(page.Events, "manager.interaction", "graph.revision", "endpoint.updated") {
+		t.Fatalf("events = %#v, want idempotent manager/graph/endpoint events", page.Events)
 	}
 }

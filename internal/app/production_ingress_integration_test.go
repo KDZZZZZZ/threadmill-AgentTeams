@@ -15,6 +15,7 @@ import (
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
@@ -24,6 +25,7 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/taskmanager"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/httpapi"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/mcpapi"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/uiprojection"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
 )
 
@@ -195,6 +197,7 @@ func TestProductionTaskManagerTrustedResourcesAndTwoStepBoundariesAgainstPostgre
 		t.Fatal(err)
 	}
 	graph := coordination.NewPostgresStore(db.SQL())
+	eventStore := evidence.NewPostgresEventStore(db.SQL(), 1<<20)
 	now := time.Date(2026, time.August, 11, 16, 0, 0, 0, time.UTC)
 	ingress, err := newProductionIngress(db.SQL(), "project-real", "room-real", assembler, graph, func() time.Time { return now })
 	if err != nil {
@@ -207,6 +210,9 @@ func TestProductionTaskManagerTrustedResourcesAndTwoStepBoundariesAgainstPostgre
 	resources := newRecordingTaskResources()
 	managerRuntime, err := newProductionTaskManagerRuntime(db.SQL(), "project-real", graph, func() time.Time { return now.Add(time.Minute) })
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := managerRuntime.setProductionEventStore(eventStore); err != nil {
 		t.Fatal(err)
 	}
 	if err := managerRuntime.setProductionDependencies(resources, resources, ingress); err != nil {
@@ -246,6 +252,13 @@ func TestProductionTaskManagerTrustedResourcesAndTwoStepBoundariesAgainstPostgre
 	if afterGraph.Revision != 2 {
 		t.Fatalf("graph revision after projection crash = %d, want 2", afterGraph.Revision)
 	}
+	events := uiprojection.NewEventLogQuery(eventStore, allowProjectPermission{projectID: "project-real"})
+	operatorPrincipal := auth.Principal{ActorPrincipalID: "operator-real", Kind: auth.PrincipalOperator, ProjectID: "project-real", Role: auth.RoleOperator}
+	assertProductionUIEvents(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
+		"manager.interaction": 1,
+		"graph.revision":      1,
+		"endpoint.updated":    3,
+	})
 	if len(afterGraph.Tasks) != 1 || afterGraph.Tasks[0].Outcome != coordination.TaskActive {
 		t.Fatalf("Runtime did not normalize task authority: %#v", afterGraph.Tasks)
 	}
@@ -272,6 +285,9 @@ WHERE c.project_id=$1 AND c.task_id=$2`, "project-real", "task-trusted").Scan(&c
 	// revision without writing a second revision.
 	restarted, err := newProductionTaskManagerRuntime(db.SQL(), "project-real", graph, func() time.Time { return now.Add(2 * time.Minute) })
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.setProductionEventStore(eventStore); err != nil {
 		t.Fatal(err)
 	}
 	if err := restarted.setProductionDependencies(resources, resources, ingress); err != nil {
@@ -325,9 +341,18 @@ WHERE c.project_id=$1 AND c.task_id=$2`, "project-real", "task-trusted").Scan(&c
 	if afterSubmitted.Revision != 3 || productionEndpoint(afterSubmitted, executeRef).State != coordination.EndpointSubmitted {
 		t.Fatalf("submitted graph = %#v", afterSubmitted)
 	}
+	assertProductionUIEvents(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
+		"manager.interaction": 2,
+		"graph.revision":      2,
+		"endpoint.updated":    4,
+		"invocation.updated":  1,
+	})
 
 	restartedAgain, err := newProductionTaskManagerRuntime(db.SQL(), "project-real", graph, func() time.Time { return now.Add(3 * time.Minute) })
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedAgain.setProductionEventStore(eventStore); err != nil {
 		t.Fatal(err)
 	}
 	if err := restartedAgain.setProductionDependencies(resources, resources, ingress); err != nil {
@@ -526,6 +551,36 @@ func revisionPointer(revision kernel.Revision) *kernel.Revision { return &revisi
 func stringsContainAll(value string, needles ...string) bool {
 	for _, needle := range needles {
 		if !strings.Contains(value, needle) {
+			return false
+		}
+	}
+	return true
+}
+
+func assertProductionUIEvents(t *testing.T, ctx context.Context, events *uiprojection.EventLogQuery, principal auth.Principal, projectID kernel.ProjectID, want map[string]int) {
+	t.Helper()
+	page, err := events.ListEvents(ctx, principal, projectID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := make(map[string]int)
+	for _, event := range page.Events {
+		counts[event.Type]++
+	}
+	for eventType, minimum := range want {
+		if counts[eventType] < minimum {
+			t.Fatalf("event type %s count = %d, want at least %d; events=%#v", eventType, counts[eventType], minimum, page.Events)
+		}
+	}
+}
+
+func productionUIEventsContain(events []uiprojection.UIEvent, eventTypes ...string) bool {
+	seen := make(map[string]struct{}, len(events))
+	for _, event := range events {
+		seen[event.Type] = struct{}{}
+	}
+	for _, eventType := range eventTypes {
+		if _, ok := seen[eventType]; !ok {
 			return false
 		}
 	}

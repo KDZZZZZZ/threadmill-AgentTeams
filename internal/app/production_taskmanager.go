@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	phasepkg "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/taskmanager"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/httpapi"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/mcpapi"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/uiprojection"
 )
 
 // productionTaskManagerRuntime binds every MCP mutation to the immutable input
@@ -32,6 +34,7 @@ type productionTaskManagerRuntime struct {
 	workspaces  productionTaskWorkspaceProvisioner
 	contexts    productionTaskContextProjector
 	followups   productionTaskManagerFollowupDispatcher
+	events      evidence.EventStore
 	now         func() time.Time
 }
 
@@ -144,6 +147,14 @@ func (p *productionTaskManagerRuntime) setProductionDependencies(workspaces prod
 	return nil
 }
 
+func (p *productionTaskManagerRuntime) setProductionEventStore(events evidence.EventStore) error {
+	if events == nil {
+		return kernel.InvalidArgument("production Task Manager event store is required")
+	}
+	p.events = events
+	return nil
+}
+
 func (p *productionTaskManagerRuntime) Snapshot(ctx context.Context, caller auth.Principal, scope auth.BoundScope, revision kernel.Revision) (coordination.GraphSnapshot, error) {
 	if _, err := p.binding(ctx, caller, scope); err != nil {
 		return coordination.GraphSnapshot{}, err
@@ -163,6 +174,9 @@ func (p *productionTaskManagerRuntime) SubmitTaskManagerDecision(ctx context.Con
 		}
 		if !matches {
 			return "", kernel.IdempotencyConflict()
+		}
+		if err := p.appendDecisionAcceptedEvent(ctx, binding, binding.DecisionRef); err != nil {
+			return "", err
 		}
 		if binding.DecisionKind == taskmanager.DecisionKindTerminal && !binding.MutationApplied {
 			if err := p.complete(ctx, caller.InvocationID, binding.DecisionRef, binding.SeenRevision); err != nil {
@@ -187,6 +201,10 @@ func (p *productionTaskManagerRuntime) SubmitTaskManagerDecision(ctx context.Con
 		return "", err
 	}
 	if err := p.persistDecisionAcceptance(ctx, binding, decisionRef, kind, decision, snapshot.Revision); err != nil {
+		return "", err
+	}
+	binding.DecisionRef, binding.DecisionKind, binding.DecisionAction = decisionRef, kind, decision.Action
+	if err := p.appendDecisionAcceptedEvent(ctx, binding, decisionRef); err != nil {
 		return "", err
 	}
 	if kind == taskmanager.DecisionKindTerminal {
@@ -231,6 +249,9 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 		if err := p.verifyAppliedPending(ctx, recoveredRevision, plan.Subgraph); err != nil {
 			return 0, fmt.Errorf("verify recovered pending subgraph: %w", err)
 		}
+		if err := p.appendGraphRevisionEvents(ctx, binding, recoveredRevision, plan.Subgraph.Endpoints); err != nil {
+			return 0, err
+		}
 		if err := p.ensurePendingContext(ctx, recoveredRevision, plan); err != nil {
 			return 0, fmt.Errorf("ensure recovered pending context: %w", err)
 		}
@@ -243,6 +264,9 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 	}
 	revision, err := p.graph(caller).ReplacePending(ctx, plan.Subgraph)
 	if err != nil {
+		return 0, err
+	}
+	if err := p.appendGraphRevisionEvents(ctx, binding, revision, plan.Subgraph.Endpoints); err != nil {
 		return 0, err
 	}
 	if err := p.ensurePendingContext(ctx, revision, plan); err != nil {
@@ -265,6 +289,9 @@ func (p *productionTaskManagerRuntime) Transition(ctx context.Context, caller au
 	if revision, found, err := p.recoverAppliedRevision(ctx, binding); err != nil {
 		return 0, err
 	} else if found {
+		if err := p.appendTransitionEvents(ctx, binding, revision); err != nil {
+			return 0, err
+		}
 		if err := p.finishTransition(ctx, binding, revision); err != nil {
 			return 0, err
 		}
@@ -272,6 +299,9 @@ func (p *productionTaskManagerRuntime) Transition(ctx context.Context, caller au
 	}
 	revision, err := p.graph(caller).Transition(ctx, binding.SeenRevision, binding.DecisionRef)
 	if err != nil {
+		return 0, err
+	}
+	if err := p.appendTransitionEvents(ctx, binding, revision); err != nil {
 		return 0, err
 	}
 	if err := p.finishTransition(ctx, binding, revision); err != nil {
@@ -601,6 +631,147 @@ func (p *productionTaskManagerRuntime) transitionFollowup(ctx context.Context, b
 		return productionInput{}, kernel.InvalidArgument("transition does not require a follow-up")
 	}
 	return input, nil
+}
+
+func (p *productionTaskManagerRuntime) appendDecisionAcceptedEvent(ctx context.Context, binding productionTaskManagerBinding, decisionRef string) error {
+	if p.events == nil {
+		return nil
+	}
+	_, err := p.events.Append(ctx, evidence.AppendEvent{
+		StableKey:     kernel.IdempotencyKey(stableProductionEventKey(p.projectID, "manager-decision", decisionRef)),
+		Type:          "manager.interaction",
+		ProjectID:     p.projectID,
+		GraphRevision: int64(binding.SeenRevision),
+		Payload: uiprojection.ManagerInteractionEventData{
+			ConversationID:  binding.ConversationID,
+			EntryID:         "decision:" + decisionRef,
+			Kind:            "decision",
+			ManagerInputRef: binding.InputRef,
+			DecisionRef:     decisionRef,
+			GraphRevision:   binding.SeenRevision,
+			Disposition:     "accepted",
+		},
+	})
+	return err
+}
+
+func (p *productionTaskManagerRuntime) appendGraphRevisionEvents(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision, endpoints []coordination.PhaseEndpoint) error {
+	if p.events == nil {
+		return nil
+	}
+	_, err := p.events.Append(ctx, evidence.AppendEvent{
+		StableKey:     kernel.IdempotencyKey(stableProductionEventKey(p.projectID, "graph", binding.InputRef, binding.DecisionRef, revision)),
+		Type:          "graph.revision",
+		ProjectID:     p.projectID,
+		GraphRevision: int64(revision),
+		Payload: uiprojection.GraphRevisedEventData{
+			Revision:        revision,
+			ManagerInputRef: binding.InputRef,
+			DecisionRef:     binding.DecisionRef,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	for _, endpoint := range endpoints {
+		if err := p.appendEndpointUpdatedEvent(ctx, binding, revision, endpoint); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *productionTaskManagerRuntime) appendTransitionEvents(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision) error {
+	if p.events == nil {
+		return nil
+	}
+	snapshot, err := p.graphStore.Snapshot(ctx, p.projectID, revision)
+	if err != nil {
+		return err
+	}
+	ref, err := trustedEndpoint(binding)
+	if err != nil {
+		return err
+	}
+	endpoint, err := productionSnapshotEndpoint(snapshot, ref)
+	if err != nil {
+		return err
+	}
+	if err := p.appendGraphRevisionEvents(ctx, binding, revision, []coordination.PhaseEndpoint{endpoint}); err != nil {
+		return err
+	}
+	return p.appendPhaseInvocationUpdatedEvent(ctx, binding, revision, endpoint)
+}
+
+func (p *productionTaskManagerRuntime) appendEndpointUpdatedEvent(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision, endpoint coordination.PhaseEndpoint) error {
+	_, err := p.events.Append(ctx, evidence.AppendEvent{
+		StableKey:     kernel.IdempotencyKey(stableProductionEventKey(p.projectID, "endpoint", binding.DecisionRef, revision, endpoint.Ref.TaskID, endpoint.Ref.EndpointID)),
+		Type:          "endpoint.updated",
+		ProjectID:     p.projectID,
+		TaskID:        endpoint.Ref.TaskID,
+		PhaseEndpoint: endpoint.Ref.EndpointID,
+		GraphRevision: int64(revision),
+		Payload: uiprojection.EndpointUpdatedEventData{
+			Endpoint:   endpoint.Ref,
+			Generation: endpoint.Generation,
+			State:      string(endpoint.State),
+		},
+	})
+	return err
+}
+
+func (p *productionTaskManagerRuntime) appendPhaseInvocationUpdatedEvent(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision, endpoint coordination.PhaseEndpoint) error {
+	invocationID := productionPhaseInvocationForEvent(binding)
+	if invocationID == "" {
+		return nil
+	}
+	_, err := p.events.Append(ctx, evidence.AppendEvent{
+		StableKey:         kernel.IdempotencyKey(stableProductionEventKey(p.projectID, "invocation", binding.DecisionRef, revision, invocationID)),
+		Type:              "invocation.updated",
+		ProjectID:         p.projectID,
+		TaskID:            endpoint.Ref.TaskID,
+		PhaseEndpoint:     endpoint.Ref.EndpointID,
+		AgentInvocationID: invocationID,
+		GraphRevision:     int64(revision),
+		Payload: uiprojection.InvocationUpdatedEventData{
+			Endpoint:     endpoint.Ref,
+			Generation:   endpoint.Generation,
+			InvocationID: invocationID,
+			Status:       productionPhaseInvocationStatusForEvent(binding.DecisionAction),
+		},
+	})
+	return err
+}
+
+func productionPhaseInvocationForEvent(binding productionTaskManagerBinding) kernel.InvocationID {
+	switch binding.InputKind {
+	case "phase_output":
+		var output productionPhaseOutputBoundary
+		if err := json.Unmarshal(binding.InputPayload, &output); err == nil {
+			return output.Receipt.InvocationID
+		}
+	case "phase_orchestration":
+		var evaluation productionPhaseEvaluationBoundary
+		if err := json.Unmarshal(binding.InputPayload, &evaluation); err == nil {
+			return evaluation.Output.Receipt.InvocationID
+		}
+	}
+	return ""
+}
+
+func productionPhaseInvocationStatusForEvent(action string) string {
+	switch action {
+	case "rejected":
+		return "failed"
+	case "stopped":
+		return "stopped"
+	default:
+		return "completed"
+	}
+}
+
+func stableProductionEventKey(parts ...any) string {
+	return "production-event:" + stableProductionSuffix(parts...)
 }
 
 func (p *productionTaskManagerRuntime) graph(caller auth.Principal) coordination.TaskManagerGraph {
