@@ -172,6 +172,11 @@ func (c *QwenPawDockerTaskflow) Call(ctx context.Context, container string, call
 			return TaskflowCallResult{}, err
 		}
 		arguments["projectId"] = carrierID
+		taskRoomID, err := c.ensureTaskRoom(ctx, container, call, carrierID)
+		if err != nil {
+			return TaskflowCallResult{}, err
+		}
+		arguments["roomId"] = taskRoomID
 	}
 	raw, err := c.executeMCP(ctx, container, "taskflow", arguments)
 	if err != nil {
@@ -185,6 +190,63 @@ func (c *QwenPawDockerTaskflow) Call(ctx context.Context, container string, call
 		return TaskflowCallResult{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw TeamHarness returned a mismatched task identity", Recoverable: true}
 	}
 	return result, nil
+}
+
+func (c *QwenPawDockerTaskflow) ensureTaskRoom(ctx context.Context, container string, call TaskflowCall, carrierID string) (string, error) {
+	invitee, err := matrixUserIDForWorker(call.RoomID, call.AssignedTo)
+	if err != nil {
+		return "", err
+	}
+	raw, err := c.executeMCP(ctx, container, "roomflow", map[string]any{
+		"action":       "create_task_room",
+		"projectId":    carrierID,
+		"name":         "Threadmill bounded execution",
+		"source":       "threadmill-runtime",
+		"sourceRoomId": call.RoomID,
+		"invite":       []string{invitee},
+	})
+	if err != nil {
+		return "", err
+	}
+	text, err := mcpTextPayload(raw)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		OK     bool   `json:"ok"`
+		Action string `json:"action"`
+		RoomID string `json:"roomId"`
+	}
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		return "", kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "TeamHarness returned an invalid task room payload", Recoverable: true}
+	}
+	payload.RoomID = strings.TrimSpace(payload.RoomID)
+	if !payload.OK || payload.Action != "create_task_room" || !validMatrixRoomID(payload.RoomID) || payload.RoomID == strings.TrimSpace(call.RoomID) {
+		return "", kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "TeamHarness task room preparation failed", Recoverable: true}
+	}
+	return payload.RoomID, nil
+}
+
+func matrixUserIDForWorker(roomID, worker string) (string, error) {
+	roomID = strings.TrimSpace(roomID)
+	worker = strings.TrimSpace(worker)
+	if !validMatrixRoomID(roomID) || !safeProviderID(worker) {
+		return "", kernel.InvalidArgument("task room source and assigned worker must be valid Matrix/provider identities")
+	}
+	separator := strings.IndexByte(roomID, ':')
+	serverName := roomID[separator+1:]
+	if strings.IndexFunc(serverName, func(char rune) bool { return char <= 0x20 || char == 0x7f || char == '/' || char == '\\' }) >= 0 {
+		return "", kernel.InvalidArgument("task room source server name is invalid")
+	}
+	return "@" + worker + ":" + serverName, nil
+}
+
+func validMatrixRoomID(roomID string) bool {
+	if len(roomID) < 4 || len(roomID) > 512 || roomID[0] != '!' {
+		return false
+	}
+	separator := strings.IndexByte(roomID, ':')
+	return separator > 1 && separator < len(roomID)-1
 }
 
 func (c *QwenPawDockerTaskflow) executeMCP(

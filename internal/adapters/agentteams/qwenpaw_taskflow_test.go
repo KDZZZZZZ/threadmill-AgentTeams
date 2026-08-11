@@ -55,6 +55,25 @@ func TestTaskCarrierProjectIDIsStableOpaqueAndPerThreadmillProject(t *testing.T)
 	}
 }
 
+func TestMatrixUserIDForWorkerUsesSourceRoomServer(t *testing.T) {
+	userID, err := matrixUserIDForWorker("!team:matrix-local.agentteams.io:18080", "threadmill-manager")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userID != "@threadmill-manager:matrix-local.agentteams.io:18080" {
+		t.Fatalf("worker Matrix user ID = %q", userID)
+	}
+	for _, invalid := range []struct{ room, worker string }{
+		{"team-room", "threadmill-manager"},
+		{"!team:matrix.example.test/path", "threadmill-manager"},
+		{"!team:matrix.example.test", "../manager"},
+	} {
+		if _, err := matrixUserIDForWorker(invalid.room, invalid.worker); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+			t.Fatalf("matrixUserIDForWorker(%q, %q) error = %v", invalid.room, invalid.worker, err)
+		}
+	}
+}
+
 func TestParseCarrierPayloadKeepsProviderErrorPrivateToTransportLogic(t *testing.T) {
 	provider := `{"ok":false,"tool":"projectflow","action":"resolve_project","error":"task not found"}`
 	outer, err := json.Marshal(map[string]any{
