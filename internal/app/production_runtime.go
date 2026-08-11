@@ -151,9 +151,6 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if err := ingress.setTaskManagerExecutionCleaner(taskManagerCleanup); err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	if err := taskManagerRuntime.setTaskManagerExecutionCleaner(taskManagerCleanup); err != nil {
-		return productionRuntimeDependencies{}, err
-	}
 	if phaseSeams.Controller == nil || phaseSeams.Runtime == nil || phaseSeams.Orchestration == nil || phaseSeams.Readiness == nil {
 		phaseSeams, err = buildProductionPhaseSeams(productionPhaseBundleOptions{
 			Config: cfg, DB: sqlDB, ProjectID: projectID, Graph: coordStore, Assembler: assembler,

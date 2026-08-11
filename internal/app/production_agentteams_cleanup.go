@@ -23,6 +23,11 @@ type productionTaskManagerExecutionCleanup struct {
 	terminator productionAgentTeamsTerminator
 }
 
+type productionTaskManagerExecutionCleanupTarget struct {
+	execution agentteams.AgentTeamsExecutionRef
+	mode      agentteams.TerminateMode
+}
+
 func newProductionTaskManagerExecutionCleanup(db *sql.DB, projectID kernel.ProjectID, terminator productionAgentTeamsTerminator) (*productionTaskManagerExecutionCleanup, error) {
 	if db == nil || kernel.IsZeroID(projectID) || terminator == nil {
 		return nil, kernel.InvalidArgument("production Task Manager execution cleanup requires database, project, and terminator")
@@ -36,45 +41,49 @@ func (c *productionTaskManagerExecutionCleanup) CleanupCompletedTaskManagerInvoc
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), productionTaskManagerCleanupTimeout)
 	defer cancel()
-	executions, err := c.completedExecutions(cleanupCtx)
+	targets, err := c.completedExecutions(cleanupCtx)
 	if err != nil {
 		return err
 	}
 	var cleanupErr error
-	for _, execution := range executions {
-		cleanupErr = errors.Join(cleanupErr, c.terminator.Terminate(cleanupCtx, execution, string(agentteams.TerminateReleaseWait)))
+	for _, target := range targets {
+		cleanupErr = errors.Join(cleanupErr, c.terminator.Terminate(cleanupCtx, target.execution, string(target.mode)))
 	}
 	return cleanupErr
 }
 
-func (c *productionTaskManagerExecutionCleanup) completedExecutions(ctx context.Context) ([]agentteams.AgentTeamsExecutionRef, error) {
+func (c *productionTaskManagerExecutionCleanup) completedExecutions(ctx context.Context) ([]productionTaskManagerExecutionCleanupTarget, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT e.invocation_id, e.agentteams_task_id, e.host_ref
+SELECT e.invocation_id, e.agentteams_task_id, e.host_ref,
+  CASE
+    WHEN e.state = 'terminated' AND e.termination_mode = 'release_wait' THEN 'release_wait'
+    ELSE 'cancel'
+  END AS cleanup_mode
 FROM agentteams_execution_refs e
 JOIN runtime_invocations r ON r.invocation_id = e.invocation_id
 WHERE r.project_id = $1
   AND r.role = $2
   AND r.status = 'completed'
   AND e.host_slot_claimed_at IS NOT NULL
-  AND e.host_slot_released_at IS NULL
   AND (
     e.state IN ('reserved', 'dispatched')
-    OR (e.state = 'terminated' AND e.termination_mode = 'release_wait')
+    OR (e.state = 'terminated' AND e.termination_mode = 'release_wait' AND e.host_slot_released_at IS NULL)
   )
 ORDER BY e.created_at, e.agentteams_task_id`, c.projectID, auth.RoleTaskManager)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var executions []agentteams.AgentTeamsExecutionRef
+	var targets []productionTaskManagerExecutionCleanupTarget
 	for rows.Next() {
 		var execution agentteams.AgentTeamsExecutionRef
-		if err := rows.Scan(&execution.InvocationID, &execution.AgentTeamsTaskID, &execution.HostRef); err != nil {
+		var mode agentteams.TerminateMode
+		if err := rows.Scan(&execution.InvocationID, &execution.AgentTeamsTaskID, &execution.HostRef, &mode); err != nil {
 			return nil, err
 		}
-		executions = append(executions, execution)
+		targets = append(targets, productionTaskManagerExecutionCleanupTarget{execution: execution, mode: mode})
 	}
-	return executions, rows.Err()
+	return targets, rows.Err()
 }
 
 var _ productionTaskManagerExecutionCleaner = (*productionTaskManagerExecutionCleanup)(nil)

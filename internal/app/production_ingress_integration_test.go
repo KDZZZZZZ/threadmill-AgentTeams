@@ -556,13 +556,8 @@ func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgai
 	if err := managerRuntime.setProductionDependencies(newRecordingTaskResources(), realContextProjector, ingress); err != nil {
 		t.Fatal(err)
 	}
-	opCtx, cancelOperation := context.WithCancel(ctx)
-	cleaner := &cancelingTaskManagerExecutionCleaner{cancel: cancelOperation}
-	if err := managerRuntime.setTaskManagerExecutionCleaner(cleaner); err != nil {
-		t.Fatal(err)
-	}
 	operator := auth.Principal{ActorPrincipalID: "operator-real", Kind: auth.PrincipalOperator, ProjectID: "project-real", Role: auth.RoleOperator}
-	requirement, err := ingress.SubmitRequirement(opCtx, operator, httpapi.RequirementCreateRequest{
+	requirement, err := ingress.SubmitRequirement(ctx, operator, httpapi.RequirementCreateRequest{
 		RequestID: "requirement-context", ProjectID: "project-real", ConversationID: "conversation-context",
 		Body: "create a task with real context projection", Motivation: "exercise trusted invocation propagation",
 		Constraints: []string{"project task context"}, Acceptance: []string{"projection is persisted"},
@@ -572,7 +567,7 @@ func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgai
 	}
 	managerPrincipal := productionTestTaskManagerPrincipal(requirement.InvocationRef)
 	managerScope := auth.BoundScope{ProjectID: "project-real", InvocationID: requirement.InvocationRef}
-	if _, err := managerRuntime.SubmitTaskManagerDecision(opCtx, managerPrincipal, managerScope, taskmanager.TaskManagerDecision{Action: "replace_pending", Reason: "create context-backed task"}); err != nil {
+	if _, err := managerRuntime.SubmitTaskManagerDecision(ctx, managerPrincipal, managerScope, taskmanager.TaskManagerDecision{Action: "replace_pending", Reason: "create context-backed task"}); err != nil {
 		t.Fatal(err)
 	}
 	intent := mcpapi.PendingSubgraphIntent{
@@ -583,12 +578,9 @@ func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgai
 			productionForgedEndpoint("task-context", coordination.EndpointVerify, "spec-verify"),
 		},
 	}
-	revision, err := managerRuntime.ReplacePending(opCtx, managerPrincipal, managerScope, intent)
+	revision, err := managerRuntime.ReplacePending(ctx, managerPrincipal, managerScope, intent)
 	if err != nil {
 		t.Fatalf("ReplacePending() with real context projection error = %v", err)
-	}
-	if cleaner.calls != 1 {
-		t.Fatalf("cleanup calls = %d, want 1", cleaner.calls)
 	}
 	if revision != 2 {
 		t.Fatalf("ReplacePending() revision = %d, want 2", revision)
@@ -664,9 +656,13 @@ func TestProductionTaskManagerExecutionCleanupReleasesCompletedSlotsAgainstPostg
 	now := time.Date(2026, time.August, 11, 17, 0, 0, 0, time.UTC)
 	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db.SQL())
 	completed := productionCleanupInvocation("tm-cleanup-completed", runtimepkg.InvocationCompleted, now)
+	completedReleased := productionCleanupInvocation("tm-cleanup-completed-released", runtimepkg.InvocationCompleted, now)
 	terminatedUnreleased := productionCleanupInvocation("tm-cleanup-terminated-unreleased", runtimepkg.InvocationCompleted, now)
 	running := productionCleanupInvocation("tm-cleanup-running", runtimepkg.InvocationRunning, now)
 	if err := invocations.Create(ctx, completed); err != nil {
+		t.Fatal(err)
+	}
+	if err := invocations.Create(ctx, completedReleased); err != nil {
 		t.Fatal(err)
 	}
 	if err := invocations.Create(ctx, terminatedUnreleased); err != nil {
@@ -681,30 +677,68 @@ func TestProductionTaskManagerExecutionCleanupReleasesCompletedSlotsAgainstPostg
 		host       string
 		state      string
 		mode       any
+		released   any
+		revoked    any
 	}{
-		{completed.ID, "agentteams-cleanup-completed", "default", "dispatched", nil},
-		{terminatedUnreleased.ID, "agentteams-cleanup-terminated-unreleased", "default", "terminated", string(agentteams.TerminateReleaseWait)},
-		{running.ID, "agentteams-cleanup-running", "other", "dispatched", nil},
+		{completed.ID, "agentteams-cleanup-completed", "default", "dispatched", nil, nil, nil},
+		{completedReleased.ID, "agentteams-cleanup-completed-released", "default", "dispatched", nil, now.Add(time.Minute), now.Add(time.Minute)},
+		{terminatedUnreleased.ID, "agentteams-cleanup-terminated-unreleased", "default", "terminated", string(agentteams.TerminateReleaseWait), nil, now.Add(time.Minute)},
+		{running.ID, "agentteams-cleanup-running", "other", "dispatched", nil, nil, nil},
 	} {
 		if _, err := db.SQL().ExecContext(ctx, `
 INSERT INTO agentteams_execution_refs (
   invocation_ref, attempt, invocation_id, agentteams_task_id, host_ref, dispatch_fingerprint,
-  state, termination_mode, host_slot_claimed_at, mcp_client_key, mcp_token_hash, mcp_token_identifier
-) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-			"manager-input:"+string(row.invocation), row.invocation, row.task, row.host, "fingerprint-"+row.task, row.state, row.mode, now, "mcp-"+row.task, []byte("hash-"+row.task), "token-"+row.task); err != nil {
+  state, termination_mode, host_slot_claimed_at, host_slot_released_at, mcp_revoked_at,
+  mcp_client_key, mcp_token_hash, mcp_token_identifier
+) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+			"manager-input:"+string(row.invocation), row.invocation, row.task, row.host, "fingerprint-"+row.task, row.state, row.mode, now, row.released, row.revoked, "mcp-"+row.task, []byte("hash-"+row.task), "token-"+row.task); err != nil {
 			t.Fatal(err)
 		}
+	}
+	available := make(map[auth.Tool]struct{})
+	for _, tool := range auth.CanonicalTools() {
+		available[tool] = struct{}{}
+	}
+	catalog, err := promptcatalog.Load(filepath.Join("..", ".."), available)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assembler, err := runtimepkg.NewAssembler(catalog)
+	if err != nil {
+		t.Fatal(err)
 	}
 	terminator := &recordingCleanupTerminator{db: db.SQL()}
 	cleaner, err := newProductionTaskManagerExecutionCleanup(db.SQL(), "project-real", terminator)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cleaner.CleanupCompletedTaskManagerInvocations(ctx); err != nil {
+	graph := coordination.NewPostgresStore(db.SQL())
+	ingress, err := newProductionIngress(db.SQL(), "project-real", "room-real", assembler, graph, func() time.Time { return now.Add(2 * time.Minute) })
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(terminator.executions) != 2 || terminator.executions[0].InvocationID != completed.ID || terminator.executions[1].InvocationID != terminatedUnreleased.ID || terminator.modes[0] != string(agentteams.TerminateReleaseWait) || terminator.modes[1] != string(agentteams.TerminateReleaseWait) {
-		t.Fatalf("cleanup executions=%#v modes=%#v, want completed and terminated-unreleased Task Manager release_wait", terminator.executions, terminator.modes)
+	dispatcher := &recordingProductionDispatcher{}
+	if err := ingress.setDispatcher(dispatcher); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingress.setTaskManagerExecutionCleaner(cleaner); err != nil {
+		t.Fatal(err)
+	}
+	operator := auth.Principal{ActorPrincipalID: "operator-real", Kind: auth.PrincipalOperator, ProjectID: "project-real", Role: auth.RoleOperator}
+	if _, err := ingress.SubmitManagerMessage(ctx, operator, httpapi.ManagerMessageRequest{RequestID: "cleanup-next-dispatch", ProjectID: "project-real", ConversationID: "conversation-cleanup", Body: "dispatch after cleanup"}); err != nil {
+		t.Fatal(err)
+	}
+	if dispatcher.calls != 1 {
+		t.Fatalf("dispatcher calls = %d, want 1 after cleanup", dispatcher.calls)
+	}
+	if len(terminator.executions) != 3 ||
+		terminator.executions[0].InvocationID != completed.ID ||
+		terminator.executions[1].InvocationID != completedReleased.ID ||
+		terminator.executions[2].InvocationID != terminatedUnreleased.ID ||
+		terminator.modes[0] != string(agentteams.TerminateCancel) ||
+		terminator.modes[1] != string(agentteams.TerminateCancel) ||
+		terminator.modes[2] != string(agentteams.TerminateReleaseWait) {
+		t.Fatalf("cleanup executions=%#v modes=%#v, want completed cancel, released legacy cancel, terminated-unreleased release_wait", terminator.executions, terminator.modes)
 	}
 	var released, revoked bool
 	if err := db.SQL().QueryRowContext(ctx, `SELECT host_slot_released_at IS NOT NULL, mcp_revoked_at IS NOT NULL FROM agentteams_execution_refs WHERE invocation_id=$1`, completed.ID).Scan(&released, &revoked); err != nil {
@@ -712,6 +746,12 @@ INSERT INTO agentteams_execution_refs (
 	}
 	if !released || !revoked {
 		t.Fatalf("completed slot released=%v revoked=%v, want both true", released, revoked)
+	}
+	if err := db.SQL().QueryRowContext(ctx, `SELECT host_slot_released_at IS NOT NULL, mcp_revoked_at IS NOT NULL FROM agentteams_execution_refs WHERE invocation_id=$1`, completedReleased.ID).Scan(&released, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !released || !revoked {
+		t.Fatalf("completed released legacy slot released=%v revoked=%v, want both true", released, revoked)
 	}
 	if err := db.SQL().QueryRowContext(ctx, `SELECT host_slot_released_at IS NOT NULL, mcp_revoked_at IS NOT NULL FROM agentteams_execution_refs WHERE invocation_id=$1`, terminatedUnreleased.ID).Scan(&released, &revoked); err != nil {
 		t.Fatal(err)
@@ -892,19 +932,6 @@ type recordingCleanupTerminator struct {
 	db         *sql.DB
 	executions []agentteams.AgentTeamsExecutionRef
 	modes      []string
-}
-
-type cancelingTaskManagerExecutionCleaner struct {
-	calls  int
-	cancel context.CancelFunc
-}
-
-func (c *cancelingTaskManagerExecutionCleaner) CleanupCompletedTaskManagerInvocations(context.Context) error {
-	c.calls++
-	if c.cancel != nil {
-		c.cancel()
-	}
-	return nil
 }
 
 func (r *recordingCleanupTerminator) Terminate(ctx context.Context, execution agentteams.AgentTeamsExecutionRef, mode string) error {
