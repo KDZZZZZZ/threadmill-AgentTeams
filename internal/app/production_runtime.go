@@ -93,6 +93,10 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	for host, container := range cfg.AgentTeamsContainers {
 		containers[host] = container
 	}
+	managerWorkers := map[string]string{}
+	if container := containers["default"]; strings.HasPrefix(container, "agentteams-worker-") {
+		managerWorkers["default"] = strings.TrimPrefix(container, "agentteams-worker-")
+	}
 	taskflow, err := agentteams.NewQwenPawDockerTaskflow("", "")
 	if err != nil {
 		return productionRuntimeDependencies{}, err
@@ -103,12 +107,13 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	}
 	phaseHostStore := phasepkg.NewPostgresAgentTeamsPhaseHostStoreFromSQL(sqlDB)
 	client, err := agentteams.NewProductionClient(agentteams.ProductionClientOptions{
-		Controller:  controller,
-		Slots:       agentteams.NewHostSlotStore(sqlDB),
-		MCPResolver: mcpResolver,
-		QwenPaw:     agentteams.DockerQwenPawProvider{Containers: containers},
-		Taskflow:    taskflow,
-		Containers:  containers,
+		Controller:     controller,
+		Slots:          agentteams.NewHostSlotStore(sqlDB),
+		MCPResolver:    mcpResolver,
+		QwenPaw:        agentteams.DockerQwenPawProvider{Containers: containers},
+		Taskflow:       taskflow,
+		Containers:     containers,
+		ManagerWorkers: managerWorkers,
 	})
 	if err != nil {
 		return productionRuntimeDependencies{}, err

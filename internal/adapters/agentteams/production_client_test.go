@@ -151,6 +151,45 @@ func TestDockerQwenPawProviderUsesHostManagementPort(t *testing.T) {
 	}
 }
 
+func TestProductionClientProjectsDedicatedManagerWorker(t *testing.T) {
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/workers":
+			_ = json.NewEncoder(w).Encode(map[string]any{"workers": []map[string]any{{
+				"name": "threadmill-manager", "phase": "Running", "runtime": "qwenpaw", "skills": []string{"teamharness"},
+			}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/managers":
+			_ = json.NewEncoder(w).Encode(map[string]any{"managers": []map[string]any{{
+				"name": "default", "phase": "Running", "runtime": "copaw",
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(controller.Close)
+	controllerClient, err := NewAgentTeamsControllerClient(controller.URL, "controller-token", controller.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewProductionClient(ProductionClientOptions{
+		Controller: controllerClient, Slots: newFakeHostSlotStore("task-manager-alias"),
+		MCPResolver: &staticMCPResolver{}, QwenPaw: staticQwenPawProvider{}, Taskflow: recordingTaskflow{},
+		Containers:     StaticContainerResolver{"default": "agentteams-worker-threadmill-manager"},
+		ManagerWorkers: map[string]string{"default": "threadmill-manager"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts, err := client.ListHosts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 1 || hosts[0].Ref != "default" || hosts[0].Kind != HostManager || !containsAll(hosts[0].Capabilities, []string{"teamharness", "manager"}) {
+		t.Fatalf("projected manager hosts = %#v", hosts)
+	}
+}
+
 func TestProductionClientRevokesServerTokenWhenResolvedMCPMaterialIsInvalid(t *testing.T) {
 	controller := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(controller.Close)

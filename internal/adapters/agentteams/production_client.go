@@ -57,23 +57,25 @@ type hostSlotStore interface {
 const productionCleanupTimeout = 5 * time.Second
 
 type ProductionClientOptions struct {
-	Controller   *AgentTeamsControllerClient
-	Slots        hostSlotStore
-	MCPResolver  InvocationMCPResolver
-	QwenPaw      QwenPawProvider
-	Taskflow     TaskflowCaller
-	Containers   ContainerResolver
-	Observations RawObservationReader
+	Controller     *AgentTeamsControllerClient
+	Slots          hostSlotStore
+	MCPResolver    InvocationMCPResolver
+	QwenPaw        QwenPawProvider
+	Taskflow       TaskflowCaller
+	Containers     ContainerResolver
+	ManagerWorkers map[string]string
+	Observations   RawObservationReader
 }
 
 type ProductionClient struct {
-	controller   *AgentTeamsControllerClient
-	slots        hostSlotStore
-	mcpResolver  InvocationMCPResolver
-	qwenPaw      QwenPawProvider
-	taskflow     TaskflowCaller
-	containers   ContainerResolver
-	observations RawObservationReader
+	controller     *AgentTeamsControllerClient
+	slots          hostSlotStore
+	mcpResolver    InvocationMCPResolver
+	qwenPaw        QwenPawProvider
+	taskflow       TaskflowCaller
+	containers     ContainerResolver
+	managerWorkers map[string]string
+	observations   RawObservationReader
 }
 
 func NewProductionClient(options ProductionClientOptions) (*ProductionClient, error) {
@@ -81,14 +83,24 @@ func NewProductionClient(options ProductionClientOptions) (*ProductionClient, er
 		options.QwenPaw == nil || options.Taskflow == nil || options.Containers == nil {
 		return nil, kernel.InvalidArgument("AgentTeams production client dependencies are required")
 	}
+	managerWorkers := make(map[string]string, len(options.ManagerWorkers))
+	for logicalHost, worker := range options.ManagerWorkers {
+		logicalHost = strings.TrimSpace(logicalHost)
+		worker = strings.TrimSpace(worker)
+		if !safeProviderID(logicalHost) || !safeProviderID(worker) || logicalHost == worker {
+			return nil, kernel.InvalidArgument("AgentTeams manager worker alias is invalid")
+		}
+		managerWorkers[logicalHost] = worker
+	}
 	return &ProductionClient{
-		controller:   options.Controller,
-		slots:        options.Slots,
-		mcpResolver:  options.MCPResolver,
-		qwenPaw:      options.QwenPaw,
-		taskflow:     options.Taskflow,
-		containers:   options.Containers,
-		observations: options.Observations,
+		controller:     options.Controller,
+		slots:          options.Slots,
+		mcpResolver:    options.MCPResolver,
+		qwenPaw:        options.QwenPaw,
+		taskflow:       options.Taskflow,
+		containers:     options.Containers,
+		managerWorkers: managerWorkers,
+		observations:   options.Observations,
 	}, nil
 }
 
@@ -101,6 +113,25 @@ func (c *ProductionClient) ListHosts(ctx context.Context) ([]HostStatus, error) 
 	if err != nil {
 		return nil, err
 	}
+	logicalByWorker := make(map[string]string, len(c.managerWorkers))
+	for logicalHost, worker := range c.managerWorkers {
+		logicalByWorker[worker] = logicalHost
+	}
+	projected := make([]HostStatus, 0, len(hosts))
+	for _, host := range hosts {
+		if host.Kind == HostManager {
+			if _, replaced := c.managerWorkers[host.Ref]; replaced {
+				continue
+			}
+		}
+		if logicalHost, aliased := logicalByWorker[host.Ref]; aliased && host.Kind == HostWorker {
+			host.Ref = logicalHost
+			host.Kind = HostManager
+			host.Capabilities = normalizeToolNames(append(host.Capabilities, "manager"))
+		}
+		projected = append(projected, host)
+	}
+	hosts = projected
 	counts, err := c.slots.ActiveCounts(ctx)
 	if err != nil {
 		return nil, err
@@ -170,8 +201,9 @@ claimed:
 		defer cancel()
 		return errors.Join(err, c.cleanupPreparationFailure(cleanupCtx, prep.HostRef, prep.InvocationID, qwenPaw))
 	}
-	if prep.Role != auth.RoleTaskManager && prep.Role != auth.RoleContext {
-		if err := c.controller.EnsureWorkerReady(ctx, prep.HostRef); err != nil {
+	providerHost := c.providerHost(prep.HostRef)
+	if providerHost != prep.HostRef || prep.Role != auth.RoleTaskManager && prep.Role != auth.RoleContext {
+		if err := c.controller.EnsureWorkerReady(ctx, providerHost); err != nil {
 			cleanupCtx, cancel := boundedCleanupContext(ctx)
 			defer cancel()
 			return errors.Join(err, c.cleanupPreparationFailure(cleanupCtx, prep.HostRef, prep.InvocationID, qwenPaw))
@@ -193,11 +225,14 @@ func (c *ProductionClient) DelegateTask(ctx context.Context, req DelegateTaskReq
 		ProjectID:  string(req.ProjectID),
 		TaskID:     req.TaskID,
 		RoomID:     req.RoomID,
-		AssignedTo: req.HostRef,
+		AssignedTo: c.providerHost(req.HostRef),
 		Spec:       req.Spec,
 	})
 	if err != nil {
 		return TaskSnapshot{}, err
+	}
+	if result.Task.HostRef == c.providerHost(req.HostRef) {
+		result.Task.HostRef = req.HostRef
 	}
 	return result.Task, nil
 }
@@ -244,7 +279,11 @@ func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) er
 			continue
 		}
 		if host.Kind == HostManager {
-			if err := c.controller.StopManager(ctx, hostRef); err != nil {
+			if providerHost := c.providerHost(hostRef); providerHost != hostRef {
+				if err := c.controller.StopWorker(ctx, providerHost); err != nil {
+					return err
+				}
+			} else if err := c.controller.StopManager(ctx, hostRef); err != nil {
 				return err
 			}
 		} else if err := c.controller.StopWorker(ctx, hostRef); err != nil {
@@ -262,6 +301,13 @@ func (c *ProductionClient) ForceStopHost(ctx context.Context, hostRef string) er
 		return c.slots.CompleteHostFence(cleanupCtx, hostRef, claims)
 	}
 	return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams host not found"}
+}
+
+func (c *ProductionClient) providerHost(logicalHost string) string {
+	if worker := c.managerWorkers[logicalHost]; worker != "" {
+		return worker
+	}
+	return logicalHost
 }
 
 func (c *ProductionClient) CancelTask(ctx context.Context, taskID string, reason string) error {
