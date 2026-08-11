@@ -424,6 +424,47 @@ def test_runtime_config_identity_distinguishes_empty_list_and_empty_object(tmp_p
     assert first.desired_identity != second.desired_identity
 
 
+def test_runtime_updater_preserves_threadmill_invocation_mcp_clients(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    api = _FakeQwenPawApi()
+    updater = _runtime_updater(
+        config=config,
+        api_client=api,
+        package_manager=_NoopPackageManager(),
+    )
+    ownership_path = config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
+    ownership_path.parent.mkdir(parents=True, exist_ok=True)
+    ownership_path.write_text(
+        json.dumps(["docs", "threadmill-abcdef1234567890abcdef12"]) + "\n",
+        encoding="utf-8",
+    )
+    api.create_mcp("docs", {"name": "docs", "url": "https://docs.example.test/mcp"})
+    api.create_mcp(
+        "threadmill-abcdef1234567890abcdef12",
+        {
+            "name": "threadmill-abcdef1234567890abcdef12",
+            "url": "https://threadmill.example.test/mcp",
+            "transport": "streamable_http",
+            "tools": ["phase.submit"],
+        },
+    )
+
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=config.runtime_config_path,
+            raw={
+                "metadata": {"generation": "1"},
+                "member": {"runtime": "qwenpaw"},
+                "desired": {},
+            },
+        )
+    )
+
+    assert "docs" not in api.mcp
+    assert "threadmill-abcdef1234567890abcdef12" in api.mcp
+    assert json.loads(ownership_path.read_text(encoding="utf-8")) == []
+
+
 def _legacy_test_runtime_updater_does_not_reapply_adapter_for_mcp_only_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
