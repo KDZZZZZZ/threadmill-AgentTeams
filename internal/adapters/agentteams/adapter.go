@@ -419,7 +419,7 @@ func (a *Adapter) Terminate(ctx context.Context, execution AgentTeamsExecutionRe
 	}
 	if record.State == executionTerminated {
 		if record.TerminationMode == mode {
-			return nil
+			return a.fenceAndRelease(ctx, execution)
 		}
 		return kernel.IdempotencyConflict()
 	}

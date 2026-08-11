@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -256,8 +257,10 @@ func TestProductionTaskManagerTrustedResourcesAndTwoStepBoundariesAgainstPostgre
 	operatorPrincipal := auth.Principal{ActorPrincipalID: "operator-real", Kind: auth.PrincipalOperator, ProjectID: "project-real", Role: auth.RoleOperator}
 	assertProductionUIEvents(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
 		"manager.interaction": 1,
-		"graph.revision":      1,
-		"endpoint.updated":    3,
+	})
+	assertProductionUIEventCounts(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
+		"graph.revision":   0,
+		"endpoint.updated": 0,
 	})
 	if len(afterGraph.Tasks) != 1 || afterGraph.Tasks[0].Outcome != coordination.TaskActive {
 		t.Fatalf("Runtime did not normalize task authority: %#v", afterGraph.Tasks)
@@ -300,6 +303,10 @@ WHERE c.project_id=$1 AND c.task_id=$2`, "project-real", "task-trusted").Scan(&c
 	if revision != 2 || resources.contextCallCount("task-trusted") != 1 {
 		t.Fatalf("recovered revision=%d successful context calls=%d", revision, resources.contextCallCount("task-trusted"))
 	}
+	assertProductionUIEvents(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
+		"graph.revision":   1,
+		"endpoint.updated": 3,
+	})
 	changedSpec := intent
 	changedSpec.Endpoints = append([]coordination.PhaseEndpoint(nil), intent.Endpoints...)
 	changedSpec.Endpoints[0].SpecRef = "agent-rewrites-frozen-spec"
@@ -343,9 +350,11 @@ WHERE c.project_id=$1 AND c.task_id=$2`, "project-real", "task-trusted").Scan(&c
 	}
 	assertProductionUIEvents(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
 		"manager.interaction": 2,
-		"graph.revision":      2,
-		"endpoint.updated":    4,
-		"invocation.updated":  1,
+	})
+	assertProductionUIEventCounts(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
+		"graph.revision":     1,
+		"endpoint.updated":   3,
+		"invocation.updated": 0,
 	})
 
 	restartedAgain, err := newProductionTaskManagerRuntime(db.SQL(), "project-real", graph, func() time.Time { return now.Add(3 * time.Minute) })
@@ -382,6 +391,11 @@ WHERE project_id=$1 AND target_kind='phase_evaluation' AND target_ref=$2`, "proj
 	if evaluationInputRef == outputInput.InputRef || evaluationInvocation == outputInput.InvocationID {
 		t.Fatal("phase evaluation reused the submitted decision input or invocation")
 	}
+	assertProductionUIEvents(t, ctx, events, operatorPrincipal, "project-real", map[string]int{
+		"graph.revision":     2,
+		"endpoint.updated":   4,
+		"invocation.updated": 1,
+	})
 	evaluationPrincipal := productionTestTaskManagerPrincipal(evaluationInvocation)
 	evaluationScope := auth.BoundScope{ProjectID: "project-real", InvocationID: evaluationInvocation}
 	if _, err := restartedAgain.SubmitTaskManagerDecision(ctx, evaluationPrincipal, evaluationScope, taskmanager.TaskManagerDecision{Action: "satisfied", TargetRef: "task-trusted/execute", Reason: "output meets the frozen contract"}); err != nil {
@@ -466,6 +480,107 @@ WHERE project_id=$1 AND decision->>'action' IN ('submitted','satisfied')`, "proj
 	}
 	if semanticDecisions != 2 {
 		t.Fatalf("submitted/satisfied decision input count = %d, want 2", semanticDecisions)
+	}
+}
+
+func TestProductionTaskManagerExecutionCleanupReleasesCompletedSlotsAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	admin, err := postgres.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer admin.Close(context.Background())
+	schema := fmt.Sprintf("tm_production_cleanup_%d", time.Now().UnixNano())
+	if _, err := admin.SQL().ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.SQL().ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+	})
+	scopedURL, err := productionTestDatabaseURLWithSearchPath(databaseURL, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := postgres.Open(ctx, scopedURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewMigrator(db.SQL()).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	now := time.Date(2026, time.August, 11, 17, 0, 0, 0, time.UTC)
+	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db.SQL())
+	completed := productionCleanupInvocation("tm-cleanup-completed", runtimepkg.InvocationCompleted, now)
+	terminatedUnreleased := productionCleanupInvocation("tm-cleanup-terminated-unreleased", runtimepkg.InvocationCompleted, now)
+	running := productionCleanupInvocation("tm-cleanup-running", runtimepkg.InvocationRunning, now)
+	if err := invocations.Create(ctx, completed); err != nil {
+		t.Fatal(err)
+	}
+	if err := invocations.Create(ctx, terminatedUnreleased); err != nil {
+		t.Fatal(err)
+	}
+	if err := invocations.Create(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		invocation kernel.InvocationID
+		task       string
+		host       string
+		state      string
+		mode       any
+	}{
+		{completed.ID, "agentteams-cleanup-completed", "default", "dispatched", nil},
+		{terminatedUnreleased.ID, "agentteams-cleanup-terminated-unreleased", "default", "terminated", string(agentteams.TerminateReleaseWait)},
+		{running.ID, "agentteams-cleanup-running", "other", "dispatched", nil},
+	} {
+		if _, err := db.SQL().ExecContext(ctx, `
+INSERT INTO agentteams_execution_refs (
+  invocation_ref, attempt, invocation_id, agentteams_task_id, host_ref, dispatch_fingerprint,
+  state, termination_mode, host_slot_claimed_at, mcp_client_key, mcp_token_hash, mcp_token_identifier
+) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			"manager-input:"+string(row.invocation), row.invocation, row.task, row.host, "fingerprint-"+row.task, row.state, row.mode, now, "mcp-"+row.task, []byte("hash-"+row.task), "token-"+row.task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	terminator := &recordingCleanupTerminator{db: db.SQL()}
+	cleaner, err := newProductionTaskManagerExecutionCleanup(db.SQL(), "project-real", terminator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cleaner.CleanupCompletedTaskManagerInvocations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(terminator.executions) != 2 || terminator.executions[0].InvocationID != completed.ID || terminator.executions[1].InvocationID != terminatedUnreleased.ID || terminator.modes[0] != string(agentteams.TerminateReleaseWait) || terminator.modes[1] != string(agentteams.TerminateReleaseWait) {
+		t.Fatalf("cleanup executions=%#v modes=%#v, want completed and terminated-unreleased Task Manager release_wait", terminator.executions, terminator.modes)
+	}
+	var released, revoked bool
+	if err := db.SQL().QueryRowContext(ctx, `SELECT host_slot_released_at IS NOT NULL, mcp_revoked_at IS NOT NULL FROM agentteams_execution_refs WHERE invocation_id=$1`, completed.ID).Scan(&released, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !released || !revoked {
+		t.Fatalf("completed slot released=%v revoked=%v, want both true", released, revoked)
+	}
+	if err := db.SQL().QueryRowContext(ctx, `SELECT host_slot_released_at IS NOT NULL, mcp_revoked_at IS NOT NULL FROM agentteams_execution_refs WHERE invocation_id=$1`, terminatedUnreleased.ID).Scan(&released, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if !released || !revoked {
+		t.Fatalf("terminated-unreleased slot released=%v revoked=%v, want both true", released, revoked)
+	}
+	if err := db.SQL().QueryRowContext(ctx, `SELECT host_slot_released_at IS NOT NULL, mcp_revoked_at IS NOT NULL FROM agentteams_execution_refs WHERE invocation_id=$1`, running.ID).Scan(&released, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if released || revoked {
+		t.Fatalf("running slot released=%v revoked=%v, want untouched", released, revoked)
 	}
 }
 
@@ -574,6 +689,23 @@ func assertProductionUIEvents(t *testing.T, ctx context.Context, events *uiproje
 	}
 }
 
+func assertProductionUIEventCounts(t *testing.T, ctx context.Context, events *uiprojection.EventLogQuery, principal auth.Principal, projectID kernel.ProjectID, want map[string]int) {
+	t.Helper()
+	page, err := events.ListEvents(ctx, principal, projectID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := make(map[string]int)
+	for _, event := range page.Events {
+		counts[event.Type]++
+	}
+	for eventType, exact := range want {
+		if counts[eventType] != exact {
+			t.Fatalf("event type %s count = %d, want exactly %d; events=%#v", eventType, counts[eventType], exact, page.Events)
+		}
+	}
+}
+
 func productionUIEventsContain(events []uiprojection.UIEvent, eventTypes ...string) bool {
 	seen := make(map[string]struct{}, len(events))
 	for _, event := range events {
@@ -587,12 +719,50 @@ func productionUIEventsContain(events []uiprojection.UIEvent, eventTypes ...stri
 	return true
 }
 
+func productionCleanupInvocation(id kernel.InvocationID, status runtimepkg.InvocationStatus, now time.Time) runtimepkg.Invocation {
+	return runtimepkg.Invocation{
+		ID:               id,
+		ActorPrincipalID: "task-manager:project-real",
+		ProjectID:        "project-real",
+		Role:             auth.RoleTaskManager,
+		Status:           status,
+		PromptHashes:     map[string]string{"task-manager": "prompt-hash"},
+		SkillHashes:      map[string]string{"task-manager": "skill-hash"},
+		EffectiveTools: []auth.Tool{
+			auth.ToolCoordinationSnapshot,
+			auth.ToolTaskManagerSubmitDecision,
+		},
+		CreatedAt: now,
+		ExpiresAt: now.Add(time.Hour),
+	}
+}
+
 type recordingProductionDispatcher struct {
 	mu             sync.Mutex
 	calls          int
 	failNext       bool
 	invocations    []string
 	duringDispatch func(string) error
+}
+
+type recordingCleanupTerminator struct {
+	db         *sql.DB
+	executions []agentteams.AgentTeamsExecutionRef
+	modes      []string
+}
+
+func (r *recordingCleanupTerminator) Terminate(ctx context.Context, execution agentteams.AgentTeamsExecutionRef, mode string) error {
+	r.executions = append(r.executions, execution)
+	r.modes = append(r.modes, mode)
+	_, err := r.db.ExecContext(ctx, `
+UPDATE agentteams_execution_refs
+SET mcp_revoked_at = COALESCE(mcp_revoked_at, now()),
+    host_slot_released_at = COALESCE(host_slot_released_at, now()),
+    state = 'terminated',
+    termination_mode = $2,
+    updated_at = now()
+WHERE agentteams_task_id = $1`, execution.AgentTeamsTaskID, mode)
+	return err
 }
 
 func (r *recordingProductionDispatcher) Dispatch(_ context.Context, invocationRef string) (agentteams.AgentTeamsExecutionRef, error) {

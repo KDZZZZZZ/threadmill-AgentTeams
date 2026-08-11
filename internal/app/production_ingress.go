@@ -28,6 +28,10 @@ type productionInvocationDispatcher interface {
 	Dispatch(context.Context, string) (agentteams.AgentTeamsExecutionRef, error)
 }
 
+type productionTaskManagerExecutionCleaner interface {
+	CleanupCompletedTaskManagerInvocations(context.Context) error
+}
+
 // productionIngress is the only production HTTP write boundary for manager
 // input. It commits the immutable input and its Task Manager invocation before
 // asking AgentTeams to perform any external work.
@@ -38,6 +42,7 @@ type productionIngress struct {
 	graph      *coordination.PostgresStore
 	assembler  *runtimepkg.Assembler
 	dispatcher productionInvocationDispatcher
+	cleaner    productionTaskManagerExecutionCleaner
 	now        func() time.Time
 }
 
@@ -75,6 +80,14 @@ func (p *productionIngress) setDispatcher(dispatcher productionInvocationDispatc
 		return kernel.InvalidArgument("production ingress dispatcher is required")
 	}
 	p.dispatcher = dispatcher
+	return nil
+}
+
+func (p *productionIngress) setTaskManagerExecutionCleaner(cleaner productionTaskManagerExecutionCleaner) error {
+	if cleaner == nil {
+		return kernel.InvalidArgument("production Task Manager execution cleaner is required")
+	}
+	p.cleaner = cleaner
 	return nil
 }
 
@@ -214,6 +227,11 @@ func (p *productionIngress) persistAndDispatch(ctx context.Context, input produc
 	}
 	if alreadyDispatched {
 		return stored, nil
+	}
+	if p.cleaner != nil {
+		if err := p.cleaner.CleanupCompletedTaskManagerInvocations(ctx); err != nil {
+			return persistedProductionInput{}, err
+		}
 	}
 	if _, err := p.dispatcher.Dispatch(ctx, string(stored.InvocationID)); err != nil {
 		return persistedProductionInput{}, err
