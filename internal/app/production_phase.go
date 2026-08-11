@@ -892,12 +892,9 @@ func (p *productionPhaseRuntime) persistOutputIntent(ctx context.Context, invoca
 	if p.invocations == nil {
 		return "", kernel.InvalidArgument("phase output intent requires invocation store")
 	}
-	invocation, ok, err := p.invocations.Get(ctx, invocationID)
+	invocation, err := p.phaseOutputIntentInvocation(ctx, invocationID)
 	if err != nil {
 		return "", err
-	}
-	if !ok {
-		return "", kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase output intent requires an existing invocation", Recoverable: true}
 	}
 	endpoint := coordination.PhaseEndpointRef{TaskID: invocation.TaskID, EndpointID: invocation.EndpointID}
 	input := productionInput{
@@ -973,6 +970,16 @@ func (p *productionPhaseRuntime) replayOutputIntents(ctx context.Context, outbox
 			errs = append(errs, err)
 			continue
 		}
+		if _, err := p.phaseOutputIntentInvocation(ctx, intent.InvocationID); err != nil {
+			if kernel.IsCode(err, kernel.CodeForbidden) || kernel.IsCode(err, kernel.CodeStaleCommand) {
+				if abandonErr := outbox.abandonIntent(ctx, "phase_output", requestID, err); abandonErr != nil {
+					errs = append(errs, abandonErr)
+				}
+				continue
+			}
+			errs = append(errs, err)
+			continue
+		}
 		receipt, deliver, abandoned, err := p.resolveOutputIntentReceipt(ctx, intent.InvocationID, requestID, intent.Output)
 		if abandoned {
 			continue
@@ -992,6 +999,26 @@ func (p *productionPhaseRuntime) replayOutputIntents(ctx context.Context, outbox
 		return err
 	}
 	return errors.Join(errs...)
+}
+
+func (p *productionPhaseRuntime) phaseOutputIntentInvocation(ctx context.Context, invocationID kernel.InvocationID) (runtimepkg.Invocation, error) {
+	if p.invocations == nil {
+		return runtimepkg.Invocation{}, kernel.InvalidArgument("phase output intent requires invocation store")
+	}
+	invocation, ok, err := p.invocations.Get(ctx, invocationID)
+	if err != nil {
+		return runtimepkg.Invocation{}, err
+	}
+	if !ok {
+		return runtimepkg.Invocation{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase output intent requires an existing invocation", Recoverable: true}
+	}
+	if invocation.ProjectID != p.projectID {
+		return runtimepkg.Invocation{}, kernel.Forbidden("phase output invocation belongs to another project")
+	}
+	if !invocation.Role.IsPhase() {
+		return runtimepkg.Invocation{}, kernel.Forbidden("phase output intent requires a phase invocation")
+	}
+	return invocation, nil
 }
 
 func (p *productionPhaseRuntime) resolveOutputIntentReceipt(ctx context.Context, invocationID kernel.InvocationID, requestID string, output phasepkg.PhaseOutput) (phasepkg.OutputReceipt, bool, bool, error) {

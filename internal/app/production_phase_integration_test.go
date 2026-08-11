@@ -645,13 +645,33 @@ func TestProductionPhaseOutputIntentAbandonsDeterministicRejectAgainstPostgres(t
 	if obligationRows != 0 {
 		t.Fatalf("obligations after missing invocation=%d, want 0", obligationRows)
 	}
+	otherProjectID := kernel.ProjectID("project-phase-output-abandon-other")
+	otherInvocationID := kernel.InvocationID("inv-cross-project-output")
+	created := time.Now().UTC()
+	if err := invocations.Create(ctx, runtimepkg.Invocation{
+		ID: otherInvocationID, ActorPrincipalID: "actor-cross-project", ProjectID: otherProjectID,
+		TaskID: "task-other", EndpointID: coordination.EndpointPlan, Generation: 1, Role: auth.RolePlanner,
+		Status: runtimepkg.InvocationRunning, BindingRef: "binding://task-other/plan/1", LeaseID: "lease-cross-project-output",
+		PromptHashes: map[string]string{"prompt": "hash"}, SkillHashes: map[string]string{"skill": "hash"},
+		EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput}, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.persistOutputIntent(ctx, otherInvocationID, phasepkg.PhaseOutput{Phase: string(coordination.EndpointPlan)}); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("persistOutputIntent cross-project invocation = %v, want forbidden", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM production_phase_terminal_obligations WHERE project_id=$1`, projectID).Scan(&obligationRows); err != nil {
+		t.Fatal(err)
+	}
+	if obligationRows != 0 {
+		t.Fatalf("obligations after cross-project invocation=%d, want 0", obligationRows)
+	}
 
 	command := coordination.PhaseCommand{
 		ID: "cmd-output-abandon", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointPlan},
 		Generation: 1, BindingRef: "binding://task-real/plan/1", LeaseRef: "lease-output-abandon", Action: coordination.CommandStart,
 	}
 	invocationID := productionPhaseInvocationID(command.ID)
-	created := time.Now().UTC()
 	if err := invocations.Create(ctx, runtimepkg.Invocation{
 		ID: invocationID, ActorPrincipalID: "actor-output-abandon", ProjectID: projectID,
 		TaskID: command.Endpoint.TaskID, EndpointID: command.Endpoint.EndpointID, Generation: uint64(command.Generation), Role: auth.RolePlanner,
@@ -680,6 +700,75 @@ func TestProductionPhaseOutputIntentAbandonsDeterministicRejectAgainstPostgres(t
 	}
 	if managerRows != 0 {
 		t.Fatalf("manager inputs after abandoned intent=%d, want 0", managerRows)
+	}
+}
+
+func TestProductionPhaseOutputIntentReplayAbandonsCrossProjectIntentAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-output-cross-replay")
+	otherProjectID := kernel.ProjectID("project-phase-output-cross-replay-other")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	ingress, err := newProductionIngress(db, projectID, "room-phase-output-cross-replay", productionPhaseTestAssembler(t), graph, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ingress.setDispatcher(&recordingProductionDispatcher{}); err != nil {
+		t.Fatal(err)
+	}
+	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db)
+	invocationID := kernel.InvocationID("inv-cross-project-replay")
+	created := time.Now().UTC()
+	if err := invocations.Create(ctx, runtimepkg.Invocation{
+		ID: invocationID, ActorPrincipalID: "actor-cross-replay", ProjectID: otherProjectID,
+		TaskID: "task-other", EndpointID: coordination.EndpointPlan, Generation: 1, Role: auth.RolePlanner,
+		Status: runtimepkg.InvocationRunning, BindingRef: "binding://task-other/plan/1", LeaseID: "lease-cross-project-replay",
+		PromptHashes: map[string]string{"prompt": "hash"}, SkillHashes: map[string]string{"skill": "hash"},
+		EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput}, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	output := phasepkg.PhaseOutput{Phase: string(coordination.EndpointPlan)}
+	payload, err := json.Marshal(productionPhaseOutputIntent{InvocationID: invocationID, Output: output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID := stableProductionSuffix(invocationID, "phase_output", hashProductionBytes(payload))
+	input := productionInput{
+		Kind: "phase_output", RequestID: requestID, ConversationID: "runtime:task-other",
+		Body: "phase output intent " + string(invocationID), Payload: payload, SeenRevision: 1,
+		SelectedEndpoint: &coordination.PhaseEndpointRef{TaskID: "task-other", EndpointID: coordination.EndpointPlan},
+		TargetKind:       "phase_output", TargetRef: "",
+	}
+	outbox := productionPhaseTerminalOutbox{db: db, projectID: projectID, ingress: ingress, now: time.Now}
+	if err := outbox.enqueueIntent(ctx, productionPhaseTerminalDelivery{
+		Input: input, InvocationID: invocationID,
+		Endpoint:   coordination.PhaseEndpointRef{TaskID: "task-other", EndpointID: coordination.EndpointPlan},
+		Generation: 1, CommandAction: coordination.CommandStart,
+	}); err != nil {
+		t.Fatalf("seed cross-project output intent: %v", err)
+	}
+	runtime := &productionPhaseRuntime{
+		db: db, projectID: projectID, graph: graph, ingress: ingress,
+		invocations: invocations, artifacts: evidence.NewPostgresArtifactRegistry(db, objectstore.NewMemoryStore(), "artifacts"), now: time.Now,
+	}
+	if err := runtime.ReplayTerminalDeliveries(ctx); err != nil {
+		t.Fatalf("ReplayTerminalDeliveries cross-project intent: %v", err)
+	}
+	assertPhaseTerminalObligationRequest(t, ctx, db, projectID, "phase_output", requestID, "abandoned")
+	var managerRows int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM production_manager_inputs WHERE project_id=$1 AND input_kind='phase_output'`, projectID).Scan(&managerRows); err != nil {
+		t.Fatal(err)
+	}
+	if managerRows != 0 {
+		t.Fatalf("manager inputs after cross-project replay=%d, want 0", managerRows)
 	}
 }
 
