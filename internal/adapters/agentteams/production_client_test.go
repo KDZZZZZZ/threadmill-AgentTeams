@@ -156,9 +156,10 @@ func TestProductionClientProjectsDedicatedManagerWorker(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/workers":
-			_ = json.NewEncoder(w).Encode(map[string]any{"workers": []map[string]any{{
-				"name": "threadmill-manager", "phase": "Running", "runtime": "qwenpaw", "skills": []string{"teamharness"},
-			}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"workers": []map[string]any{
+				{"name": "threadmill-manager", "phase": "Running", "runtime": "qwenpaw", "skills": []string{"teamharness"}},
+				{"name": "threadmill-dispatcher", "phase": "Running", "runtime": "qwenpaw", "skills": []string{"teamharness"}},
+			}})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/managers":
 			_ = json.NewEncoder(w).Encode(map[string]any{"managers": []map[string]any{{
 				"name": "default", "phase": "Running", "runtime": "copaw",
@@ -172,11 +173,16 @@ func TestProductionClientProjectsDedicatedManagerWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	taskflow := &capturingTaskflow{}
 	client, err := NewProductionClient(ProductionClientOptions{
 		Controller: controllerClient, Slots: newFakeHostSlotStore("task-manager-alias"),
-		MCPResolver: &staticMCPResolver{}, QwenPaw: staticQwenPawProvider{}, Taskflow: recordingTaskflow{},
-		Containers:     StaticContainerResolver{"default": "agentteams-worker-threadmill-manager"},
-		ManagerWorkers: map[string]string{"default": "threadmill-manager"},
+		MCPResolver: &staticMCPResolver{}, QwenPaw: staticQwenPawProvider{}, Taskflow: taskflow,
+		Containers: StaticContainerResolver{
+			"default":               "agentteams-worker-threadmill-manager",
+			"threadmill-dispatcher": "agentteams-worker-threadmill-dispatcher",
+		},
+		ManagerWorkers:  map[string]string{"default": "threadmill-manager"},
+		TaskflowHostRef: "threadmill-dispatcher",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -187,6 +193,15 @@ func TestProductionClientProjectsDedicatedManagerWorker(t *testing.T) {
 	}
 	if len(hosts) != 1 || hosts[0].Ref != "default" || hosts[0].Kind != HostManager || !containsAll(hosts[0].Capabilities, []string{"teamharness", "manager"}) {
 		t.Fatalf("projected manager hosts = %#v", hosts)
+	}
+	task, err := client.DelegateTask(context.Background(), DelegateTaskRequest{
+		ProjectID: "project-a", TaskID: "task-manager-alias", HostRef: "default", RoomID: "!room:example.test", Spec: "bounded manager work",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskflow.container != "agentteams-worker-threadmill-dispatcher" || taskflow.call.AssignedTo != "threadmill-manager" || task.HostRef != "default" {
+		t.Fatalf("taskflow projection container=%q call=%#v task=%#v", taskflow.container, taskflow.call, task)
 	}
 }
 
@@ -284,6 +299,20 @@ func (p staticQwenPawProvider) ForHost(context.Context, string) (*QwenPawAPI, er
 type recordingTaskflow struct{}
 
 func (recordingTaskflow) Call(_ context.Context, _ string, call TaskflowCall) (TaskflowCallResult, error) {
+	return TaskflowCallResult{
+		OK: true, Action: call.Action, Effective: true,
+		Task: TaskSnapshot{TaskID: call.TaskID, ProjectID: kernel.ProjectID(call.ProjectID), HostRef: call.AssignedTo, Status: "submitted"},
+	}, nil
+}
+
+type capturingTaskflow struct {
+	container string
+	call      TaskflowCall
+}
+
+func (c *capturingTaskflow) Call(_ context.Context, container string, call TaskflowCall) (TaskflowCallResult, error) {
+	c.container = container
+	c.call = call
 	return TaskflowCallResult{
 		OK: true, Action: call.Action, Effective: true,
 		Task: TaskSnapshot{TaskID: call.TaskID, ProjectID: kernel.ProjectID(call.ProjectID), HostRef: call.AssignedTo, Status: "submitted"},

@@ -57,25 +57,27 @@ type hostSlotStore interface {
 const productionCleanupTimeout = 5 * time.Second
 
 type ProductionClientOptions struct {
-	Controller     *AgentTeamsControllerClient
-	Slots          hostSlotStore
-	MCPResolver    InvocationMCPResolver
-	QwenPaw        QwenPawProvider
-	Taskflow       TaskflowCaller
-	Containers     ContainerResolver
-	ManagerWorkers map[string]string
-	Observations   RawObservationReader
+	Controller      *AgentTeamsControllerClient
+	Slots           hostSlotStore
+	MCPResolver     InvocationMCPResolver
+	QwenPaw         QwenPawProvider
+	Taskflow        TaskflowCaller
+	Containers      ContainerResolver
+	ManagerWorkers  map[string]string
+	TaskflowHostRef string
+	Observations    RawObservationReader
 }
 
 type ProductionClient struct {
-	controller     *AgentTeamsControllerClient
-	slots          hostSlotStore
-	mcpResolver    InvocationMCPResolver
-	qwenPaw        QwenPawProvider
-	taskflow       TaskflowCaller
-	containers     ContainerResolver
-	managerWorkers map[string]string
-	observations   RawObservationReader
+	controller      *AgentTeamsControllerClient
+	slots           hostSlotStore
+	mcpResolver     InvocationMCPResolver
+	qwenPaw         QwenPawProvider
+	taskflow        TaskflowCaller
+	containers      ContainerResolver
+	managerWorkers  map[string]string
+	taskflowHostRef string
+	observations    RawObservationReader
 }
 
 func NewProductionClient(options ProductionClientOptions) (*ProductionClient, error) {
@@ -92,15 +94,20 @@ func NewProductionClient(options ProductionClientOptions) (*ProductionClient, er
 		}
 		managerWorkers[logicalHost] = worker
 	}
+	taskflowHostRef := strings.TrimSpace(options.TaskflowHostRef)
+	if taskflowHostRef != "" && !safeProviderID(taskflowHostRef) {
+		return nil, kernel.InvalidArgument("AgentTeams taskflow host is invalid")
+	}
 	return &ProductionClient{
-		controller:     options.Controller,
-		slots:          options.Slots,
-		mcpResolver:    options.MCPResolver,
-		qwenPaw:        options.QwenPaw,
-		taskflow:       options.Taskflow,
-		containers:     options.Containers,
-		managerWorkers: managerWorkers,
-		observations:   options.Observations,
+		controller:      options.Controller,
+		slots:           options.Slots,
+		mcpResolver:     options.MCPResolver,
+		qwenPaw:         options.QwenPaw,
+		taskflow:        options.Taskflow,
+		containers:      options.Containers,
+		managerWorkers:  managerWorkers,
+		taskflowHostRef: taskflowHostRef,
+		observations:    options.Observations,
 	}, nil
 }
 
@@ -119,6 +126,9 @@ func (c *ProductionClient) ListHosts(ctx context.Context) ([]HostStatus, error) 
 	}
 	projected := make([]HostStatus, 0, len(hosts))
 	for _, host := range hosts {
+		if host.Ref == c.taskflowHostRef {
+			continue
+		}
 		if host.Kind == HostManager {
 			if _, replaced := c.managerWorkers[host.Ref]; replaced {
 				continue
@@ -216,7 +226,7 @@ func (c *ProductionClient) DelegateTask(ctx context.Context, req DelegateTaskReq
 	if strings.TrimSpace(req.HostRef) == "" || strings.TrimSpace(req.TaskID) == "" {
 		return TaskSnapshot{}, kernel.InvalidArgument("delegate_task host_ref and task_id are required")
 	}
-	container, err := c.containers.ContainerForHost(ctx, req.HostRef)
+	container, err := c.taskflowContainer(ctx, req.HostRef)
 	if err != nil {
 		return TaskSnapshot{}, err
 	}
@@ -310,6 +320,14 @@ func (c *ProductionClient) providerHost(logicalHost string) string {
 	return logicalHost
 }
 
+func (c *ProductionClient) taskflowContainer(ctx context.Context, fallbackHost string) (string, error) {
+	hostRef := c.taskflowHostRef
+	if hostRef == "" {
+		hostRef = fallbackHost
+	}
+	return c.containers.ContainerForHost(ctx, hostRef)
+}
+
 func (c *ProductionClient) CancelTask(ctx context.Context, taskID string, reason string) error {
 	claim, ok, err := c.slots.ByTaskID(ctx, taskID)
 	if err != nil {
@@ -318,7 +336,7 @@ func (c *ProductionClient) CancelTask(ctx context.Context, taskID string, reason
 	if !ok {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams task slot not found"}
 	}
-	container, err := c.containers.ContainerForHost(ctx, claim.HostRef)
+	container, err := c.taskflowContainer(ctx, claim.HostRef)
 	if err != nil {
 		return err
 	}
@@ -334,7 +352,7 @@ func (c *ProductionClient) CheckTask(ctx context.Context, taskID string) (TaskCh
 	if !ok {
 		return TaskCheck{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams task slot not found"}
 	}
-	container, err := c.containers.ContainerForHost(ctx, claim.HostRef)
+	container, err := c.taskflowContainer(ctx, claim.HostRef)
 	if err != nil {
 		return TaskCheck{}, err
 	}

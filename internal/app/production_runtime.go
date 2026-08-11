@@ -97,6 +97,16 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if container := containers["default"]; strings.HasPrefix(container, "agentteams-worker-") {
 		managerWorkers["default"] = strings.TrimPrefix(container, "agentteams-worker-")
 	}
+	const dedicatedTaskflowHostRef = "threadmill-dispatcher"
+	taskflowHostRef := ""
+	if _, ok := containers[dedicatedTaskflowHostRef]; ok {
+		taskflowHostRef = dedicatedTaskflowHostRef
+	}
+	if len(managerWorkers) > 0 {
+		if taskflowHostRef == "" {
+			return productionRuntimeDependencies{}, errors.New("dedicated AgentTeams manager worker requires a taskflow dispatcher host")
+		}
+	}
 	taskflow, err := agentteams.NewQwenPawDockerTaskflow("", "")
 	if err != nil {
 		return productionRuntimeDependencies{}, err
@@ -107,13 +117,14 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	}
 	phaseHostStore := phasepkg.NewPostgresAgentTeamsPhaseHostStoreFromSQL(sqlDB)
 	client, err := agentteams.NewProductionClient(agentteams.ProductionClientOptions{
-		Controller:     controller,
-		Slots:          agentteams.NewHostSlotStore(sqlDB),
-		MCPResolver:    mcpResolver,
-		QwenPaw:        agentteams.DockerQwenPawProvider{Containers: containers},
-		Taskflow:       taskflow,
-		Containers:     containers,
-		ManagerWorkers: managerWorkers,
+		Controller:      controller,
+		Slots:           agentteams.NewHostSlotStore(sqlDB),
+		MCPResolver:     mcpResolver,
+		QwenPaw:         agentteams.DockerQwenPawProvider{Containers: containers},
+		Taskflow:        taskflow,
+		Containers:      containers,
+		ManagerWorkers:  managerWorkers,
+		TaskflowHostRef: taskflowHostRef,
 	})
 	if err != nil {
 		return productionRuntimeDependencies{}, err
