@@ -196,6 +196,7 @@ type Config struct {
 	Host            Host
 	RecoveryStore   RecoveryStore
 	Lifecycle       baseruntime.InvocationLifecycle
+	Observations    coordination.PhaseObservationWriter
 	Now             func() time.Time
 	InvocationTTL   time.Duration
 }
@@ -209,6 +210,7 @@ type Controller struct {
 	host      Host
 	recovery  RecoveryStore
 	lifecycle baseruntime.InvocationLifecycle
+	obs       coordination.PhaseObservationWriter
 	now       func() time.Time
 	ttl       time.Duration
 
@@ -251,6 +253,7 @@ func NewController(cfg Config) *Controller {
 		host:      cfg.Host,
 		recovery:  cfg.RecoveryStore,
 		lifecycle: lifecycle,
+		obs:       cfg.Observations,
 		now:       now,
 		ttl:       ttl,
 		commands:  make(map[string]commandRecord),
@@ -366,10 +369,13 @@ func (c *Controller) SubmitPhaseOutput(ctx context.Context, invocationID kernel.
 	if err := c.host.Revoke(ctx, invocationID); err != nil {
 		return OutputReceipt{}, err
 	}
-	if err := c.lifecycle.End(ctx, active.Invocation); err != nil {
+	if err := c.lifecycle.Complete(ctx, active.Invocation); err != nil {
 		return OutputReceipt{}, err
 	}
 	if err := c.transitionToCompleted(ctx, invocationID); err != nil {
+		return OutputReceipt{}, err
+	}
+	if err := c.recordOutputSubmitted(ctx, active); err != nil {
 		return OutputReceipt{}, err
 	}
 	if c.recovery != nil {
@@ -479,30 +485,35 @@ func (c *Controller) pendingOrRouteReceipt(ctx context.Context, active ActiveInv
 }
 
 func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) error {
+	role, err := phaseRole(command.Endpoint.EndpointID)
+	if err != nil {
+		return err
+	}
 	binding, err := c.bindings.Resolve(ctx, command)
 	if err != nil {
 		return err
 	}
 	if err := validateBindingForCommand(binding, command); err != nil {
+		c.cleanupResolvedBinding(ctx, command, role, binding)
 		return err
 	}
 	if command.Action == coordination.CommandStart && binding.CheckpointRef != "" {
+		c.cleanupResolvedBinding(ctx, command, role, binding)
 		return kernel.Error{Code: kernel.CodeStaleCheckpoint, Message: "start command cannot use checkpoint-bound binding", Recoverable: true}
 	}
 	if command.Action == coordination.CommandResume {
 		if binding.NonResumable || binding.CheckpointRef == "" {
+			c.cleanupResolvedBinding(ctx, command, role, binding)
 			return kernel.Error{Code: kernel.CodeStaleCheckpoint, Message: "resume checkpoint is missing or non-resumable", Recoverable: true}
 		}
 		if c.recovery == nil {
+			c.cleanupResolvedBinding(ctx, command, role, binding)
 			return kernel.Error{Code: kernel.CodeStaleCheckpoint, Message: "resume evidence store is required", Recoverable: true}
 		}
 		if err := c.recovery.ValidateResume(ctx, command, binding); err != nil {
+			c.cleanupResolvedBinding(ctx, command, role, binding)
 			return err
 		}
-	}
-	role, err := phaseRole(command.Endpoint.EndpointID)
-	if err != nil {
-		return err
 	}
 	now := c.now().UTC()
 	invocation := baseruntime.Invocation{
@@ -522,6 +533,27 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 		CreatedAt:           now,
 		ExpiresAt:           now.Add(c.ttl),
 	}
+	storedInvocation := false
+	if existing, ok, err := c.store.Get(ctx, invocation.ID); err != nil {
+		c.cleanupResolvedInvocation(ctx, invocation)
+		return err
+	} else if ok {
+		if existing.Status == baseruntime.InvocationRunning {
+			active := ActiveInvocation{
+				Invocation: existing,
+				Command:    command,
+				Binding:    cloneBindingSnapshot(binding),
+				Inputs:     clonePhaseInputSet(binding.Inputs),
+			}
+			return c.finishStarted(ctx, active)
+		}
+		if existing.Status != baseruntime.InvocationPrepared {
+			c.cleanupResolvedInvocation(ctx, invocation)
+			return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "existing phase invocation is not running", Recoverable: true}
+		}
+		invocation = existing
+		storedInvocation = true
+	}
 	start := StartPhaseInput{
 		InvocationID: invocation.ID,
 		Endpoint:     command.Endpoint,
@@ -531,15 +563,20 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 	}
 	renderData, err := c.renderData(invocation, start, binding)
 	if err != nil {
+		c.cleanupResolvedInvocation(ctx, invocation)
 		return err
 	}
 	assembly, err := c.assembler.Assemble(invocation, renderData)
 	if err != nil {
+		c.cleanupResolvedInvocation(ctx, invocation)
 		return err
 	}
 	invocation = assembly.Invocation
-	if err := c.store.Create(ctx, invocation); err != nil {
-		return err
+	if !storedInvocation {
+		if err := c.store.Create(ctx, invocation); err != nil {
+			c.cleanupResolvedInvocation(ctx, invocation)
+			return err
+		}
 	}
 	active := ActiveInvocation{
 		Invocation: invocation,
@@ -549,6 +586,7 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 	}
 	if c.recovery != nil {
 		if err := c.recovery.RecordActiveInvocation(ctx, active); err != nil {
+			c.cleanupResolvedInvocation(ctx, invocation)
 			return err
 		}
 	}
@@ -565,23 +603,31 @@ func (c *Controller) applyStartLike(ctx context.Context, command PhaseCommand) e
 			_ = c.recovery.ClearActiveInvocation(ctx, invocation.ID)
 		}
 		_ = c.host.Revoke(ctx, invocation.ID)
+		_ = c.lifecycle.End(ctx, invocation)
 		return err
 	}
 	if err := c.store.Transition(ctx, invocation.ID, baseruntime.InvocationPrepared, baseruntime.InvocationRunning); err != nil {
 		_ = c.host.Revoke(ctx, invocation.ID)
+		_ = c.lifecycle.End(ctx, invocation)
 		return err
 	}
 	active.Invocation.Status = baseruntime.InvocationRunning
+	return c.finishStarted(ctx, active)
+}
+
+func (c *Controller) finishStarted(ctx context.Context, active ActiveInvocation) error {
 	if c.recovery != nil {
 		if err := c.recovery.RecordActiveInvocation(ctx, active); err != nil {
-			_ = c.host.Revoke(ctx, invocation.ID)
 			return err
 		}
 	}
 	c.mu.Lock()
-	c.active[invocation.ID] = active
-	c.byLease[command.LeaseRef] = invocation.ID
+	c.active[active.Invocation.ID] = active
+	c.byLease[active.Command.LeaseRef] = active.Invocation.ID
 	c.mu.Unlock()
+	if err := c.recordInvocationStarted(ctx, active); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -614,6 +660,20 @@ func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error 
 	}
 	if active.Invocation.Status == baseruntime.InvocationStopped {
 		if c.recovery != nil {
+			result, ok, err := c.recovery.GetStopEvidence(ctx, active.Invocation.ID, command.ID)
+			if err != nil {
+				return err
+			}
+			if ok {
+				if err := validateStopResult(result); err != nil {
+					return err
+				}
+				if err := c.recordInvocationStopped(ctx, active, command, result); err != nil {
+					return err
+				}
+			}
+		}
+		if c.recovery != nil {
 			if err := c.recovery.ClearActiveInvocation(ctx, active.Invocation.ID); err != nil {
 				return err
 			}
@@ -629,7 +689,7 @@ func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error 
 		if err := validateStopResult(existing); err != nil {
 			return err
 		}
-		return c.finishPersistedStop(ctx, active)
+		return c.finishPersistedStop(ctx, active, command, existing)
 	}
 	result, err := c.host.Stop(ctx, StopRequest{Invocation: active.Invocation, Command: command, Binding: binding})
 	if err != nil {
@@ -641,10 +701,10 @@ func (c *Controller) applyStop(ctx context.Context, command PhaseCommand) error 
 	if err := c.recovery.RecordStopEvidence(ctx, active, command, result); err != nil {
 		return err
 	}
-	return c.finishPersistedStop(ctx, active)
+	return c.finishPersistedStop(ctx, active, command, result)
 }
 
-func (c *Controller) finishPersistedStop(ctx context.Context, active ActiveInvocation) error {
+func (c *Controller) finishPersistedStop(ctx context.Context, active ActiveInvocation, command PhaseCommand, result StopResult) error {
 	if err := c.host.Revoke(ctx, active.Invocation.ID); err != nil {
 		return err
 	}
@@ -652,6 +712,9 @@ func (c *Controller) finishPersistedStop(ctx context.Context, active ActiveInvoc
 		return err
 	}
 	if err := c.transitionToStopped(ctx, active.Invocation.ID); err != nil {
+		return err
+	}
+	if err := c.recordInvocationStopped(ctx, active, command, result); err != nil {
 		return err
 	}
 	if c.recovery != nil {
@@ -665,6 +728,46 @@ func (c *Controller) finishPersistedStop(ctx context.Context, active ActiveInvoc
 	delete(c.byLease, active.Command.LeaseRef)
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Controller) cleanupResolvedBinding(ctx context.Context, command PhaseCommand, role auth.Role, binding BindingSnapshot) {
+	invocation := baseruntime.Invocation{
+		ID:               deterministicInvocationID(command),
+		ActorPrincipalID: binding.ActorPrincipalID,
+		ProjectID:        binding.ProjectID,
+		TaskID:           command.Endpoint.TaskID,
+		EndpointID:       command.Endpoint.EndpointID,
+		Generation:       uint64(command.Generation),
+		Role:             role,
+		BindingRef:       command.BindingRef,
+		LeaseID:          command.LeaseRef,
+	}
+	_ = c.lifecycle.End(ctx, invocation)
+}
+
+func (c *Controller) cleanupResolvedInvocation(ctx context.Context, invocation baseruntime.Invocation) {
+	_ = c.lifecycle.End(ctx, invocation)
+}
+
+func (c *Controller) recordInvocationStarted(ctx context.Context, active ActiveInvocation) error {
+	if c.obs == nil {
+		return nil
+	}
+	return c.obs.RecordPhaseInvocationStarted(ctx, active.Invocation.ProjectID, active.Command)
+}
+
+func (c *Controller) recordOutputSubmitted(ctx context.Context, active ActiveInvocation) error {
+	if c.obs == nil {
+		return nil
+	}
+	return c.obs.RecordPhaseOutputSubmitted(ctx, active.Invocation.ProjectID, active.Command)
+}
+
+func (c *Controller) recordInvocationStopped(ctx context.Context, active ActiveInvocation, command PhaseCommand, result StopResult) error {
+	if c.obs == nil {
+		return nil
+	}
+	return c.obs.RecordPhaseInvocationStopped(ctx, active.Invocation.ProjectID, command, result.CheckpointRef, result.NonResumable)
 }
 
 func (c *Controller) recoverActiveByLease(ctx context.Context, command PhaseCommand, binding BindingSnapshot) (ActiveInvocation, bool, error) {

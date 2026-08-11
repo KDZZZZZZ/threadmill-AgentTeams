@@ -138,13 +138,21 @@ type InvocationStore interface {
 }
 
 type InvocationLifecycle interface {
+	// Complete is keyed by invocation ID and must be idempotent. Implementations
+	// finalize successful workspace state and then end invocation-scoped runtime
+	// resources exactly once even when completion cleanup is retried.
+	Complete(context.Context, Invocation) error
 	// End is keyed by invocation ID and must be idempotent. Implementations
-	// terminate tokens, model sessions, task handles, and subscriptions exactly
-	// once even when recovery retries call End again after persisted evidence.
+	// terminate tokens, model sessions, task handles, subscriptions, and other
+	// abort-scoped resources exactly once after stop or failed startup cleanup.
 	End(context.Context, Invocation) error
 }
 
 type NoopInvocationLifecycle struct{}
+
+func (NoopInvocationLifecycle) Complete(context.Context, Invocation) error {
+	return nil
+}
 
 func (NoopInvocationLifecycle) End(context.Context, Invocation) error {
 	return nil

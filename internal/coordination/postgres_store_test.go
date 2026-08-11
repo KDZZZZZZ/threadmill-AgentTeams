@@ -174,8 +174,15 @@ func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
 			t.Fatalf("concurrent reconcile failed: %v", err)
 		}
 	}
-	if commands := store.runtimeCommands(ctx, projectID); len(commands) != 1 || commands[0].Action != CommandStart {
+	commands := store.runtimeCommands(ctx, projectID)
+	if len(commands) != 1 || commands[0].Action != CommandStart {
 		t.Fatalf("commands after concurrent reconcile = %#v, want one start", commands)
+	}
+	if err := store.RecordPhaseInvocationStarted(ctx, projectID, commands[0]); err != nil {
+		t.Fatalf("record started observation: %v", err)
+	}
+	if err := store.RecordPhaseInvocationStarted(ctx, projectID, commands[0]); err != nil {
+		t.Fatalf("idempotent started observation: %v", err)
 	}
 	if active := countPostgresActiveLeases(ctx, store, projectID); active != 1 {
 		t.Fatalf("active leases = %d, want 1", active)
@@ -201,6 +208,15 @@ func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
 	stop := restartedController.lastCommand()
 	if stop.LeaseRef == "" || stop.Endpoint != ref("pg-task-a", EndpointPlan) {
 		t.Fatalf("stop command = %#v, want persisted active lease stop", stop)
+	}
+	if err := store.RecordPhaseInvocationStopped(ctx, projectID, stop, "checkpoint://pg-task-a/plan/1", false); err != nil {
+		t.Fatalf("record stopped observation: %v", err)
+	}
+	if err := store.RecordPhaseInvocationStopped(ctx, projectID, stop, "checkpoint://pg-task-a/plan/1", false); err != nil {
+		t.Fatalf("idempotent stopped observation: %v", err)
+	}
+	if err := store.RecordPhaseInvocationStopped(ctx, projectID, stop, "checkpoint://pg-task-a/plan/other", false); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
+		t.Fatalf("conflicting stopped observation = %v, want idempotency_conflict", err)
 	}
 }
 

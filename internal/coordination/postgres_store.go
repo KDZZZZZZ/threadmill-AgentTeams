@@ -457,6 +457,16 @@ func (s *PostgresStore) appendObservation(ctx context.Context, projectID kernel.
 			return err
 		}
 	}
+	existing, ok, err := loadObservation(ctx, tx, projectID, observation.ID)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if existing == observation {
+			return tx.Commit()
+		}
+		return kernel.IdempotencyConflict()
+	}
 	if err := insertObservation(ctx, tx, projectID, observation); err != nil {
 		return err
 	}
@@ -822,6 +832,25 @@ func insertObservation(ctx context.Context, q postgresDBTX, projectID kernel.Pro
 	_, err := q.ExecContext(ctx, `INSERT INTO coordination_runtime_observations(project_id, event_id, command_id, lease_ref, task_id, endpoint_id, generation, binding_ref, kind, checkpoint_ref, non_resumable, folded)
 VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12)`, projectID, observation.ID, observation.CommandID, observation.LeaseRef, observation.Endpoint.TaskID, observation.Endpoint.EndpointID, observation.Generation, observation.BindingRef, observation.Kind, observation.CheckpointRef, observation.NonResumable, observation.Folded)
 	return mapPostgresError(err)
+}
+
+func loadObservation(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, eventID string) (phaseObservation, bool, error) {
+	var observation phaseObservation
+	var commandID, leaseRef, checkpointRef sql.NullString
+	err := q.QueryRowContext(ctx, `SELECT event_id, command_id, lease_ref, task_id, endpoint_id, generation, binding_ref, kind, checkpoint_ref, non_resumable, folded
+FROM coordination_runtime_observations
+WHERE project_id = $1 AND event_id = $2
+FOR UPDATE`, projectID, eventID).Scan(&observation.ID, &commandID, &leaseRef, &observation.Endpoint.TaskID, &observation.Endpoint.EndpointID, &observation.Generation, &observation.BindingRef, &observation.Kind, &checkpointRef, &observation.NonResumable, &observation.Folded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return phaseObservation{}, false, nil
+	}
+	if err != nil {
+		return phaseObservation{}, false, mapPostgresError(err)
+	}
+	observation.CommandID = commandID.String
+	observation.LeaseRef = kernel.LeaseID(leaseRef.String)
+	observation.CheckpointRef = checkpointRef.String
+	return observation, true, nil
 }
 
 func persistRuntimeBinding(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, transition GraphTransition) error {

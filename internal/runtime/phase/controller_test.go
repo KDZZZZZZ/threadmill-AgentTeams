@@ -114,6 +114,7 @@ func TestApplyStartRejectsStaleBindingLeaseAndDispatchFailureLeavesNoActiveSessi
 		t.Fatalf("active sessions after failed dispatch = %d, want 0", got)
 	}
 	harness.host.dispatchErr = nil
+	harness.now = func() time.Time { return time.Date(2026, 8, 11, 1, 0, 0, 0, time.UTC) }
 	if err := controller.Apply(ctx, cmd); err != nil {
 		t.Fatalf("retry after dispatch failure: %v", err)
 	}
@@ -122,6 +123,30 @@ func TestApplyStartRejectsStaleBindingLeaseAndDispatchFailureLeavesNoActiveSessi
 	}
 	if harness.host.dispatches[0].Invocation.ID != deterministicInvocationID(cmd) {
 		t.Fatalf("retry did not reuse deterministic invocation id")
+	}
+}
+
+func TestApplyStartObservationFailureRetriesWithoutRedispatch(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.observations.failStartedOnce = kernel.Error{Code: kernel.CodeRevisionConflict, Message: "observation unavailable", Recoverable: true}
+	controller := harness.controller()
+	cmd := validCommand("cmd-start-observation-retry", coordination.CommandStart, "binding-1", "lease-1", 1)
+
+	if err := controller.Apply(ctx, cmd); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("apply with observation failure = %v, want revision_conflict", err)
+	}
+	if got := len(harness.host.dispatches); got != 1 {
+		t.Fatalf("dispatches after failed observation = %d, want 1", got)
+	}
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("retry observation: %v", err)
+	}
+	if got := len(harness.host.dispatches); got != 1 {
+		t.Fatalf("retry redispatched invocation = %d, want 1", got)
+	}
+	if got := len(harness.observations.started); got != 1 || harness.observations.started[0] != cmd {
+		t.Fatalf("started observations = %#v, want one command", harness.observations.started)
 	}
 }
 
@@ -389,8 +414,14 @@ func TestSubmitPhaseOutputEndsInvocationLifecycle(t *testing.T) {
 	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err != nil {
 		t.Fatalf("submit output: %v", err)
 	}
-	if got := harness.lifecycle.endCalls[invocationID]; got != 1 {
-		t.Fatalf("lifecycle end calls = %d, want 1", got)
+	if got := harness.lifecycle.completeCalls[invocationID]; got != 1 {
+		t.Fatalf("lifecycle complete calls = %d, want 1", got)
+	}
+	if got := harness.lifecycle.endCalls[invocationID]; got != 0 {
+		t.Fatalf("successful submit ended lifecycle as abort = %d, want 0", got)
+	}
+	if got := len(harness.observations.outputs); got != 1 || harness.observations.outputs[0] != cmd {
+		t.Fatalf("output observations = %#v, want submitted command", harness.observations.outputs)
 	}
 	if _, ok := harness.recovery.active[invocationID]; ok {
 		t.Fatal("completed invocation kept active recovery obligation")
@@ -685,6 +716,44 @@ func TestStopTransitionFailureKeepsRecoveryObligation(t *testing.T) {
 	}
 }
 
+func TestStopObservationFailureRetriesWithoutCallingHostStopAgain(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.observations.failStoppedOnce = kernel.Error{Code: kernel.CodeRevisionConflict, Message: "observation unavailable", Recoverable: true}
+	controller := harness.controller()
+	if err := controller.Apply(ctx, validCommand("cmd-start-stop-observation", coordination.CommandStart, "binding-1", "lease-1", 1)); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	stop := validCommand("cmd-stop-observation-retry", coordination.CommandStop, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, stop); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("stop with observation failure = %v, want revision_conflict", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("host stop calls after observation failure = %d, want 1", got)
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("observation failure removed active recovery obligation")
+	}
+
+	rebuilt := harness.controller()
+	if err := rebuilt.Apply(ctx, stop); err != nil {
+		t.Fatalf("retry stop observation: %v", err)
+	}
+	if got := len(harness.host.stops); got != 1 {
+		t.Fatalf("retry called host stop again: %d, want 1", got)
+	}
+	if got := len(harness.observations.stopped); got != 1 || harness.observations.stopped[0].command != stop {
+		t.Fatalf("stopped observations = %#v, want one stop command", harness.observations.stopped)
+	}
+	if harness.observations.stopped[0].checkpointRef != "checkpoint-1" || harness.observations.stopped[0].nonResumable {
+		t.Fatalf("stopped evidence = %#v, want checkpoint from stop result", harness.observations.stopped[0])
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("retry kept active recovery obligation")
+	}
+}
+
 func TestStopRevokeFailureAfterEvidenceRetriesMechanicalEndAndCleanup(t *testing.T) {
 	ctx := context.Background()
 	harness := newHarness(t)
@@ -806,14 +875,16 @@ func TestHardStopNonResumableMakesResumeStaleCheckpoint(t *testing.T) {
 }
 
 type testHarness struct {
-	store     *fakeInvocationStore
-	assembler *fakeAssembler
-	binding   *fakeBindingResolver
-	inputs    *fakeInputRuntime
-	artifacts *fakeArtifactRouter
-	host      *fakeHost
-	recovery  *fakeRecoveryStore
-	lifecycle *fakeLifecycle
+	store        *fakeInvocationStore
+	assembler    *fakeAssembler
+	binding      *fakeBindingResolver
+	inputs       *fakeInputRuntime
+	artifacts    *fakeArtifactRouter
+	host         *fakeHost
+	recovery     *fakeRecoveryStore
+	lifecycle    *fakeLifecycle
+	observations *fakeObservationWriter
+	now          func() time.Time
 }
 
 func newHarness(t *testing.T) *testHarness {
@@ -861,7 +932,14 @@ func newHarness(t *testing.T) *testHarness {
 		artifacts: &fakeArtifactRouter{},
 		host:      newFakeHost(),
 		recovery:  newFakeRecoveryStore(),
-		lifecycle: &fakeLifecycle{endCalls: map[kernel.InvocationID]int{}, ended: map[kernel.InvocationID]bool{}},
+		lifecycle: &fakeLifecycle{
+			completeCalls: map[kernel.InvocationID]int{},
+			completed:     map[kernel.InvocationID]bool{},
+			endCalls:      map[kernel.InvocationID]int{},
+			ended:         map[kernel.InvocationID]bool{},
+		},
+		observations: &fakeObservationWriter{},
+		now:          func() time.Time { return time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC) },
 	}
 }
 
@@ -875,7 +953,8 @@ func (h *testHarness) controller() *Controller {
 		Host:            h.host,
 		RecoveryStore:   h.recovery,
 		Lifecycle:       h.lifecycle,
-		Now:             func() time.Time { return time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC) },
+		Observations:    h.observations,
+		Now:             h.now,
 	})
 }
 
@@ -1107,9 +1186,22 @@ func (h *fakeHost) Revoke(_ context.Context, invocationID kernel.InvocationID) e
 }
 
 type fakeLifecycle struct {
-	endCalls map[kernel.InvocationID]int
-	ended    map[kernel.InvocationID]bool
-	errOnce  error
+	completeCalls map[kernel.InvocationID]int
+	completed     map[kernel.InvocationID]bool
+	endCalls      map[kernel.InvocationID]int
+	ended         map[kernel.InvocationID]bool
+	errOnce       error
+}
+
+func (l *fakeLifecycle) Complete(_ context.Context, invocation baseruntime.Invocation) error {
+	l.completeCalls[invocation.ID]++
+	if l.errOnce != nil {
+		err := l.errOnce
+		l.errOnce = nil
+		return err
+	}
+	l.completed[invocation.ID] = true
+	return nil
 }
 
 func (l *fakeLifecycle) End(_ context.Context, invocation baseruntime.Invocation) error {
@@ -1120,6 +1212,63 @@ func (l *fakeLifecycle) End(_ context.Context, invocation baseruntime.Invocation
 		return err
 	}
 	l.ended[invocation.ID] = true
+	return nil
+}
+
+type fakeStopObservation struct {
+	command       PhaseCommand
+	checkpointRef string
+	nonResumable  bool
+}
+
+type fakeObservationWriter struct {
+	failStartedOnce error
+	failOutputOnce  error
+	failFailedOnce  error
+	failStoppedOnce error
+	started         []PhaseCommand
+	outputs         []PhaseCommand
+	failed          []PhaseCommand
+	stopped         []fakeStopObservation
+}
+
+func (w *fakeObservationWriter) RecordPhaseInvocationStarted(_ context.Context, _ kernel.ProjectID, command coordination.PhaseCommand) error {
+	if w.failStartedOnce != nil {
+		err := w.failStartedOnce
+		w.failStartedOnce = nil
+		return err
+	}
+	w.started = append(w.started, command)
+	return nil
+}
+
+func (w *fakeObservationWriter) RecordPhaseOutputSubmitted(_ context.Context, _ kernel.ProjectID, command coordination.PhaseCommand) error {
+	if w.failOutputOnce != nil {
+		err := w.failOutputOnce
+		w.failOutputOnce = nil
+		return err
+	}
+	w.outputs = append(w.outputs, command)
+	return nil
+}
+
+func (w *fakeObservationWriter) RecordPhaseInvocationFailed(_ context.Context, _ kernel.ProjectID, command coordination.PhaseCommand) error {
+	if w.failFailedOnce != nil {
+		err := w.failFailedOnce
+		w.failFailedOnce = nil
+		return err
+	}
+	w.failed = append(w.failed, command)
+	return nil
+}
+
+func (w *fakeObservationWriter) RecordPhaseInvocationStopped(_ context.Context, _ kernel.ProjectID, command coordination.PhaseCommand, checkpointRef string, nonResumable bool) error {
+	if w.failStoppedOnce != nil {
+		err := w.failStoppedOnce
+		w.failStoppedOnce = nil
+		return err
+	}
+	w.stopped = append(w.stopped, fakeStopObservation{command: command, checkpointRef: checkpointRef, nonResumable: nonResumable})
 	return nil
 }
 

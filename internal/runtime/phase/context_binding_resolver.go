@@ -155,6 +155,10 @@ func (l ContextBindingLifecycle) End(ctx context.Context, invocation baseruntime
 	return l.Contexts.EndInvocation(ctx, principal, invocation.ID)
 }
 
+func (l ContextBindingLifecycle) Complete(ctx context.Context, invocation baseruntime.Invocation) error {
+	return l.End(ctx, invocation)
+}
+
 func phaseContextPrincipal(command PhaseCommand, invocationID kernel.InvocationID, binding BindingSnapshot) (auth.Principal, error) {
 	role, err := phaseRole(command.Endpoint.EndpointID)
 	if err != nil {
