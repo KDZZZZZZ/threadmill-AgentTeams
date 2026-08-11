@@ -2,8 +2,10 @@ package phase
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -11,8 +13,12 @@ import (
 	adapter "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
+	platformpostgres "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/postgres"
 	baseruntime "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime/promptcatalog"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func TestAgentTeamsPhaseHostDispatchPersistsPreparedBeforeDispatch(t *testing.T) {
@@ -23,10 +29,14 @@ func TestAgentTeamsPhaseHostDispatchPersistsPreparedBeforeDispatch(t *testing.T)
 		t.Fatalf("Dispatch() error = %v", err)
 	}
 
-	if got, want := service.calls[0], "dispatch:"+agentTeamsInvocationRef(req.Invocation.ID); got != want {
+	invocationRef, err := agentTeamsInvocationRef(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := service.calls[0], "dispatch:"+invocationRef; got != want {
 		t.Fatalf("first adapter call = %q, want %q", got, want)
 	}
-	prepared, err := writer.LoadPreparedInvocation(context.Background(), agentTeamsInvocationRef(req.Invocation.ID))
+	prepared, err := writer.LoadPreparedInvocation(context.Background(), invocationRef)
 	if err != nil {
 		t.Fatalf("prepared invocation was not saved: %v", err)
 	}
@@ -49,7 +59,7 @@ func TestAgentTeamsPhaseHostDispatchPersistsPreparedBeforeDispatch(t *testing.T)
 }
 
 func TestAgentTeamsPhaseHostSuspendThenRehydrateCreatesNewAttempt(t *testing.T) {
-	host, service, _, state := newAgentTeamsPhaseHostHarness(t)
+	host, service, writer, state := newAgentTeamsPhaseHostHarness(t)
 	req := validAgentTeamsDispatchRequest("inv-await")
 	if err := host.Dispatch(context.Background(), req); err != nil {
 		t.Fatalf("Dispatch() error = %v", err)
@@ -57,7 +67,13 @@ func TestAgentTeamsPhaseHostSuspendThenRehydrateCreatesNewAttempt(t *testing.T) 
 	if err := host.Suspend(context.Background(), req.Invocation.ID); err != nil {
 		t.Fatalf("Suspend() error = %v", err)
 	}
-	if err := host.Rehydrate(context.Background(), req); err != nil {
+	rehydrate := req
+	rehydrate.Prompt.Text = "execute the bounded phase with fresh context"
+	rehydrate.Prompt.SHA256 = "rendered-sha-fresh"
+	rehydrate.Start.Inputs.InputRevision = "inputs-fresh"
+	rehydrate.Binding.ContextSliceRef = "context-slice-fresh"
+	rehydrate.Binding.WorkspaceRevision = "workspace-rev-fresh"
+	if err := host.Rehydrate(context.Background(), rehydrate); err != nil {
 		t.Fatalf("Rehydrate() error = %v", err)
 	}
 
@@ -67,6 +83,17 @@ func TestAgentTeamsPhaseHostSuspendThenRehydrateCreatesNewAttempt(t *testing.T) 
 	}
 	if current.Execution.AgentTeamsTaskID != "agentteams-task-2" {
 		t.Fatalf("rehydrated task id = %q, want second attempt", current.Execution.AgentTeamsTaskID)
+	}
+	prepared, err := writer.LoadPreparedInvocation(context.Background(), current.InvocationRef)
+	if err != nil {
+		t.Fatalf("load rehydrated prepared invocation: %v", err)
+	}
+	var spec agentTeamsPhaseSpecDocument
+	if err := json.Unmarshal([]byte(prepared.Spec), &spec); err != nil {
+		t.Fatalf("rehydrated spec is not JSON: %v", err)
+	}
+	if spec.Prompt != rehydrate.Prompt.Text || spec.InputRevision != "inputs-fresh" || spec.WorkspaceRevision != "workspace-rev-fresh" {
+		t.Fatalf("rehydrated spec = %#v, want fresh prompt/input/workspace", spec)
 	}
 	if got := service.terminationModes["agentteams-task-1"]; got != adapter.TerminateReleaseWait {
 		t.Fatalf("first attempt termination = %q, want release_wait", got)
@@ -104,9 +131,9 @@ func TestAgentTeamsPhaseHostStopThenRevokeUsesRecoverableStopMode(t *testing.T) 
 	}
 }
 
-func TestAgentTeamsPhaseHostStopWithoutCheckpointIsNonResumable(t *testing.T) {
+func TestAgentTeamsPhaseHostStopWithoutCheckpointDerivesStableCheckpoint(t *testing.T) {
 	host, _, _, _ := newAgentTeamsPhaseHostHarness(t)
-	req := validAgentTeamsDispatchRequest("inv-stop-hard")
+	req := validAgentTeamsDispatchRequest("inv-stop-derived")
 	req.Binding.CheckpointRef = ""
 	if err := host.Dispatch(context.Background(), req); err != nil {
 		t.Fatalf("Dispatch() error = %v", err)
@@ -115,8 +142,31 @@ func TestAgentTeamsPhaseHostStopWithoutCheckpointIsNonResumable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
-	if !result.NonResumable || result.CheckpointRef != "" || result.ResumeStateRef != "" {
-		t.Fatalf("non-resumable stop result = %#v", result)
+	if result.NonResumable || result.CheckpointRef == "" || result.ResumeStateRef == "" || result.WorkspaceRevision != req.Binding.WorkspaceRevision {
+		t.Fatalf("derived resumable stop result = %#v", result)
+	}
+	again, err := host.Stop(context.Background(), StopRequest{Invocation: req.Invocation, Binding: req.Binding})
+	if err != nil {
+		t.Fatalf("repeat Stop() error = %v", err)
+	}
+	if again != result {
+		t.Fatalf("derived stop evidence changed: %#v then %#v", result, again)
+	}
+}
+
+func TestAgentTeamsPhaseHostStopExplicitNonResumableHardStops(t *testing.T) {
+	host, _, _, _ := newAgentTeamsPhaseHostHarness(t)
+	req := validAgentTeamsDispatchRequest("inv-stop-hard")
+	req.Binding.NonResumable = true
+	if err := host.Dispatch(context.Background(), req); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	result, err := host.Stop(context.Background(), StopRequest{Invocation: req.Invocation, Binding: req.Binding})
+	if err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if !result.NonResumable || result.CheckpointRef != "" || result.ResumeStateRef != "" || result.WorkspaceRevision != "" {
+		t.Fatalf("explicit hard stop result = %#v", result)
 	}
 }
 
@@ -141,6 +191,32 @@ func TestAgentTeamsPhaseHostNormalRevokeCancelsExecution(t *testing.T) {
 	}
 }
 
+func TestAgentTeamsPhaseHostTerminationIntentPersistsBeforeExternalTerminate(t *testing.T) {
+	host, service, _, state := newAgentTeamsPhaseHostHarness(t)
+	req := validAgentTeamsDispatchRequest("inv-crash-order")
+	if err := host.Dispatch(context.Background(), req); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	service.failTerminate = fmt.Errorf("external terminate failed after intent persisted")
+	if _, err := host.Stop(context.Background(), StopRequest{Invocation: req.Invocation, Binding: req.Binding}); err == nil {
+		t.Fatal("Stop() error = nil, want external failure")
+	}
+	saved, ok, err := state.LoadAgentTeamsPhaseHostState(context.Background(), req.Invocation.ID)
+	if err != nil || !ok {
+		t.Fatalf("load phase host state = ok %v err %v", ok, err)
+	}
+	if saved.TerminationMode != adapter.TerminateRecoverableStop {
+		t.Fatalf("persisted termination intent after external failure = %q, want recoverable_stop", saved.TerminationMode)
+	}
+	service.failTerminate = nil
+	if err := host.Revoke(context.Background(), req.Invocation.ID); err != nil {
+		t.Fatalf("retry Revoke() after persisted intent error = %v", err)
+	}
+	if got := service.terminationModes["agentteams-task-1"]; got != adapter.TerminateRecoverableStop {
+		t.Fatalf("retried external termination mode = %q, want recoverable_stop", got)
+	}
+}
+
 func TestAgentTeamsPhaseHostRestartReusesPersistentState(t *testing.T) {
 	host, service, writer, state := newAgentTeamsPhaseHostHarness(t)
 	req := validAgentTeamsDispatchRequest("inv-restart")
@@ -162,6 +238,96 @@ func TestAgentTeamsPhaseHostRestartReusesPersistentState(t *testing.T) {
 	}
 	if service.dispatchCalls != 1 {
 		t.Fatalf("restart suspend redispatched unexpectedly: dispatch calls = %d", service.dispatchCalls)
+	}
+}
+
+func TestPostgresAgentTeamsPhaseHostStoreRealPostgresRestart(t *testing.T) {
+	dsn := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = os.Getenv("DATABASE_URL")
+	}
+	if dsn == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL or DATABASE_URL is required for real PostgreSQL integration")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("ping postgres: %v", err)
+	}
+	schema := fmt.Sprintf("threadmill_phase_host_it_%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `CREATE SCHEMA `+quoteIdent(schema)); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer db.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+quoteIdent(schema)+` CASCADE`)
+	if _, err := db.ExecContext(ctx, `SET search_path TO `+quoteIdent(schema)); err != nil {
+		t.Fatalf("set search_path: %v", err)
+	}
+	loaded, err := platformpostgres.LoadMigrations(migrations.FS, ".")
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if err := platformpostgres.NewMigrator(db).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply full migrations: %v", err)
+	}
+
+	store := NewPostgresAgentTeamsPhaseHostStoreFromSQL(db)
+	service := newFakeAgentTeamsPhaseAdapter()
+	host, err := NewAgentTeamsPhaseHost(AgentTeamsPhaseHostConfig{
+		Adapter: service,
+		Writer:  store,
+		State:   store,
+		RoomID:  "!threadmill:example.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := validAgentTeamsDispatchRequest("inv-pg-restart")
+	if err := host.Dispatch(ctx, req); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	restartedStore := NewPostgresAgentTeamsPhaseHostStoreFromSQL(db)
+	restarted, err := NewAgentTeamsPhaseHost(AgentTeamsPhaseHostConfig{
+		Adapter: service,
+		Writer:  restartedStore,
+		State:   restartedStore,
+		RoomID:  "!threadmill:example.test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Suspend(ctx, req.Invocation.ID); err != nil {
+		t.Fatalf("restarted Suspend() error = %v", err)
+	}
+	refreshed := req
+	refreshed.Prompt.Text = "postgres restart fresh prompt"
+	refreshed.Prompt.SHA256 = "pg-fresh-sha"
+	refreshed.Start.Inputs.InputRevision = "pg-inputs-2"
+	if err := restarted.Rehydrate(ctx, refreshed); err != nil {
+		t.Fatalf("restarted Rehydrate() error = %v", err)
+	}
+	state, ok, err := NewPostgresAgentTeamsPhaseHostStoreFromSQL(db).LoadAgentTeamsPhaseHostState(ctx, req.Invocation.ID)
+	if err != nil || !ok {
+		t.Fatalf("load postgres host state = ok %v err %v", ok, err)
+	}
+	if state.Execution.AgentTeamsTaskID != "agentteams-task-2" {
+		t.Fatalf("postgres rehydrate task = %q, want second attempt", state.Execution.AgentTeamsTaskID)
+	}
+	prepared, err := NewPostgresAgentTeamsPhaseHostStoreFromSQL(db).LoadPreparedInvocation(ctx, state.InvocationRef)
+	if err != nil {
+		t.Fatalf("load postgres prepared invocation: %v", err)
+	}
+	var spec agentTeamsPhaseSpecDocument
+	if err := json.Unmarshal([]byte(prepared.Spec), &spec); err != nil {
+		t.Fatalf("postgres prepared spec JSON: %v", err)
+	}
+	if spec.Prompt != refreshed.Prompt.Text || spec.InputRevision != "pg-inputs-2" {
+		t.Fatalf("postgres rehydrated spec = %#v", spec)
 	}
 }
 
@@ -251,6 +417,7 @@ type fakeAgentTeamsPhaseAdapter struct {
 	terminationModes map[string]adapter.TerminateMode
 	terminateCalls   map[string]int
 	calls            []string
+	failTerminate    error
 }
 
 func newFakeAgentTeamsPhaseAdapter() *fakeAgentTeamsPhaseAdapter {
@@ -276,7 +443,7 @@ func (a *fakeAgentTeamsPhaseAdapter) Dispatch(_ context.Context, invocationRef s
 		}
 	}
 	execution := adapter.AgentTeamsExecutionRef{
-		InvocationID:     kernel.InvocationID(strings.TrimPrefix(invocationRef, agentTeamsInvocationRefPrefix)),
+		InvocationID:     invocationIDFromAgentTeamsRef(invocationRef),
 		AgentTeamsTaskID: fmt.Sprintf("agentteams-task-%d", a.nextAttempt),
 		HostRef:          "worker-a",
 	}
@@ -290,6 +457,9 @@ func (a *fakeAgentTeamsPhaseAdapter) Terminate(_ context.Context, execution adap
 	mode := adapter.TerminateMode(rawMode)
 	a.calls = append(a.calls, "terminate:"+execution.AgentTeamsTaskID+":"+rawMode)
 	a.terminateCalls[execution.AgentTeamsTaskID]++
+	if a.failTerminate != nil {
+		return a.failTerminate
+	}
 	if a.states[execution.AgentTeamsTaskID] == "terminated" {
 		if a.terminationModes[execution.AgentTeamsTaskID] == mode {
 			return nil

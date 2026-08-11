@@ -3,6 +3,7 @@ package phase
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	adapter "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
+	baseruntime "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
 )
 
 const (
@@ -81,10 +83,10 @@ func (h *AgentTeamsPhaseHost) Suspend(ctx context.Context, invocationID kernel.I
 		return err
 	}
 	state.TerminationMode = adapter.TerminateReleaseWait
-	if err := h.adapter.Terminate(ctx, state.Execution, string(adapter.TerminateReleaseWait)); err != nil {
+	if err := h.state.SaveAgentTeamsPhaseHostState(ctx, state); err != nil {
 		return err
 	}
-	return h.state.SaveAgentTeamsPhaseHostState(ctx, state)
+	return h.adapter.Terminate(ctx, state.Execution, string(adapter.TerminateReleaseWait))
 }
 
 func (h *AgentTeamsPhaseHost) Stop(ctx context.Context, req StopRequest) (StopResult, error) {
@@ -93,23 +95,13 @@ func (h *AgentTeamsPhaseHost) Stop(ctx context.Context, req StopRequest) (StopRe
 		return StopResult{}, err
 	}
 	state.TerminationMode = adapter.TerminateRecoverableStop
-	if err := h.adapter.Terminate(ctx, state.Execution, string(adapter.TerminateRecoverableStop)); err != nil {
-		return StopResult{}, err
-	}
 	if err := h.state.SaveAgentTeamsPhaseHostState(ctx, state); err != nil {
 		return StopResult{}, err
 	}
-	result := StopResult{
-		ResumeStateRef:    fmt.Sprintf("agentteams://resume-state/%s/%s", state.Execution.AgentTeamsTaskID, req.Invocation.ID),
-		CheckpointRef:     req.Binding.CheckpointRef,
-		WorkspaceRevision: req.Binding.WorkspaceRevision,
+	if err := h.adapter.Terminate(ctx, state.Execution, string(adapter.TerminateRecoverableStop)); err != nil {
+		return StopResult{}, err
 	}
-	if req.Binding.CheckpointRef == "" {
-		result.NonResumable = true
-		result.ResumeStateRef = ""
-		result.WorkspaceRevision = ""
-	}
-	return result, nil
+	return h.stopEvidence(req, state), nil
 }
 
 func (h *AgentTeamsPhaseHost) Revoke(ctx context.Context, invocationID kernel.InvocationID) error {
@@ -122,35 +114,26 @@ func (h *AgentTeamsPhaseHost) Revoke(ctx context.Context, invocationID kernel.In
 		mode = adapter.TerminateCancel
 		state.TerminationMode = mode
 	}
-	if err := h.adapter.Terminate(ctx, state.Execution, string(mode)); err != nil {
+	if err := h.state.SaveAgentTeamsPhaseHostState(ctx, state); err != nil {
 		return err
 	}
-	return h.state.SaveAgentTeamsPhaseHostState(ctx, state)
+	return h.adapter.Terminate(ctx, state.Execution, string(mode))
 }
 
 func (h *AgentTeamsPhaseHost) dispatch(ctx context.Context, req DispatchRequest, rehydrate bool) error {
 	if err := validateAgentTeamsDispatch(req); err != nil {
 		return err
 	}
-	invocationRef := agentTeamsInvocationRef(req.Invocation.ID)
-	if !rehydrate {
-		prepared, err := h.preparedInvocation(req, invocationRef)
-		if err != nil {
-			return err
-		}
-		if err := h.writer.SavePreparedInvocation(ctx, invocationRef, prepared); err != nil {
-			return err
-		}
-	} else if _, ok, err := h.state.LoadAgentTeamsPhaseHostState(ctx, req.Invocation.ID); err != nil {
+	invocationRef, err := agentTeamsInvocationRef(req)
+	if err != nil {
 		return err
-	} else if !ok {
-		prepared, err := h.preparedInvocation(req, invocationRef)
-		if err != nil {
-			return err
-		}
-		if err := h.writer.SavePreparedInvocation(ctx, invocationRef, prepared); err != nil {
-			return err
-		}
+	}
+	prepared, err := h.preparedInvocation(req, invocationRef)
+	if err != nil {
+		return err
+	}
+	if err := h.writer.SavePreparedInvocation(ctx, invocationRef, prepared); err != nil {
+		return err
 	}
 	execution, err := h.adapter.Dispatch(ctx, invocationRef)
 	if err != nil {
@@ -179,20 +162,7 @@ func (h *AgentTeamsPhaseHost) executionState(ctx context.Context, invocationID k
 	if ok {
 		return state, nil
 	}
-	invocationRef := agentTeamsInvocationRef(invocationID)
-	execution, err := h.adapter.Dispatch(ctx, invocationRef)
-	if err != nil {
-		return AgentTeamsPhaseHostState{}, err
-	}
-	state = AgentTeamsPhaseHostState{
-		InvocationID:  invocationID,
-		InvocationRef: invocationRef,
-		Execution:     execution,
-	}
-	if err := h.state.SaveAgentTeamsPhaseHostState(ctx, state); err != nil {
-		return AgentTeamsPhaseHostState{}, err
-	}
-	return state, nil
+	return AgentTeamsPhaseHostState{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams phase host state not found"}
 }
 
 func (h *AgentTeamsPhaseHost) preparedInvocation(req DispatchRequest, invocationRef string) (adapter.PreparedInvocation, error) {
@@ -211,6 +181,21 @@ func (h *AgentTeamsPhaseHost) preparedInvocation(req DispatchRequest, invocation
 		EnvelopeRef:          agentTeamsEnvelopeRef(req.Invocation.ID, invocationRef, req.Prompt.SHA256),
 		RequiredCapabilities: requiredAgentTeamsCapabilities(req.Capability),
 	}, nil
+}
+
+func (h *AgentTeamsPhaseHost) stopEvidence(req StopRequest, state AgentTeamsPhaseHostState) StopResult {
+	if req.Binding.NonResumable || strings.TrimSpace(req.Binding.WorkspaceRevision) == "" {
+		return StopResult{NonResumable: true}
+	}
+	checkpointRef := strings.TrimSpace(req.Binding.CheckpointRef)
+	if checkpointRef == "" {
+		checkpointRef = deterministicWorkspaceCheckpointRef(req.Invocation.ID, req.Binding.WorkspaceRevision)
+	}
+	return StopResult{
+		ResumeStateRef:    deterministicResumeStateRef(req.Invocation.ID, state.Execution.AgentTeamsTaskID, checkpointRef),
+		CheckpointRef:     checkpointRef,
+		WorkspaceRevision: req.Binding.WorkspaceRevision,
+	}
 }
 
 type agentTeamsPhaseSpecDocument struct {
@@ -288,8 +273,38 @@ func requiredAgentTeamsCapabilities(capability auth.Capability) []string {
 	return nil
 }
 
-func agentTeamsInvocationRef(invocationID kernel.InvocationID) string {
-	return agentTeamsInvocationRefPrefix + string(invocationID)
+func agentTeamsInvocationRef(req DispatchRequest) (string, error) {
+	spec, err := agentTeamsPhaseSpec(req)
+	if err != nil {
+		return "", err
+	}
+	payload := struct {
+		InvocationID      kernel.InvocationID `json:"invocation_id"`
+		PromptSHA256      string              `json:"prompt_sha256"`
+		Spec              string              `json:"spec"`
+		WorkspaceRevision string              `json:"workspace_revision"`
+		InputRevision     string              `json:"input_revision"`
+	}{
+		InvocationID:      req.Invocation.ID,
+		PromptSHA256:      req.Prompt.SHA256,
+		Spec:              spec,
+		WorkspaceRevision: req.Binding.WorkspaceRevision,
+		InputRevision:     req.Start.Inputs.InputRevision,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", kernel.InvalidArgument("AgentTeams invocation ref payload cannot be encoded")
+	}
+	sum := sha256.Sum256(raw)
+	return agentTeamsInvocationRefPrefix + string(req.Invocation.ID) + "/" + hex.EncodeToString(sum[:16]), nil
+}
+
+func invocationIDFromAgentTeamsRef(invocationRef string) kernel.InvocationID {
+	value := strings.TrimPrefix(invocationRef, agentTeamsInvocationRefPrefix)
+	if index := strings.IndexByte(value, '/'); index >= 0 {
+		value = value[:index]
+	}
+	return kernel.InvocationID(value)
 }
 
 func agentTeamsRuntimeConfigRef(invocationID kernel.InvocationID) string {
@@ -299,6 +314,16 @@ func agentTeamsRuntimeConfigRef(invocationID kernel.InvocationID) string {
 func agentTeamsEnvelopeRef(invocationID kernel.InvocationID, invocationRef string, promptHash string) string {
 	sum := sha256.Sum256([]byte(string(invocationID) + "\x00" + invocationRef + "\x00" + promptHash))
 	return agentTeamsEnvelopeRefPrefix + string(invocationID) + "/" + hex.EncodeToString(sum[:16])
+}
+
+func deterministicWorkspaceCheckpointRef(invocationID kernel.InvocationID, workspaceRevision string) string {
+	sum := sha256.Sum256([]byte(string(invocationID) + "\x00" + workspaceRevision))
+	return "agentteams://workspace-checkpoint/" + string(invocationID) + "/" + hex.EncodeToString(sum[:16])
+}
+
+func deterministicResumeStateRef(invocationID kernel.InvocationID, taskID string, checkpointRef string) string {
+	sum := sha256.Sum256([]byte(string(invocationID) + "\x00" + taskID + "\x00" + checkpointRef))
+	return "agentteams://resume-state/" + string(invocationID) + "/" + hex.EncodeToString(sum[:16])
 }
 
 type MemoryPreparedInvocationWriter struct {
@@ -342,6 +367,217 @@ func (w *MemoryPreparedInvocationWriter) LoadPreparedInvocation(ctx context.Cont
 	return clonePreparedInvocation(prepared), nil
 }
 
+type PostgresAgentTeamsPhaseHostStore struct {
+	db baseruntime.DBTX
+}
+
+func NewPostgresAgentTeamsPhaseHostStore(db baseruntime.DBTX) *PostgresAgentTeamsPhaseHostStore {
+	return &PostgresAgentTeamsPhaseHostStore{db: db}
+}
+
+func NewPostgresAgentTeamsPhaseHostStoreFromSQL(db baseruntime.SQLDBTX) *PostgresAgentTeamsPhaseHostStore {
+	return NewPostgresAgentTeamsPhaseHostStore(baseruntime.WrapSQLDBTX(db))
+}
+
+func (s *PostgresAgentTeamsPhaseHostStore) SavePreparedInvocation(ctx context.Context, ref string, prepared adapter.PreparedInvocation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s == nil || s.db == nil {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "Postgres AgentTeams phase host store is not configured"}
+	}
+	if strings.TrimSpace(ref) == "" {
+		return kernel.InvalidArgument("prepared invocation ref is required")
+	}
+	requiredCapabilities, err := json.Marshal(prepared.RequiredCapabilities)
+	if err != nil {
+		return kernel.InvalidArgument("prepared required capabilities cannot be encoded")
+	}
+	result, err := s.db.ExecContext(ctx, `
+INSERT INTO phase_agentteams_prepared_invocations (
+  invocation_ref, invocation_id, project_id, role, operation, room_id, spec,
+  runtime_config_ref, envelope_ref, required_capabilities
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+ON CONFLICT (invocation_ref) DO NOTHING`,
+		ref,
+		prepared.InvocationID,
+		prepared.ProjectID,
+		prepared.Role,
+		prepared.Operation,
+		prepared.RoomID,
+		prepared.Spec,
+		prepared.RuntimeConfigRef,
+		prepared.EnvelopeRef,
+		string(requiredCapabilities),
+	)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected == 1 {
+		return nil
+	}
+	existing, err := s.loadPrepared(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if !samePreparedInvocation(existing, prepared) {
+		return kernel.IdempotencyConflict()
+	}
+	return nil
+}
+
+func (s *PostgresAgentTeamsPhaseHostStore) LoadPreparedInvocation(ctx context.Context, ref string) (adapter.PreparedInvocation, error) {
+	if err := ctx.Err(); err != nil {
+		return adapter.PreparedInvocation{}, err
+	}
+	if s == nil || s.db == nil {
+		return adapter.PreparedInvocation{}, kernel.Error{Code: kernel.CodeInternalError, Message: "Postgres AgentTeams phase host store is not configured"}
+	}
+	return s.loadPrepared(ctx, ref)
+}
+
+func (s *PostgresAgentTeamsPhaseHostStore) LoadAgentTeamsPhaseHostState(ctx context.Context, invocationID kernel.InvocationID) (AgentTeamsPhaseHostState, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return AgentTeamsPhaseHostState{}, false, err
+	}
+	if s == nil || s.db == nil {
+		return AgentTeamsPhaseHostState{}, false, kernel.Error{Code: kernel.CodeInternalError, Message: "Postgres AgentTeams phase host store is not configured"}
+	}
+	if err := kernel.RequireID("invocation_id", invocationID); err != nil {
+		return AgentTeamsPhaseHostState{}, false, err
+	}
+	return s.loadState(ctx, invocationID)
+}
+
+func (s *PostgresAgentTeamsPhaseHostStore) SaveAgentTeamsPhaseHostState(ctx context.Context, state AgentTeamsPhaseHostState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s == nil || s.db == nil {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "Postgres AgentTeams phase host store is not configured"}
+	}
+	if err := validateAgentTeamsPhaseHostState(state); err != nil {
+		return err
+	}
+	existing, found, err := s.loadState(ctx, state.InvocationID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		result, err := s.db.ExecContext(ctx, `
+INSERT INTO phase_agentteams_host_states (
+  invocation_id, invocation_ref, agentteams_task_id, host_ref, termination_mode
+) VALUES ($1, $2, $3, $4, NULLIF($5, ''))
+ON CONFLICT (invocation_id) DO NOTHING`,
+			state.InvocationID,
+			state.InvocationRef,
+			state.Execution.AgentTeamsTaskID,
+			state.Execution.HostRef,
+			string(state.TerminationMode),
+		)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err == nil && affected == 1 {
+			return nil
+		}
+		existing, found, err = s.loadState(ctx, state.InvocationID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "AgentTeams phase host state was not inserted", Recoverable: true}
+		}
+	}
+	next, ok, err := nextAgentTeamsPhaseHostState(existing, state)
+	if err != nil || !ok {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE phase_agentteams_host_states
+SET invocation_ref = $2,
+    agentteams_task_id = $3,
+    host_ref = $4,
+    termination_mode = NULLIF($5, ''),
+    updated_at = now()
+WHERE invocation_id = $1
+  AND invocation_ref = $6
+  AND agentteams_task_id = $7
+  AND host_ref = $8
+  AND COALESCE(termination_mode::text, '') = $9`,
+		next.InvocationID,
+		next.InvocationRef,
+		next.Execution.AgentTeamsTaskID,
+		next.Execution.HostRef,
+		string(next.TerminationMode),
+		existing.InvocationRef,
+		existing.Execution.AgentTeamsTaskID,
+		existing.Execution.HostRef,
+		string(existing.TerminationMode),
+	)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected != 1 {
+		return kernel.Error{Code: kernel.CodeRevisionConflict, Message: "AgentTeams phase host state changed", Recoverable: true}
+	}
+	return nil
+}
+
+func (s *PostgresAgentTeamsPhaseHostStore) loadPrepared(ctx context.Context, ref string) (adapter.PreparedInvocation, error) {
+	var prepared adapter.PreparedInvocation
+	var requiredCapabilities []byte
+	err := s.db.QueryRowContext(ctx, `
+SELECT invocation_id, project_id, role, operation, room_id, spec, runtime_config_ref,
+       envelope_ref, required_capabilities
+FROM phase_agentteams_prepared_invocations
+WHERE invocation_ref = $1`, ref).Scan(
+		&prepared.InvocationID,
+		&prepared.ProjectID,
+		&prepared.Role,
+		&prepared.Operation,
+		&prepared.RoomID,
+		&prepared.Spec,
+		&prepared.RuntimeConfigRef,
+		&prepared.EnvelopeRef,
+		&requiredCapabilities,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return adapter.PreparedInvocation{}, kernel.Error{Code: kernel.CodeNotFound, Message: "prepared invocation not found"}
+	}
+	if err != nil {
+		return adapter.PreparedInvocation{}, err
+	}
+	if err := json.Unmarshal(requiredCapabilities, &prepared.RequiredCapabilities); err != nil {
+		return adapter.PreparedInvocation{}, fmt.Errorf("decode prepared invocation capabilities: %w", err)
+	}
+	return prepared, nil
+}
+
+func (s *PostgresAgentTeamsPhaseHostStore) loadState(ctx context.Context, invocationID kernel.InvocationID) (AgentTeamsPhaseHostState, bool, error) {
+	var state AgentTeamsPhaseHostState
+	var terminationMode string
+	err := s.db.QueryRowContext(ctx, `
+SELECT invocation_id, invocation_ref, agentteams_task_id, host_ref, COALESCE(termination_mode::text, '')
+FROM phase_agentteams_host_states
+WHERE invocation_id = $1`, invocationID).Scan(
+		&state.InvocationID,
+		&state.InvocationRef,
+		&state.Execution.AgentTeamsTaskID,
+		&state.Execution.HostRef,
+		&terminationMode,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentTeamsPhaseHostState{}, false, nil
+	}
+	if err != nil {
+		return AgentTeamsPhaseHostState{}, false, err
+	}
+	state.Execution.InvocationID = state.InvocationID
+	state.TerminationMode = adapter.TerminateMode(terminationMode)
+	return state, true, nil
+}
+
 type MemoryAgentTeamsPhaseHostStateStore struct {
 	mu    sync.RWMutex
 	items map[kernel.InvocationID]AgentTeamsPhaseHostState
@@ -365,6 +601,30 @@ func (s *MemoryAgentTeamsPhaseHostStateStore) SaveAgentTeamsPhaseHostState(ctx c
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := validateAgentTeamsPhaseHostState(state); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.items == nil {
+		s.items = make(map[kernel.InvocationID]AgentTeamsPhaseHostState)
+	}
+	if existing, ok := s.items[state.InvocationID]; ok {
+		next, ok, err := nextAgentTeamsPhaseHostState(existing, state)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		s.items[state.InvocationID] = next
+		return nil
+	}
+	s.items[state.InvocationID] = state
+	return nil
+}
+
+func validateAgentTeamsPhaseHostState(state AgentTeamsPhaseHostState) error {
 	if err := kernel.RequireID("invocation_id", state.InvocationID); err != nil {
 		return err
 	}
@@ -377,28 +637,34 @@ func (s *MemoryAgentTeamsPhaseHostStateStore) SaveAgentTeamsPhaseHostState(ctx c
 	if state.Execution.InvocationID != state.InvocationID {
 		return kernel.InvalidArgument("AgentTeams execution invocation_id does not match phase host state")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.items == nil {
-		s.items = make(map[kernel.InvocationID]AgentTeamsPhaseHostState)
+	switch state.TerminationMode {
+	case "", adapter.TerminateReleaseWait, adapter.TerminateRecoverableStop, adapter.TerminateCancel:
+		return nil
+	default:
+		return kernel.InvalidArgument("AgentTeams termination mode is invalid")
 	}
-	if existing, ok := s.items[state.InvocationID]; ok {
-		if existing.InvocationRef != state.InvocationRef {
-			return kernel.IdempotencyConflict()
-		}
-		if existing.Execution != state.Execution {
-			if existing.TerminationMode != adapter.TerminateReleaseWait || state.TerminationMode != "" {
-				return kernel.IdempotencyConflict()
-			}
-			s.items[state.InvocationID] = state
-			return nil
-		}
-		if existing.TerminationMode != "" && state.TerminationMode == "" {
-			state.TerminationMode = existing.TerminationMode
-		}
+}
+
+func nextAgentTeamsPhaseHostState(existing, requested AgentTeamsPhaseHostState) (AgentTeamsPhaseHostState, bool, error) {
+	if existing.InvocationID != requested.InvocationID {
+		return AgentTeamsPhaseHostState{}, false, kernel.IdempotencyConflict()
 	}
-	s.items[state.InvocationID] = state
-	return nil
+	if existing.InvocationRef != requested.InvocationRef || existing.Execution != requested.Execution {
+		if existing.TerminationMode != adapter.TerminateReleaseWait || requested.TerminationMode != "" {
+			return AgentTeamsPhaseHostState{}, false, kernel.IdempotencyConflict()
+		}
+		return requested, true, nil
+	}
+	if existing.TerminationMode != "" && requested.TerminationMode == "" {
+		requested.TerminationMode = existing.TerminationMode
+	}
+	if existing.TerminationMode != "" && requested.TerminationMode != existing.TerminationMode {
+		return AgentTeamsPhaseHostState{}, false, kernel.IdempotencyConflict()
+	}
+	if existing == requested {
+		return existing, false, nil
+	}
+	return requested, true, nil
 }
 
 func clonePreparedInvocation(prepared adapter.PreparedInvocation) adapter.PreparedInvocation {
