@@ -115,6 +115,58 @@ func TestProductionRuntimeLoopObservesWorkersBeforeReconcile(t *testing.T) {
 	}
 }
 
+func TestProductionRuntimeLoopRetriesTerminalBeforeReconcile(t *testing.T) {
+	now := time.Date(2026, time.August, 11, 13, 0, 0, 0, time.UTC)
+	runner := &recordingProductionRunner{}
+	retryErr := errors.New("terminal retry unavailable")
+	retryCalls := 0
+	loop := newProductionRuntimeLoop(staticProductionHosts{}, &recordingProductionCapacity{}, runner, productionTestProbe{}, true, func() time.Time { return now })
+	loop.terminalRetry = func(context.Context) error {
+		retryCalls++
+		if retryCalls == 1 {
+			return retryErr
+		}
+		return nil
+	}
+
+	loop.step(context.Background())
+	if retryCalls != 1 || runner.calls != 0 {
+		t.Fatalf("failed terminal retry calls=%d reconcile=%d, want retry only", retryCalls, runner.calls)
+	}
+	if err := loop.Check(context.Background()); !errors.Is(err, retryErr) {
+		t.Fatalf("runtime readiness after retry failure = %v, want retry err", err)
+	}
+
+	loop.step(context.Background())
+	if retryCalls != 2 || runner.calls != 1 {
+		t.Fatalf("recovered terminal retry calls=%d reconcile=%d, want retry then reconcile", retryCalls, runner.calls)
+	}
+	if err := loop.Check(context.Background()); err != nil {
+		t.Fatalf("runtime readiness after retry recovery = %v, want ready", err)
+	}
+}
+
+func TestProductionRuntimeLoopCloseCancelsTerminalRetry(t *testing.T) {
+	loop := newProductionRuntimeLoop(staticProductionHosts{}, &recordingProductionCapacity{}, &recordingProductionRunner{}, productionTestProbe{}, true, time.Now)
+	entered := make(chan struct{})
+	loop.terminalRetry = func(ctx context.Context) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	loop.Start(context.Background())
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("terminal retry was not entered")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := loop.Close(closeCtx); err != nil {
+		t.Fatalf("Close() = %v, want cancelled terminal retry to exit", err)
+	}
+}
+
 func validProductionInvocation(now time.Time, role auth.Role) runtimepkg.Invocation {
 	return runtimepkg.Invocation{
 		ID: "invocation-a", ActorPrincipalID: "agent-a", ProjectID: "project-a", Role: role,

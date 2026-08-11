@@ -161,6 +161,9 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 		return productionRuntimeDependencies{}, err
 	}
 	loop := newProductionRuntimeLoop(client, scheduler.NewPostgresCapacityLedger(sqlDB, projectID), graphRuntime, phaseSeams.Readiness, phaseConfigured, time.Now)
+	if runtime, ok := phaseSeams.Runtime.(*productionPhaseRuntime); ok {
+		loop.terminalRetry = runtime.ReplayTerminalDeliveries
+	}
 	loop.Start(ctx)
 	workspaceTools := workspace.NewAgentTools(workspace.NewPostgresService(sqlDB))
 	objectProbe, err := newProductionMinIOReadiness(cfg.ObjectStoreEndpoint, cfg.ObjectStoreSecure)
@@ -358,17 +361,18 @@ type productionCapacityObserver interface {
 }
 
 type productionRuntimeLoop struct {
-	hosts      productionHostLister
-	capacity   productionCapacityObserver
-	runtime    coordination.RuntimeRunner
-	phase      productionReadinessProbe
-	phaseReady bool
-	now        func() time.Time
-	cancel     context.CancelFunc
-	done       chan struct{}
-	mu         sync.RWMutex
-	lastErr    error
-	reconciled bool
+	hosts         productionHostLister
+	capacity      productionCapacityObserver
+	runtime       coordination.RuntimeRunner
+	phase         productionReadinessProbe
+	terminalRetry func(context.Context) error
+	phaseReady    bool
+	now           func() time.Time
+	cancel        context.CancelFunc
+	done          chan struct{}
+	mu            sync.RWMutex
+	lastErr       error
+	reconciled    bool
 }
 
 func newProductionRuntimeLoop(hosts productionHostLister, capacity productionCapacityObserver, runtime coordination.RuntimeRunner, phase productionReadinessProbe, phaseReady bool, now func() time.Time) *productionRuntimeLoop {
@@ -414,6 +418,11 @@ func (l *productionRuntimeLoop) step(ctx context.Context) {
 			active = healthy
 		}
 		_, err = l.capacity.Observe(ctx, healthy, active)
+	}
+	if err == nil {
+		if l.terminalRetry != nil {
+			err = l.terminalRetry(ctx)
+		}
 	}
 	if err == nil {
 		err = l.runtime.Reconcile(ctx)

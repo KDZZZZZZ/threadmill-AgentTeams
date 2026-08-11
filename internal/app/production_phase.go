@@ -96,6 +96,7 @@ func buildProductionPhaseSeams(options productionPhaseBundleOptions) (production
 		db: options.DB, projectID: options.ProjectID, graph: options.Graph, ingress: options.Ingress,
 		invocations: invocations, workspaces: workspaces, artifacts: artifacts, source: phaseBindings, now: now,
 	}
+	recovery := phasepkg.NewPostgresRecoveryStoreFromSQL(options.DB, invocations)
 	controller := phasepkg.NewController(phasepkg.Config{
 		InvocationStore: invocations,
 		Assembler:       options.Assembler,
@@ -103,7 +104,7 @@ func buildProductionPhaseSeams(options productionPhaseBundleOptions) (production
 		InputRuntime:    productionPhaseInputs{source: phaseBindings},
 		ArtifactRouter:  productionPhaseArtifactRouter{registry: artifacts},
 		Host:            host,
-		RecoveryStore:   phasepkg.NewPostgresRecoveryStoreFromSQL(options.DB, invocations),
+		RecoveryStore:   recovery,
 		Lifecycle: productionPhaseLifecycle{
 			workspaces: workspaces,
 			contexts:   phasepkg.ContextBindingLifecycle{Contexts: contexts},
@@ -114,6 +115,7 @@ func buildProductionPhaseSeams(options productionPhaseBundleOptions) (production
 		Now: now,
 	})
 	phaseRuntime.controller = controller
+	phaseRuntime.recovery = recovery
 	return productionPhaseSeams{
 		Controller:     controller,
 		Runtime:        phaseRuntime,
@@ -213,6 +215,9 @@ func (s *productionPhaseBindingSource) resolve(ctx context.Context, command coor
 	inputs, err := s.inputs(ctx, snapshot, command)
 	if err != nil {
 		return phasepkg.BindingSnapshot{}, nil, err
+	}
+	if command.Action != coordination.CommandStop && hasPendingStartInput(inputs.Pending) {
+		return phasepkg.BindingSnapshot{}, nil, kernel.TransitionRejected("phase start inputs are not fully materialized")
 	}
 	contractJSON, err := stableProductionJSON(contract)
 	if err != nil {
@@ -496,16 +501,20 @@ func (s *productionPhaseBindingSource) inputs(ctx context.Context, snapshot coor
 		result, ok := results[edge.From]
 		output := outputs[result.OutputRef]
 		if ok && result.OutputRef != "" && output.OutputRef != "" {
-			requiredArtifacts, err := s.resolveRequiredArtifacts(ctx, edge.ArtifactKinds, output)
+			requiredArtifacts, satisfied, err := s.resolveRequiredArtifacts(ctx, edge.ArtifactKinds, output)
 			if err != nil {
 				return phasepkg.PhaseInputSet{}, err
 			}
 			req.RequiredArtifacts = requiredArtifacts
 			required = append(required, req)
-			delivered = append(delivered, phasepkg.InputDelivery{
-				InputID: inputID, FromEndpoint: edge.From, PhaseOutputRef: result.OutputRef,
-				ArtifactRefs: append([]string(nil), output.ArtifactRefs...), SourceRevision: fmt.Sprint(snapshot.Revision),
-			})
+			if satisfied {
+				delivered = append(delivered, phasepkg.InputDelivery{
+					InputID: inputID, FromEndpoint: edge.From, PhaseOutputRef: result.OutputRef,
+					ArtifactRefs: append([]string(nil), output.ArtifactRefs...), SourceRevision: fmt.Sprint(snapshot.Revision),
+				})
+				continue
+			}
+			pending = append(pending, phasepkg.PendingInput{InputID: inputID, FromEndpoint: edge.From, RequiredBy: string(edge.RequiredBy)})
 			continue
 		}
 		required = append(required, req)
@@ -519,13 +528,24 @@ func (s *productionPhaseBindingSource) inputs(ctx context.Context, snapshot coor
 	return inputs, nil
 }
 
-func (s *productionPhaseBindingSource) resolveRequiredArtifacts(ctx context.Context, kinds []string, output productionPhaseOutputRecord) ([]string, error) {
+func hasPendingStartInput(pending []phasepkg.PendingInput) bool {
+	for _, item := range pending {
+		if item.RequiredBy == string(coordination.RequiredByStart) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *productionPhaseBindingSource) resolveRequiredArtifacts(ctx context.Context, kinds []string, output productionPhaseOutputRecord) ([]string, bool, error) {
 	if len(kinds) == 0 {
-		return nil, nil
+		return nil, true, nil
 	}
 	artifactSet := make(map[string]struct{}, len(output.ArtifactRefs))
 	for _, ref := range output.ArtifactRefs {
-		artifactSet[ref] = struct{}{}
+		if strings.HasPrefix(ref, "art_") {
+			artifactSet[ref] = struct{}{}
+		}
 	}
 	required := make([]string, 0, len(output.ArtifactRefs))
 	seen := map[string]struct{}{}
@@ -542,19 +562,26 @@ func (s *productionPhaseBindingSource) resolveRequiredArtifacts(ctx context.Cont
 	for _, kind := range kinds {
 		switch {
 		case kind == "phase_output":
+			if len(artifactSet) == 0 {
+				return nil, false, nil
+			}
 			for _, ref := range output.ArtifactRefs {
-				add(ref)
+				if _, ok := artifactSet[ref]; ok {
+					add(ref)
+				}
 			}
 		case strings.HasPrefix(kind, "art_"):
+			if _, ok := artifactSet[kind]; !ok {
+				return nil, false, nil
+			}
 			add(kind)
 		default:
 			matched, err := s.artifactsByType(ctx, output.ArtifactRefs, kind)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if len(matched) == 0 {
-				add(kind)
-				continue
+				return nil, false, nil
 			}
 			for _, ref := range matched {
 				if _, ok := artifactSet[ref]; ok {
@@ -564,7 +591,7 @@ func (s *productionPhaseBindingSource) resolveRequiredArtifacts(ctx context.Cont
 		}
 	}
 	sort.Strings(required)
-	return required, nil
+	return required, true, nil
 }
 
 func (s *productionPhaseBindingSource) artifactsByType(ctx context.Context, refs []string, artifactType string) ([]string, error) {
@@ -686,13 +713,16 @@ func (p productionPhaseInputs) AwaitInputs(ctx context.Context, active phasepkg.
 }
 
 func (p productionPhaseInputs) read(ctx context.Context, active phasepkg.ActiveInvocation, req phasepkg.AwaitInputsRequest) (phasepkg.InputWaitResult, bool, error) {
+	if !active.Invocation.ExpiresAt.IsZero() && !p.source.now().Before(active.Invocation.ExpiresAt) {
+		return phasepkg.InputWaitResult{InputRevision: active.Inputs.InputRevision, Delivered: active.Inputs.Delivered, Pending: active.Inputs.Pending, TerminalReason: "lease_expired"}, true, nil
+	}
 	snapshot, err := p.source.graph.Latest(ctx, active.Invocation.ProjectID)
 	if err != nil {
 		return phasepkg.InputWaitResult{}, false, err
 	}
 	for _, endpoint := range snapshot.Endpoints {
 		if endpoint.Ref == active.Command.Endpoint && endpoint.Generation != active.Command.Generation {
-			return phasepkg.InputWaitResult{TerminalReason: "endpoint_generation_changed"}, true, nil
+			return phasepkg.InputWaitResult{InputRevision: active.Inputs.InputRevision, Delivered: active.Inputs.Delivered, Pending: active.Inputs.Pending, TerminalReason: "input_stale"}, true, nil
 		}
 	}
 	inputs, err := p.source.inputs(ctx, snapshot, active.Command)
@@ -700,8 +730,16 @@ func (p productionPhaseInputs) read(ctx context.Context, active phasepkg.ActiveI
 		return phasepkg.InputWaitResult{}, false, err
 	}
 	result := phasepkg.InputWaitResult{InputRevision: inputs.InputRevision, Delivered: inputs.Delivered, Pending: inputs.Pending}
+	if reason := sourceTerminalReason(snapshot, active.Command); reason != "" {
+		result.TerminalReason = reason
+		return result, true, nil
+	}
+	if active.Inputs.InputRevision != "" && inputs.InputRevision != active.Inputs.InputRevision {
+		result.TerminalReason = "input_stale"
+		return result, true, nil
+	}
 	if len(req.InputIDs) == 0 {
-		return result, len(inputs.Pending) == 0 || inputs.InputRevision != active.Inputs.InputRevision, nil
+		return result, len(inputs.Pending) == 0, nil
 	}
 	delivered := map[string]struct{}{}
 	for _, item := range inputs.Delivered {
@@ -713,6 +751,32 @@ func (p productionPhaseInputs) read(ctx context.Context, active phasepkg.ActiveI
 		}
 	}
 	return result, true, nil
+}
+
+func sourceTerminalReason(snapshot coordination.GraphSnapshot, command coordination.PhaseCommand) string {
+	tasks := make(map[kernel.TaskID]coordination.TaskOutcome, len(snapshot.Tasks))
+	for _, task := range snapshot.Tasks {
+		tasks[task.ID] = task.Outcome
+	}
+	endpoints := make(map[coordination.PhaseEndpointRef]coordination.EndpointState, len(snapshot.Endpoints))
+	for _, endpoint := range snapshot.Endpoints {
+		endpoints[endpoint.Ref] = endpoint.State
+	}
+	for _, edge := range snapshot.Edges {
+		if edge.To != command.Endpoint {
+			continue
+		}
+		switch tasks[edge.From.TaskID] {
+		case coordination.TaskCanceled:
+			return "source_cancelled"
+		case coordination.TaskFailed:
+			return "source_failed"
+		}
+		if endpoints[edge.From] == coordination.EndpointRejected {
+			return "source_failed"
+		}
+	}
+	return ""
 }
 
 type productionPhaseArtifactRouter struct {
@@ -785,6 +849,7 @@ type productionPhaseRuntime struct {
 	workspaces  *workspace.Service
 	artifacts   *evidence.PostgresArtifactRegistry
 	source      *productionPhaseBindingSource
+	recovery    phasepkg.RecoveryStore
 	now         func() time.Time
 }
 
@@ -793,30 +858,209 @@ func (p *productionPhaseRuntime) AwaitInputs(ctx context.Context, invocationID k
 }
 
 func (p *productionPhaseRuntime) SubmitPhaseOutput(ctx context.Context, invocationID kernel.InvocationID, output phasepkg.PhaseOutput) (phasepkg.OutputReceipt, error) {
-	receipt, err := p.controller.SubmitPhaseOutput(ctx, invocationID, output)
+	requestID, err := p.persistOutputIntent(ctx, invocationID, output)
 	if err != nil {
 		return phasepkg.OutputReceipt{}, err
+	}
+	receipt, deliver, abandoned, err := p.resolveOutputIntentReceipt(ctx, invocationID, requestID, output)
+	if err != nil {
+		return phasepkg.OutputReceipt{}, err
+	}
+	if abandoned {
+		return phasepkg.OutputReceipt{}, kernel.IdempotencyConflict()
+	}
+	if !deliver {
+		return phasepkg.OutputReceipt{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase output receipt is not ready", Recoverable: true}
+	}
+	if err := p.deliverOutputReceipt(ctx, receipt, requestID, output); err != nil {
+		return receipt, err
+	}
+	return receipt, nil
+}
+
+func (p *productionPhaseRuntime) persistOutputIntent(ctx context.Context, invocationID kernel.InvocationID, output phasepkg.PhaseOutput) (string, error) {
+	payload, err := json.Marshal(productionPhaseOutputIntent{InvocationID: invocationID, Output: output})
+	if err != nil {
+		return "", err
+	}
+	requestID := stableProductionSuffix(invocationID, "phase_output", hashProductionBytes(payload))
+	if p.invocations == nil {
+		return "", kernel.InvalidArgument("phase output intent requires invocation store")
+	}
+	invocation, ok, err := p.invocations.Get(ctx, invocationID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase output intent requires an existing invocation", Recoverable: true}
+	}
+	endpoint := coordination.PhaseEndpointRef{TaskID: invocation.TaskID, EndpointID: invocation.EndpointID}
+	input := productionInput{
+		Kind: "phase_output", RequestID: requestID, ConversationID: "runtime:" + string(endpoint.TaskID),
+		Body: "phase output intent " + string(invocationID), Payload: payload, SeenRevision: 1,
+		SelectedEndpoint: &endpoint, TargetKind: "phase_output", TargetRef: "",
+	}
+	return requestID, (productionPhaseTerminalOutbox{db: p.db, projectID: p.projectID, ingress: p.ingress, now: p.now}).enqueueIntent(ctx, productionPhaseTerminalDelivery{
+		Input: input, InvocationID: invocationID, Endpoint: endpoint, Generation: int(invocation.Generation), CommandAction: coordination.CommandStart,
+	})
+}
+
+func (p *productionPhaseRuntime) deliverOutputReceipt(ctx context.Context, receipt phasepkg.OutputReceipt, requestID string, intentOutput phasepkg.PhaseOutput) error {
+	outbox := productionPhaseTerminalOutbox{db: p.db, projectID: p.projectID, ingress: p.ingress, now: p.now}
+	if delivered, err := outbox.deliverExistingFinal(ctx, "phase_output", requestID); err != nil {
+		return err
+	} else if delivered {
+		return nil
 	}
 	outputRef, err := p.persistOutput(ctx, receipt)
 	if err != nil {
-		return phasepkg.OutputReceipt{}, err
+		return err
 	}
 	snapshot, err := p.graph.Latest(ctx, p.projectID)
 	if err != nil {
-		return phasepkg.OutputReceipt{}, err
+		return err
 	}
 	payload, _ := json.Marshal(struct {
 		OutputRef string                 `json:"output_ref"`
 		Receipt   phasepkg.OutputReceipt `json:"receipt"`
 	}{outputRef, receipt})
-	_, err = p.ingress.persistAndDispatch(ctx, productionInput{
-		Kind: "phase_output", RequestID: stableProductionSuffix(invocationID, outputRef),
+	input := productionInput{
+		Kind: "phase_output", RequestID: requestID,
 		ConversationID: "runtime:" + string(receipt.Endpoint.TaskID),
 		Body:           fmt.Sprintf("phase output %s %s", receipt.Endpoint.EndpointID, outputRef),
 		Payload:        payload, SeenRevision: snapshot.Revision, SelectedEndpoint: &receipt.Endpoint,
 		TargetKind: "phase_output", TargetRef: outputRef,
+	}
+	return outbox.promoteAndDeliver(ctx, productionPhaseTerminalDelivery{
+		Input: input, InvocationID: receipt.InvocationID, CommandID: receipt.CommandID,
+		CommandAction: receipt.CommandAction, Endpoint: receipt.Endpoint, Generation: receipt.Generation, IntentOutput: intentOutput,
 	})
-	return receipt, err
+}
+
+func (p *productionPhaseRuntime) ReplayTerminalDeliveries(ctx context.Context) error {
+	outbox := productionPhaseTerminalOutbox{db: p.db, projectID: p.projectID, ingress: p.ingress, now: p.now}
+	if err := p.replayOutputIntents(ctx, outbox); err != nil {
+		return err
+	}
+	return outbox.replay(ctx)
+}
+
+type productionPhaseOutputIntent struct {
+	InvocationID kernel.InvocationID  `json:"invocation_id"`
+	Output       phasepkg.PhaseOutput `json:"output"`
+}
+
+func (p *productionPhaseRuntime) replayOutputIntents(ctx context.Context, outbox productionPhaseTerminalOutbox) error {
+	rows, err := p.db.QueryContext(ctx, `SELECT payload, request_id FROM production_phase_terminal_obligations WHERE project_id=$1 AND input_kind='phase_output' AND status='intent' ORDER BY updated_at, obligation_id`, p.projectID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var errs []error
+	for rows.Next() {
+		var payload []byte
+		var requestID string
+		if err := rows.Scan(&payload, &requestID); err != nil {
+			return err
+		}
+		var intent productionPhaseOutputIntent
+		if err := json.Unmarshal(payload, &intent); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		receipt, deliver, abandoned, err := p.resolveOutputIntentReceipt(ctx, intent.InvocationID, requestID, intent.Output)
+		if abandoned {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if !deliver {
+			continue
+		}
+		if err := p.deliverOutputReceipt(ctx, receipt, requestID, intent.Output); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return errors.Join(errs...)
+}
+
+func (p *productionPhaseRuntime) resolveOutputIntentReceipt(ctx context.Context, invocationID kernel.InvocationID, requestID string, output phasepkg.PhaseOutput) (phasepkg.OutputReceipt, bool, bool, error) {
+	if p.controller == nil {
+		recovered, ok, err := p.recoveredOutputReceipt(ctx, invocationID)
+		if err != nil {
+			return phasepkg.OutputReceipt{}, false, false, err
+		}
+		if ok && productionPhaseReceiptMatchesOutput(recovered, output) {
+			return recovered, true, false, nil
+		}
+		return phasepkg.OutputReceipt{}, false, false, kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase output controller is not available and no matching receipt was recovered", Recoverable: true}
+	}
+	receipt, err := p.controller.SubmitPhaseOutput(ctx, invocationID, output)
+	if err == nil {
+		return receipt, true, false, nil
+	}
+	if productionPhaseTerminalError(err) {
+		if abandonErr := p.abandonOutputIntent(ctx, invocationID, requestID, output, err); abandonErr != nil {
+			return phasepkg.OutputReceipt{}, false, false, abandonErr
+		}
+		return phasepkg.OutputReceipt{}, false, true, err
+	}
+	recovered, ok, recoverErr := p.recoveredOutputReceipt(ctx, invocationID)
+	if recoverErr != nil {
+		return phasepkg.OutputReceipt{}, false, false, recoverErr
+	}
+	if ok && productionPhaseReceiptMatchesOutput(recovered, output) {
+		return recovered, true, false, nil
+	}
+	return phasepkg.OutputReceipt{}, false, false, err
+}
+
+func (p *productionPhaseRuntime) abandonOutputIntent(ctx context.Context, invocationID kernel.InvocationID, requestID string, output phasepkg.PhaseOutput, cause error) error {
+	if receipt, ok, err := p.recoveredOutputReceipt(ctx, invocationID); err != nil {
+		return err
+	} else if ok && productionPhaseReceiptMatchesOutput(receipt, output) {
+		return nil
+	}
+	return (productionPhaseTerminalOutbox{db: p.db, projectID: p.projectID, ingress: p.ingress, now: p.now}).abandonIntent(ctx, "phase_output", requestID, cause)
+}
+
+func productionPhaseReceiptMatchesOutput(receipt phasepkg.OutputReceipt, output phasepkg.PhaseOutput) bool {
+	outputRaw, err := json.Marshal(output)
+	if err != nil {
+		return false
+	}
+	if receipt.OutputFingerprint != "" {
+		return receipt.OutputFingerprint == hashProductionBytes(outputRaw)
+	}
+	receiptOutput, err := json.Marshal(receipt.Output)
+	if err != nil {
+		return false
+	}
+	return string(receiptOutput) == string(outputRaw)
+}
+
+func productionPhaseTerminalError(err error) bool {
+	var kernelErr kernel.Error
+	if errors.As(err, &kernelErr) {
+		return !kernelErr.Recoverable
+	}
+	var kernelErrPtr *kernel.Error
+	if errors.As(err, &kernelErrPtr) && kernelErrPtr != nil {
+		return !kernelErrPtr.Recoverable
+	}
+	return false
+}
+
+func (p *productionPhaseRuntime) recoveredOutputReceipt(ctx context.Context, invocationID kernel.InvocationID) (phasepkg.OutputReceipt, bool, error) {
+	if p.recovery == nil {
+		return phasepkg.OutputReceipt{}, false, nil
+	}
+	return p.recovery.GetOutputReceipt(ctx, invocationID, "")
 }
 
 func (p *productionPhaseRuntime) SubmitOrchestrationIntent(ctx context.Context, principal auth.Principal, scope auth.BoundScope, intent phasepkg.OrchestrationIntent) (phasepkg.OrchestrationProposal, error) {
@@ -883,6 +1127,20 @@ func (p *productionPhaseRuntime) SubmitOrchestrationIntent(ctx context.Context, 
 }
 
 func (p *productionPhaseRuntime) persistOutput(ctx context.Context, receipt phasepkg.OutputReceipt) (string, error) {
+	outputRaw, _ := json.Marshal(receipt.Output)
+	var existingRef string
+	if err := p.db.QueryRowContext(ctx, `SELECT output_ref FROM production_phase_outputs WHERE project_id=$1 AND invocation_id=$2 AND output=$3::jsonb`, p.projectID, receipt.InvocationID, string(outputRaw)).Scan(&existingRef); err == nil {
+		return existingRef, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	var existingCount int
+	if err := p.db.QueryRowContext(ctx, `SELECT count(*) FROM production_phase_outputs WHERE project_id=$1 AND invocation_id=$2`, p.projectID, receipt.InvocationID).Scan(&existingCount); err != nil {
+		return "", err
+	}
+	if existingCount > 0 {
+		return "", kernel.IdempotencyConflict()
+	}
 	payload, err := json.Marshal(receipt)
 	if err != nil {
 		return "", err
@@ -899,7 +1157,6 @@ func (p *productionPhaseRuntime) persistOutput(ctx context.Context, receipt phas
 	refs = append(refs, receipt.Output.EvidenceRefs...)
 	refs = append(refs, string(artifact.ID))
 	sort.Strings(refs)
-	outputRaw, _ := json.Marshal(receipt.Output)
 	refsRaw, _ := json.Marshal(refs)
 	result, err := p.db.ExecContext(ctx, `
 INSERT INTO production_phase_outputs (
@@ -944,9 +1201,6 @@ func (w productionPhaseObservationWriter) RecordPhaseInvocationFailed(ctx contex
 }
 
 func (w productionPhaseObservationWriter) RecordPhaseInvocationStopped(ctx context.Context, projectID kernel.ProjectID, command coordination.PhaseCommand, checkpointRef string, nonResumable bool) error {
-	if err := w.graph.RecordPhaseInvocationStopped(ctx, projectID, command, checkpointRef, nonResumable); err != nil {
-		return err
-	}
 	snapshot, err := w.ingress.graph.Latest(ctx, projectID)
 	if err != nil {
 		return err
@@ -960,14 +1214,392 @@ func (w productionPhaseObservationWriter) RecordPhaseInvocationStopped(ctx conte
 		CheckpointRef string                        `json:"checkpoint_ref"`
 		NonResumable  bool                          `json:"non_resumable"`
 	}{command.ID, command.Endpoint, command.Generation, command.BindingRef, command.LeaseRef, checkpointRef, nonResumable})
-	_, err = w.ingress.persistAndDispatch(ctx, productionInput{
+	input := productionInput{
 		Kind: "phase_stopped", RequestID: stableProductionSuffix(command.ID, checkpointRef, nonResumable),
 		ConversationID: "runtime:" + string(command.Endpoint.TaskID),
 		Body:           fmt.Sprintf("phase stopped %s/%s", command.Endpoint.TaskID, command.Endpoint.EndpointID),
 		Payload:        payload, SeenRevision: snapshot.Revision, SelectedEndpoint: &command.Endpoint,
 		TargetKind: "phase_stopped", TargetRef: command.ID,
-	})
+	}
+	outbox := productionPhaseTerminalOutbox{db: w.ingress.db, projectID: projectID, ingress: w.ingress, now: w.now}
+	if _, err := outbox.enqueue(ctx, productionPhaseTerminalDelivery{
+		Input: input, InvocationID: deterministicPhaseInvocationID(command.ID), CommandID: command.ID,
+		CommandAction: command.Action, Endpoint: command.Endpoint, Generation: command.Generation,
+	}); err != nil {
+		return err
+	}
+	if err := w.graph.RecordPhaseInvocationStopped(ctx, projectID, command, checkpointRef, nonResumable); err != nil {
+		return err
+	}
+	obligationID := stableRuntimeRef("phase-terminal", projectID, input.Kind, input.RequestID)
+	return outbox.deliver(ctx, obligationID)
+}
+
+type productionPhaseTerminalDelivery struct {
+	Input         productionInput
+	InvocationID  kernel.InvocationID
+	CommandID     string
+	CommandAction coordination.CommandAction
+	Endpoint      coordination.PhaseEndpointRef
+	Generation    int
+	IntentOutput  phasepkg.PhaseOutput
+}
+
+type productionPhaseTerminalOutbox struct {
+	db        *sql.DB
+	projectID kernel.ProjectID
+	ingress   *productionIngress
+	now       func() time.Time
+}
+
+func (o productionPhaseTerminalOutbox) enqueueAndDeliver(ctx context.Context, delivery productionPhaseTerminalDelivery) error {
+	obligationID, err := o.enqueue(ctx, delivery)
+	if err != nil {
+		return err
+	}
+	return o.deliver(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) promoteAndDeliver(ctx context.Context, delivery productionPhaseTerminalDelivery) error {
+	obligationID := stableRuntimeRef("phase-terminal", o.projectID, delivery.Input.Kind, delivery.Input.RequestID)
+	payloadHash := hashProductionBytes(delivery.Input.Payload)
+	identityHash, err := o.identityHash(delivery, payloadHash)
+	if err != nil {
+		return err
+	}
+	intentPayloadHash, intentIdentityHash, intentFound, err := o.intentHashesForReceiptDelivery(ctx, obligationID, delivery)
+	if err != nil {
+		return err
+	}
+	now := o.timestamp()
+	affected := int64(0)
+	if intentFound {
+		result, err := o.db.ExecContext(ctx, `
+UPDATE production_phase_terminal_obligations
+SET invocation_id=$2, command_id=$3, command_action=$4, task_id=$5, endpoint_id=$6,
+    generation=$7, conversation_id=$8, body=$9, payload=$10::jsonb, payload_hash=$11,
+    identity_hash=$12, seen_revision=$13, target_kind=$14, target_ref=$15,
+    status='pending', last_error='', updated_at=$16
+WHERE obligation_id=$1 AND project_id=$17 AND status='intent'
+  AND intent_payload_hash=$18 AND intent_identity_hash=$19`,
+			obligationID, delivery.InvocationID, delivery.CommandID, delivery.CommandAction,
+			delivery.Endpoint.TaskID, delivery.Endpoint.EndpointID, delivery.Generation, delivery.Input.ConversationID,
+			delivery.Input.Body, string(delivery.Input.Payload), payloadHash, identityHash, delivery.Input.SeenRevision,
+			delivery.Input.TargetKind, delivery.Input.TargetRef, now, o.projectID, intentPayloadHash, intentIdentityHash)
+		if err != nil {
+			return err
+		}
+		affected, _ = result.RowsAffected()
+	}
+	if affected == 0 {
+		if delivered, err := o.deliverExistingFinalByID(ctx, obligationID); err != nil {
+			return err
+		} else if delivered {
+			return nil
+		}
+		if _, err := o.enqueue(ctx, delivery); err != nil {
+			return err
+		}
+	}
+	return o.deliver(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) abandonIntent(ctx context.Context, kind, requestID string, cause error) error {
+	if o.db == nil {
+		return kernel.InvalidArgument("production phase terminal outbox database is required")
+	}
+	now := o.timestamp()
+	_, err := o.db.ExecContext(ctx, `
+UPDATE production_phase_terminal_obligations
+SET status='abandoned', attempts=attempts+1, last_error=$4, updated_at=$5
+WHERE project_id=$1 AND input_kind=$2 AND request_id=$3 AND status='intent'`,
+		o.projectID, kind, requestID, cause.Error(), now)
 	return err
+}
+
+func (o productionPhaseTerminalOutbox) enqueueIntent(ctx context.Context, delivery productionPhaseTerminalDelivery) error {
+	if o.db == nil {
+		return kernel.InvalidArgument("production phase terminal outbox database is required")
+	}
+	if delivery.Input.Kind != "phase_output" || delivery.InvocationID == "" || len(delivery.Input.Payload) == 0 || delivery.Input.RequestID == "" {
+		return kernel.InvalidArgument("production phase output intent identity is required")
+	}
+	obligationID := stableRuntimeRef("phase-terminal", o.projectID, delivery.Input.Kind, delivery.Input.RequestID)
+	payloadHash := hashProductionBytes(delivery.Input.Payload)
+	identityHash, err := o.intentIdentityHash(delivery, payloadHash)
+	if err != nil {
+		return err
+	}
+	now := o.timestamp()
+	_, err = o.db.ExecContext(ctx, `
+INSERT INTO production_phase_terminal_obligations (
+  obligation_id, project_id, invocation_id, command_id, command_action, task_id, endpoint_id,
+  generation, input_kind, request_id, conversation_id, body, payload, payload_hash,
+  identity_hash, intent_payload_hash, intent_identity_hash, seen_revision, target_kind, target_ref, status, created_at, updated_at
+) VALUES ($1,$2,$3,'',$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$13,$14,$15,$16,'','intent',$17,$17)
+ON CONFLICT (obligation_id) DO NOTHING`,
+		obligationID, o.projectID, delivery.InvocationID, delivery.CommandAction, delivery.Endpoint.TaskID,
+		delivery.Endpoint.EndpointID, positiveGeneration(delivery.Generation), delivery.Input.Kind, delivery.Input.RequestID,
+		delivery.Input.ConversationID, delivery.Input.Body, string(delivery.Input.Payload), payloadHash,
+		identityHash, positiveRevision(delivery.Input.SeenRevision), delivery.Input.TargetKind, now)
+	if err != nil {
+		return err
+	}
+	return o.checkExisting(ctx, obligationID, payloadHash, identityHash, true)
+}
+
+func (o productionPhaseTerminalOutbox) enqueue(ctx context.Context, delivery productionPhaseTerminalDelivery) (string, error) {
+	if o.now == nil {
+		o.now = time.Now
+	}
+	if o.db == nil || o.ingress == nil {
+		return "", kernel.InvalidArgument("production phase terminal outbox dependencies are required")
+	}
+	if delivery.Input.SelectedEndpoint == nil || len(delivery.Input.Payload) == 0 || delivery.Input.RequestID == "" || delivery.Input.TargetKind == "" || delivery.Input.TargetRef == "" {
+		return "", kernel.InvalidArgument("production phase terminal delivery identity is required")
+	}
+	obligationID := stableRuntimeRef("phase-terminal", o.projectID, delivery.Input.Kind, delivery.Input.RequestID)
+	payloadHash := hashProductionBytes(delivery.Input.Payload)
+	identityHash, err := o.identityHash(delivery, payloadHash)
+	if err != nil {
+		return "", err
+	}
+	now := o.timestamp()
+	_, err = o.db.ExecContext(ctx, `
+INSERT INTO production_phase_terminal_obligations (
+  obligation_id, project_id, invocation_id, command_id, command_action, task_id, endpoint_id,
+  generation, input_kind, request_id, conversation_id, body, payload, payload_hash,
+  identity_hash, intent_payload_hash, intent_identity_hash, seen_revision, target_kind, target_ref, created_at, updated_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,'','',$16,$17,$18,$19,$19)
+ON CONFLICT (obligation_id) DO NOTHING`,
+		obligationID, o.projectID, delivery.InvocationID, delivery.CommandID, delivery.CommandAction,
+		delivery.Endpoint.TaskID, delivery.Endpoint.EndpointID, delivery.Generation, delivery.Input.Kind,
+		delivery.Input.RequestID, delivery.Input.ConversationID, delivery.Input.Body, string(delivery.Input.Payload),
+		payloadHash, identityHash, delivery.Input.SeenRevision, delivery.Input.TargetKind, delivery.Input.TargetRef, now)
+	if err != nil {
+		return "", err
+	}
+	if err := o.checkExisting(ctx, obligationID, payloadHash, identityHash, false); err != nil {
+		return "", err
+	}
+	return obligationID, nil
+}
+
+func (o productionPhaseTerminalOutbox) checkExisting(ctx context.Context, obligationID, payloadHash, identityHash string, allowIntent bool) error {
+	var storedPayloadHash, storedIdentityHash, storedIntentPayloadHash, storedIntentIdentityHash, status string
+	if err := o.db.QueryRowContext(ctx, `SELECT payload_hash, identity_hash, intent_payload_hash, intent_identity_hash, status FROM production_phase_terminal_obligations WHERE obligation_id=$1`, obligationID).Scan(&storedPayloadHash, &storedIdentityHash, &storedIntentPayloadHash, &storedIntentIdentityHash, &status); err != nil {
+		return err
+	}
+	if allowIntent {
+		if storedIntentPayloadHash == payloadHash && storedIntentIdentityHash == identityHash {
+			return nil
+		}
+		if status == "intent" && storedPayloadHash == payloadHash && storedIdentityHash == identityHash {
+			return nil
+		}
+	}
+	if storedPayloadHash != payloadHash || storedIdentityHash != identityHash {
+		return kernel.IdempotencyConflict()
+	}
+	return nil
+}
+
+func (o productionPhaseTerminalOutbox) deliver(ctx context.Context, obligationID string) error {
+	delivery, status, err := o.load(ctx, obligationID)
+	if err != nil {
+		return err
+	}
+	if status == "delivered" {
+		return nil
+	}
+	stored, err := o.ingress.persistAndDispatch(ctx, delivery.Input)
+	if err != nil {
+		_ = o.recordFailure(ctx, obligationID, err)
+		return err
+	}
+	return o.markDelivered(ctx, obligationID, stored.InputRef)
+}
+
+func (o productionPhaseTerminalOutbox) deliverExistingFinal(ctx context.Context, kind, requestID string) (bool, error) {
+	obligationID := stableRuntimeRef("phase-terminal", o.projectID, kind, requestID)
+	return o.deliverExistingFinalByID(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) deliverExistingFinalByID(ctx context.Context, obligationID string) (bool, error) {
+	var status string
+	if err := o.db.QueryRowContext(ctx, `SELECT status FROM production_phase_terminal_obligations WHERE obligation_id=$1 AND project_id=$2`, obligationID, o.projectID).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if status != "pending" && status != "delivered" {
+		return false, nil
+	}
+	return true, o.deliver(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) replay(ctx context.Context) error {
+	rows, err := o.db.QueryContext(ctx, `SELECT obligation_id FROM production_phase_terminal_obligations WHERE project_id=$1 AND status='pending' ORDER BY updated_at, obligation_id`, o.projectID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var errs []error
+	for rows.Next() {
+		var obligationID string
+		if err := rows.Scan(&obligationID); err != nil {
+			return err
+		}
+		if err := o.deliver(ctx, obligationID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return errors.Join(errs...)
+}
+
+func (o productionPhaseTerminalOutbox) load(ctx context.Context, obligationID string) (productionPhaseTerminalDelivery, string, error) {
+	var delivery productionPhaseTerminalDelivery
+	var endpointID coordination.EndpointID
+	var payload []byte
+	var status string
+	err := o.db.QueryRowContext(ctx, `
+SELECT invocation_id, command_id, command_action, task_id, endpoint_id, generation,
+       input_kind, request_id, conversation_id, body, payload, seen_revision, target_kind, target_ref, status
+FROM production_phase_terminal_obligations
+WHERE obligation_id=$1 AND project_id=$2`, obligationID, o.projectID).Scan(
+		&delivery.InvocationID, &delivery.CommandID, &delivery.CommandAction, &delivery.Endpoint.TaskID, &endpointID,
+		&delivery.Generation, &delivery.Input.Kind, &delivery.Input.RequestID, &delivery.Input.ConversationID,
+		&delivery.Input.Body, &payload, &delivery.Input.SeenRevision, &delivery.Input.TargetKind, &delivery.Input.TargetRef, &status)
+	if err != nil {
+		return productionPhaseTerminalDelivery{}, "", err
+	}
+	delivery.Endpoint.EndpointID = endpointID
+	delivery.Input.Payload = payload
+	delivery.Input.SelectedEndpoint = &delivery.Endpoint
+	return delivery, status, nil
+}
+
+func (o productionPhaseTerminalOutbox) recordFailure(ctx context.Context, obligationID string, cause error) error {
+	now := o.timestamp()
+	_, err := o.db.ExecContext(ctx, `UPDATE production_phase_terminal_obligations SET attempts=attempts+1, last_error=$2, updated_at=$3 WHERE obligation_id=$1`, obligationID, cause.Error(), now)
+	return err
+}
+
+func (o productionPhaseTerminalOutbox) markDelivered(ctx context.Context, obligationID, inputRef string) error {
+	now := o.timestamp()
+	_, err := o.db.ExecContext(ctx, `UPDATE production_phase_terminal_obligations SET status='delivered', manager_input_ref=$2, last_error='', updated_at=$3 WHERE obligation_id=$1`, obligationID, inputRef, now)
+	return err
+}
+
+func (o productionPhaseTerminalOutbox) timestamp() time.Time {
+	if o.now != nil {
+		return o.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func positiveGeneration(generation int) int {
+	if generation > 0 {
+		return generation
+	}
+	return 1
+}
+
+func positiveRevision(revision kernel.Revision) kernel.Revision {
+	if revision > 0 {
+		return revision
+	}
+	return 1
+}
+
+func (o productionPhaseTerminalOutbox) identityHash(delivery productionPhaseTerminalDelivery, payloadHash string) (string, error) {
+	raw, err := stableProductionJSON(map[string]any{
+		"project_id":      o.projectID,
+		"invocation_id":   delivery.InvocationID,
+		"command_id":      delivery.CommandID,
+		"command_action":  delivery.CommandAction,
+		"endpoint":        delivery.Endpoint,
+		"generation":      delivery.Generation,
+		"input_kind":      delivery.Input.Kind,
+		"request_id":      delivery.Input.RequestID,
+		"conversation_id": delivery.Input.ConversationID,
+		"body":            delivery.Input.Body,
+		"payload_hash":    payloadHash,
+		"seen_revision":   delivery.Input.SeenRevision,
+		"target_kind":     delivery.Input.TargetKind,
+		"target_ref":      delivery.Input.TargetRef,
+	})
+	if err != nil {
+		return "", err
+	}
+	return hashProductionBytes(raw), nil
+}
+
+func (o productionPhaseTerminalOutbox) intentIdentityHash(delivery productionPhaseTerminalDelivery, payloadHash string) (string, error) {
+	raw, err := stableProductionJSON(map[string]any{
+		"project_id":    o.projectID,
+		"invocation_id": delivery.InvocationID,
+		"input_kind":    delivery.Input.Kind,
+		"request_id":    delivery.Input.RequestID,
+		"payload_hash":  payloadHash,
+		"target_kind":   delivery.Input.TargetKind,
+	})
+	if err != nil {
+		return "", err
+	}
+	return hashProductionBytes(raw), nil
+}
+
+func (o productionPhaseTerminalOutbox) intentHashesForReceiptDelivery(ctx context.Context, obligationID string, delivery productionPhaseTerminalDelivery) (string, string, bool, error) {
+	var intentPayload []byte
+	var intentPayloadHash, intentIdentityHash, status string
+	if err := o.db.QueryRowContext(ctx, `SELECT payload, intent_payload_hash, intent_identity_hash, status FROM production_phase_terminal_obligations WHERE obligation_id=$1 AND project_id=$2`, obligationID, o.projectID).Scan(&intentPayload, &intentPayloadHash, &intentIdentityHash, &status); errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	} else if err != nil {
+		return "", "", false, err
+	}
+	if status != "intent" {
+		return "", "", false, nil
+	}
+	var intent productionPhaseOutputIntent
+	if err := json.Unmarshal(intentPayload, &intent); err != nil {
+		return "", "", false, err
+	}
+	canonicalIntentPayload, err := json.Marshal(intent)
+	if err != nil {
+		return "", "", false, err
+	}
+	if intent.InvocationID != delivery.InvocationID {
+		return "", "", false, kernel.IdempotencyConflict()
+	}
+	var envelope struct {
+		Receipt phasepkg.OutputReceipt `json:"receipt"`
+	}
+	if err := json.Unmarshal(delivery.Input.Payload, &envelope); err != nil {
+		return "", "", false, err
+	}
+	if envelope.Receipt.InvocationID != delivery.InvocationID || envelope.Receipt.Endpoint != delivery.Endpoint || envelope.Receipt.Generation != delivery.Generation {
+		return "", "", false, kernel.IdempotencyConflict()
+	}
+	intentOutputRaw, err := json.Marshal(intent.Output)
+	if err != nil {
+		return "", "", false, err
+	}
+	if envelope.Receipt.OutputFingerprint != "" {
+		if envelope.Receipt.OutputFingerprint != hashProductionBytes(intentOutputRaw) {
+			return "", "", false, kernel.IdempotencyConflict()
+		}
+	} else if !productionPhaseReceiptMatchesOutput(envelope.Receipt, intent.Output) {
+		return "", "", false, kernel.IdempotencyConflict()
+	}
+	expectedRequestID := stableProductionSuffix(delivery.InvocationID, "phase_output", hashProductionBytes(canonicalIntentPayload))
+	if delivery.Input.RequestID != expectedRequestID || intentPayloadHash != hashProductionBytes(canonicalIntentPayload) {
+		return "", "", false, kernel.IdempotencyConflict()
+	}
+	return intentPayloadHash, intentIdentityHash, true, nil
 }
 
 type productionPhaseReadiness struct {
@@ -993,7 +1625,7 @@ func (r productionPhaseReadiness) Check(ctx context.Context) error {
 	if _, err := os.Stat(r.worktreeParent); err != nil {
 		return fmt.Errorf("phase worktree parent: %w", err)
 	}
-	for _, table := range []string{"production_phase_bindings", "production_phase_outputs", "phase_agentteams_prepared_invocations", "phase_agentteams_host_states", "context_subscriptions"} {
+	for _, table := range []string{"production_phase_bindings", "production_phase_outputs", "production_phase_terminal_obligations", "phase_agentteams_prepared_invocations", "phase_agentteams_host_states", "context_subscriptions"} {
 		var exists bool
 		if err := r.db.QueryRowContext(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			return err
