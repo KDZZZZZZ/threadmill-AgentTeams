@@ -556,8 +556,13 @@ func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgai
 	if err := managerRuntime.setProductionDependencies(newRecordingTaskResources(), realContextProjector, ingress); err != nil {
 		t.Fatal(err)
 	}
+	opCtx, cancelOperation := context.WithCancel(ctx)
+	cleaner := &cancelingTaskManagerExecutionCleaner{cancel: cancelOperation}
+	if err := managerRuntime.setTaskManagerExecutionCleaner(cleaner); err != nil {
+		t.Fatal(err)
+	}
 	operator := auth.Principal{ActorPrincipalID: "operator-real", Kind: auth.PrincipalOperator, ProjectID: "project-real", Role: auth.RoleOperator}
-	requirement, err := ingress.SubmitRequirement(ctx, operator, httpapi.RequirementCreateRequest{
+	requirement, err := ingress.SubmitRequirement(opCtx, operator, httpapi.RequirementCreateRequest{
 		RequestID: "requirement-context", ProjectID: "project-real", ConversationID: "conversation-context",
 		Body: "create a task with real context projection", Motivation: "exercise trusted invocation propagation",
 		Constraints: []string{"project task context"}, Acceptance: []string{"projection is persisted"},
@@ -567,7 +572,7 @@ func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgai
 	}
 	managerPrincipal := productionTestTaskManagerPrincipal(requirement.InvocationRef)
 	managerScope := auth.BoundScope{ProjectID: "project-real", InvocationID: requirement.InvocationRef}
-	if _, err := managerRuntime.SubmitTaskManagerDecision(ctx, managerPrincipal, managerScope, taskmanager.TaskManagerDecision{Action: "replace_pending", Reason: "create context-backed task"}); err != nil {
+	if _, err := managerRuntime.SubmitTaskManagerDecision(opCtx, managerPrincipal, managerScope, taskmanager.TaskManagerDecision{Action: "replace_pending", Reason: "create context-backed task"}); err != nil {
 		t.Fatal(err)
 	}
 	intent := mcpapi.PendingSubgraphIntent{
@@ -578,40 +583,43 @@ func TestProductionReplacePendingUsesBoundInvocationForRealContextProjectionAgai
 			productionForgedEndpoint("task-context", coordination.EndpointVerify, "spec-verify"),
 		},
 	}
-	revision, err := managerRuntime.ReplacePending(ctx, managerPrincipal, managerScope, intent)
+	revision, err := managerRuntime.ReplacePending(opCtx, managerPrincipal, managerScope, intent)
 	if err != nil {
 		t.Fatalf("ReplacePending() with real context projection error = %v", err)
+	}
+	if cleaner.calls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", cleaner.calls)
 	}
 	if revision != 2 {
 		t.Fatalf("ReplacePending() revision = %d, want 2", revision)
 	}
 	var mutationApplied bool
 	var appliedRevision kernel.Revision
-	if err := db.SQL().QueryRowContext(ctx, `SELECT mutation_applied, applied_graph_revision FROM production_taskmanager_bindings WHERE invocation_id=$1`, requirement.InvocationRef).Scan(&mutationApplied, &appliedRevision); err != nil {
+	if err := db.SQL().QueryRowContext(context.Background(), `SELECT mutation_applied, applied_graph_revision FROM production_taskmanager_bindings WHERE invocation_id=$1`, requirement.InvocationRef).Scan(&mutationApplied, &appliedRevision); err != nil {
 		t.Fatal(err)
 	}
 	if !mutationApplied || appliedRevision != 2 {
 		t.Fatalf("binding mutation_applied=%v applied_revision=%d, want true/2", mutationApplied, appliedRevision)
 	}
 	var status string
-	if err := db.SQL().QueryRowContext(ctx, `SELECT status FROM runtime_invocations WHERE invocation_id=$1`, requirement.InvocationRef).Scan(&status); err != nil {
+	if err := db.SQL().QueryRowContext(context.Background(), `SELECT status FROM runtime_invocations WHERE invocation_id=$1`, requirement.InvocationRef).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(runtimepkg.InvocationCompleted) {
 		t.Fatalf("runtime status = %q, want completed", status)
 	}
 	var projectionRows, taskSubgraphs int
-	if err := db.SQL().QueryRowContext(ctx, `SELECT count(*) FROM context_task_projections WHERE project_id=$1`, "project-real").Scan(&projectionRows); err != nil {
+	if err := db.SQL().QueryRowContext(context.Background(), `SELECT count(*) FROM context_task_projections WHERE project_id=$1`, "project-real").Scan(&projectionRows); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SQL().QueryRowContext(ctx, `SELECT count(*) FROM context_task_subgraph_bindings WHERE project_id=$1 AND task_id=$2`, "project-real", "task-context").Scan(&taskSubgraphs); err != nil {
+	if err := db.SQL().QueryRowContext(context.Background(), `SELECT count(*) FROM context_task_subgraph_bindings WHERE project_id=$1 AND task_id=$2`, "project-real", "task-context").Scan(&taskSubgraphs); err != nil {
 		t.Fatal(err)
 	}
 	if projectionRows != 1 || taskSubgraphs != 1 {
 		t.Fatalf("context projection rows=%d task subgraphs=%d, want 1/1", projectionRows, taskSubgraphs)
 	}
 	events := uiprojection.NewEventLogQuery(eventStore, allowProjectPermission{projectID: "project-real"})
-	assertProductionUIEvents(t, ctx, events, operator, "project-real", map[string]int{
+	assertProductionUIEvents(t, context.Background(), events, operator, "project-real", map[string]int{
 		"manager.interaction": 1,
 		"endpoint.updated":    3,
 		"graph.revision":      1,
@@ -884,6 +892,19 @@ type recordingCleanupTerminator struct {
 	db         *sql.DB
 	executions []agentteams.AgentTeamsExecutionRef
 	modes      []string
+}
+
+type cancelingTaskManagerExecutionCleaner struct {
+	calls  int
+	cancel context.CancelFunc
+}
+
+func (c *cancelingTaskManagerExecutionCleaner) CleanupCompletedTaskManagerInvocations(context.Context) error {
+	c.calls++
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return nil
 }
 
 func (r *recordingCleanupTerminator) Terminate(ctx context.Context, execution agentteams.AgentTeamsExecutionRef, mode string) error {

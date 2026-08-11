@@ -190,13 +190,13 @@ func (p *productionTaskManagerRuntime) SubmitTaskManagerDecision(ctx context.Con
 				return "", err
 			}
 		}
+		if err := p.appendDecisionAcceptedEvent(ctx, binding, binding.DecisionRef); err != nil {
+			return "", err
+		}
 		if binding.DecisionKind == taskmanager.DecisionKindTerminal {
 			if err := p.cleanupTaskManagerExecution(ctx); err != nil {
 				return "", err
 			}
-		}
-		if err := p.appendDecisionAcceptedEvent(ctx, binding, binding.DecisionRef); err != nil {
-			return "", err
 		}
 		return binding.DecisionRef, nil
 	}
@@ -226,6 +226,11 @@ func (p *productionTaskManagerRuntime) SubmitTaskManagerDecision(ctx context.Con
 	}
 	if err := p.appendDecisionAcceptedEvent(ctx, binding, decisionRef); err != nil {
 		return "", err
+	}
+	if kind == taskmanager.DecisionKindTerminal {
+		if err := p.cleanupTaskManagerExecution(ctx); err != nil {
+			return "", err
+		}
 	}
 	return decisionRef, nil
 }
@@ -271,10 +276,11 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 			if err := p.complete(ctx, caller.InvocationID, binding.DecisionRef, recoveredRevision); err != nil {
 				return 0, err
 			}
-		} else if err := p.cleanupTaskManagerExecution(ctx); err != nil {
-			return 0, err
 		}
 		if err := p.appendGraphRevisionEvents(ctx, binding, recoveredRevision, plan.Subgraph.Endpoints); err != nil {
+			return 0, err
+		}
+		if err := p.cleanupTaskManagerExecution(ctx); err != nil {
 			return 0, err
 		}
 		return recoveredRevision, nil
@@ -290,6 +296,9 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 		return 0, err
 	}
 	if err := p.appendGraphRevisionEvents(ctx, binding, revision, plan.Subgraph.Endpoints); err != nil {
+		return 0, err
+	}
+	if err := p.cleanupTaskManagerExecution(ctx); err != nil {
 		return 0, err
 	}
 	return revision, nil
@@ -312,6 +321,9 @@ func (p *productionTaskManagerRuntime) Transition(ctx context.Context, caller au
 		if err := p.appendTransitionEvents(ctx, binding, revision); err != nil {
 			return 0, err
 		}
+		if err := p.cleanupTaskManagerExecution(ctx); err != nil {
+			return 0, err
+		}
 		return revision, nil
 	}
 	revision, err := p.graph(caller).Transition(ctx, binding.SeenRevision, binding.DecisionRef)
@@ -322,6 +334,9 @@ func (p *productionTaskManagerRuntime) Transition(ctx context.Context, caller au
 		return 0, err
 	}
 	if err := p.appendTransitionEvents(ctx, binding, revision); err != nil {
+		return 0, err
+	}
+	if err := p.cleanupTaskManagerExecution(ctx); err != nil {
 		return 0, err
 	}
 	return revision, nil
@@ -576,7 +591,7 @@ func (p *productionTaskManagerRuntime) finishTransition(ctx context.Context, bin
 		}
 	}
 	if binding.MutationApplied {
-		return p.cleanupTaskManagerExecution(ctx)
+		return nil
 	}
 	return p.complete(ctx, binding.InvocationID, binding.DecisionRef, revision)
 }
@@ -1421,7 +1436,7 @@ WHERE invocation_id=$1 AND decision_ref=$2 AND (applied_graph_revision IS NULL O
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return p.cleanupTaskManagerExecution(ctx)
+	return nil
 }
 
 func (p *productionTaskManagerRuntime) persistDecisionAcceptance(ctx context.Context, binding productionTaskManagerBinding, decisionRef string, kind taskmanager.DecisionKind, decision taskmanager.TaskManagerDecision, revision kernel.Revision) error {
