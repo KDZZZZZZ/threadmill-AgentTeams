@@ -204,7 +204,9 @@ func TestProductionClientProjectsDedicatedManagerWorker(t *testing.T) {
 	if taskflow.container != "agentteams-worker-threadmill-dispatcher" || taskflow.call.AssignedTo != "threadmill-manager" || task.HostRef != "default" {
 		t.Fatalf("taskflow projection container=%q call=%#v task=%#v", taskflow.container, taskflow.call, task)
 	}
-	if !strings.HasPrefix(taskflow.call.Spec, "Read the complete authoritative task specification before acting: shared/tasks/task-manager-alias/spec.md") || !strings.HasSuffix(taskflow.call.Spec, "bounded manager work") {
+	if !strings.HasPrefix(taskflow.call.Spec, "Read the complete authoritative task specification before acting: shared/tasks/task-manager-alias/spec.md") ||
+		!strings.Contains(taskflow.call.Spec, "immediately call TeamHarness filesync pull for shared/tasks/task-manager-alias") ||
+		!strings.HasSuffix(taskflow.call.Spec, "bounded manager work") {
 		t.Fatalf("taskflow specification = %q", taskflow.call.Spec)
 	}
 }

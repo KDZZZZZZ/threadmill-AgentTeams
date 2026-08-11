@@ -251,7 +251,8 @@ func (c *ProductionClient) DelegateTask(ctx context.Context, req DelegateTaskReq
 
 func taskflowSpecification(taskID, spec string) string {
 	return "Read the complete authoritative task specification before acting: shared/tasks/" + taskID + "/spec.md\n" +
-		"The Matrix assignment body is only a preview. Do not infer or omit truncated input.\n\n" + spec
+		"The Matrix assignment body is only a preview. Do not infer or omit truncated input.\n" +
+		"If the path is not local yet, immediately call TeamHarness filesync pull for shared/tasks/" + taskID + "; then read spec.md. Do not inspect unrelated tasks or files.\n\n" + spec
 }
 
 func (c *ProductionClient) ReleaseHostSlot(ctx context.Context, taskID string, hostRef string) error {
