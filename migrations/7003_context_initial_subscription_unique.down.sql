@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS context_subscriptions_active_initial_once_idx;

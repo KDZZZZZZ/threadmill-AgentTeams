@@ -347,6 +347,48 @@ func TestPostgresStoreRuntimeCriticalContextGraph(t *testing.T) {
 	}
 }
 
+func TestPostgresEnsureInitialSliceIsAtomicAcrossStores(t *testing.T) {
+	ctx := context.Background()
+	db := openContextGraphTestDB(t, ctx)
+	defer db.Close()
+
+	now := time.Date(2026, 8, 11, 12, 30, 0, 0, time.UTC)
+	storeA := NewPostgresStore(db, func() time.Time { return now })
+	storeB := NewPostgresStore(db, func() time.Time { return now })
+	curator := contextPrincipal(auth.ToolContextCreateSubgraph, auth.ToolContextCreateNode)
+	sg, err := storeA.CreateSubgraph(ctx, curator, CreateGeneralSubgraphRequest{Name: "Initial Race", Summary: "runtime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storeA.CreateNode(ctx, curator, CreateGeneralNodeRequest{
+		Statement:   "initial race node",
+		Kind:        string(NodeKindFact),
+		SourceRefs:  []string{"source:initial-race"},
+		SubgraphIDs: []string{sg.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	phase := principal(auth.RoleExecutor, "phase-initial-race", "task-initial-race", auth.ToolSet(auth.ToolContextSubscribe))
+	phase.InvocationID = "inv-initial-race"
+	runContextGraphRace(t, func(i int) error {
+		store := storeA
+		if i%2 == 1 {
+			store = storeB
+		}
+		return retryContextGraphMutation(func() error {
+			_, err := store.EnsureInitialSlice(ctx, phase, []string{sg.ID})
+			return err
+		})
+	})
+	var activeInitial int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM context_subscriptions WHERE project_id = $1 AND consumer_invocation_id = $2 AND source = 'initial_slice' AND active`, phase.ProjectID, phase.InvocationID).Scan(&activeInitial); err != nil {
+		t.Fatal(err)
+	}
+	if activeInitial != 1 {
+		t.Fatalf("active initial subscriptions = %d, want 1", activeInitial)
+	}
+}
+
 func TestPostgresStoreSearchHonorsAnchorRefs(t *testing.T) {
 	ctx := context.Background()
 	db := openContextGraphTestDB(t, ctx)

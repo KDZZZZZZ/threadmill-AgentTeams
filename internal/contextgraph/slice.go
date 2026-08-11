@@ -9,6 +9,10 @@ import (
 )
 
 func (s *MemoryStore) CreateInitialSlice(ctx context.Context, principal auth.Principal, subgraphIDs []string) (ContextSlice, error) {
+	return s.EnsureInitialSlice(ctx, principal, subgraphIDs)
+}
+
+func (s *MemoryStore) EnsureInitialSlice(ctx context.Context, principal auth.Principal, subgraphIDs []string) (ContextSlice, error) {
 	if err := ctx.Err(); err != nil {
 		return ContextSlice{}, err
 	}
@@ -17,6 +21,9 @@ func (s *MemoryStore) CreateInitialSlice(ctx context.Context, principal auth.Pri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if active := s.activeSubscriptionIDsLocked(principal.ProjectID, consumerInvocationID(principal)); len(active) > 0 {
+		return s.materializeInvocationSliceLocked(principal, consumerInvocationID(principal)), nil
+	}
 	sub, err := s.createSubscription(s.now().UTC(), principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, subscriptionSourceInitial)
 	if err != nil {
 		return ContextSlice{}, err

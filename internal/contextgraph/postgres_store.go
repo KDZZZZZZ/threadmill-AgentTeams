@@ -403,23 +403,37 @@ func (s *PostgresStore) InspectSubscriptions(ctx context.Context, principal auth
 }
 
 func (s *PostgresStore) CreateInitialSlice(ctx context.Context, principal auth.Principal, subgraphIDs []string) (ContextSlice, error) {
+	return s.EnsureInitialSlice(ctx, principal, subgraphIDs)
+}
+
+func (s *PostgresStore) EnsureInitialSlice(ctx context.Context, principal auth.Principal, subgraphIDs []string) (ContextSlice, error) {
 	if err := requireTool(principal, auth.ToolContextSubscribe, principal.ProjectID); err != nil {
 		return ContextSlice{}, err
+	}
+	if consumerInvocationID(principal) == "" {
+		return ContextSlice{}, kernel.InvalidArgument("consumer invocation is required")
 	}
 	tx, err := s.begin(ctx, serializableContextTx())
 	if err != nil {
 		return ContextSlice{}, err
 	}
 	defer tx.Rollback()
-	sub, err := createSubscriptionSQL(ctx, tx, principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, subscriptionSourceInitial, s.now().UTC())
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, principal.ProjectID, consumerInvocationID(principal)); err != nil {
+		return ContextSlice{}, mapContextPostgresError(err)
+	}
+	active, err := activeSubscriptionIDsSQL(ctx, tx, principal.ProjectID, consumerInvocationID(principal))
 	if err != nil {
 		return ContextSlice{}, err
+	}
+	if len(active) == 0 {
+		if _, err := ensureInitialSubscriptionSQL(ctx, tx, principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, s.now().UTC()); err != nil {
+			return ContextSlice{}, err
+		}
 	}
 	slice, err := materializeInvocationSliceSQL(ctx, tx, principal)
 	if err != nil {
 		return ContextSlice{}, err
 	}
-	slice.SubscriptionIDs = []string{sub.ID}
 	return slice, mapContextPostgresError(tx.Commit())
 }
 
@@ -1493,6 +1507,58 @@ func createSubscriptionSQL(ctx context.Context, q postgresDBTX, principal auth.P
 	sub := ContextSubscription{ID: newContextID("sub", principal.ProjectID), ConsumerInvocationID: string(invocationID), SubgraphIDs: subgraphIDs, EventKinds: events, PermissionSnapshot: fmt.Sprintf("%s:%s:%s", principal.ProjectID, subscriptionConsumerTaskID(principal, source), subscriptionConsumerRole(principal, source))}
 	_, err = q.ExecContext(ctx, `INSERT INTO context_subscriptions(id, project_id, consumer_invocation_id, subgraph_ids, event_kinds, permission_snapshot, source, active, created_at, task_id, role) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, true, $8, NULLIF($9, ''), $10)`, sub.ID, principal.ProjectID, sub.ConsumerInvocationID, string(rawSubgraphs), string(rawEvents), sub.PermissionSnapshot, source, now, subscriptionConsumerTaskID(principal, source), subscriptionConsumerRole(principal, source))
 	return sub, mapContextPostgresError(err)
+}
+
+func ensureInitialSubscriptionSQL(ctx context.Context, q postgresDBTX, principal auth.Principal, req SubscribeRequest, now time.Time) (ContextSubscription, error) {
+	invocationID, err := subscriptionConsumerInvocationID(principal, subscriptionSourceInitial)
+	if err != nil {
+		return ContextSubscription{}, err
+	}
+	if invocationID == "" {
+		return ContextSubscription{}, kernel.InvalidArgument("consumer invocation is required")
+	}
+	subgraphIDs, err := visibleSubscriptionSubgraphsSQL(ctx, q, principal, req.SubgraphIDs)
+	if err != nil {
+		return ContextSubscription{}, err
+	}
+	events := uniqueStrings(req.EventKinds)
+	rawSubgraphs, _ := marshalJSONArray(subgraphIDs)
+	rawEvents, _ := marshalJSONArray(events)
+	sub := ContextSubscription{ID: newContextID("sub", principal.ProjectID), ConsumerInvocationID: string(invocationID), SubgraphIDs: subgraphIDs, EventKinds: events, PermissionSnapshot: fmt.Sprintf("%s:%s:%s", principal.ProjectID, subscriptionConsumerTaskID(principal, subscriptionSourceInitial), subscriptionConsumerRole(principal, subscriptionSourceInitial))}
+	if _, err := q.ExecContext(ctx, `INSERT INTO context_subscriptions(id, project_id, consumer_invocation_id, subgraph_ids, event_kinds, permission_snapshot, source, active, created_at, task_id, role) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, true, $8, NULLIF($9, ''), $10) ON CONFLICT DO NOTHING`, sub.ID, principal.ProjectID, sub.ConsumerInvocationID, string(rawSubgraphs), string(rawEvents), sub.PermissionSnapshot, subscriptionSourceInitial, now, subscriptionConsumerTaskID(principal, subscriptionSourceInitial), subscriptionConsumerRole(principal, subscriptionSourceInitial)); err != nil {
+		return ContextSubscription{}, mapContextPostgresError(err)
+	}
+	var rawExistingSubgraphs, rawExistingEvents string
+	if err := q.QueryRowContext(ctx, `SELECT id, subgraph_ids::text, event_kinds::text, permission_snapshot FROM context_subscriptions WHERE project_id = $1 AND consumer_invocation_id = $2 AND source = $3 AND active ORDER BY created_at, id LIMIT 1`, principal.ProjectID, invocationID, subscriptionSourceInitial).Scan(&sub.ID, &rawExistingSubgraphs, &rawExistingEvents, &sub.PermissionSnapshot); err != nil {
+		return ContextSubscription{}, mapContextPostgresError(err)
+	}
+	if err := json.Unmarshal([]byte(rawExistingSubgraphs), &sub.SubgraphIDs); err != nil {
+		return ContextSubscription{}, err
+	}
+	if err := json.Unmarshal([]byte(rawExistingEvents), &sub.EventKinds); err != nil {
+		return ContextSubscription{}, err
+	}
+	return sub, nil
+}
+
+func activeSubscriptionIDsSQL(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, invocationID kernel.InvocationID) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id FROM context_subscriptions WHERE project_id = $1 AND consumer_invocation_id = $2 AND active ORDER BY id`, projectID, invocationID)
+	if err != nil {
+		return nil, mapContextPostgresError(err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, mapContextPostgresError(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapContextPostgresError(err)
+	}
+	return ids, nil
 }
 
 func visibleSubscriptionSubgraphsSQL(ctx context.Context, q postgresDBTX, principal auth.Principal, subgraphIDs []string) ([]string, error) {
