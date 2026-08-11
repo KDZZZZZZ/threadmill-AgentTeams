@@ -128,6 +128,34 @@ func TestProductionClientRevokesServerTokenWhenSlotClaimFails(t *testing.T) {
 	}
 }
 
+func TestDockerQwenPawProviderUsesHostManagementPort(t *testing.T) {
+	provider := DockerQwenPawProvider{
+		Containers: StaticContainerResolver{
+			"default":  "agentteams-manager",
+			"worker-a": "agentteams-worker-a",
+		},
+		ManagementPorts: map[string]int{"default": 18799},
+	}
+	manager, err := provider.ForHost(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.baseURL != "http://127.0.0.1:18799" {
+		t.Fatalf("manager base URL = %q, want manager management port", manager.baseURL)
+	}
+	worker, err := provider.ForHost(context.Background(), "worker-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.baseURL != "http://127.0.0.1:8088" {
+		t.Fatalf("worker base URL = %q, want default worker management port", worker.baseURL)
+	}
+	provider.ManagementPorts["default"] = 70000
+	if _, err := provider.ForHost(context.Background(), "default"); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+		t.Fatalf("invalid management port error = %v, want invalid_request", err)
+	}
+}
+
 func TestProductionClientRevokesServerTokenWhenResolvedMCPMaterialIsInvalid(t *testing.T) {
 	controller := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(controller.Close)

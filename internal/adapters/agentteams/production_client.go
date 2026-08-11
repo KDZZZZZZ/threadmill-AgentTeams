@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -386,9 +387,10 @@ func (r StaticContainerResolver) ContainerForHost(_ context.Context, hostRef str
 }
 
 type DockerQwenPawProvider struct {
-	Containers   ContainerResolver
-	DockerBinary string
-	PythonBinary string
+	Containers      ContainerResolver
+	ManagementPorts map[string]int
+	DockerBinary    string
+	PythonBinary    string
 }
 
 func (p DockerQwenPawProvider) ForHost(ctx context.Context, hostRef string) (*QwenPawAPI, error) {
@@ -400,7 +402,14 @@ func (p DockerQwenPawProvider) ForHost(ctx context.Context, hostRef string) (*Qw
 	if err != nil {
 		return nil, err
 	}
-	return NewQwenPawAPI("http://127.0.0.1:8088", &http.Client{Transport: transport})
+	port := 8088
+	if configured := p.ManagementPorts[hostRef]; configured != 0 {
+		if configured < 1 || configured > 65535 {
+			return nil, kernel.InvalidArgument("QwenPaw management port is invalid")
+		}
+		port = configured
+	}
+	return NewQwenPawAPI("http://127.0.0.1:"+strconv.Itoa(port), &http.Client{Transport: transport})
 }
 
 var _ Client = (*ProductionClient)(nil)

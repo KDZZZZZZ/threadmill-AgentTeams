@@ -106,9 +106,12 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 		Controller:  controller,
 		Slots:       agentteams.NewHostSlotStore(sqlDB),
 		MCPResolver: mcpResolver,
-		QwenPaw:     agentteams.DockerQwenPawProvider{Containers: containers},
-		Taskflow:    taskflow,
-		Containers:  containers,
+		QwenPaw: agentteams.DockerQwenPawProvider{
+			Containers:      containers,
+			ManagementPorts: map[string]int{"default": 18799},
+		},
+		Taskflow:   taskflow,
+		Containers: containers,
 	})
 	if err != nil {
 		return productionRuntimeDependencies{}, err
