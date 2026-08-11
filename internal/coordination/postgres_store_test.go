@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -258,6 +259,69 @@ func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreRejectsInvalidReplacePendingWithoutPartialWrites(t *testing.T) {
+	dsn := os.Getenv("THREADMILL_PG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("THREADMILL_PG_TEST_DSN is not set")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("coordination_atomic_%d", time.Now().UnixNano())
+	baseDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseDB.Close()
+	if _, err := baseDB.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer baseDB.ExecContext(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
+
+	db, err := sql.Open("pgx", dsnWithSearchPath(t, dsn, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewMigrator(db).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	graph := NewTaskManagerGraph(taskManagerPrincipal(), store, store, kernel.NewMemoryIdempotencyStore())
+	revision := createPostgresTask(t, graph, store, "pg-task-a")
+	before := mustSnapshot(t, graph, revision)
+	beforeCounts := postgresGraphTableCounts(t, ctx, db, projectID)
+
+	runPolicyDecision := kernel.IdempotencyKey("decision-invalid-run-policy")
+	if err := store.RegisterReplacePending(ctx, projectID, runPolicyDecision); err != nil {
+		t.Fatal(err)
+	}
+	invalidRunPolicy := PendingSubgraph{
+		RequestID:    runPolicyDecision,
+		BaseRevision: revision,
+		Endpoints:    []PhaseEndpoint{mustEndpoint(t, before, ref("pg-task-a", EndpointPlan))},
+	}
+	invalidRunPolicy.Endpoints[0].RunPolicy = RunHeld
+	if _, err := graph.ReplacePending(ctx, invalidRunPolicy); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+		t.Fatalf("invalid run_policy replace err = %v, want invalid_request", err)
+	}
+	assertPostgresGraphUnchanged(t, ctx, db, graph, projectID, before, beforeCounts)
+
+	fixedEdgeDecision := kernel.IdempotencyKey("decision-invalid-fixed-edge")
+	if err := store.RegisterReplacePending(ctx, projectID, fixedEdgeDecision); err != nil {
+		t.Fatal(err)
+	}
+	invalidFixedEdge := basicSubgraph("pg-task-b", fixedEdgeDecision, revision)
+	invalidFixedEdge.Edges = []Edge{edge(ref("pg-task-b", EndpointPlan), ref("pg-task-b", EndpointExecute))}
+	if _, err := graph.ReplacePending(ctx, invalidFixedEdge); !kernel.IsCode(err, kernel.CodeInvalidGraph) {
+		t.Fatalf("invalid fixed-edge replace err = %v, want invalid_graph", err)
+	}
+	assertPostgresGraphUnchanged(t, ctx, db, graph, projectID, before, beforeCounts)
+}
+
 type recordingDBTX struct {
 	execs []recordedExec
 }
@@ -319,4 +383,49 @@ func countPostgresActiveLeases(ctx context.Context, store *PostgresStore, projec
 		}
 	}
 	return active
+}
+
+type postgresGraphCounts struct {
+	revisions int
+	tasks     int
+	endpoints int
+	edges     int
+	blockers  int
+	results   int
+}
+
+func postgresGraphTableCounts(t *testing.T, ctx context.Context, db *sql.DB, projectID kernel.ProjectID) postgresGraphCounts {
+	t.Helper()
+	return postgresGraphCounts{
+		revisions: countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_graph_revisions WHERE project_id = $1`, projectID),
+		tasks:     countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_tasks WHERE project_id = $1`, projectID),
+		endpoints: countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_endpoints WHERE project_id = $1`, projectID),
+		edges:     countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_edges WHERE project_id = $1`, projectID),
+		blockers:  countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_blockers WHERE project_id = $1`, projectID),
+		results:   countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_phase_results WHERE project_id = $1`, projectID),
+	}
+}
+
+func countPostgresRows(t *testing.T, ctx context.Context, db *sql.DB, query string, args ...any) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func assertPostgresGraphUnchanged(t *testing.T, ctx context.Context, db *sql.DB, graph *Service, projectID kernel.ProjectID, before GraphSnapshot, beforeCounts postgresGraphCounts) {
+	t.Helper()
+	after, err := graph.Snapshot(ctx, kernel.LatestRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("latest graph changed after rejected replace:\nafter=%#v\nbefore=%#v", after, before)
+	}
+	afterCounts := postgresGraphTableCounts(t, ctx, db, projectID)
+	if afterCounts != beforeCounts {
+		t.Fatalf("graph table counts changed after rejected replace: after=%#v before=%#v", afterCounts, beforeCounts)
+	}
 }
