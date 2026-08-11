@@ -387,10 +387,9 @@ func (r StaticContainerResolver) ContainerForHost(_ context.Context, hostRef str
 }
 
 type DockerQwenPawProvider struct {
-	Containers      ContainerResolver
-	ManagementPorts map[string]int
-	DockerBinary    string
-	PythonBinary    string
+	Containers   ContainerResolver
+	DockerBinary string
+	PythonBinary string
 }
 
 func (p DockerQwenPawProvider) ForHost(ctx context.Context, hostRef string) (*QwenPawAPI, error) {
@@ -402,14 +401,15 @@ func (p DockerQwenPawProvider) ForHost(ctx context.Context, hostRef string) (*Qw
 	if err != nil {
 		return nil, err
 	}
-	port := 8088
-	if configured := p.ManagementPorts[hostRef]; configured != 0 {
-		if configured < 1 || configured > 65535 {
-			return nil, kernel.InvalidArgument("QwenPaw management port is invalid")
-		}
-		port = configured
-	}
+	port := qwenPawManagementPort(container)
 	return NewQwenPawAPI("http://127.0.0.1:"+strconv.Itoa(port), &http.Client{Transport: transport})
+}
+
+func qwenPawManagementPort(container string) int {
+	if container == "agentteams-manager" || strings.HasPrefix(container, "agentteams-manager-") {
+		return 18799
+	}
+	return 8088
 }
 
 var _ Client = (*ProductionClient)(nil)

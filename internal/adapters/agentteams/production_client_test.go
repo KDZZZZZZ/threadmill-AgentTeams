@@ -134,7 +134,6 @@ func TestDockerQwenPawProviderUsesHostManagementPort(t *testing.T) {
 			"default":  "agentteams-manager",
 			"worker-a": "agentteams-worker-a",
 		},
-		ManagementPorts: map[string]int{"default": 18799},
 	}
 	manager, err := provider.ForHost(context.Background(), "default")
 	if err != nil {
@@ -149,10 +148,6 @@ func TestDockerQwenPawProviderUsesHostManagementPort(t *testing.T) {
 	}
 	if worker.baseURL != "http://127.0.0.1:8088" {
 		t.Fatalf("worker base URL = %q, want default worker management port", worker.baseURL)
-	}
-	provider.ManagementPorts["default"] = 70000
-	if _, err := provider.ForHost(context.Background(), "default"); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
-		t.Fatalf("invalid management port error = %v, want invalid_request", err)
 	}
 }
 

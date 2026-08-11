@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +28,8 @@ for item in Path("/proc/1/environ").read_bytes().split(b"\0"):
         key, value = item.split(b"=", 1)
         pid1_env[key.decode()] = value.decode()
 
-with urlopen("http://127.0.0.1:8088/api/mcp/teamharness", timeout=10) as response:
+management_port = int(sys.argv[1])
+with urlopen(f"http://127.0.0.1:{management_port}/api/mcp/teamharness", timeout=10) as response:
     client = json.load(response)
 
 cwd = Path(client["cwd"])
@@ -212,7 +214,7 @@ func (c *QwenPawDockerTaskflow) executeMCP(
 		ctx,
 		c.dockerBinary,
 		"exec", "-i", container,
-		c.pythonBinary, "-c", qwenPawTeamHarnessBridge,
+		c.pythonBinary, "-c", qwenPawTeamHarnessBridge, strconv.Itoa(qwenPawManagementPort(container)),
 	)
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Stdin = bytes.NewReader(request)
