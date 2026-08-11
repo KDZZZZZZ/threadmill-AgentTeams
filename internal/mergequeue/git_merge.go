@@ -20,6 +20,20 @@ type backendFailure struct {
 func (e backendFailure) Error() string { return e.err.Error() }
 func (e backendFailure) Unwrap() error { return e.err }
 
+type pushCASDriftError struct {
+	err error
+}
+
+func (e pushCASDriftError) Error() string { return e.err.Error() }
+func (e pushCASDriftError) Unwrap() error { return e.err }
+
+type ambiguousPushError struct {
+	err error
+}
+
+func (e ambiguousPushError) Error() string { return e.err.Error() }
+func (e ambiguousPushError) Unwrap() error { return e.err }
+
 type PreparedMerge struct {
 	Root               string
 	TargetRepository   string
@@ -33,6 +47,8 @@ type PreparedMerge struct {
 // only package component allowed to push the managed main branch.
 type GitBackend struct {
 	TempParent string
+
+	pushErrorAfterSuccess error
 }
 
 func (b GitBackend) Prepare(ctx context.Context, candidate Candidate, binding workspace.Binding) (prepared PreparedMerge, err error) {
@@ -106,23 +122,26 @@ func (b GitBackend) PushExact(ctx context.Context, prepared PreparedMerge, expec
 	}
 	latest, err := gitOutput(ctx, prepared.TargetRepository, "rev-parse", "refs/heads/"+prepared.TargetBranch)
 	if err != nil {
-		return backendFailure{reason: FailureMainDrift, err: err}
+		return ambiguousPushError{err: err}
 	}
 	if latest != prepared.LatestMainRevision {
-		return backendFailure{reason: FailureMainDrift, err: fmt.Errorf("main advanced from %s to %s", prepared.LatestMainRevision, latest)}
+		return pushCASDriftError{err: fmt.Errorf("main advanced from %s to %s", prepared.LatestMainRevision, latest)}
 	}
 	if prepared.AlreadyMerged && expectedMergedRevision == latest {
 		return nil
 	}
 	actual, err := gitOutput(ctx, prepared.Root, "rev-parse", "HEAD")
 	if err != nil {
-		return backendFailure{reason: FailureConflict, err: err}
+		return ambiguousPushError{err: err}
 	}
 	if actual != expectedMergedRevision {
-		return backendFailure{reason: FailureConflict, err: fmt.Errorf("prepared merge commit changed from %s to %s", expectedMergedRevision, actual)}
+		return ambiguousPushError{err: fmt.Errorf("prepared merge commit changed from %s to %s", expectedMergedRevision, actual)}
 	}
 	if err := gitRun(ctx, prepared.Root, "push", "--porcelain", "origin", expectedMergedRevision+":refs/heads/"+prepared.TargetBranch); err != nil {
-		return backendFailure{reason: FailureMainDrift, err: err}
+		return ambiguousPushError{err: err}
+	}
+	if b.pushErrorAfterSuccess != nil {
+		return ambiguousPushError{err: b.pushErrorAfterSuccess}
 	}
 	return nil
 }
@@ -157,7 +176,7 @@ func (b GitBackend) Merge(ctx context.Context, prepared PreparedMerge, candidate
 		return "", err
 	}
 	if err := b.PushExact(ctx, prepared, merged); err != nil {
-		return "", backendFailure{reason: FailureMainDrift, err: err}
+		return "", err
 	}
 	return merged, nil
 }
@@ -186,11 +205,20 @@ func (b GitBackend) Cleanup(prepared PreparedMerge) error {
 }
 
 func failureReason(err error, fallback FailureReason) FailureReason {
+	var drift pushCASDriftError
+	if errors.As(err, &drift) {
+		return FailureMainDrift
+	}
 	var failure backendFailure
 	if errors.As(err, &failure) && validFailureReason(failure.reason) {
 		return failure.reason
 	}
 	return fallback
+}
+
+func isPushCASDrift(err error) bool {
+	var drift pushCASDriftError
+	return errors.As(err, &drift)
 }
 
 func gitRun(ctx context.Context, dir string, args ...string) error {

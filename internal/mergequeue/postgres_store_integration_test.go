@@ -3,6 +3,7 @@ package mergequeue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -360,6 +361,66 @@ func TestPostgresReconcilerRecoversPendingMergeOperationWithExactRevision(t *tes
 	stored, err := store.Get(ctx, candidate.ID)
 	if err != nil || stored.MergedRevision != op.ExpectedMergedRevision {
 		t.Fatalf("stored candidate = %#v err=%v", stored, err)
+	}
+}
+
+func TestPostgresReconcilerFinalizesWhenPushReportsErrorAfterSideEffect(t *testing.T) {
+	ctx := context.Background()
+	db := openMergeQueuePostgresSchema(t, ctx)
+	repo := seedRepo(t)
+	binding := createMergeQueueGitBinding(t, repo, "task-push-side-effect", "workspace/pushed.txt", "pushed\n")
+	insertMergeQueueWorkspaceBinding(t, ctx, db, binding)
+
+	artifacts := evidence.NewArtifactRegistry(objectstore.NewMemoryStore(), "artifacts")
+	verifyRef := registerArtifact(t, artifacts, "project-a", binding.TaskID, "verify side effect")
+	diffRef := registerArtifact(t, artifacts, "project-a", binding.TaskID, "diff side effect")
+	passRef := registerArtifact(t, artifacts, "project-a", binding.TaskID, "targeted verify passed")
+	for _, ref := range []evidence.ArtifactID{verifyRef, diffRef, passRef} {
+		insertMergeQueueArtifact(t, ctx, db, ref, "project-a", binding.TaskID)
+	}
+
+	store := NewPostgresStore(db)
+	reconciler := NewReconciler(
+		store,
+		staticWorkspaceReader{binding: binding},
+		&fakeVerifier{result: TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{passRef}}},
+		GitBackend{TempParent: t.TempDir(), pushErrorAfterSuccess: errors.New("simulated transport error after push side effect")},
+		artifacts,
+		evidence.NewEventLog(64*1024),
+	)
+	if _, err := reconciler.Enqueue(ctx, EnqueueRequest{
+		ID:                "candidate-push-side-effect",
+		ProjectID:         "project-a",
+		TaskID:            binding.TaskID,
+		WorkspaceRef:      binding.ID,
+		VerifyResultRef:   verifyRef,
+		DiffArtifactRef:   diffRef,
+		TargetRepository:  repo,
+		TargetBranch:      "main",
+		BaseRevision:      binding.BaseRevision,
+		MainRevision:      binding.BaseRevision,
+		CandidateRevision: binding.CurrentRevision,
+		EvidenceRefs:      []evidence.ArtifactID{verifyRef, diffRef},
+	}); err != nil {
+		t.Fatalf("enqueue side-effect candidate: %v", err)
+	}
+
+	merged, processed, err := reconciler.ReconcileOne(ctx, repo)
+	if err != nil || !processed {
+		t.Fatalf("reconcile side-effect push error = %#v processed=%v err=%v", merged, processed, err)
+	}
+	if merged.Status != StatusMerged || merged.MergedRevision == "" || merged.FailureReason != "" {
+		t.Fatalf("merged candidate after side-effect push error = %#v", merged)
+	}
+	if got := fileAtBranch(t, repo, "main", "workspace/pushed.txt"); got != "pushed\n" {
+		t.Fatalf("pushed file = %q", got)
+	}
+	op, active, err := store.pendingMergeOperation(ctx, repo)
+	if err != nil {
+		t.Fatalf("pending operation lookup: %v", err)
+	}
+	if active || op.Status == "aborted" || op.Status == "recovery_required" {
+		t.Fatalf("operation left active after contained side-effect push error: %#v active=%v", op, active)
 	}
 }
 

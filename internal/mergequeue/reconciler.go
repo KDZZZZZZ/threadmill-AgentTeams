@@ -177,24 +177,30 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		return Candidate{}, true, err
 	}
 	if err := r.backend.PushExact(ctx, prepared, op.ExpectedMergedRevision); err != nil {
-		if failureReason(err, "") == FailureMainDrift {
+		contained, containsErr := r.backend.ContainsRevision(ctx, op.TargetRepository, op.TargetBranch, op.ExpectedMergedRevision)
+		if containsErr == nil && contained {
+			merged, finalizeErr := r.store.finalizeMergeOperation(ctx, op)
+			if finalizeErr != nil {
+				return Candidate{}, true, finalizeErr
+			}
+			return merged, true, r.flushAudits(ctx, candidate.ProjectID)
+		}
+		if isPushCASDrift(err) {
 			if abortErr := r.store.abortMergeOperation(ctx, op); abortErr != nil {
 				return Candidate{}, true, abortErr
 			}
 			failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, FailureMainDrift, err)
 			return failed, true, failErr
 		}
-		contained, containsErr := r.backend.ContainsRevision(ctx, op.TargetRepository, op.TargetBranch, op.ExpectedMergedRevision)
+		reason := err.Error()
 		if containsErr != nil {
-			return Candidate{}, true, containsErr
+			reason = reason + "; contains check failed: " + containsErr.Error()
 		}
-		if !contained {
-			blocked, markErr := r.store.markMergeOperationRecoveryRequired(ctx, op, err.Error())
-			if markErr != nil {
-				return Candidate{}, true, markErr
-			}
-			return blocked, true, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge operation requires manual recovery before new claims", Recoverable: true}
+		blocked, markErr := r.store.markMergeOperationRecoveryRequired(ctx, op, reason)
+		if markErr != nil {
+			return Candidate{}, true, markErr
 		}
+		return blocked, true, kernel.Error{Code: kernel.CodeTransitionRejected, Message: "merge operation requires manual recovery before new claims", Recoverable: true}
 	}
 	merged, err := r.store.finalizeMergeOperation(ctx, op)
 	if err != nil {
