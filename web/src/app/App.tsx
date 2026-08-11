@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { MotionConfig } from "motion/react";
-import { MessageSquareText, PanelRightOpen, RefreshCw } from "lucide-react";
+import {
+  MessageSquareText,
+  PanelRightOpen,
+  RefreshCw,
+  Workflow,
+} from "lucide-react";
 import { getCoordinationSnapshot } from "../api/client";
 import { openEventStream } from "../api/events";
 import type { EndpointRef, UiEvent } from "../api/types";
@@ -8,24 +13,24 @@ import { CapacityStrip } from "../features/capacity/CapacityStrip";
 import { CoordinationWorkspace } from "../features/coordination/CoordinationWorkspace";
 import { EndpointInspectorPanel } from "../features/endpoint-inspector/EndpointInspectorPanel";
 import { ManagerPanel } from "../features/manager/ManagerPanel";
+import { RequirementComposer } from "../features/requirements/RequirementComposer";
 import { consoleReducer, initialConsoleState } from "./state";
 
-function queryValue(name: string, fallback: string): string {
-  return (
-    new URLSearchParams(window.location.search).get(name)?.trim() || fallback
-  );
+function queryValue(name: string): string {
+  return new URLSearchParams(window.location.search).get(name)?.trim() || "";
 }
 
 export function App() {
-  const projectID = useMemo(() => queryValue("project_id", "demo-project"), []);
+  const projectID = useMemo(() => queryValue("project_id"), []);
   const conversationID = useMemo(
-    () => queryValue("conversation_id", `${projectID}-manager`),
+    () => queryValue("conversation_id") || `${projectID}-manager`,
     [projectID],
   );
   const [state, dispatch] = useReducer(consoleReducer, initialConsoleState);
   const [loadError, setLoadError] = useState<string>();
 
   const refreshSnapshot = useCallback(async () => {
+    if (!projectID) return;
     try {
       const snapshot = await getCoordinationSnapshot(projectID);
       dispatch({ type: "snapshot.loaded", snapshot });
@@ -42,7 +47,7 @@ export function App() {
   }, [refreshSnapshot]);
 
   useEffect(() => {
-    if (!state.snapshot) return;
+    if (!projectID || !state.snapshot) return;
     const stream = openEventStream(projectID, state.snapshot?.cursor, {
       onOpen: () =>
         dispatch({ type: "connection.changed", connection: "live" }),
@@ -62,6 +67,19 @@ export function App() {
     },
     [],
   );
+
+  if (!projectID) {
+    return (
+      <main className="configuration-error" role="alert">
+        <Workflow size={24} aria-hidden="true" />
+        <h1>缺少项目上下文</h1>
+        <p>
+          生产控制台要求 URL 显式提供 <code>project_id</code>。界面不会回退到
+          demo 项目或展示示例数据。
+        </p>
+      </main>
+    );
+  }
 
   return (
     <MotionConfig reducedMotion="user" transition={{ duration: 0.16 }}>
@@ -112,6 +130,16 @@ export function App() {
               dispatch({ type: "capacity.loaded", capacity })
             }
             onConflict={refreshSnapshot}
+          />
+        ) : null}
+
+        {state.snapshot ? (
+          <RequirementComposer
+            projectID={projectID}
+            conversationID={conversationID}
+            graphRevision={state.snapshot.revision}
+            hasTasks={state.snapshot.tasks.length > 0}
+            onAccepted={refreshSnapshot}
           />
         ) : null}
 

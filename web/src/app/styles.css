@@ -68,6 +68,31 @@ code,
   min-height: 100dvh;
 }
 
+.configuration-error {
+  min-height: 100dvh;
+  padding: 32px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.configuration-error h1 {
+  margin: 12px 0 6px;
+  color: var(--text-primary);
+}
+
+.configuration-error p {
+  max-width: 58ch;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.configuration-error code {
+  color: var(--text-primary);
+}
+
 .command-bar {
   min-height: 68px;
   padding: 10px 20px;
@@ -234,6 +259,146 @@ h3 {
   gap: 24px;
   background: var(--surface-panel);
   border-bottom: 1px solid var(--border-subtle);
+}
+
+.requirement-region {
+  padding: 14px 20px;
+  display: grid;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(420px, 1.6fr);
+  gap: 14px 24px;
+  background: var(--surface-panel);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.requirement-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.requirement-heading h2 {
+  margin-bottom: 5px;
+}
+
+.requirement-heading p,
+.requirement-actions p {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.requirement-heading .revision-label {
+  flex: none;
+}
+
+.requirement-form {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.requirement-form label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.requirement-form textarea {
+  width: 100%;
+  padding: 9px 10px;
+  resize: vertical;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  line-height: 1.45;
+}
+
+.requirement-details {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.requirement-details summary {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.requirement-detail-grid {
+  padding: 4px 0 8px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.requirement-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.requirement-actions .primary-button {
+  flex: none;
+}
+
+.requirement-status,
+.requirement-error {
+  grid-column: 2;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.requirement-status {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.requirement-status.is-updated {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.requirement-status > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.requirement-status span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.requirement-status code {
+  min-width: 0;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.requirement-error {
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .capacity-title {
@@ -412,6 +577,29 @@ h3 {
 .graph-view.is-visible {
   height: 620px;
   display: block;
+}
+
+.graph-empty {
+  height: 620px;
+  padding: 32px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.graph-empty h3 {
+  margin: 10px 0 5px;
+  color: var(--text-primary);
+  font-size: 16px;
+}
+
+.graph-empty p {
+  max-width: 46ch;
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .list-view.is-visible {
@@ -954,6 +1142,15 @@ h3 {
 }
 
 @media (max-width: 1199px) {
+  .requirement-region {
+    grid-template-columns: 1fr;
+  }
+
+  .requirement-status,
+  .requirement-error {
+    grid-column: 1;
+  }
+
   .console-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -971,7 +1168,8 @@ h3 {
   }
 
   .command-bar,
-  .capacity-strip {
+  .capacity-strip,
+  .requirement-region {
     align-items: stretch;
   }
 
@@ -987,6 +1185,29 @@ h3 {
   .capacity-strip {
     grid-template-columns: 1fr;
     gap: 12px;
+  }
+
+  .requirement-region {
+    padding: 14px;
+  }
+
+  .requirement-heading,
+  .requirement-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .requirement-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .requirement-actions .primary-button {
+    width: 100%;
+  }
+
+  .requirement-status span {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .capacity-values {

@@ -59,4 +59,18 @@ describe("consoleReducer", () => {
     expect(result.snapshot?.capacity.desired_concurrency).toBe(3);
     expect(result.snapshot?.cursor).toBe("cursor-5");
   });
+
+  it("does not regress the graph when snapshot refreshes resolve out of order", () => {
+    const loaded = consoleReducer(initialConsoleState, {
+      type: "snapshot.loaded",
+      snapshot,
+    });
+
+    const result = consoleReducer(loaded, {
+      type: "snapshot.loaded",
+      snapshot: { ...snapshot, revision: 3, cursor: "cursor-3" },
+    });
+
+    expect(result).toBe(loaded);
+  });
 });

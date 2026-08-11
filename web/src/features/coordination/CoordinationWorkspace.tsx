@@ -8,7 +8,7 @@ import {
   type Node,
   type NodeMouseHandler,
 } from "@xyflow/react";
-import { ListTree, Network } from "lucide-react";
+import { ListTree, Network, Workflow } from "lucide-react";
 import type {
   CoordinationSnapshot,
   EndpointRef,
@@ -133,23 +133,40 @@ export function CoordinationWorkspace({
         className={`graph-view ${view === "graph" ? "is-visible" : ""}`}
         aria-hidden={view !== "graph"}
       >
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={{ phase: PhaseNode }}
-          onNodeClick={handleNodeClick}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          elementsSelectable
-          fitView
-          minZoom={0.35}
-          maxZoom={1.6}
-          proOptions={{ hideAttribution: true }}
-          aria-label="Coordination Graph 节点和依赖"
-        >
-          <Background gap={24} size={1} color="var(--graph-dot)" />
-          <Controls showInteractive={false} position="bottom-left" />
-        </ReactFlow>
+        {endpointNodes.length ? (
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={{ phase: PhaseNode }}
+            onNodeClick={handleNodeClick}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable
+            fitView
+            minZoom={0.35}
+            maxZoom={1.6}
+            proOptions={{ hideAttribution: true }}
+            aria-label="Coordination Graph 节点和依赖"
+          >
+            <Background gap={24} size={1} color="var(--graph-dot)" />
+            <Controls showInteractive={false} position="bottom-left" />
+          </ReactFlow>
+        ) : (
+          <div className="graph-empty">
+            <Workflow size={22} aria-hidden="true" />
+            <h3>协调图还没有节点</h3>
+            <p>提交需求后，Task Manager 才能通过受控接口创建待执行子图。</p>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() =>
+                document.getElementById("requirement-body")?.focus()
+              }
+            >
+              提交首个需求
+            </button>
+          </div>
+        )}
       </div>
 
       <div className={`list-view ${view === "list" ? "is-visible" : ""}`}>

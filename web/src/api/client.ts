@@ -5,6 +5,7 @@ import type {
   EndpointInspector,
   EndpointRef,
   ManagerConversation,
+  RequirementCreateResponse,
 } from "./types";
 
 export class ApiError extends Error {
@@ -54,6 +55,30 @@ export function getCoordinationSnapshot(
 ): Promise<CoordinationSnapshot> {
   const params = new URLSearchParams({ project_id: projectID });
   return request(`/v1/coordination/snapshot?${params}`);
+}
+
+export function submitRequirement(input: {
+  projectID: string;
+  conversationID: string;
+  body: string;
+  motivation?: string;
+  constraints?: string[];
+  acceptance?: string[];
+}): Promise<RequirementCreateResponse> {
+  return request("/v1/requirements", {
+    method: "POST",
+    headers: { "X-Threadmill-CSRF": csrfToken() },
+    body: JSON.stringify({
+      request_id: crypto.randomUUID(),
+      project_id: input.projectID,
+      conversation_id: input.conversationID,
+      body: input.body,
+      motivation: input.motivation,
+      constraints: input.constraints,
+      acceptance: input.acceptance,
+      source: { kind: "browser" },
+    }),
+  });
 }
 
 export function getCapacity(projectID: string): Promise<CapacityState> {

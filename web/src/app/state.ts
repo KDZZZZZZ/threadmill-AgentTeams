@@ -41,6 +41,13 @@ export function consoleReducer(
 ): ConsoleState {
   switch (action.type) {
     case "snapshot.loaded":
+      if (
+        state.snapshot &&
+        (action.snapshot.project_id !== state.snapshot.project_id ||
+          action.snapshot.revision < state.snapshot.revision)
+      ) {
+        return state;
+      }
       return {
         ...state,
         snapshot: action.snapshot,

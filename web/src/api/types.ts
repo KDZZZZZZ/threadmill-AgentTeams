@@ -54,6 +54,14 @@ export interface CoordinationSnapshot {
   capacity: CapacityState;
 }
 
+export interface RequirementCreateResponse {
+  requirement_id: string;
+  manager_input_ref: string;
+  invocation_ref: string;
+  conversation_id?: string;
+  status: "accepted";
+}
+
 export interface InvocationProjection {
   invocation_id: string;
   provider?: "agentteams_qwenpaw_taskflow";
