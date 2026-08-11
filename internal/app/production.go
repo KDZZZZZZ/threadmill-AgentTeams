@@ -154,6 +154,7 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 	events := uiprojection.NewEventLogQuery(eventStore, permissions)
 	coordStore := coordination.NewPostgresStore(sqlDB)
 	contextStore := contextgraph.NewPostgresStore(sqlDB, time.Now)
+	contextStore.SetTaskEndpointResolver(productionTaskEndpointResolver{projectID: projectID, graph: coordStore})
 	invocations := runtime.NewPostgresInvocationStoreFromSQL(sqlDB)
 	capacity := productionCapacity{projectID: projectID, ledger: scheduler.NewPostgresCapacityLedger(sqlDB, projectID), db: sqlDB}
 	ui := uiprojection.NewService(capacity, coordStore, productionInvocations{db: sqlDB}, productionContextInspector{db: sqlDB, contexts: contextStore}, events, permissions)

@@ -159,6 +159,22 @@ func TestProductionRuntimeLoopReportsPhaseDependency(t *testing.T) {
 	}
 }
 
+func TestProductionInvocationSourceRoutesPhaseRefsToPhaseStore(t *testing.T) {
+	phaseSource := &recordingInvocationSource{prepared: agentteams.PreparedInvocation{InvocationID: "phase-inv", ProjectID: "project-a", Role: auth.RoleExecutor, RoomID: "room", Spec: "phase", RuntimeConfigRef: "runtime", EnvelopeRef: "envelope"}}
+	taskManagerSource := &recordingInvocationSource{prepared: agentteams.PreparedInvocation{InvocationID: "tm-inv", ProjectID: "project-a", Role: auth.RoleTaskManager, RoomID: "room", Spec: "tm", RuntimeConfigRef: "runtime", EnvelopeRef: "envelope"}}
+	source := productionInvocationSource{taskManager: taskManagerSource, phase: phaseSource}
+
+	if prepared, err := source.LoadPreparedInvocation(context.Background(), "threadmill://phase-invocation/phase-inv/hash"); err != nil || prepared.InvocationID != "phase-inv" {
+		t.Fatalf("phase source prepared=%#v err=%v", prepared, err)
+	}
+	if prepared, err := source.LoadPreparedInvocation(context.Background(), "tm-inv"); err != nil || prepared.InvocationID != "tm-inv" {
+		t.Fatalf("task manager source prepared=%#v err=%v", prepared, err)
+	}
+	if phaseSource.calls != 1 || taskManagerSource.calls != 1 {
+		t.Fatalf("source calls phase=%d taskManager=%d", phaseSource.calls, taskManagerSource.calls)
+	}
+}
+
 func TestValidateProductionWorkspacePathsFailsClosed(t *testing.T) {
 	repository := t.TempDir()
 	worktrees := t.TempDir()
@@ -168,4 +184,15 @@ func TestValidateProductionWorkspacePathsFailsClosed(t *testing.T) {
 	if err := validateProductionWorkspacePaths(repository, worktrees+"-missing"); err == nil {
 		t.Fatal("missing worktree parent accepted")
 	}
+}
+
+type recordingInvocationSource struct {
+	calls    int
+	prepared agentteams.PreparedInvocation
+	err      error
+}
+
+func (s *recordingInvocationSource) LoadPreparedInvocation(context.Context, string) (agentteams.PreparedInvocation, error) {
+	s.calls++
+	return s.prepared, s.err
 }

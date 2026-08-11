@@ -37,10 +37,12 @@ const productionReconcileInterval = 2 * time.Second
 // callers may inject the authoritative phase implementation without changing
 // ingress, AgentTeams, or GraphRuntime wiring.
 type productionPhaseSeams struct {
-	Controller    coordination.PhaseController
-	Runtime       mcpapi.PhaseRuntime
-	Orchestration mcpapi.OrchestrationProposalRuntime
-	Readiness     productionReadinessProbe
+	Controller     coordination.PhaseController
+	Runtime        mcpapi.PhaseRuntime
+	Orchestration  mcpapi.OrchestrationProposalRuntime
+	Readiness      productionReadinessProbe
+	TaskWorkspaces productionTaskWorkspaceProvisioner
+	TaskContexts   productionTaskContextProjector
 }
 
 func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, db *postgres.DB, phaseSeams productionPhaseSeams) (productionRuntimeDependencies, error) {
@@ -53,6 +55,10 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 		return productionRuntimeDependencies{}, err
 	}
 	store, err := objectstore.NewMinIOStore(objectstore.MinIOConfig{Endpoint: cfg.ObjectStoreEndpoint, AccessKey: cfg.ObjectStoreAccessKey, SecretKey: cfg.ObjectStoreSecretKey, Bucket: cfg.ObjectStoreBucket, Secure: cfg.ObjectStoreSecure})
+	if err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	sharedStore, err := objectstore.NewMinIOStore(objectstore.MinIOConfig{Endpoint: cfg.ObjectStoreEndpoint, AccessKey: cfg.ObjectStoreAccessKey, SecretKey: cfg.ObjectStoreSecretKey, Bucket: cfg.AgentTeamsSharedBucket, Secure: cfg.ObjectStoreSecure})
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
@@ -78,20 +84,6 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 		return productionRuntimeDependencies{}, err
 	}
 	invocationStore := runtimepkg.NewPostgresInvocationStoreFromSQL(sqlDB)
-	phaseBoundary := &productionUnavailablePhaseBoundary{invocations: invocationStore}
-	phaseConfigured := phaseSeams.Controller != nil && phaseSeams.Runtime != nil && phaseSeams.Orchestration != nil && phaseSeams.Readiness != nil
-	if phaseSeams.Controller == nil {
-		phaseSeams.Controller = phaseBoundary
-	}
-	if phaseSeams.Runtime == nil {
-		phaseSeams.Runtime = phaseBoundary
-	}
-	if phaseSeams.Orchestration == nil {
-		phaseSeams.Orchestration = phaseBoundary
-	}
-	if phaseSeams.Readiness == nil {
-		phaseSeams.Readiness = phaseBoundary
-	}
 
 	controller, err := agentteams.NewAgentTeamsControllerClient(cfg.AgentTeamsControllerURL, cfg.AgentTeamsControllerBearer, nil)
 	if err != nil {
@@ -109,6 +101,7 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
+	phaseHostStore := phasepkg.NewPostgresAgentTeamsPhaseHostStoreFromSQL(sqlDB)
 	client, err := agentteams.NewProductionClient(agentteams.ProductionClientOptions{
 		Controller:  controller,
 		Slots:       agentteams.NewHostSlotStore(sqlDB),
@@ -120,16 +113,44 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	files, err := agentteams.NewSharedObjectFileTransport(store, cfg.AgentTeamsSharedBucket, cfg.AgentTeamsSharedPrefix)
+	files, err := agentteams.NewSharedObjectFileTransport(sharedStore, cfg.AgentTeamsSharedBucket, cfg.AgentTeamsSharedPrefix)
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	adapter, err := agentteams.NewAdapter(client, ingress, files, agentteams.NewPostgresExecutionStore(sqlDB), time.Now, 30*time.Second)
+	adapter, err := agentteams.NewAdapter(client, productionInvocationSource{taskManager: ingress, phase: phaseHostStore}, files, agentteams.NewPostgresExecutionStore(sqlDB), time.Now, 30*time.Second)
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
 	if err := ingress.setDispatcher(adapter); err != nil {
 		return productionRuntimeDependencies{}, err
+	}
+	if phaseSeams.Controller == nil || phaseSeams.Runtime == nil || phaseSeams.Orchestration == nil || phaseSeams.Readiness == nil {
+		phaseSeams, err = buildProductionPhaseSeams(productionPhaseBundleOptions{
+			Config: cfg, DB: sqlDB, ProjectID: projectID, Graph: coordStore, Assembler: assembler,
+			Adapter: adapter, Ingress: ingress, ObjectStore: store, Now: time.Now,
+		})
+		if err != nil {
+			return productionRuntimeDependencies{}, err
+		}
+	}
+	phaseBoundary := &productionUnavailablePhaseBoundary{invocations: invocationStore}
+	phaseConfigured := phaseSeams.Controller != nil && phaseSeams.Runtime != nil && phaseSeams.Orchestration != nil && phaseSeams.Readiness != nil
+	if phaseSeams.Controller == nil {
+		phaseSeams.Controller = phaseBoundary
+	}
+	if phaseSeams.Runtime == nil {
+		phaseSeams.Runtime = phaseBoundary
+	}
+	if phaseSeams.Orchestration == nil {
+		phaseSeams.Orchestration = phaseBoundary
+	}
+	if phaseSeams.Readiness == nil {
+		phaseSeams.Readiness = phaseBoundary
+	}
+	if phaseSeams.TaskWorkspaces != nil || phaseSeams.TaskContexts != nil {
+		if err := taskManagerRuntime.setProductionDependencies(phaseSeams.TaskWorkspaces, phaseSeams.TaskContexts, ingress); err != nil {
+			return productionRuntimeDependencies{}, err
+		}
 	}
 	graphRuntime, err := coordination.NewRuntime(coordination.RuntimeOptions{
 		ProjectID: projectID, Store: coordStore, PhaseController: phaseSeams.Controller,
