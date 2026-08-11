@@ -348,6 +348,25 @@ func newAgentTeamsPhaseHostHarness(t *testing.T) (*AgentTeamsPhaseHost, *fakeAge
 	return host, service, writer, state
 }
 
+func TestMemoryPreparedInvocationWriterReplacesUndispatchedEnvelope(t *testing.T) {
+	writer := NewMemoryPreparedInvocationWriter()
+	first := adapter.PreparedInvocation{InvocationID: "inv-retry", Spec: "first"}
+	second := adapter.PreparedInvocation{InvocationID: "inv-retry", Spec: "second"}
+	if err := writer.SavePreparedInvocation(context.Background(), "ref-first", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SavePreparedInvocation(context.Background(), "ref-second", second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.LoadPreparedInvocation(context.Background(), "ref-first"); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("superseded prepared envelope error = %v, want not_found", err)
+	}
+	loaded, err := writer.LoadPreparedInvocation(context.Background(), "ref-second")
+	if err != nil || loaded.Spec != "second" {
+		t.Fatalf("latest prepared envelope = %#v err %v", loaded, err)
+	}
+}
+
 func validAgentTeamsDispatchRequest(invocationID string) DispatchRequest {
 	now := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
 	invocation := baseruntime.Invocation{

@@ -350,6 +350,11 @@ func (w *MemoryPreparedInvocationWriter) SavePreparedInvocation(ctx context.Cont
 	if existing, ok := w.items[ref]; ok && !samePreparedInvocation(existing, prepared) {
 		return kernel.IdempotencyConflict()
 	}
+	for existingRef, existing := range w.items {
+		if existingRef != ref && existing.InvocationID == prepared.InvocationID {
+			delete(w.items, existingRef)
+		}
+	}
 	w.items[ref] = clonePreparedInvocation(prepared)
 	return nil
 }
@@ -392,6 +397,19 @@ func (s *PostgresAgentTeamsPhaseHostStore) SavePreparedInvocation(ctx context.Co
 	requiredCapabilities, err := json.Marshal(prepared.RequiredCapabilities)
 	if err != nil {
 		return kernel.InvalidArgument("prepared required capabilities cannot be encoded")
+	}
+	// A recoverable pre-dispatch retry may re-render Context after the previous
+	// attempt was cleaned up. Until host state exists, only the newest prepared
+	// envelope is reachable; retaining every failed envelope creates unbounded
+	// rows for one deterministic Invocation.
+	if _, err := s.db.ExecContext(ctx, `
+DELETE FROM phase_agentteams_prepared_invocations p
+WHERE p.invocation_id = $1
+  AND p.invocation_ref <> $2
+  AND NOT EXISTS (
+    SELECT 1 FROM phase_agentteams_host_states h WHERE h.invocation_id = $1
+  )`, prepared.InvocationID, ref); err != nil {
+		return err
 	}
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO phase_agentteams_prepared_invocations (
