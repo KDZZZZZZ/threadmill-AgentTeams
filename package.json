@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "design:check": "designmd lint DESIGN.md && designmd export --format dtcg DESIGN.md"
+  },
+  "devDependencies": {
+    "@google/design.md": "^0.4.0",
+    "better-icons": "^1.0.4"
+  }
+}

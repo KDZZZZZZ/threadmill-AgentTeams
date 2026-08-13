@@ -285,6 +285,7 @@ verify 失败（契约不满足、计划过时、缺前置）→ verifier 提交
 - [Task Manager Agent 定义与工具](./task-manager-agent.md)
 - [Phase Agent 接口与数据结构契约](./phase-agent.md)
 - [Context Agent 定义与工具](./context-agent.md)
+- [五类 Agent 主提示词与 Skill 目录](./agent-prompts.md)
 - [Coordination Graph 详细设计](./coordination-graph.md)
 - [Agent Runtime 详细设计](./agent-runtime.md)
 - [Context Graph 节点与子图设计](./context-graph.md)

@@ -39,6 +39,7 @@ TEAMS_INTERNAL_CONTROL_MARKER = (
 )
 TEAMS_CONTEXT_START = "<!-- BEGIN AGENTTEAMS RUNTIME TEAM CONTEXT -->"
 TEAMS_CONTEXT_END = "<!-- END AGENTTEAMS RUNTIME TEAM CONTEXT -->"
+THREADMILL_INVOCATION_MCP_KEY = re.compile(r"^threadmill-[0-9a-f]{24}$")
 AGENT_IDENTITY_DATA_ENDPOINT_FORMAT = "agentidentitydata.{region_id}.aliyuncs.com"
 REGION_ID_ENV_NAMES = ("AGENTTEAMS_REGION", "ALIBABA_CLOUD_REGION_ID", "REGION_ID")
 
@@ -127,6 +128,10 @@ def _named_keys(value: Any) -> str:
         return "-"
     names = sorted(str(name).strip() for name in value.keys() if str(name).strip())
     return ",".join(names) if names else "-"
+
+
+def _is_threadmill_invocation_mcp_key(value: str) -> bool:
+    return THREADMILL_INVOCATION_MCP_KEY.fullmatch(_string(value)) is not None
 
 
 def _duration_ms(started_at: float) -> int:
@@ -1560,6 +1565,8 @@ class RuntimeUpdater:
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
         for key in sorted((managed & existing.keys()) - servers.keys()):
+            if _is_threadmill_invocation_mcp_key(key):
+                continue
             self.api_client.delete_mcp(key)
         for key, server in servers.items():
             transport = _string(server.get("transport") or "http")
@@ -1604,6 +1611,8 @@ class RuntimeUpdater:
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
         for key in sorted((managed & existing.keys()) - servers.keys()):
+            if _is_threadmill_invocation_mcp_key(key):
+                continue
             self.api_client.delete_mcp(key)
         for key, server in servers.items():
             payload = dict(server)

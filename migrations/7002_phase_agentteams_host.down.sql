@@ -1,0 +1,5 @@
+DROP INDEX IF EXISTS phase_agentteams_host_states_execution_idx;
+DROP TABLE IF EXISTS phase_agentteams_host_states;
+
+DROP INDEX IF EXISTS phase_agentteams_prepared_invocations_invocation_idx;
+DROP TABLE IF EXISTS phase_agentteams_prepared_invocations;

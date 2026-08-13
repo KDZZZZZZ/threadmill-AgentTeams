@@ -1,0 +1,7 @@
+interface:
+  display_name: "编排升级"
+  short_description: "提交依赖、重排、拆分、重试等可审计的编排意图或独立需求"
+  default_prompt: "使用 $orchestration-escalation 提交当前所需的编排意图。"
+
+policy:
+  allow_implicit_invocation: false

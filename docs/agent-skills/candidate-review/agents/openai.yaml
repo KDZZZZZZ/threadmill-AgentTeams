@@ -1,0 +1,7 @@
+interface:
+  display_name: "候选记忆审查"
+  short_description: "逐项原子审查冻结的任务记忆候选批次并提交完整裁决结果"
+  default_prompt: "使用 $candidate-review 原子审查本次冻结的候选批次。"
+
+policy:
+  allow_implicit_invocation: false

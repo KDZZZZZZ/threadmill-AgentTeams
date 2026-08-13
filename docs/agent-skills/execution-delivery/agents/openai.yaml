@@ -1,0 +1,7 @@
+interface:
+  display_name: "执行阶段交付"
+  short_description: "在批准范围内实施计划、运行检查并生成可独立复核的证据"
+  default_prompt: "使用 $execution-delivery 安全实施已批准的 Threadmill 计划。"
+
+policy:
+  allow_implicit_invocation: false

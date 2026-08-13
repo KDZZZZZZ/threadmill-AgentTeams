@@ -1,0 +1,7 @@
+interface:
+  display_name: "上下文订阅"
+  short_description: "管理当前调用的上下文订阅、取消操作、订阅并集与增量事件"
+  default_prompt: "使用 $context-subscription 管理当前调用的上下文订阅与增量事件。"
+
+policy:
+  allow_implicit_invocation: false

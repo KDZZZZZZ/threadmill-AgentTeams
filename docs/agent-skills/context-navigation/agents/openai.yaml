@@ -1,0 +1,7 @@
+interface:
+  display_name: "上下文导航"
+  short_description: "在权限和预算范围内列出并渐进探索当前可见的上下文子图"
+  default_prompt: "使用 $context-navigation 检查当前可见的 Threadmill 上下文。"
+
+policy:
+  allow_implicit_invocation: false
