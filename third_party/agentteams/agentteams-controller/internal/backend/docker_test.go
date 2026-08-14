@@ -12,6 +12,22 @@ import (
 	"testing"
 )
 
+func TestRetryableHostPortErrorIncludesWindowsExcludedPort(t *testing.T) {
+	tests := []struct {
+		message string
+		want    bool
+	}{
+		{message: "Bind for 0.0.0.0:11460 failed: port is already allocated", want: true},
+		{message: "listen tcp 0.0.0.0:11460: bind: An attempt was made to access a socket in a way forbidden by its access permissions.", want: true},
+		{message: "permission denied opening image layer", want: false},
+	}
+	for _, tt := range tests {
+		if got := retryableHostPortError(tt.message); got != tt.want {
+			t.Fatalf("retryableHostPortError(%q) = %v, want %v", tt.message, got, tt.want)
+		}
+	}
+}
+
 // mockDockerAPI creates a test HTTP server that simulates Docker Engine API responses.
 func mockDockerAPI(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -65,7 +81,10 @@ func mockDockerAPI(t *testing.T) *httptest.Server {
 			"Id":    id,
 			"Name":  "/" + name,
 			"State": map[string]interface{}{"Status": "created"},
-			"Image": body["Image"],
+			"Image": "sha256-" + fmt.Sprint(body["Image"]),
+			"Config": map[string]interface{}{
+				"Image": body["Image"],
+			},
 		}
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{"Id": id})
@@ -379,6 +398,9 @@ func TestDockerCreatePullsImage(t *testing.T) {
 	if result.Status != StatusRunning {
 		t.Errorf("expected running, got %s", result.Status)
 	}
+	if result.Image != "custom/image:v2" {
+		t.Errorf("expected image custom/image:v2, got %q", result.Image)
+	}
 }
 
 // captureCreateImagesServer is a minimal Docker mock that records the Image
@@ -447,6 +469,40 @@ func TestDockerStatus(t *testing.T) {
 	}
 	if result.Status != StatusRunning {
 		t.Errorf("expected running, got %s", result.Status)
+	}
+	if result.Image != "img:latest" {
+		t.Errorf("expected image img:latest, got %q", result.Image)
+	}
+	if result.ImageID == "" {
+		t.Error("expected image ID from Docker inspect")
+	}
+}
+
+func TestDockerResolveImageID(t *testing.T) {
+	srv := mockDockerAPI(t)
+	defer srv.Close()
+	b := newTestDockerBackend(t, srv.URL)
+
+	got, err := b.ResolveImageID(context.Background(), "img:latest")
+	if err != nil {
+		t.Fatalf("ResolveImageID failed: %v", err)
+	}
+	if got != "sha256-img:latest" {
+		t.Fatalf("ResolveImageID=%q, want sha256-img:latest", got)
+	}
+}
+
+func TestDockerResolveImageIDUnknownIsEmpty(t *testing.T) {
+	srv := mockDockerAPI(t)
+	defer srv.Close()
+	b := newTestDockerBackend(t, srv.URL)
+
+	got, err := b.ResolveImageID(context.Background(), "missing/image:latest")
+	if err != nil {
+		t.Fatalf("ResolveImageID unknown image error: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("ResolveImageID unknown=%q, want empty", got)
 	}
 }
 

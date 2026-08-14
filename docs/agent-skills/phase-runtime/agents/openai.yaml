@@ -1,0 +1,7 @@
+interface:
+  display_name: "阶段运行时"
+  short_description: "处理阶段调用的启动、恢复、输入等待、动态事件以及受控停止"
+  default_prompt: "使用 $phase-runtime 处理当前阶段调用及其输入生命周期。"
+
+policy:
+  allow_implicit_invocation: false

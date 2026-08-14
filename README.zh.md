@@ -6,8 +6,8 @@
 
 **把多 Agent 工作变成可审计、可恢复、可交付的控制平面。**
 
-[![Go](https://img.shields.io/badge/Go-1.23.3-00ADD8?logo=go&logoColor=white)](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main)
-[![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/web)
+[![Go](https://img.shields.io/badge/Go-1.23.3-00ADD8?logo=go&logoColor=white)](go.mod)
+[![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](web)
 [![Status](https://img.shields.io/badge/status-alpha-f0b429)](#状态)
 
 requirement → plan → execute → verify → merge → done
@@ -15,7 +15,13 @@ requirement → plan → execute → verify → merge → done
 </div>
 
 > [!NOTE]
-> 这份 README 是 main 分支对当前可运行实现的总览；实现代码来自 oops-dev，现保存在[预览快照](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main)。main 当前以设计文档为主，下面的本地启动命令请在预览快照执行。
+> 这份 README 描述仓库内的可运行实现；下面的本地操作台和验证命令可以直接从当前检出运行。
+
+## 协作回放
+
+[![Threadmill 协调图与共享上下文回放](docs/assets/threadmill-coordination-demo.png)](docs/assets/threadmill-coordination-demo.mp4)
+
+[播放 1 分 47 秒 MP4](docs/assets/threadmill-coordination-demo.mp4)。revision 87 之前来自记录的真实时间线；末尾标为 `demo` 的四帧仅用于演示协调图完结状态。
 
 ## 一句话理解
 
@@ -175,34 +181,30 @@ sequenceDiagram
 
 ## 仓库导航
 
-设计文档位于 main；实现目录链接到从 oops-dev 生成的预览快照，确保这份 README 在代码尚未晋升时仍然准确。
+设计契约与其实现位于同一棵目录树中。
 
 | 区域 | 作用 |
 | --- | --- |
-| [docs/architecture.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/architecture.md) | 系统边界与依赖方向 |
-| [docs/task-graph.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/task-graph.md) | 持久化工作身份与图语义 |
-| [docs/workspace-merge.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/workspace-merge.md) | Workspace 绑定与 Merge Queue 策略 |
-| [docs/CONTEXT.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/CONTEXT.md) | 上下文和记忆模型 |
-| [cmd/threadmilld](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/cmd/threadmilld) | CLI：serve、migrate、check、bootstrap-operator |
-| [internal/coordination](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/coordination) | Coordination Graph、revision、lease 与 runtime |
-| [internal/contextgraph](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/contextgraph) | 订阅、切片、delta 与记忆审核 |
-| [internal/taskmanager](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/taskmanager) | 需求入口与决策持久化 |
-| [internal/workspace](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/workspace) | Workspace Binding 与仓库操作 |
-| [internal/mergequeue](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/mergequeue) | latest-main 验证与 main 写入门 |
-| [internal/uiprojection](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/uiprojection) | 权限过滤快照与 UI 事件 |
-| [web](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/web) | React + TypeScript + Vite 操作台 |
-| [api/openapi](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/api/openapi) | 浏览器端契约 |
-| [third_party/agentteams](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/main/third_party/agentteams) | 归档 provider 代码；根项目默认只读 |
+| [docs/architecture.md](docs/architecture.md) | 系统边界与依赖方向 |
+| [docs/coordination-graph.md](docs/coordination-graph.md) | 持久化工作身份与图语义 |
+| [docs/workspace-merge.md](docs/workspace-merge.md) | Workspace 绑定与 Merge Queue 策略 |
+| [docs/CONTEXT.md](docs/CONTEXT.md) | 上下文和记忆模型 |
+| [cmd/threadmilld](cmd/threadmilld) | CLI：serve、migrate、check、bootstrap-operator |
+| [internal/coordination](internal/coordination) | Coordination Graph、revision、lease 与 runtime |
+| [internal/contextgraph](internal/contextgraph) | 订阅、切片、delta 与记忆审核 |
+| [internal/taskmanager](internal/taskmanager) | 需求入口与决策持久化 |
+| [internal/workspace](internal/workspace) | Workspace Binding 与仓库操作 |
+| [internal/mergequeue](internal/mergequeue) | latest-main 验证与 main 写入门 |
+| [internal/uiprojection](internal/uiprojection) | 权限过滤快照与 UI 事件 |
+| [web](web) | React + TypeScript + Vite 操作台 |
+| [api/openapi](api/openapi) | 浏览器端契约 |
+| [third_party/agentteams](third_party/agentteams) | 归档 provider 代码；仅在任务明确涉及 adapter 基座时修改 |
 
-## 快速开始：运行预览版
-
-下面的命令针对从 oops-dev 生成的预览快照，不是以文档为主的 main 快照：
+## 快速开始
 
 ~~~powershell
 git clone https://github.com/KDZZZZZZ/threadmill-AgentTeams.git
 cd threadmill-AgentTeams
-git fetch origin docs/readme-oops-dev-main
-git switch --track origin/docs/readme-oops-dev-main
 
 npm --prefix web ci
 npm --prefix web run build
@@ -227,19 +229,19 @@ npm --prefix web run build
 
 | 能力 | 证据 | 状态 |
 | --- | --- | --- |
-| 持久化工作模型 | 设计文档定义 Requirement、Contract、Task、Attempt、Invocation 与阶段端点 | 设计进行中 |
-| Coordination / Context Graph | 所有权、revision、订阅、切片和 delta 已明确分离 | 设计进行中 |
-| 本地操作台 | 预览快照包含 fake host、OpenAPI、SSE、projection 和 React 验收路径 | 预览版 |
+| 持久化工作模型 | Requirement、Contract、Task、Attempt、Invocation 与阶段端点已有实现和测试 | 已实现 |
+| Coordination / Context Graph | 所有权、revision、订阅、切片和 delta 作为独立持久模型实现 | 已实现 |
+| 本地操作台 | fake host、OpenAPI、SSE、过滤投影和 React 验收路径 | 已实现 |
 | 生产运行时 | PostgreSQL、MinIO/S3、真实 provider 凭据、跨进程恢复和部署仍需环境验证 | 尚未宣称完成 |
 
 ## 深入阅读
 
-- [统一设计](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/threadmill-unified-design.md)
-- [Coordination Graph](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/coordination-graph.md)
-- [Context Graph](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/context-graph.md)
-- [GUI 与 SSE](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/gui.md)
-- [设计—代码—测试追踪](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/traceability.md)
-- [架构设计依据](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/design-rationale.md)
+- [统一设计](docs/threadmill-unified-design.md)
+- [Coordination Graph](docs/coordination-graph.md)
+- [Context Graph](docs/context-graph.md)
+- [GUI 与 SSE](docs/gui.md)
+- [设计—代码—测试追踪](docs/traceability.md)
+- [架构设计依据](docs/design-rationale.md)
 
 ## 贡献
 

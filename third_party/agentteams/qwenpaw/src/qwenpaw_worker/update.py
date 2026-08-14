@@ -1553,13 +1553,12 @@ class RuntimeUpdater:
             if servers:
                 raise RuntimeError("QwenPaw API client is required for MCP configuration")
             return
-        existing = {str(item.get("key")): item for item in self.api_client.list_mcp()}
         ownership_path = self.config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
         try:
             managed = set(json.loads(ownership_path.read_text(encoding="utf-8")))
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
-        for key in sorted((managed & existing.keys()) - servers.keys()):
+        for key in sorted(managed - servers.keys()):
             self.api_client.delete_mcp(key)
         for key, server in servers.items():
             transport = _string(server.get("transport") or "http")
@@ -1576,7 +1575,7 @@ class RuntimeUpdater:
                 "env": dict(server.get("env") or {}),
                 "cwd": _string(server.get("cwd")),
             }
-            if key in existing:
+            if self.api_client.get_mcp_if_present(key) is not None:
                 self.api_client.update_mcp(key, payload)
             else:
                 self.api_client.create_mcp(key, payload)
@@ -1595,7 +1594,6 @@ class RuntimeUpdater:
                     "QwenPaw API client is required for agent package MCP configuration",
                 )
             return
-        existing = {str(item.get("key")): item for item in self.api_client.list_mcp()}
         ownership_path = (
             self.config.qwenpaw_working_dir / ".agentteams-managed-package-mcp.json"
         )
@@ -1603,12 +1601,12 @@ class RuntimeUpdater:
             managed = set(json.loads(ownership_path.read_text(encoding="utf-8")))
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
-        for key in sorted((managed & existing.keys()) - servers.keys()):
+        for key in sorted(managed - servers.keys()):
             self.api_client.delete_mcp(key)
         for key, server in servers.items():
             payload = dict(server)
             payload.setdefault("name", key)
-            if key in existing:
+            if self.api_client.get_mcp_if_present(key) is not None:
                 self.api_client.update_mcp(key, payload)
             else:
                 self.api_client.create_mcp(key, payload)
@@ -1665,8 +1663,8 @@ class RuntimeUpdater:
             "encryption": _env_bool("AGENTTEAMS_MATRIX_E2EE"),
             "group_disabled": False,
             "dm_disabled": False,
-            "show_tool_calls": True,
-            "show_tool_results": True,
+            "show_tool_calls": False,
+            "show_tool_results": False,
             "show_thinking": True,
             "groups": groups,
             },

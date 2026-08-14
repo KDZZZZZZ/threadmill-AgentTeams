@@ -1,0 +1,7 @@
+interface:
+  display_name: "验证阶段交付"
+  short_description: "独立检查候选结果、契约和证据并形成可复现的验证报告"
+  default_prompt: "使用 $verification-delivery 独立验证本次候选结果。"
+
+policy:
+  allow_implicit_invocation: false

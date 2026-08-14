@@ -1,0 +1,7 @@
+interface:
+  display_name: "协调图控制"
+  short_description: "通过受控决定读取并更新 Threadmill 协调图的任务状态"
+  default_prompt: "使用 $coordination-control 安全读取并更新协调图。"
+
+policy:
+  allow_implicit_invocation: false

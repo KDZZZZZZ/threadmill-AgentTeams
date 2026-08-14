@@ -46,15 +46,30 @@ def prune_generated(path)
   end
 end
 
+def normalize_text_files(path)
+  extensions = %w[.json .md .py .txt .yaml .yml]
+  Dir.glob((path / "**/*").to_s).each do |item|
+    next unless File.file?(item) && extensions.include?(File.extname(item).downcase)
+
+    contents = File.binread(item)
+    normalized = contents.gsub("\r\n", "\n")
+    File.binwrite(item, normalized) unless normalized == contents
+  end
+end
+
+def python_command
+  candidates = [ENV["PYTHON"], "python3", "python"].compact.uniq
+  candidates.each do |candidate|
+    _, _, status = Open3.capture3(candidate, "--version")
+    return candidate if status.success?
+  rescue Errno::ENOENT
+    next
+  end
+  abort("no usable Python interpreter found")
+end
+
 def zip_dir(root, package_name, out_path)
   FileUtils.rm_f(out_path)
-  if system("zip", "-v", out: File::NULL, err: File::NULL)
-    Dir.chdir(root) do
-      system("zip", "-qry", out_path.to_s, package_name) || abort("zip failed")
-    end
-    return
-  end
-
   python = <<~PY
     import os, zipfile
     root = #{root.to_s.dump}
@@ -68,7 +83,7 @@ def zip_dir(root, package_name, out_path)
                 rel = os.path.relpath(path, root)
                 zf.write(path, rel)
   PY
-  stdout, stderr, status = Open3.capture3("python3", "-c", python)
+  stdout, stderr, status = Open3.capture3(python_command, "-c", python)
   abort("python zip failed: #{stderr}#{stdout}") unless status.success?
 end
 
@@ -134,6 +149,7 @@ Dir.mktmpdir("teamharness-qwenpaw-") do |tmp|
     encoding: "UTF-8"
   )
 
+  normalize_text_files(staging)
   prune_generated(staging)
 
   validate = adapter_root / "scripts/validate-qwenpaw-plugin.rb"

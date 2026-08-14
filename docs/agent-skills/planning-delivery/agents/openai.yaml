@@ -1,0 +1,7 @@
+interface:
+  display_name: "计划阶段交付"
+  short_description: "根据任务契约产出计划、声明写集、风险说明与验证方案"
+  default_prompt: "使用 $planning-delivery 产出符合契约的计划阶段交付。"
+
+policy:
+  allow_implicit_invocation: false

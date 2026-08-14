@@ -1,0 +1,7 @@
+interface:
+  display_name: "上下文语义检索"
+  short_description: "把自然语言上下文问题转换为受权限约束的机械检索请求"
+  default_prompt: "使用 $context-semantic-retrieval 回答调用方的上下文检索问题。"
+
+policy:
+  allow_implicit_invocation: false

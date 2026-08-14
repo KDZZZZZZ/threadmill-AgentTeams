@@ -82,7 +82,9 @@ class FileSync:
         self.mc_alias = _storage_alias()
         self._alias_set = False
 
-    def _mc(self, *args: str, check: bool = True, text: bool = True) -> subprocess.CompletedProcess:
+    def _mc(
+        self, *args: str, check: bool = True, text: bool = True
+    ) -> subprocess.CompletedProcess:
         mc_bin = shutil.which("mc")
         if not mc_bin:
             raise RuntimeError("mc binary not found")
@@ -98,11 +100,17 @@ class FileSync:
             return
         if os.getenv(f"MC_HOST_{self.mc_alias}"):
             self._alias_set = True
-            logger.info("storage alias ready component=sync worker=%s mode=env", self.worker_name)
+            logger.info(
+                "storage alias ready component=sync worker=%s mode=env",
+                self.worker_name,
+            )
             return
         if os.getenv("AGENTTEAMS_RUNTIME") == "k8s":
             self._alias_set = True
-            logger.info("storage alias ready component=sync worker=%s mode=k8s-wrapper", self.worker_name)
+            logger.info(
+                "storage alias ready component=sync worker=%s mode=k8s-wrapper",
+                self.worker_name,
+            )
             return
         missing = [
             name
@@ -126,11 +134,22 @@ class FileSync:
             self.bucket,
         )
         try:
-            self._mc("alias", "set", self.mc_alias, endpoint, self.access_key, self.secret_key)
+            self._mc(
+                "alias",
+                "set",
+                self.mc_alias,
+                endpoint,
+                self.access_key,
+                self.secret_key,
+            )
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"configure storage alias failed: {_mc_error_message(exc)}") from None
+            raise RuntimeError(
+                f"configure storage alias failed: {_mc_error_message(exc)}"
+            ) from None
         self._alias_set = True
-        logger.info("storage alias ready component=sync worker=%s mode=static", self.worker_name)
+        logger.info(
+            "storage alias ready component=sync worker=%s mode=static", self.worker_name
+        )
 
     def _object_path(self, key: str) -> str:
         return f"{self.mc_alias}/{self.bucket}/{key.strip('/')}"
@@ -142,7 +161,9 @@ class FileSync:
             return result.stdout
         if _looks_like_missing_object_error(result.stderr):
             return None
-        logger.debug("mc cat failed component=sync key=%s returncode=%s", key, result.returncode)
+        logger.debug(
+            "mc cat failed component=sync key=%s returncode=%s", key, result.returncode
+        )
         return None
 
     def _cat_bytes(self, key: str) -> Optional[bytes]:
@@ -150,7 +171,11 @@ class FileSync:
         try:
             result = self._mc("cat", self._object_path(key), check=False, text=False)
         except Exception as exc:
-            logger.debug("mc cat failed component=sync key=%s error_type=%s", key, type(exc).__name__)
+            logger.debug(
+                "mc cat failed component=sync key=%s error_type=%s",
+                key,
+                type(exc).__name__,
+            )
             return None
         if result.returncode == 0:
             stdout = result.stdout
@@ -159,7 +184,9 @@ class FileSync:
             return _to_text(stdout).encode("utf-8")
         if _looks_like_missing_object_error(result.stderr):
             return None
-        logger.debug("mc cat failed component=sync key=%s returncode=%s", key, result.returncode)
+        logger.debug(
+            "mc cat failed component=sync key=%s returncode=%s", key, result.returncode
+        )
         return None
 
     def _mirror_prefix(self, remote_prefix: str, local_dir: Path) -> None:
@@ -184,7 +211,9 @@ class FileSync:
             if _looks_like_missing_object_error(exc.stderr):
                 logger.info("storage prefix is empty component=sync remote=%s", remote)
                 return
-            raise RuntimeError(f"mirror storage failed: {_mc_error_message(exc)}") from None
+            raise RuntimeError(
+                f"mirror storage failed: {_mc_error_message(exc)}"
+            ) from None
         logger.info(
             "mirrored storage prefix component=sync worker=%s remote=%s local=%s",
             self.worker_name,
@@ -201,7 +230,9 @@ class FileSync:
         self.ensure_alias()
         self._mirror_prefix(remote_prefix, local_dir)
 
-    def pull_runtime_config(self, local_path: Path, remote_key: Optional[str] = None) -> bool:
+    def pull_runtime_config(
+        self, local_path: Path, remote_key: Optional[str] = None
+    ) -> bool:
         self.ensure_alias()
         key = remote_key or f"{self.remote_prefix}/runtime/runtime.yaml"
         local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,7 +240,9 @@ class FileSync:
         if result.returncode == 0:
             return True
         if _looks_like_missing_object_error(result.stderr):
-            logger.info("runtime config not found in storage component=sync key=%s", key)
+            logger.info(
+                "runtime config not found in storage component=sync key=%s", key
+            )
             return False
         raise RuntimeError(f"pull runtime config failed: {_mc_error_message(result)}")
 
@@ -225,7 +258,9 @@ class FileSync:
             try:
                 rel = path.resolve().relative_to(local_root)
             except ValueError:
-                raise ValueError(f"path is outside worker storage root: {path}") from None
+                raise ValueError(
+                    f"path is outside worker storage root: {path}"
+                ) from None
             key = f"{self.remote_prefix}/{rel.as_posix()}"
             if path.stat().st_size <= COMPARE_CONTENT_MAX_BYTES:
                 remote = self._cat_bytes(key)
@@ -234,7 +269,9 @@ class FileSync:
             try:
                 self._mc("cp", str(path), self._object_path(key), check=True)
             except subprocess.CalledProcessError as exc:
-                raise RuntimeError(f"persist migrated state failed: {_mc_error_message(exc)}") from None
+                raise RuntimeError(
+                    f"persist migrated state failed: {_mc_error_message(exc)}"
+                ) from None
             pushed.append(rel.as_posix())
         return pushed
 
@@ -250,12 +287,16 @@ class FileSync:
             try:
                 rel = directory.resolve().relative_to(local_root)
             except ValueError:
-                raise ValueError(f"directory is outside worker storage root: {directory}") from None
+                raise ValueError(
+                    f"directory is outside worker storage root: {directory}"
+                ) from None
             remote = self._object_path(f"{self.remote_prefix}/{rel.as_posix()}")
             try:
                 self._mc("mirror", f"{directory}/", f"{remote}/", "--overwrite")
             except subprocess.CalledProcessError as exc:
-                raise RuntimeError(f"persist migrated state failed: {_mc_error_message(exc)}") from None
+                raise RuntimeError(
+                    f"persist migrated state failed: {_mc_error_message(exc)}"
+                ) from None
             mirrored.append(rel.as_posix())
         return mirrored
 
@@ -270,17 +311,32 @@ def _skip_background_push(rel: Path) -> bool:
         ".qwenpaw/workspaces/default/shared",
         ".qwenpaw/workspaces/default/global-shared",
         ".qwenpaw/workspaces/default/tool_result",
+        ".qwenpaw/workspaces/default/tool_results",
+        ".qwenpaw/workspaces/default/tool-results",
+        ".qwenpaw/workspaces/default/sessions",
+        ".qwenpaw/workspaces/default/notes",
+        ".qwenpaw/workspaces/default/memory",
+        ".qwenpaw/workspaces/default/mem_metadata",
         ".qwenpaw/workspaces/default/file_store",
         ".qwenpaw/workspaces/default/media",
         ".qwenpaw/workspaces/default/embedding_cache",
     )
-    if any(rel_path == prefix or rel_path.startswith(f"{prefix}/") for prefix in excluded_prefixes):
+    if any(
+        rel_path == prefix or rel_path.startswith(f"{prefix}/")
+        for prefix in excluded_prefixes
+    ):
         return True
     excluded_dirs = {".cache", ".local", ".mc", "__pycache__", "logs"}
     if any(part in excluded_dirs for part in rel.parts):
         return True
-    excluded_files = {".DS_Store", "qwenpaw.log", "heartbeat.json", "token_usage.json"}
-    if rel.name in excluded_files:
+    excluded_files = {
+        ".DS_Store",
+        "qwenpaw.log",
+        "heartbeat.json",
+        "token_usage.json",
+        "chats.json",
+    }
+    if rel.name in excluded_files or rel.name.startswith("history.db"):
         return True
     return rel.suffix in {".lock", ".pyc"}
 
@@ -315,7 +371,11 @@ def push_local(sync: FileSync, since: float = 0) -> List[str]:
             sync._mc("cp", str(path), sync._object_path(key), check=True)
             pushed.append(rel.as_posix())
         except Exception as exc:
-            logger.debug("push_local failed component=sync file=%s error_type=%s", rel, type(exc).__name__)
+            logger.debug(
+                "push_local failed component=sync file=%s error_type=%s",
+                rel,
+                type(exc).__name__,
+            )
 
     return pushed
 
@@ -344,7 +404,10 @@ async def push_loop(sync: FileSync, check_interval: float = 5) -> None:
                     _preview_list(pushed),
                 )
         except asyncio.CancelledError:
-            logger.info("qwenpaw FileSync push loop stopped component=sync worker=%s", sync.worker_name)
+            logger.info(
+                "qwenpaw FileSync push loop stopped component=sync worker=%s",
+                sync.worker_name,
+            )
             break
         except Exception as exc:
             logger.warning(

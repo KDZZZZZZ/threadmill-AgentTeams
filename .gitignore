@@ -1,4 +1,3 @@
-```
 # Logs and temp files
 *.log
 *.tmp
@@ -26,6 +25,7 @@ target/
 .gradle/
 
 # Compiled files
+*.tsbuildinfo
 *.pyc
 *.class
 *.o
@@ -44,6 +44,12 @@ Thumbs.db
 coverage/
 htmlcov/
 .coverage
+*.test
+coverage.out
+
+# Browser test artifacts
+test-results/
+playwright-report/
 
 # Compressed files
 *.zip
@@ -64,4 +70,7 @@ htmlcov/
 *.Z
 *.lz
 *.lzo
-```
+
+# Project-local agent skills
+.omc/skills/ponytail/
+.omc/skills/codebase-design/

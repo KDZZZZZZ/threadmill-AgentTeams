@@ -2466,6 +2466,9 @@ def _resolve_filesync(arguments: dict[str, Any]) -> tuple[str, str, Path, str, b
         global_root = _remote_root(global_shared_prefix)
     workspace = _workspace_dir(arguments)
     local = workspace / Path(*parts)
+    if action == "push" and local.is_dir():
+        is_directory = True
+        normalized = normalized.rstrip("/") + "/"
     remote_root = shared_root if kind == "shared" else global_root
     remote = remote_root + "/".join(parts[1:])
     if is_directory:

@@ -6,8 +6,8 @@
 
 **A control plane that turns multi-agent work into an auditable, recoverable delivery chain.**
 
-[![Go](https://img.shields.io/badge/Go-1.23.3-00ADD8?logo=go&logoColor=white)](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main)
-[![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/web)
+[![Go](https://img.shields.io/badge/Go-1.23.3-00ADD8?logo=go&logoColor=white)](go.mod)
+[![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)](web)
 [![Status](https://img.shields.io/badge/status-alpha-f0b429)](#status)
 
 requirement → plan → execute → verify → merge → done
@@ -15,7 +15,13 @@ requirement → plan → execute → verify → merge → done
 </div>
 
 > [!NOTE]
-> This README is the main-branch overview of the runnable implementation developed from oops-dev and preserved in the [preview snapshot](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main). The main branch is documentation-first; use the preview snapshot for the local console and Go commands below.
+> This README describes the runnable implementation in this repository. The local console and verification commands below run directly from the checkout.
+
+## Coordination replay
+
+[![Threadmill coordination and shared-context replay](docs/assets/threadmill-coordination-demo.png)](docs/assets/threadmill-coordination-demo.mp4)
+
+[Play the 1:47 MP4](docs/assets/threadmill-coordination-demo.mp4). The replay is backed by the recorded timeline through revision 87; the four ending frames labeled `demo` are presentation-only completion states.
 
 ## The idea
 
@@ -175,34 +181,30 @@ sequenceDiagram
 
 ## Repository map
 
-The design documents live on main; the implementation map below links to the preview snapshot derived from oops-dev so this README remains honest while the code is promoted.
+Design contracts and their implementation live in the same tree.
 
 | Area | Purpose |
 | --- | --- |
-| [docs/architecture.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/architecture.md) | System boundaries and dependency direction |
-| [docs/task-graph.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/task-graph.md) | Durable work identity and graph semantics |
-| [docs/workspace-merge.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/workspace-merge.md) | Workspace binding and Merge Queue policy |
-| [docs/CONTEXT.md](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/CONTEXT.md) | Context and memory model |
-| [cmd/threadmilld](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/cmd/threadmilld) | CLI: serve, migrate, check, bootstrap-operator |
-| [internal/coordination](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/coordination) | Coordination Graph, revisions, leases, and runtime |
-| [internal/contextgraph](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/contextgraph) | Subscriptions, slices, deltas, and memory review |
-| [internal/taskmanager](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/taskmanager) | Requirement intake and decision persistence |
-| [internal/workspace](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/workspace) | Workspace Binding and repository operations |
-| [internal/mergequeue](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/mergequeue) | Latest-main verification and main-write gate |
-| [internal/uiprojection](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/internal/uiprojection) | Permission-filtered snapshots and UI events |
-| [web](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/web) | React + TypeScript + Vite operator console |
-| [api/openapi](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/docs/readme-oops-dev-main/api/openapi) | Browser-facing contract |
-| [third_party/agentteams](https://github.com/KDZZZZZZ/threadmill-AgentTeams/tree/main/third_party/agentteams) | Archived provider code; read-only for root-project work |
+| [docs/architecture.md](docs/architecture.md) | System boundaries and dependency direction |
+| [docs/coordination-graph.md](docs/coordination-graph.md) | Durable work identity and graph semantics |
+| [docs/workspace-merge.md](docs/workspace-merge.md) | Workspace binding and Merge Queue policy |
+| [docs/CONTEXT.md](docs/CONTEXT.md) | Context and memory model |
+| [cmd/threadmilld](cmd/threadmilld) | CLI: serve, migrate, check, bootstrap-operator |
+| [internal/coordination](internal/coordination) | Coordination Graph, revisions, leases, and runtime |
+| [internal/contextgraph](internal/contextgraph) | Subscriptions, slices, deltas, and memory review |
+| [internal/taskmanager](internal/taskmanager) | Requirement intake and decision persistence |
+| [internal/workspace](internal/workspace) | Workspace Binding and repository operations |
+| [internal/mergequeue](internal/mergequeue) | Latest-main verification and main-write gate |
+| [internal/uiprojection](internal/uiprojection) | Permission-filtered snapshots and UI events |
+| [web](web) | React + TypeScript + Vite operator console |
+| [api/openapi](api/openapi) | Browser-facing contract |
+| [third_party/agentteams](third_party/agentteams) | Archived provider code; change only when the task explicitly targets the adapter substrate |
 
-## Quick start: runnable preview
-
-The following commands target the preview snapshot derived from oops-dev, not the documentation-only main snapshot:
+## Quick start
 
 ~~~powershell
 git clone https://github.com/KDZZZZZZ/threadmill-AgentTeams.git
 cd threadmill-AgentTeams
-git fetch origin docs/readme-oops-dev-main
-git switch --track origin/docs/readme-oops-dev-main
 
 npm --prefix web ci
 npm --prefix web run build
@@ -227,19 +229,19 @@ GitHub Actions are intentionally disabled for this repository. The commands abov
 
 | Capability | Evidence | Status |
 | --- | --- | --- |
-| Durable work model | Requirements, Contracts, Tasks, Attempts, Invocations, and phase endpoints are specified in the design docs | Active design |
-| Coordination and Context Graphs | Ownership, revisions, subscriptions, slices, and deltas are explicitly separated | Active design |
-| Local operator console | The preview snapshot contains the fake-host, OpenAPI, SSE, projection, and React acceptance path | Preview |
+| Durable work model | Requirements, Contracts, Tasks, Attempts, Invocations, and phase endpoints are implemented and covered by tests | Implemented |
+| Coordination and Context Graphs | Ownership, revisions, subscriptions, slices, and deltas are implemented as separate durable models | Implemented |
+| Local operator console | Fake host, OpenAPI, SSE, filtered projection, and React acceptance path | Implemented |
 | Production runtime | PostgreSQL, MinIO/S3, real provider credentials, cross-process recovery, and deployment still require environment-backed validation | Not claimed complete |
 
 ## Further reading
 
-- [Unified design](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/threadmill-unified-design.md)
-- [Coordination Graph](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/coordination-graph.md)
-- [Context Graph](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/context-graph.md)
-- [GUI and SSE](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/gui.md)
-- [Traceability](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/docs/readme-oops-dev-main/docs/traceability.md)
-- [Architecture rationale](https://github.com/KDZZZZZZ/threadmill-AgentTeams/blob/main/docs/design-rationale.md)
+- [Unified design](docs/threadmill-unified-design.md)
+- [Coordination Graph](docs/coordination-graph.md)
+- [Context Graph](docs/context-graph.md)
+- [GUI and SSE](docs/gui.md)
+- [Traceability](docs/traceability.md)
+- [Architecture rationale](docs/design-rationale.md)
 
 ## Contributing
 

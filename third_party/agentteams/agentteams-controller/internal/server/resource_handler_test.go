@@ -322,6 +322,7 @@ func TestGetWorkerEnrichesTeamReferencesMemberCR(t *testing.T) {
 	worker.Spec.Skills = []string{"github-operations"}
 	worker.Status.RoomID = "!worker-room:example.com"
 	worker.Status.MatrixUserID = "@alpha-dev:example.com"
+	worker.Status.LastHeartbeat = "2026-08-12T14:30:00Z"
 
 	team := &v1beta1.Team{}
 	team.Name = "alpha-team"
@@ -353,6 +354,9 @@ func TestGetWorkerEnrichesTeamReferencesMemberCR(t *testing.T) {
 	}
 	if resp.Runtime != "copaw" || resp.RoomID != "!worker-room:example.com" {
 		t.Fatalf("runtime/room not preserved from Worker CR: %+v", resp)
+	}
+	if resp.LastHeartbeat != "2026-08-12T14:30:00Z" {
+		t.Fatalf("lastHeartbeat not preserved from Worker CR: %+v", resp)
 	}
 	if resp.Identity != "backend engineer" || !reflect.DeepEqual(resp.Skills, []string{"github-operations"}) {
 		t.Fatalf("Worker spec not preserved in response: %+v", resp)
@@ -405,6 +409,7 @@ func TestListWorkersTeamFilterIncludesTeamReferencesMembers(t *testing.T) {
 	lead.Name = "alpha-lead"
 	lead.Namespace = "default"
 	lead.Spec.Runtime = "copaw"
+	lead.Status.LastHeartbeat = "2026-08-12T14:31:00Z"
 
 	dev := &v1beta1.Worker{}
 	dev.Name = "alpha-dev"
@@ -440,14 +445,19 @@ func TestListWorkersTeamFilterIncludesTeamReferencesMembers(t *testing.T) {
 		t.Fatalf("expected 2 team members, got %d: %+v", list.Total, list.Workers)
 	}
 	roles := map[string]string{}
+	heartbeats := map[string]string{}
 	for _, w := range list.Workers {
 		if w.Team != "alpha-team" {
 			t.Fatalf("unexpected team for %s: %+v", w.Name, w)
 		}
 		roles[w.Name] = w.Role
+		heartbeats[w.Name] = w.LastHeartbeat
 	}
 	if roles["alpha-lead"] != "team_leader" || roles["alpha-dev"] != "worker" {
 		t.Fatalf("roles=%v, want lead team_leader and dev worker", roles)
+	}
+	if heartbeats["alpha-lead"] != "2026-08-12T14:31:00Z" {
+		t.Fatalf("heartbeats=%v, want alpha-lead heartbeat", heartbeats)
 	}
 	if _, ok := roles["solo"]; ok {
 		t.Fatalf("solo worker leaked into team filter: %+v", list.Workers)

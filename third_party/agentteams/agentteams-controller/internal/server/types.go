@@ -73,6 +73,7 @@ type WorkerResponse struct {
 	ContainerState   string                     `json:"containerState,omitempty"`
 	MatrixUserID     string                     `json:"matrixUserID,omitempty"`
 	RoomID           string                     `json:"roomID,omitempty"`
+	LastHeartbeat    string                     `json:"lastHeartbeat,omitempty"`
 	Message          string                     `json:"message,omitempty"`
 	ExposedPorts     []ExposedPortInfo          `json:"exposedPorts,omitempty"`
 	Team             string                     `json:"team,omitempty"`

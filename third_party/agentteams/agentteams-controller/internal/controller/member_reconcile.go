@@ -514,12 +514,15 @@ func ensureMemberContainerPresent(ctx context.Context, d MemberDeps, m MemberCon
 	// doc). Both Worker and Team paths fill this boolean with their own
 	// equivalence check so this phase stays agnostic of the upstream CR.
 	specChanged := m.SpecChanged
-	if specChanged && result.Status != backend.StatusNotFound {
-		logger.Info("spec changed, deleting stale backend resource before recreate",
+	imageChanged := backend.ImageChanged(ctx, wb, m.Spec.Image, result)
+	if (specChanged || imageChanged) && result.Status != backend.StatusNotFound {
+		logger.Info("spec or backend image changed, deleting stale backend resource before recreate",
 			"name", m.Name,
 			"backend", wb.Name(),
 			"status", result.Status,
-			"rawStatus", result.RawStatus)
+			"rawStatus", result.RawStatus,
+			"desiredImage", m.Spec.Image,
+			"actualImage", result.Image)
 		if err := wb.Delete(ctx, m.Name); err != nil && !errors.Is(err, backend.ErrNotFound) {
 			return reconcile.Result{}, fmt.Errorf("delete stale backend resource before recreate: %w", err)
 		}

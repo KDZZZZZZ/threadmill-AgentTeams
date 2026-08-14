@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -298,6 +299,8 @@ type WorkerResult struct {
 	DeploymentMode  string       `json:"deployment_mode"`
 	Status          WorkerStatus `json:"status"`
 	ContainerID     string       `json:"container_id,omitempty"`
+	Image           string       `json:"image,omitempty"`
+	ImageID         string       `json:"image_id,omitempty"`
 	AppID           string       `json:"app_id,omitempty"`
 	RawStatus       string       `json:"raw_status,omitempty"`
 	ConsoleHostPort string       `json:"console_host_port,omitempty"`
@@ -339,6 +342,76 @@ type WorkerBackend interface {
 
 	// Status returns the current status of a worker.
 	Status(ctx context.Context, name string) (*WorkerResult, error)
+}
+
+// ImageResolver is an optional backend capability for resolving an image
+// reference to the backend-local immutable image ID. Docker implements this;
+// Kubernetes and sandbox backends intentionally do not, so callers must not
+// infer digest drift for them.
+type ImageResolver interface {
+	ResolveImageID(ctx context.Context, image string) (string, error)
+}
+
+// ImageChanged compares a desired image reference with a backend-reported
+// actual image reference/ID. It only reports drift when both sides are known.
+// If the mutable image ref string is identical, it asks Docker-like backends
+// for the current local desired image ID and compares that against the
+// container image ID. Failure to resolve the desired ID is fail-safe: no drift.
+func ImageChanged(ctx context.Context, wb WorkerBackend, desired string, result *WorkerResult) bool {
+	if result == nil {
+		return false
+	}
+	if ImageRefChanged(desired, result.Image) {
+		return true
+	}
+	if !ImageRefEquivalent(desired, result.Image) {
+		return false
+	}
+	resolver, ok := wb.(ImageResolver)
+	if !ok || strings.TrimSpace(result.ImageID) == "" {
+		return false
+	}
+	desiredID, err := resolver.ResolveImageID(ctx, desired)
+	if err != nil || strings.TrimSpace(desiredID) == "" {
+		return false
+	}
+	return normalizeImageID(desiredID) != normalizeImageID(result.ImageID)
+}
+
+// ImageRefChanged compares desired and actual mutable image references. It only
+// reports drift when both refs are known and not equivalent.
+func ImageRefChanged(desired, actual string) bool {
+	return !ImageRefEquivalent(desired, actual) &&
+		normalizeComparableImageRef(desired) != "" &&
+		normalizeComparableImageRef(actual) != ""
+}
+
+// ImageRefEquivalent returns true when two mutable image refs are known and
+// equivalent after lightweight normalization.
+func ImageRefEquivalent(desired, actual string) bool {
+	desired = normalizeComparableImageRef(desired)
+	actual = normalizeComparableImageRef(actual)
+	return desired != "" && actual != "" && desired == actual
+}
+
+func normalizeComparableImageRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	if strings.Contains(ref, "@") {
+		return strings.ToLower(ref)
+	}
+	lastSlash := strings.LastIndex(ref, "/")
+	lastColon := strings.LastIndex(ref, ":")
+	if lastColon <= lastSlash {
+		ref += ":latest"
+	}
+	return strings.ToLower(ref)
+}
+
+func normalizeImageID(id string) string {
+	return strings.TrimSpace(strings.ToLower(id))
 }
 
 // AuthTokenProjector is implemented by backends that can replace a running

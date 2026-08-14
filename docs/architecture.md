@@ -1,588 +1,296 @@
-# Multi-Agent Vibe Coding Control Plane 总体架构
+# Threadmill 总体架构
 
-版本：v0.2
+版本：v2.0（以五节点运行闭环为主线重写）
 状态：Draft
-定位：本文件只描述产品判断、总体架构、模块简述和模块间关系。各模块详细设计见文末链接。
+定位：系统总览。本文以五节点架构图为叙事中心，说明五个核心节点、两条主链路（协调链与上下文闭环）、关键边界与间接执行语义；Runtime、Workspace、Scheduler、Verify、Merge Queue 等执行支撑降为支撑层，服务于主图。本文只描述职责、依赖方向与数据流，不重复各模块详细接口。
+
+> **语义以 [threadmill-unified-design.md](./threadmill-unified-design.md) 为准**。术语定义见 [CONTEXT.md](./CONTEXT.md)；本文与模块草案冲突时，统一设计优先。
 
 ---
 
-## 1. 产品判断
+## 1. 定位与核心图
 
-当前 vibe coding 的核心瓶颈不是“agent 不够聪明”，而是 **人类被迫承担了调度系统的工作**。
+### 1.1 一句话架构
 
-当多个 agent 同时工作时，用户通常需要手动处理这些事情：
-
-1. 重新告诉新 session 当前项目状态。
-2. 解释其他 agent 正在做什么。
-3. 手动拆任务。
-4. 手动同步上下文。
-5. 手动避免 worktree 和代码冲突。
-6. 手动判断哪个结果可以合并。
-7. 手动判断新 task 是否重复、依赖谁、会阻塞谁。
-8. 手动判断运行中的 agent 应该看哪些上下文。
-
-这个系统的产品判断是：
-
-> 用户不应该管理 session，也不应该手动调度每个 agent。用户只应该表达需求、预算和并发意图；系统负责把需求登记为 requirement，再生成 task graph（统一 task 节点 + 图关系），并调度可用 agent 完成、验证和合并。
-
-因此，产品形态不是“多开几个 Claude/Codex 窗口”，而是一个 **Multi-Agent Control Plane**：
+Threadmill 是一个多 Agent 控制面：**五个核心节点**承担全部编排与记忆语义——**Phase Agent** 完成工作，**Task Manager Agent** 编排，**Coordination Graph** 记录编排，**Context Agent**（即此前 Ctx Manager Agent / 图中 ctx agent）管理外部记忆，**Context Graph**（图中 ctx graph）保存知识。系统只保留这两张持久图；Agent 是临时计算资源，Task 不属于任何 Agent Session。
 
 ```text
-用户输入：
-  我需要什么 + 我愿意投入多少钱/多少 agent/多少时间
-
-系统负责：
-  通过 Agent Runtime 启动 Task Manager Agent，登记 requirement、创建任务并编排依赖
-  通过 Agent Runtime 启动 Ctx Manager Agent / Ctx Agent，控制上下文存取和运行时查询
-  通过 Agent Runtime 启动 planner / executor / verifier，并包装 CLI agent 自身的 worktree/tool/git 能力
-  调度 agent、验收、处理冲突、合并
+Agent 是临时计算资源；
+Task 不属于 Agent Session；
+Coordination Graph 是编排的事实来源（谁可运行、被什么阻塞）；
+Context Graph 是所有 Agent 的外部记忆通信面；
+系统把 Requirement 变成可验收 Task，把验收结果机械合并进 main。
 ```
+
+### 1.2 五节点核心图
+
+下图与五节点架构图一致：五个节点与箭头方向逐一对应。标签中的说明文字用于澄清间接执行（详见 [第 4 节](#4-边界与间接语义)）；虚线边表示图中标注的"与 phase agent 相同"的共享 Context 操作面。
+
+```mermaid
+flowchart TB
+  PA["Phase Agent<br/>（一次 phase Invocation：planner / executor / verifier …）"]
+  CA["Context Agent<br/>（即此前 Ctx Manager Agent / 图中 ctx agent）"]
+  CX[("Context Graph<br/>（图中 ctx graph）")]
+  TM["Task Manager Agent"]
+  CG[("Coordination Graph")]
+
+  %% 上下文闭环：Phase → Context Agent 自然语言检索（独立模块接口）
+  PA -->|"请求自然语言检索（contextAgent.retrieve，独立模块接口，不属于 ContextGraphReader）"| CA
+  CA -->|"经 ContextGraphSearcher.Search 机械检索 Context Graph（关键词+scope+anchorRefs，只读不写；Searcher 仅 Context Agent 可用）"| CX
+  CX -->|"主动推送 Context Delta（revision 提交后内部订阅执行器生成，经 Runtime 送达；仅限已订阅子图）"| PA
+
+  %% 上下文闭环：Phase → Context Graph 列表 / 探索 / 订阅生命周期
+  PA -->|"列表、探索、订阅/取消订阅子图（Reader 不含 Search）；Runtime 按当前 Invocation 的有效订阅子图并集提供上下文；积累记忆仍只入 Task 缓冲"| CX
+
+  %% 协调链
+  TM -->|"编排（唯一写入口；审批 Proposal 并热修改图）"| CG
+  CG -->|"控制（经 Scheduler 选择、Runtime 启动落地）"| PA
+
+  %% Task Manager 与 phase agent 相同的 Context 操作
+  TM -.->|"请求 Context Agent 自然语言检索（与 phase agent 相同，独立模块接口）"| CA
+  TM -.->|"经 ContextGraphReader 列表/探索/订阅/取消订阅 Context Graph；Runtime 按当前 Invocation 的有效订阅子图并集提供上下文（与 phase agent 相同）"| CX
+```
+
+节点身份对照与边注释：
+
+- **Context Agent** 即此前 Ctx Manager Agent / 图中 ctx agent，**Context Graph**（图中 ctx graph）为正式名；"phase agent" 泛指任何一次 phase Invocation 内的 Agent（planner、executor、verifier 等）。
+- **每个 Task 固定三阶段**：`plan -> execute -> verify`；`prepared / done` 是派生门控状态，人工或外部决定是 blocker/decision 条件，不增加第四阶段。
+- **一个 Task 两块记忆区**：`ContextSliceRef` 指向已落图、可探索/订阅的上下文；`TaskMemoryBufferRef` 指向该 Task 三阶段共享的 append-only 候选缓冲快照。候选仅同 Task 可见，不参与图检索、revision 或推送。
+- **“积累记忆”是受控写入**：Phase Agent 经 `CandidateSubmitter`（context-graph.md §6.3）追加缓冲，经 `TaskMemoryBufferReader`（§6.2）读取；Task done 后 `TaskMemoryFinalizer`（§6.4）冻结终审。task 子图只经 `TaskContextWriter`（§6.5）投影。
+- **控制与推送分离**：Scheduler/Runtime 执行 Coordination Graph；ContextDelta 只由成功的图事务触发，缓冲追加不推送。
+
+### 1.3 核心工作链
+
+```text
+Requirement -> Task Contract -> Task -> 轮次(Round) -> Agent Invocation
+```
+
+- `Requirement`：原始目标、动机、约束与验收意图，保存来源，不直接调度。
+- `Task Contract`：稳定定义交付什么、为什么、允许边界与怎样算完成；不含实现步骤。
+- `Task`：由 Task Contract 约束的持久工作身份，寿命长于任何 Invocation。
+- `轮次（Round）`：对同一 Task 的一次有界尝试，由该轮次的 Workspace Binding 标识。
+- `Agent Invocation`：在指定角色、阶段、工作区、上下文、权限和预算下的一次有界调用。
 
 ---
 
-## 2. 核心目标
+## 2. 五节点职责
 
-1. **需求和并发解耦**
-   用户发布新任务，不等于手动开启新 agent；用户点击 `agent +1`，也不等于给某个 agent 分配具体任务。
-
-2. **第一阶段先支持 Claude Code 基本包装**
-   MVP 不先追求同时接入所有 CLI agent，而是先把 Claude Code CLI 的 headless 启动、输入输出、事件记录和能力声明跑通。
-
-3. **所有 agent 都经 Agent Runtime 运行**
-   Task Manager Agent、Ctx Manager Agent / Ctx Agent、planner、executor、verifier 都不是旁路服务；它们都是 Agent Runtime 管理的 agent invocation。差异只在 role、system prompt、context pack、tool/capability 授权和可调用的 backend service。
-
-4. **worktree 属于 agent CLI 能力包装的一部分**
-   系统不在 task graph 里重新实现一套独立 worktree 抽象；Agent Runtime 负责包装 CLI agent 自身的 worktree、tool、git 和执行目录能力，并把结果归一化给上层调度。
-
-5. **用 task graph 管理工作，而不是用 session 管理工作**
-   用户输入是 requirement；task graph 保存统一的 task、attempt 和 phase endpoint，拆解、依赖、阻塞、决策和冲突都通过图关系表达。
-
-6. **所有 requirement 都经 Task Manager Agent 编排成 task graph**
-   创建或更新 task graph 需要看到当前所有 task 及其状态，避免重复、错误依赖和不可验收拆分；人类和其他 agent 都向 Task Manager Agent 提交 requirement，由它统一创建 task、phase endpoint、decision endpoint、edge 或 blocker。
-
-7. **用 ctxlib 管理项目记忆，而不是依赖 session memory**
-   所有有价值的设计、判断、验收、失败和冲突信息沉淀到结构化上下文库。
-
-8. **ctxlib 存取由 Ctx Manager Agent / Ctx Agent 控制**
-   新 agent 启动前的 context pack 和运行中其他 agent 的 ctxlib 查询，都通过 Ctx Agent 受控访问。
-
-9. **每个 task 用 CLI agent 包装出来的 worktree 能力隔离执行**
-   agent 不直接修改 main；verify 通过后进入 merge queue。
-
-10. **复杂任务允许通过提交 requirement 扩展 task graph 作为交付**
-   执行 task 的 planner / executor / verifier 不必一次性解决所有细节，可以向 Task Manager Agent 提交新的 requirement；Task Manager Agent 负责把这些 requirement 编排成 task、phase endpoint、decision endpoint、依赖、阻塞和拆解关系。
-
-11. **verify 是进入项目事实的闸门**
-   task 只有通过验收后才允许 merge；失败则回到 plan 循环。
-
-12. **并发冲突由系统协调**
-   verify/merge 阶段检查活跃 task，如果冲突则广播 conflict context 给相关 active task，避免互相等待和死锁。
-
----
-
-## 3. 非目标
-
-本系统不追求：
-
-1. 让所有 CLI agent 拥有完全一致的能力。
-2. 把所有历史 session 原样塞进新 agent 上下文。
-3. 让 agent 自由修改 main branch。
-4. 让 execute agent 在没有 replan 的情况下任意扩大任务范围。
-5. 用 embedding-only memory 替代结构化上下文管理。
-6. 让人类继续手动协调每个 agent 的具体工作。
-
----
-
-## 4. 总体架构
-
-```text
-┌──────────────────────────────────────────────┐
-│                   Human UI                   │
-│  需求输入 / agent+1 / 预算 / 进度 / 验收       │
-└───────────────────────┬──────────────────────┘
-                        │
-                        ▼
-┌──────────────────────────────────────────────┐
-│                 Control Plane                │
-│  Scheduler / Policy / Budget / Orchestration │
-└───────────────────────┬──────────────────────┘
-                        │ AgentRunParams(role/capability/tool policy)
-                        ▼
-┌──────────────────────────────────────────────┐
-│                 Agent Runtime                │
-│  invoke / permission / tool boundary / events│
-└───────┬──────────────┬──────────────┬────────┘
-        │              │              │
-        ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ Task Manager │ │ Ctx Manager  │ │ Worker Agents│
-│ Agent        │ │ Agent        │ │ plan/exec/ver│
-└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-       │graph_write     │ctx_read/write  │worktree/tools
-       ▼                ▼                ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│ Task Graph   │ │ Context Lib  │ │ CLI Worktree │
-│ 状态与依赖    │ │ 项目级记忆    │ │ Tools / Git  │
-└──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-       │                │                │
-       ▼                ▼                ▼
-┌──────────────────────────────────────────────┐
-│              Verify / Merge Queue            │
-│        Diff / Conflict / Project Facts       │
-└───────────────────────┬──────────────────────┘
-                        ▼
-┌──────────────────────────────────────────────┐
-│          Event Log / Artifact Store          │
-│     Logs / Results / Diff / Test Evidence    │
-└──────────────────────────────────────────────┘
-```
-
-一句话概括：
-
-```text
-Agent Runtime 是所有 agent invocation 的统一入口，包括 Task Manager Agent、Ctx Manager Agent 和 worker agents。
-Task Manager Agent 接收 requirement，并决定是否以及如何编排成 task / phase endpoint / decision endpoint / edge / blocker。
-Task Graph 记录现在有哪些 task、状态是什么、谁阻塞谁。
-Ctx Manager Agent / Ctx Agent 决定 agent 应该知道什么，以及运行中能查什么。
-Context Lib 保存可复用的项目记忆。
-Agent Runtime 决定谁来做，并包装 CLI agent 自身的 worktree/tool/git 能力。
-Verifier 和 Merge Queue 决定什么能进入项目事实。
-Event Log 决定系统如何追溯和复盘。
-```
-
----
-
-## 4.1 技术栈边界
-
-本项目技术栈确定为：**Go backend + Electron shell + React/TypeScript/Vite frontend**。
-
-```text
-Go backend
-  - 承载 Control Plane、Task Manager Agent、Task Graph、Ctx Agent、ctxlib、Agent Runtime、Event/Artifact Store、Workspace/Merge Queue。
-  - 后端接口、领域模型、调度状态机和权限策略以 Go 类型为设计源头。
-
-Electron shell
-  - 负责桌面壳、窗口生命周期、本地进程启动入口和与 Go backend 的本机通信边界。
-  - 不承载核心调度规则，不直接写 task graph / ctxlib。
-
-React + TypeScript + Vite frontend
-  - 负责需求输入、task graph 可视化、agent 状态、日志流、diff/test 证据和人工审批 UI。
-  - TypeScript 类型应从 Go backend API schema 生成或镜像，不作为核心领域模型的唯一事实来源。
-```
-
-文档中的接口设计代码块默认以 Go backend 为准；只有 Electron/React/Vite 专属 UI 代码才使用 TypeScript。
-
-## 4.2 设计基线：工作不属于 Agent Session
-
-Threadmill 管理的是尚未完成的工作，而不是某个 Agent 对话。即使一个 Agent 退出、换 provider 或被重试，下面这些问题仍然必须有明确答案：
-
-- 原始 requirement 是什么，哪些约束不能在转述中丢失；
-- 一个 task 是否必须等待另一个 task，以及等到哪个 phase endpoint；
-- 当前 attempt 基于哪个输入 revision，实际改动是否越过批准范围；
-- 哪一份验证结果仍然有效，谁有资格让结果进入主分支。
-
-工作沿着下面的链路逐步收敛：
-
-```text
-Requirement -> Task Contract -> Task -> Task Attempt -> Agent Invocation
-```
-
-它们不是同一个对象的不同名字：
-
-- `Requirement` 保存最初为什么要做；
-- `Task Contract` 固定要交付什么、边界在哪里、怎样算完成；
-- `Task` 是需要持续协调的工作身份；
-- `Task Attempt` 是对同一契约的一次有界尝试；
-- `Agent Invocation` 是某个阶段临时借用的一次计算能力。
-
-Agent Invocation 可以重建，Task Contract、Task 和未完成的依赖不能随 session 一起消失。一次 invocation 只拿到完成当前职责所需的 Task Contract、attempt、允许工具、工作区、Context Pack 和输出约束。
-
-### 领域术语边界
-
-```text
-Thread
-  provider 为一次 Agent Invocation 保留的局部对话状态；丢弃 Thread 不应丢失 Task 或已接受的项目事实。
-
-Worker Capacity
-  Scheduler 当前可以并发使用的 Agent Invocation 数量；只改变吞吐，不改变 Task Graph 的含义。
-
-Evidence
-  用于判断主张的可观察结果，例如 diff、测试结果、tool output 或 human decision，并且可以追溯来源。
-
-Project Fact
-  在验收或决策边界通过后，获准供后续工作复用的主张。
-
-Context Block
-  从 Event 或 Artifact 中提炼出的、可追溯且可复用的陈述；可能被替代，不能自动视为 Project Fact。
-
-Context Pack
-  针对一次 Agent Invocation 及其精确工作边界选出的有限 Context Block 快照，不等于全量项目历史。
-```
-
-把 Agent 视为临时执行资源解决四个问题：
-
-1. executor 崩溃后，新的 invocation 可以从显式状态恢复，而不是猜旧对话发生了什么；
-2. planner、executor 和 verifier 可以由不同 provider 承担，调度不依赖某个 CLI 的 session 语义；
-3. 并发 Agent 不会制造多个项目真相，任务依赖、验收结论和已合入事实仍有单一权威记录；
-4. 权限可以按 invocation 收口：规划可只读，执行只写指定工作区，验证默认不能修改实现。
-
-“临时”不等于每说一句话都新建 invocation。只要输入基线、角色、权限和目标没有变化，一个 invocation 可以持续完成它的局部工作；发生重规划、权限变化、上下文基线变化或角色切换时，才建立新的边界。
-
-### Plan、Execute、Verify 的分工
-
-三个阶段不是让不同 Agent 重复复述同一段话，而是分别固定三种不能由同一份输出证明的事实：
-
-```text
-Plan
-  在修改前声明影响面、依赖事实、权限需求和验收证据。
-  可以请求 Task Manager 扩展 graph，但不能按实现偏好改写 Task Contract。
-
-Execute
-  在隔离工作区内实施批准范围，产生候选 diff、测试输出、工具记录和新发现。
-  不能静默扩大范围、直接改 graph 或宣布自己已经完成。
-
-Verify
-  同时读取 Task Contract、批准的 plan、真实 diff、测试证据和输入 revision，
-  判断候选结果是否可接受，而不是判断 executor 是否看起来努力过。
-```
-
-验证失败通常为同一个 task 创建新 attempt；只有暴露出独立生命周期的工作时才创建新 task。`done` 不是执行阶段，而是验收、依赖和交付条件全部满足后的图结论。
-
-### 各模块各自拥有一个决定
-
-| 模块 | 它拥有的决定 | 它不能替谁决定 |
+| 节点 | 职责 | 边界 |
 | --- | --- | --- |
-| Task Manager Agent | requirement 是否形成 task，以及 endpoint 如何建立关系 | 不替 planner 选择实现方案 |
-| Scheduler | 当前哪些 endpoint 值得占用 worker capacity | 不改 Task Contract 和 graph 语义 |
-| Agent Runtime | invocation 如何在明确权限、工作区和预算内运行 | 不判断 task 是否完成 |
-| Ctx Manager Agent | invocation 应获得哪些可追溯上下文 | 不把摘要直接宣布为项目事实 |
-| Executor | 如何在批准范围内产生候选结果 | 不批准自己的结果，不写主分支 |
-| Verifier | 候选结果是否满足契约、证据是否新鲜 | 不修改实现来让验证通过 |
-| Merge Queue | 已获资格的候选是否能机械进入最新 main | 不修冲突，不重写 graph |
-
-如果一个实现让某个模块替另一个模块作决定，权威来源就会分叉。
-
-### 设计检查
-
-后续设计至少应能回答：
-
-1. 杀掉所有 Agent 进程后，哪些对象足以恢复未完成工作？
-2. 某个结论来自 Task Contract、Agent 推断，还是已经验证的 evidence？
-3. 每条 graph edge 阻止哪个 endpoint，携带什么数据，解除条件是什么？
-4. 失败是在重试同一 Task Contract，还是暴露了新的独立工作？
-5. Context Pack 绑定哪个 input revision，过期后谁触发重选或重验？
-6. 最终写入 main 的决定能否追溯到 requirement、真实 diff 和仍有效的验证结果？
+| Phase Agent | 完成 plan/execute/verify 当前阶段；读取 `ContextSliceRef` 与同 Task 的 `TaskMemoryBufferRef`；可刷新缓冲并提交 MemoryCandidate / PhaseOutput / OrchestrationProposal | 不直接写图、不跨 Task 读缓冲、不宣布 done |
+| Context Agent | 响应自然语言检索；探索已落图知识；经 Context Service 对 general 节点和 general 子图执行 CRUD；Task done 后批量裁决冻结候选 | 不操作 task 子图或其节点、不直连图存储、不执行推送 |
+| Context Graph / Task Memory Buffer | Graph 保存已落图知识并提供探索/订阅；每 Task 缓冲保存三阶段共享的未终审工作记忆 | 缓冲不是 Graph，不参与 Graph revision、Search 或订阅 |
+| Task Manager Agent | 编排固定三阶段，维护契约/边/blocker；投影 task 节点；done 后触发候选终审 | 不创建第四阶段；不跨 Task 暴露候选 |
+| Coordination Graph | 记录依赖、阻塞、阶段契约和结果引用 | 只有 Task Manager 能写；Scheduler 只读 |
 
 ---
 
-## 5. 模块简述
+## 3. 两条主链路
 
-## 5.1 Human UI
-
-Human UI 由 Electron shell 承载 React/TypeScript/Vite frontend，面向用户不暴露底层 session，而暴露需求、预算、agent capacity、task graph、active agents、verify 状态和 merge 状态。
-
-核心操作：
+### 3.1 协调链：决定"做什么"
 
 ```text
-- 提交需求
-- 增加/减少 agent 数量
-- 调整预算
-- 查看 task graph
-- 查看阻塞和冲突
-- 批准高风险操作
-- 查看验收结果
+Requirement
+  -> Task Manager Agent 规整为 Task Contract
+  -> 创建 Task 固定的 plan / execute / verify endpoint，写 edge / blocker、DeliverySpec / ReportSpec
+  -> Coordination Graph（唯一写入口：Task Manager）
+  -> Scheduler 选择 runnable Phase Endpoint
+  -> Runtime 创建 Invocation：装配 Workspace Binding、ContextSliceRef 与该 Task 的 TaskMemoryBufferRef
+  -> Phase Agent 完成阶段
+  -> 阶段结束提交 PhaseOutput；运行中发现编排不再合适则提交 OrchestrationProposal
+  -> Task Manager 结合图与证据裁决：接受则热修改图（拆分/补前置/重排/失效旧输出），拒绝则返回结构化理由
+  -> Scheduler 在图更新后重算 runnable endpoint（循环直至 done）
 ```
 
----
+done 的判定：`verify passed` 只获得进入 Merge Queue 的资格；对 `code_merge` 型 Task，`done = verify passed && latest-main targeted verify passed && merge succeeded && 依赖/人工决定条件满足`，由 DeliveryPolicy 决定。
 
-## 5.2 Control Plane
-
-Control Plane 是 Go backend 中的调度中枢，负责把用户需求、预算和 agent capacity 转成可执行调度。
-
-它不直接创建 task，也不直接读写 ctxlib；这些动作分别通过 Agent Runtime 启动的专门 agent 完成：
+### 3.2 上下文闭环：决定"知道什么"
 
 ```text
-Control Plane -> Agent Runtime(role=task_manager)：提交 / 登记 requirement，由 Task Manager Agent 编排 task、phase endpoint、decision endpoint、edge、blocker 或 task 状态更新。
-Control Plane -> Agent Runtime(role=ctx_manager)：请求 Ctx Manager Agent 为某个 task phase 选择 context pack，或处理运行时 ctx 查询。
-Control Plane -> Agent Runtime(role=planner/executor/verifier)：启动 Claude Code planner / executor / verifier 等 CLI worker。
-Control Plane -> Merge Queue：提交 verify passed 的结果进入合并流程。
-Control Plane -> Event Log：记录所有关键事件。
+Phase Agent 同时读取两块记忆：已落图 Context Slice 与当前 Task 候选缓冲
+  -> Graph 不足时经 Context Agent 检索；缓冲经 TaskMemoryBufferReader 直接读取
+  -> plan/execute/verify 任一阶段标注 MemoryCandidate，追加到同一 Task 缓冲，后续阶段立即可见
+  -> 缓冲追加不写图、不改变 revision、不触发 ContextDelta
+  -> Task Manager 持久化权威 done 后冻结缓冲
+  -> Context Agent 批量裁决 general 候选，Context Service 原子落图
+  -> 只有落图事务触发订阅 Delta
+  -> 图变得更丰富，后续 Context Slice/Search 质量提高
 ```
 
-第一阶段 Control Plane 的实现范围只需要覆盖：Claude Code wrapper、Task Manager Agent、Task Graph 调度、Ctx Agent、CtxLib 存取。
+Context Agent 的受控语义边界包括自然语言检索、冻结候选审查，以及 general 节点和 general 子图 CRUD。它可以在显式 Invocation、权限和预算内探索并调用 Context Service mutation 工具；不主动无界巡图、不提示、不操作 task 子图、不直连图存储、不执行推送。
+
+### 3.3 两条链的交汇
+
+两条链在 **Phase Agent** 处交汇：一次 Invocation 由协调链"控制"启动（做什么、何时、以什么权限），携带上下文闭环产出的 Context Slice 与订阅（知道什么），并在执行中通过 `PhaseOutput` / `OrchestrationProposal` 反馈回协调链、通过 MemoryCandidate 反馈回上下文闭环。
+
+- 协调链产生的结果（merge 后的新事实、验收结论）经 Task 权威 `done` 后的批量候选审查或 `TaskContextWriter` 投影进入 Context Graph；
+- 上下文闭环推来的 Delta 若证明当前编排或计划失效，收到 Delta 的 Agent 提交 `OrchestrationProposal`，由 Task Manager 裁决并热修改 Coordination Graph——Delta 本身不写图。
 
 ---
 
-## 5.3 Task Manager Agent / Task Graph
+## 4. 边界与间接语义
 
-Task Manager Agent 是 task graph 的唯一写入口，同时它自己也是经 Agent Runtime 启动和记录的系统 agent。把 requirement 编排成 task graph 变更之前，它必须看到当前所有 task 及其状态，判断新 task 是否重复、是否应该拆分、依赖谁、会阻塞谁，以及验收标准是否足够清晰。
-
-Task Graph 是工作结构的存储和状态机。
-
-- **requirement**：人类或 agent 提出的原始需求、目标、约束和验收意图；它是 provenance，不是可调度 task。
-- **task contract**：固定要交付什么、为什么交付、允许的边界和怎样算完成；不包含 planner 的实现步骤。
-- **task**：由 task contract 约束的持久工作身份，不区分 root / child 类型。
-- **task attempt**：对同一个 task contract 的一次有界尝试；失败或输入过期通常创建新 attempt，而不是新 task。
-- **phase endpoint**：`prepare / plan / execute / verify / done` 的编排锚点。
-- **edge**：phase endpoint 之间的依赖、阻塞、冲突、替代或决策关系，并可携带 evidence。
-- **blocked task**：等待其他 task、依赖、冲突处理或人类决策的任务。
-
-复杂任务可以通过扩展 task graph 作为合法交付。当前 task 不因为新增相关 task 而完成，而是通过 blocker / edge 进入 blocked 状态，等相关 task 完成后再重新验收自身目标。
-
-详见：[Task Manager Agent 详细设计](./task-manager-agent.md)、[Task Graph 详细设计](./task-graph.md)。
+1. **图 mutation 只能经权威服务。** Phase Agent 只能提交 MemoryCandidate；Task Manager 只能写 Coordination Graph，并经 `TaskContextWriter` 投影 task 子图；Context Agent 可经 Context Service 的受控工具 CRUD general 节点和 general 子图。没有 Agent 能绕过服务直连图存储。
+2. **"主动推送"由 Context Graph 触发其内部订阅执行器执行。** Context Graph 提交节点/边/子图 revision 并递增受影响 subgraph revision 后，主动触发内部订阅执行器按子图、事件类型、权限与新鲜度匹配已存在订阅，合并更新生成增量、可合并、可重放的 Context Delta；Runtime 只负责把它送达活动 Invocation。订阅只有两种来源：切片/Search 结果自动订阅与 Agent 主动订阅（Search 的自动订阅绑定发起检索的原始请求方 Invocation，而非 Context Agent 自己）；不存在订阅之外的旁路推送；推送不是 Context Agent 行为，也不是 Agent 轮询拉取。
+3. **"控制"经 Scheduler/Runtime 落地。** Coordination Graph 是被读的编排状态，不主动执行；控制 = Scheduler 选择 runnable endpoint + Runtime 启动/约束/结束 Invocation。Scheduler 不创建/修改 task、edge、blocker。
+4. **不存在 Agent mailbox。** Agent 之间没有消息队列式直接通信；外部记忆只来自 Context Slice、图探索、检索、订阅与自动 Delta。
+5. **不存在持久 Agent 身份。** Agent 是临时计算资源：订阅绑定 Invocation 并随其过期，后续 Invocation 重新经切片自动订阅或主动订阅；Task、轮次与图的身份独立于任何 Agent。
+6. **Context Agent 只做受控工作。** 可使用 ListSubgraphs/GetSubgraph/GetNode/Explore/Search，并经 Context Service CRUD general 节点和 general 子图；不操作 task 子图或其节点，不主动提示，不执行订阅/推送，不直连图存储。
+7. **Coordination Graph 只保存编排义务**（依赖、阻塞、完成信号、结果引用），不保存 Agent 运行过程上下文；运行过程是 Agent Runtime 的内部现场。
 
 ---
 
-## 5.4 Agent Runtime
+## 5. 执行支撑层
 
-Agent Runtime 位于 Go backend，是所有 agent 的统一运行入口。它将 Claude Code、Codex、Gemini CLI 等不同 CLI agent 包装成统一 worker，也用同一套 invocation / permission / event / artifact 机制运行 Task Manager Agent 和 Ctx Manager Agent。第一阶段只实现 Claude Code 的基本包装。
+Runtime、Workspace、Scheduler、Verify、Merge Queue、Event Log / Artifact Store 不进入五节点核心，但它们是两条链得以运转的执行支撑：协调链经 Scheduler/Runtime 落地"控制"，上下文闭环经 Context Graph 的内部订阅执行器与 Runtime 落地"主动推送"。
 
-统一不是指能力完全相同，而是每个 agent 暴露 capability profile，并把 CLI 自身能力包装给上层：
+### 5.1 支撑组件职责
+
+| 组件 | 服务于 | 不做 |
+| --- | --- | --- |
+| Scheduler | 读取 Coordination Graph，选择 runnable Phase Endpoint 并请求 Runtime；按预算/容量/优先级调度 | 创建/修改 task、edge、blocker；解释编排建议 |
+| Agent Runtime | 启动/取消 Invocation；施加 phase 权限与写 lease；装配 Workspace；初始 Context Slice 由 Context Service 装配（内部启动步骤）；记录事件；校验输出形状；转交受控请求与 Delta | 判断业务完成；解释编排建议；写任一图；替 Context Agent 检索或接受记忆；合并 main |
+| Workspace Service | 为轮次创建/复用/封存执行现场（git worktree + branch-per-round 等）；观察 write set | 调度 Agent；判断验收；写 main |
+| Verifier | 独立检查候选是否满足 Task Contract 与 Approved Plan（同一轮次 Workspace 上只读） | 修改实现；自我批准 |
+| Merge Queue | main 唯一写入口：latest-main 机械应用检查、targeted verify、串行合入 | 修冲突；重写 Coordination Graph；直接写 Context Graph |
+| Event Log / Artifact Store | 运行事件与图变更的审计记录；交付物/报告/证据的存放；Context Graph 是其可追溯投影 | — |
+
+### 5.2 落地关系
+
+```mermaid
+flowchart LR
+  CG[(Coordination Graph)] -->|"控制：选择 runnable endpoint"| S[Scheduler]
+  S -->|"run request"| RT[Agent Runtime]
+  RT -->|"启动 Invocation：phase 权限 / Workspace / Context Slice"| PA[Phase Agent]
+  WS[Workspace Service] --> RT
+  CX[(Context Graph)] -->|"revision 提交后主动触发（仅已订阅子图）"| SE[内部订阅执行器]
+  SE -->|"生成 Context Delta"| RT
+  RT -->|"只投递：送达订阅中的 Invocation"| PA
+```
+
+支撑组件只沿图中两条边（控制、推送）落地执行，不增加新的核心业务边；支撑组件不属于五节点核心。
+
+### 5.3 plan → execute → verify
+
+每个 Task 固定三个工作阶段 `plan -> execute -> verify`，共享同一轮次 Workspace Binding 与同一 Task 候选缓冲；后阶段可读前阶段候选。`prepared/done` 和人工 decision 只是门控状态/条件，不增加阶段。
+
+---
+
+## 6. 部署与 AgentTeams 基座映射简表
+
+AgentTeams（`third_party/agentteams`）是归档基座：只复用已证实能力，不继承其以 Matrix 房间与持久 Worker 身份为中心的编排模型。Threadmill 控制面（新建 Go 服务）插入四层基座，与 agentteams-controller 并存。详细文件级映射与取舍理由见 [设计理由](./design-rationale.md) 及各详细设计文档。
+
+| 基座层 | 部署方式 | Threadmill 处置 |
+| --- | --- | --- |
+| 基础设施层（Higress / Tuwunel Matrix / MinIO / Element Web） | 原样部署（本地栈 `install/agentteams-install.sh` 或 K8s `helm/agentteams`） | Higress 承载 LLM 与 MCP 路由；MinIO 承载 Workspace/Artifact/Event 物理存储 |
+| 控制面层（agentteams-controller） | 原样部署 | 与 Threadmill 控制面并存，管理 Invocation 容器 |
+| Manager 层 | 原样部署 | 承载 Task Manager / Context Agent Invocation；Manager 容器不拥有持久任务身份 |
+| Worker 运行时层 | 原样部署 | 承载 phase Invocation；Worker 容器只提供执行容量，不拥有持久任务身份 |
+
+复用判定分四档：
+
+### 6.1 直接复用（原样使用，不改语义）
+
+| Threadmill 需求 | AgentTeams 落点 |
+| --- | --- |
+| MCP 工具面与 ACL（phase agent 的受控工具集） | teamharness / workerflow 的 MCP server；qwenpaw_worker api.py 的 MCP client 注册与 ACL 策略 |
+| Worker 进程托管（分阶段启动、就绪门控、优雅停机） | qwenpaw_worker worker.py |
+| 期望状态→运行时应用管道；技能分发与渲染 | update.py；render-skills.sh（envsubst 白名单渲染） |
+| Invocation 与任务/项目关联（证据链） | task_trace.py（OTel span） |
+| Invocation 容器生命周期 | agentteams-controller sandbox.go、member_reconcile.go |
+| Workspace/Artifact 物理同步底座 | worker-file-sync.sh、qwenpaw sync.py |
+| 人工可见性与最终报告通道 | Tuwunel Matrix + Element Web（仅人工界面与 requester 报告） |
+| 存储/配置迁移框架 | migrate/skill + tests/test-28-migration-e2e.sh |
+
+### 6.2 适配封装（复用机制，包裹 Threadmill 语义）
+
+| Threadmill 语义 | 基座机制 | 包裹方式 |
+| --- | --- | --- |
+| Agent Invocation | Worker 生命周期 | 一次性 Invocation：每次 phase 独立启动，不建立持久花名册 |
+| Phase 权限与工具面 | agent/MCP/ACL 配置 | 按 phase lease 施加：plan 只读、execute 写批准范围、verify 只读 |
+| Workspace Binding | FileSync + `shared/tasks/{id}/workspace/` 目录约定 | git worktree + branch-per-round；FileSync 只做物理同步 |
+| Coordination Graph 存储与 ready 判定 | FileSystemTaskStore 文件协议 + `_ready_nodes` 算法 | 增加 Phase/轮次维度与 revision；写入口改为 Task Manager 唯一 |
+| Task Manager Agent 行为 | team-leader-agent AGENTS.md + dag 技能 | 作为 prompt 蓝本：删"自行完成工作"与直接写状态，补 DeliverySpec/ReportSpec 与 Proposal 审批 |
+| Artifact 物理存储 / 人工审批界面 | MinIO / Element Web 房间 | Artifact Store 注册表新建；human decision 作为 blocker/decision 条件经 Task Manager 入图，不创建额外 Phase Endpoint |
+
+### 6.3 Threadmill 新建（AgentTeams 无对应，需自建）
+
+| 组件 | 说明 |
+| --- | --- |
+| Coordination Graph 本体 | Phase Endpoint/edge/blocker/Decision、DeliverySpec/ReportSpec、图 revision、热修改与结果失效 |
+| Scheduler | runnable endpoint 选择 + 容量/预算/优先级（复用 `_ready_nodes` 判定算法，外包选择逻辑） |
+| Workspace Binding 与 Write Set 观察 | 轮次标识、phase lease、Declared/Observed Write Set |
+| PhaseOutput 结构化协议 | endpoint 输出载荷 + 形状校验 |
+| Verify gate 与 Merge Queue | latest-main 机械检查、临时 merge-check workspace、targeted verify、串行合入 |
+| Event Log + Artifact Store 注册表 | append-only 事件流、ContentHash 索引、审计 |
+| Context Graph 全套 | Context Node/Edge/Subgraph、ContextSlice、ContextSubscription、Task-scoped 候选缓冲与 TaskMemoryFinalizer 批量审查、订阅执行器与 Context Delta |
+| Context Agent 角色 | 自然语言检索 + 受控探索 + general 节点/子图 CRUD + done 后冻结候选批量审查；所有 mutation 由 Context Service 执行，task 对象拒绝 |
+
+### 6.4 不应复用（语义冲突，必须新建或改写）
+
+| AgentTeams 能力 | 冲突 | Threadmill 替代 |
+| --- | --- | --- |
+| Matrix 文本协议作控制面（`TASK_COMPLETED`/`TASK_BLOCKED`、git-request prompt 级 git 代执行） | 无结构、无 revision、执行与验收混在聊天文本 | 结构化 PhaseOutput / OrchestrationProposal；git 由 Workspace Service 与 Merge Queue 机械化执行 |
+| Agent mailbox / 房间消息编排（message 工具、mention/房间/ping-pong 防护） | 与"无 mailbox、无订阅外旁路推送"冲突 | Context Graph 列表/探索/检索/订阅 + 自动 Context Delta |
+| Leader 双写模型（Leader 直接写 meta/plan/result 并自行验收） | 与"Task Manager 唯一写入口 + 独立 verify"冲突 | Task Manager 唯一写 Coordination Graph；verify 独立判断 |
+| TaskMeta/ProjectMeta 状态词表 | 无 Phase/轮次维度、无 revision、无失效语义 | plan → execute → verify + Phase Endpoint + PhaseResultBinding |
+| 每 Agent 私有记忆（MEMORY.md / remelight / memory_enabled） | 单 Agent 私有会话记忆，无准入、无共享、无子图 | Context Graph 是唯一共享外部记忆 |
+| MinIO 全 workspace mirror 作合并机制 | last-writer-wins、无合并语义 | git worktree + branch + Merge Queue 机械合入 |
+
+---
+
+## 7. 关键场景
+
+### 7.1 新需求进入（协调链走完一轮）
 
 ```text
-- 是否支持 headless
-- 是否支持 structured output
-- 是否能编辑文件
-- 是否能运行 shell
-- 是否支持 MCP
-- 是否支持或可包装 worktree / git / cwd 隔离能力
-- 上下文窗口和成本模型
-- 适合承担 planner/executor/verifier 中哪些角色
+Human UI 提交 Requirement
+  -> Task Manager 规整为 Task Contract，建 Task/Endpoint/edge/blocker，写 DeliverySpec/ReportSpec；创建轮次时由 Workspace Service 配套创建 Workspace Binding
+  -> Scheduler 激活 plan -> Context Service 按启动 binding 装配初始 Context Slice 并自动订阅（内部启动步骤）-> planner 产出 Submitted Plan
+  -> 审批冻结 Approved Plan -> execute -> verify
+  -> verify passed -> MergeCandidate -> Merge Queue（latest-main 检查 + targeted verify + 串行合入）
+  -> merge 成功 -> Task Manager 按 DeliveryPolicy 持久化 done -> Task Manager 投影 merge 新事实（TaskContextWriter），并调用 FinalizeTaskMemory 冻结候选缓冲；Context Agent 批量审查、Context Service 落图 -> 订阅中的 Agent 收到 Delta
 ```
 
-worktree 不作为独立于 agent 的抽象先行实现，而是先落在 Claude Code wrapper 的能力包装里。
+### 7.2 记忆积累（上下文闭环走完一轮）
 
-详见：[Agent Runtime 详细设计](./agent-runtime.md)。
+execute 中发现一个跨模块约定值得复用：Agent 标注 MemoryCandidate → 只进入该 Task 的候选缓冲 → Task Manager 按 DeliveryPolicy 持久化权威 done → 调用 TaskMemoryFinalizer 冻结为 `frozen-unreviewed` → Context Agent 批量裁决 general 候选，Context Service 原子落图并保存审查回执 → 标记 `reviewed`，递增 revision 并推送 Context Delta。审查或落图失败时重试同一冻结批次，不改变 Task 的 done；收到 Delta 的 Agent 若发现编排或计划失效，提交 OrchestrationProposal，由 Task Manager 裁决后热修改图。**phase agent 与 Task Manager 接收 Delta 的语义完全相同**；Delta 本身不写 Coordination Graph。
+
+### 7.3 验证失败与重排（协调链上的反馈闭环）
+
+verify 失败（契约不满足、计划过时、缺前置）→ verifier 提交 retry / split / dependency 等 OrchestrationProposal → Task Manager 结合图与可见证据裁决：失效旧输出、在图上重开 execute→verify 端点（或创建新 Task、补前置边）、从最新有效基线新建轮次 Workspace（旧现场封存为 evidence）→ Scheduler 重算。失败证据同时进入 Event Log，可在 Task 权威 `done` 后的批量审查中由 Context Agent 裁决、Context Service 落图为失败模式记忆。
 
 ---
 
-## 5.5 Ctx Agent / Context Lib
+## 8. 架构不变量（总览级）
 
-Ctx Manager Agent 是 runtime role 名称；Ctx Agent 是早期文档沿用的模块简称。
-
-Ctx Manager Agent / Ctx Agent 是 ctxlib 的唯一受控访问入口，同时它自己也是经 Agent Runtime 启动和记录的系统 agent。它以 Event Log 为唯一数据来源构建 ctxlib（读 log、策展、去重、supersede、标注），对外只提供受控的 context pack 构建和查询。其他 agent 不直接读写 ctxlib，也不向 ctxlib 推送内容——它们的活动被自动记入 log，再由 Ctx Agent 从 log 中提炼。
-
-Context Lib 是项目级上下文库，用来替代 session memory。它存储经过提取、标注和验证的项目记忆，例如：
-
-```text
-- 架构决策
-- 模块摘要
-- 任务摘要
-- 验收结果
-- 失败原因
-- 冲突分析
-- 用户偏好
-- rejected approaches
-```
-
-新 agent 启动时不会加载全量 ctxlib，而是由 Ctx Agent 根据 task、phase、scope、confidence、freshness 和 risk 选择有限 context pack。运行中的其他 agent 也可以通过 Ctx Agent 查询 ctxlib，但不能直接读取 ctxlib 底层存储。
-
-详见：[Context Lib 详细设计](./ctxlib.md)。
-
----
-
-## 5.6 Workspace / Git / Merge Queue
-
-Workspace / Git 不再被视为独立于 agent runtime 的第一阶段核心模块。第一阶段先把 worktree、git、cwd 和 tool 权限作为 Claude Code wrapper 的一部分包装。
-
-Merge Queue 仍然负责 verify passed 结果的合并与冲突协调。
-
-基本原则：
-
-```text
-- 每个 task attempt 使用 agent runtime 包装出来的 worktree/cwd 隔离能力。
-- agent 不直接修改 main。
-- verify 通过后才进入 merge queue。
-- merge 前检查 active conflicts。
-- merge 结果记入 Event Log，成为新的项目事实；ctxlib 由 Ctx Agent 从 log 提炼。
-```
-
-详见：[Workspace 与 Merge Queue 详细设计](./workspace-merge.md)。
-
----
-
-## 5.7 Scheduler / Budget
-
-Scheduler 根据 task graph、agent capacity、预算、风险和依赖关系决定下一步启动什么。
-
-用户点击 `agent +1` 时，只是增加 worker capacity；Scheduler 决定新增 worker 去执行哪个 task phase。
-
-预算不仅是金钱，还包括：
-
-```text
-- token
-- 时间
-- 并发数
-- retry 次数
-- verify 强度
-- shell 执行成本
-```
-
-详见：[Scheduler 与 Budget 详细设计](./scheduler-budget.md)。
-
----
-
-## 5.8 Event Log / Artifact Store
-
-Event Log 是系统事实来源。task 表、ctxlib 索引、UI 状态都可以视为 event log 的 projection。
-
-Artifact Store 保存大对象：
-
-```text
-- agent transcript
-- tool output
-- test output
-- diff patch
-- screenshots
-- benchmark result
-```
-
-详见：[Event Log 与 Artifact Store 详细设计](./event-artifact-store.md)。
-
----
-
-## 6. 模块间关系
-
-## 6.1 提交新需求
-
-```text
-Human UI 或其他 agent
-  -> Agent Runtime(role=task_manager)
-  -> Task Manager Agent（查看全局 task，去重、编排依赖）
-  -> Task Graph 写入 requirement / task / phase endpoint / decision endpoint / edge
-  -> Ctx Agent 选择初始 context pack
-  -> Scheduler 决定何时向 Agent Runtime 提交 planner AgentRunParams
-```
-
-关键判断：提交需求只是把 requirement 放入系统，并由 Task Manager Agent 决定是否创建 / 更新 task graph；这不等于立即开一个新 session。
-
----
-
-## 6.2 增加 agent 数量
-
-```text
-Human UI: agent +1
-  -> Control Plane 增加 worker capacity
-  -> Scheduler 选择下一个可运行 task phase
-  -> Agent Runtime 启动对应 CLI agent（第一阶段为 Claude Code）
-```
-
-关键判断：增加 agent 是增加系统吞吐，不是让用户手动指定“这个新 agent 去做什么”。
-
----
-
-## 6.3 执行一个 task
-
-```text
-Task Graph 提供 task contract
-  -> Agent Runtime(role=ctx_manager) 启动 Ctx Manager Agent 生成 context pack
-  -> Agent Runtime 在包装出的 worktree 隔离环境启动 plan / execute / verify agent
-  -> 运行中 agent 需要更多上下文时 -> 通过 Agent Runtime(role=ctx_manager) 受控查询 ctxlib
-  -> Event Log 记录过程
-  -> Verify 通过后进入 Merge Queue
-```
-
----
-
-## 6.4 复杂任务拆解
-
-```text
-Planner / Executor / Verifier 发现当前 task 需要拆解、补工作或补验收
-  -> 通过 Agent Runtime(role=task_manager) 向 Task Manager Agent 提交新的 requirement（严格模式，带 client_ref 和触发证据）
-  -> Task Manager Agent 校验 requirement，并编排 task / phase endpoint / decision endpoint / edge / blocker
-  -> 当前 task 或当前 phase endpoint 进入 blocked（如果需要等待新增 task、特定状态或决策）
-  -> Scheduler 调度新增 task 或等待依赖 endpoint 满足
-  -> 相关 endpoint 满足后当前 task 回到 planning / executing / verifying
-```
-
-关键判断：扩展 task graph 是复杂任务的合法交付，不是失败；但 planner / executor / verifier 提交的是 requirement，不是 task / edge。依赖关系由 Task Manager Agent 统一编排，并且可以细到 phase endpoint，例如 `Task A.verify depends_on Task B.done`。
-
----
-
-## 6.5 上下文沉淀与再利用
-
-```text
-Agent 输出 summary / verify failure / merge result
-  -> Event Log 自动记录这些活动（agent 无需显式写日志）
-  -> Agent Runtime(role=ctx_manager) 启动 Ctx Manager Agent（含 Context Curator）从 log 提取 context block
-  -> Context Lib 标注、去重、supersede
-  -> 后续 task phase 由 Ctx Agent 选择 context pack
-```
-
-关键判断：长期记忆属于 ctxlib，不属于某个 agent session；ctxlib 只从 log 构建，读写都经过 Ctx Agent。
-
----
-
-## 6.6 并发冲突协调
-
-```text
-Task A verify passed
-  -> Merge Queue 检查 active tasks
-  -> 发现 Task B 有 write set 重叠
-  -> 广播 conflict context 给 Task B
-  -> Task B 单边 replan 或 adapt
-```
-
-关键判断：已经 verify passed 的 task 优先，仍在执行的 task 负责适配，避免双方互相等待。
-
----
-
-## 7. 架构不变量
-
-```text
-1. 所有 agent invocation 都必须经 Agent Runtime，包括 Task Manager Agent、Ctx Manager Agent、planner、executor、verifier。
-2. task 未通过 verify 不得 merge。
-3. agent 不拥有长期记忆，ctxlib 拥有长期记忆。
-4. agent 启动不加载全量 ctxlib。
-5. 每个 task attempt 在 agent runtime 包装出的隔离环境执行。
-6. execute 不直接修改 main。
-7. verify agent 不自我批准 execute 结果。
-8. 通过提交 requirement 扩展 task graph 是复杂任务的合法交付。
-9. blocked 不是 failed。
-10. merge 后必须产生可追溯事件和上下文沉淀。
-11. 用户控制需求和资源，系统控制调度细节。
-12. task graph 只能由经 Agent Runtime 授权的 Task Manager Agent 写入。
-13. planner / executor / verifier 不直接创建 task / edge；依赖关系由 Task Manager Agent 编排。
-14. task 使用固定的 phase endpoint 表达生命周期，依赖可以指向具体的 phase endpoint 或 decision endpoint。
-15. ctxlib 只能由经 Agent Runtime 授权的 Ctx Manager Agent / Ctx Agent 读写。
-```
-
----
-
-## 8. MVP 分期总览
-
-```text
-MVP 0：Claude Code wrapper + Task Graph + CtxLib（第一步）
-  - 基本包装 Claude Code CLI（headless 启动、输入输出、事件记录、能力声明）。
-  - Task Manager Agent：经 Agent Runtime 启动，能看到全部 task 及状态，作为 task 创建的唯一入口。
-  - Task Graph 调度：task 状态机、依赖、阻塞、基本推进。
-  - Ctx Manager Agent + CtxLib：经 Agent Runtime 启动，提供 context block 的基本存取和受控查询。
-  worktree/tool/git 先作为 Claude Code wrapper 的能力包装，不单独抽象。
-
-MVP 1：Context Pack
-  用结构化 context block 替代人工 session handoff，由 Ctx Agent 生成 pack。
-
-MVP 2：运行时 ctxlib 检索
-  允许运行中的其他 agent 通过 Ctx Agent 查询 ctxlib，并在必要时触发 replan。
-
-MVP 3：多 CLI Agent + Worker Pool
-  在 Claude Code 之外接入更多 CLI agent，实现 agent+1。
-
-MVP 4：Conflict-Aware Merge Queue
-  支持多 agent 安全并发和冲突广播。
-
-MVP 5：Context Curator
-  自动沉淀项目记忆、标注上下文、识别 supersede 和失败经验。
-```
+1. 所有 Agent Invocation 都经 Agent Runtime。
+2. Coordination Graph 只有 Task Manager 能写；Context Graph 持久化 mutation 只有 Context Service 能执行。Context Agent 可经 Context Service CRUD general 节点和 general 子图；`task` 子图只接受 Task Manager 经 `TaskContextWriter` 的受控投影；main 只有 Merge Queue 能写。
+3. Phase Agent 不直接写任一图；Task 工作期候选只停留缓冲、不落图不推送；Task Manager 不能绕过 `TaskContextWriter`，Context Agent 不能操作 task 子图或直连图存储。
+4. 不存在 Agent mailbox；外部记忆只来自 Context Slice、图探索、检索、有效订阅并集与自动 Context Delta。
+5. 不存在持久 Agent 身份：Agent 是临时计算资源，订阅绑定当前 consumer Invocation，可提前取消并在 Invocation 结束时过期。
+6. Context Agent 只在检索、候选审查或显式图管理 Invocation 中受控探索和 CRUD；不主动提示、不操作 task 子图、不直连图存储、不执行订阅/推送。
+7. Coordination Graph 不主动执行："控制"经 Scheduler 选择与 Runtime 启动落地；Scheduler 只读图。
+8. 同一 Task 同一轮次内 plan、execute、verify 共享同一 Workspace Binding；任何阶段只有一个有效写 lease。
+9. Task 未通过 verify 不得进入 Merge Queue；verify passed 不等于 done（done 由 DeliveryPolicy 决定）。
+10. Task Manager 与 phase agent 使用同一 Context 读/订阅生命周期接口（`ContextGraphReader`，见 [context-graph.md](./context-graph.md) §6.1；只含列表/探索/订阅/取消订阅，不含 Search）；Agent Runtime 按当前 consumer Invocation 的有效订阅子图并集提供上下文；`Search` 经 `ContextGraphSearcher` 仅 Context Agent 可用；Context Agent 不依赖 Scheduler。
+11. 跨模块数据只使用 Task Contract、PhaseOutput、OrchestrationProposal、ArtifactRef、ContextSlice 与受控 service request。
+12. AgentTeams 是归档基座：只复用已证实能力，编排与记忆语义全部落在 Threadmill 控制面。
 
 ---
 
 ## 9. 详细设计文档
 
-- [Task Manager Agent 详细设计](./task-manager-agent.md)
-- [Task Graph 详细设计](./task-graph.md)
+- [统一设计（语义权威）](./threadmill-unified-design.md)
+- [Task Manager Agent 定义与工具](./task-manager-agent.md)
+- [Phase Agent 接口与数据结构契约](./phase-agent.md)
+- [Context Agent 定义与工具](./context-agent.md)
+- [五类 Agent 主提示词与 Skill 目录](./agent-prompts.md)
+- [Coordination Graph 详细设计](./coordination-graph.md)
 - [Agent Runtime 详细设计](./agent-runtime.md)
-- [Context Lib 详细设计](./ctxlib.md)
+- [Context Graph 节点与子图设计](./context-graph.md)
 - [Workspace 与 Merge Queue 详细设计](./workspace-merge.md)
 - [Scheduler 与 Budget 详细设计](./scheduler-budget.md)
 - [Event Log 与 Artifact Store 详细设计](./event-artifact-store.md)
+- [设计理由](./design-rationale.md)
+- [领域语言](./CONTEXT.md)
