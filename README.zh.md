@@ -19,9 +19,9 @@ requirement → plan → execute → verify → merge → done
 
 ## 协作回放
 
-[![Threadmill 协调图与共享上下文回放](docs/assets/threadmill-coordination-demo.png)](docs/assets/threadmill-coordination-demo.mp4)
+https://github.com/user-attachments/assets/21fac2e2-314d-4ff6-987f-99288a665396
 
-[播放 1 分 47 秒 MP4](docs/assets/threadmill-coordination-demo.mp4)。revision 87 之前来自记录的真实时间线；末尾标为 `demo` 的四帧仅用于演示协调图完结状态。
+[下载 1 分 47 秒 MP4](docs/assets/threadmill-coordination-demo.mp4)。revision 87 之前来自记录的真实时间线；末尾标为 `demo` 的四帧仅用于演示协调图完结状态。
 
 ## 一句话理解
 

@@ -19,9 +19,9 @@ requirement → plan → execute → verify → merge → done
 
 ## Coordination replay
 
-[![Threadmill coordination and shared-context replay](docs/assets/threadmill-coordination-demo.png)](docs/assets/threadmill-coordination-demo.mp4)
+https://github.com/user-attachments/assets/21fac2e2-314d-4ff6-987f-99288a665396
 
-[Play the 1:47 MP4](docs/assets/threadmill-coordination-demo.mp4). The replay is backed by the recorded timeline through revision 87; the four ending frames labeled `demo` are presentation-only completion states.
+[Download the 1:47 MP4](docs/assets/threadmill-coordination-demo.mp4). The replay is backed by the recorded timeline through revision 87; the four ending frames labeled `demo` are presentation-only completion states.
 
 ## The idea
 
