@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -138,6 +139,51 @@ func TestReplacePendingRejectsBindingMutationAndIdempotencyConflict(t *testing.T
 	_, err = graph.ReplacePending(ctx, conflict)
 	if !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("idempotency err = %v, want idempotency_conflict", err)
+	}
+}
+
+func TestReplacePendingAdvancesGenerationOnlyAfterDefinitivePreStartDispatchRejection(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-rejected-dispatch")
+	plan := mustEndpoint(t, mustSnapshot(t, graph, revision), ref("task-rejected-dispatch", EndpointPlan))
+	command, claimed, err := store.claimLeaseAndAppendCommand(ctx, projectID, revision, plan, CommandStart, "revision://rejected-dispatch")
+	if err != nil || !claimed {
+		t.Fatalf("claim start command claimed=%v err=%v", claimed, err)
+	}
+	store.rejectCommand(ctx, projectID, command, kernel.Error{Code: kernel.CodeStaleCommand, Message: "provider was never delegated"})
+
+	requestID := kernel.IdempotencyKey("decision-retry-rejected-dispatch")
+	if err := decisions.RegisterReplacePending(projectID, requestID); err != nil {
+		t.Fatal(err)
+	}
+	next := PendingSubgraph{RequestID: requestID, BaseRevision: revision, Endpoints: []PhaseEndpoint{plan}}
+	next.Endpoints[0].Generation++
+	next.Endpoints[0].BindingRef = "binding://task-rejected-dispatch/plan/2"
+	nextRevision, err := graph.ReplacePending(ctx, next)
+	if err != nil {
+		t.Fatalf("ReplacePending after definitive rejection: %v", err)
+	}
+	got := mustEndpoint(t, mustSnapshot(t, graph, nextRevision), plan.Ref)
+	if got.Generation != 2 || got.BindingRef != next.Endpoints[0].BindingRef {
+		t.Fatalf("replacement endpoint = %#v, want generation 2 binding %s", got, next.Endpoints[0].BindingRef)
+	}
+}
+
+func TestReplacePendingRejectsCallerGenerationAdvanceWithoutDispatchRejection(t *testing.T) {
+	graph, decisions, _ := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-forged-retry")
+	plan := mustEndpoint(t, mustSnapshot(t, graph, revision), ref("task-forged-retry", EndpointPlan))
+	requestID := kernel.IdempotencyKey("decision-forged-retry")
+	if err := decisions.RegisterReplacePending(projectID, requestID); err != nil {
+		t.Fatal(err)
+	}
+	next := PendingSubgraph{RequestID: requestID, BaseRevision: revision, Endpoints: []PhaseEndpoint{plan}}
+	next.Endpoints[0].Generation++
+	next.Endpoints[0].BindingRef = "binding://task-forged-retry/plan/2"
+	if _, err := graph.ReplacePending(ctx, next); !kernel.IsCode(err, kernel.CodeStaleBinding) {
+		t.Fatalf("ReplacePending forged generation advance = %v, want stale_binding", err)
 	}
 }
 
@@ -325,6 +371,75 @@ func TestReplacePendingSameRequestIDIsConcurrentIdempotent(t *testing.T) {
 	}
 }
 
+func TestCompletionEdgesAndBlockersGateSubmittedTransition(t *testing.T) {
+	graph, decisions, _ := newGraphHarness()
+	ctx := context.Background()
+	requestID := kernel.IdempotencyKey("decision-completion-join")
+	if err := decisions.RegisterReplacePending(projectID, requestID); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := graph.ReplacePending(ctx, PendingSubgraph{
+		RequestID:    requestID,
+		BaseRevision: 1,
+		Tasks: []Task{
+			{ID: "join-source", ContractRef: "contract://join-source", Outcome: TaskActive},
+			{ID: "join-target", ContractRef: "contract://join-target", Outcome: TaskActive},
+		},
+		Endpoints: append(endpointsFor("join-source"), endpointsFor("join-target")...),
+		Edges: []Edge{{
+			From: ref("join-source", EndpointPlan), To: ref("join-target", EndpointPlan),
+			Signal: SignalPhaseSatisfied, RequiredBy: RequiredByCompletion,
+			ArtifactKinds: []string{"phase_output"}, OnFalse: OnFalseBlock,
+		}},
+		Blockers: []Blocker{{
+			ID: "join-approval", Target: ref("join-target", EndpointPlan),
+			RequiredBy: RequiredByCompletion, OnFalse: OnFalseBlock, State: BlockerActive,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registerTransition(t, decisions, "join-target-too-early", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: ref("join-target", EndpointPlan),
+		Action: string(EndpointSubmitted), Generation: 1,
+	})
+	if _, err := graph.Transition(ctx, revision, "join-target-too-early"); !kernel.IsCode(err, kernel.CodeTransitionRejected) {
+		t.Fatalf("target submitted before completion edge = %v, want transition_rejected", err)
+	}
+
+	registerTransition(t, decisions, "join-source-submitted", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: ref("join-source", EndpointPlan),
+		Action: string(EndpointSubmitted), Generation: 1,
+	})
+	revision = mustTransition(t, graph, revision, "join-source-submitted")
+	registerTransition(t, decisions, "join-source-satisfied", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: ref("join-source", EndpointPlan),
+		Action: string(EndpointSatisfied), Generation: 1,
+		Result: phaseResult("result-join-source-plan", "join-source", EndpointPlan),
+	})
+	revision = mustTransition(t, graph, revision, "join-source-satisfied")
+
+	registerTransition(t, decisions, "join-target-blocked", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: ref("join-target", EndpointPlan),
+		Action: string(EndpointSubmitted), Generation: 1,
+	})
+	if _, err := graph.Transition(ctx, revision, "join-target-blocked"); !kernel.IsCode(err, kernel.CodeTransitionRejected) {
+		t.Fatalf("target submitted before completion blocker = %v, want transition_rejected", err)
+	}
+	registerTransition(t, decisions, "join-approval-resolved", GraphTransition{
+		TargetKind: TargetBlocker, BlockerID: "join-approval", Action: string(BlockerResolved),
+	})
+	revision = mustTransition(t, graph, revision, "join-approval-resolved")
+	registerTransition(t, decisions, "join-target-submitted", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: ref("join-target", EndpointPlan),
+		Action: string(EndpointSubmitted), Generation: 1,
+	})
+	if _, err := graph.Transition(ctx, revision, "join-target-submitted"); err != nil {
+		t.Fatalf("target submitted after completion join: %v", err)
+	}
+}
+
 func TestTransitionUsesPersistedDecisionAndClosedStateSet(t *testing.T) {
 	graph, decisions, _ := newGraphHarness()
 	ctx := context.Background()
@@ -422,6 +537,184 @@ func TestTransitionRejectsRevisionConflictAndTaskDoneBeforeVerify(t *testing.T) 
 	}
 }
 
+func TestReopenRoundAtomicallyRollsExecuteAndVerify(t *testing.T) {
+	graph, decisions, _ := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-reopen-round")
+	revision = satisfyTaskRound(t, graph, decisions, revision, "task-reopen-round", 1)
+	before := mustSnapshot(t, graph, revision)
+
+	registerTransition(t, decisions, "reopen-round", GraphTransition{
+		TargetKind:        TargetTask,
+		TaskID:            "task-reopen-round",
+		Action:            "reopen_round",
+		ExecuteBindingRef: "binding://task-reopen-round/execute/2",
+		VerifyBindingRef:  "binding://task-reopen-round/verify/2",
+		EvidenceRefs:      []string{"proposal://targeted-verify/reopen"},
+	})
+	revision = mustTransition(t, graph, revision, "reopen-round")
+	snapshot := mustSnapshot(t, graph, revision)
+
+	plan := mustEndpoint(t, snapshot, ref("task-reopen-round", EndpointPlan))
+	if plan.State != EndpointSatisfied || plan.Generation != 1 || plan.BindingRef != "binding://task-reopen-round/plan/1" {
+		t.Fatalf("plan after reopen_round = %#v, want unchanged satisfied generation 1", plan)
+	}
+	execute := mustEndpoint(t, snapshot, ref("task-reopen-round", EndpointExecute))
+	if execute.State != EndpointPending || execute.RunPolicy != RunEnabled || execute.Generation != 2 || execute.BindingRef != "binding://task-reopen-round/execute/2" {
+		t.Fatalf("execute after reopen_round = %#v, want pending enabled generation 2 with new binding", execute)
+	}
+	verify := mustEndpoint(t, snapshot, ref("task-reopen-round", EndpointVerify))
+	if verify.State != EndpointPending || verify.RunPolicy != RunEnabled || verify.Generation != 2 || verify.BindingRef != "binding://task-reopen-round/verify/2" {
+		t.Fatalf("verify after reopen_round = %#v, want pending enabled generation 2 with new binding", verify)
+	}
+	if len(snapshot.Results) != len(before.Results) {
+		t.Fatalf("results len after reopen_round = %d, want preserved audit len %d", len(snapshot.Results), len(before.Results))
+	}
+
+	registerTransition(t, decisions, "old-generation-execute-output", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("task-reopen-round", EndpointExecute),
+		Action:     string(EndpointSatisfied),
+		Generation: 1,
+		Result: PhaseResult{
+			Endpoint:   ref("task-reopen-round", EndpointExecute),
+			BindingRef: "binding://task-reopen-round/execute/1",
+			OutputRef:  "artifact://phase-output/task-reopen-round/execute/old",
+		},
+	})
+	if _, err := graph.Transition(ctx, revision, "old-generation-execute-output"); !kernel.IsCode(err, kernel.CodeTransitionRejected) {
+		t.Fatalf("old generation execute output err = %v, want transition_rejected", err)
+	}
+}
+
+func TestReopenRoundAllowsMergeWithheldPendingVerify(t *testing.T) {
+	graph, decisions, _ := newGraphHarness()
+	revision := createTask(t, graph, decisions, "task-merge-withheld-verify")
+	for _, endpointID := range []EndpointID{EndpointPlan, EndpointExecute} {
+		submitRef := fmt.Sprintf("submit-withheld-%s", endpointID)
+		registerTransition(t, decisions, submitRef, GraphTransition{
+			TargetKind: TargetPhaseEndpoint,
+			Endpoint:   ref("task-merge-withheld-verify", endpointID),
+			Action:     string(EndpointSubmitted),
+			Generation: 1,
+		})
+		revision = mustTransition(t, graph, revision, submitRef)
+		satisfyRef := fmt.Sprintf("satisfy-withheld-%s", endpointID)
+		registerTransition(t, decisions, satisfyRef, GraphTransition{
+			TargetKind: TargetPhaseEndpoint,
+			Endpoint:   ref("task-merge-withheld-verify", endpointID),
+			Action:     string(EndpointSatisfied),
+			Generation: 1,
+			Result: PhaseResult{
+				Endpoint:   ref("task-merge-withheld-verify", endpointID),
+				BindingRef: kernel.BindingRef(fmt.Sprintf("binding://task-merge-withheld-verify/%s/1", endpointID)),
+				OutputRef:  fmt.Sprintf("artifact://phase-output/task-merge-withheld-verify/%s/1", endpointID),
+			},
+		})
+		revision = mustTransition(t, graph, revision, satisfyRef)
+	}
+
+	registerTransition(t, decisions, "reopen-withheld-verify", GraphTransition{
+		TargetKind:        TargetTask,
+		TaskID:            "task-merge-withheld-verify",
+		Action:            "reopen_round",
+		ExecuteBindingRef: "binding://task-merge-withheld-verify/execute/2",
+		VerifyBindingRef:  "binding://task-merge-withheld-verify/verify/2",
+		EvidenceRefs:      []string{"targeted-verify-proposal:proposal-a"},
+	})
+	revision = mustTransition(t, graph, revision, "reopen-withheld-verify")
+	snapshot := mustSnapshot(t, graph, revision)
+	for _, endpointID := range []EndpointID{EndpointExecute, EndpointVerify} {
+		endpoint := mustEndpoint(t, snapshot, ref("task-merge-withheld-verify", endpointID))
+		if endpoint.State != EndpointPending || endpoint.RunPolicy != RunEnabled || endpoint.Generation != 2 {
+			t.Fatalf("reopened %s endpoint = %#v, want pending enabled generation 2", endpointID, endpoint)
+		}
+	}
+}
+
+func TestReopenRoundRejectsShapeStateAndActiveLease(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-reopen-guard")
+	if err := decisions.RegisterTransition(projectID, "bad-reopen-round-shape", GraphTransition{
+		TargetKind:        TargetTask,
+		TaskID:            "task-reopen-guard",
+		Action:            "reopen_round",
+		Endpoint:          ref("task-reopen-guard", EndpointExecute),
+		ExecuteBindingRef: "binding://task-reopen-guard/execute/2",
+		VerifyBindingRef:  "binding://task-reopen-guard/verify/2",
+	}); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+		t.Fatalf("bad reopen_round shape err = %v, want invalid_request", err)
+	}
+
+	registerTransition(t, decisions, "too-early-reopen-round", GraphTransition{
+		TargetKind:        TargetTask,
+		TaskID:            "task-reopen-guard",
+		Action:            "reopen_round",
+		ExecuteBindingRef: "binding://task-reopen-guard/execute/2",
+		VerifyBindingRef:  "binding://task-reopen-guard/verify/2",
+	})
+	if _, err := graph.Transition(ctx, revision, "too-early-reopen-round"); !kernel.IsCode(err, kernel.CodeTransitionRejected) {
+		t.Fatalf("too early reopen_round err = %v, want transition_rejected", err)
+	}
+
+	revision = satisfyTaskRound(t, graph, decisions, revision, "task-reopen-guard", 1)
+	store.mu.Lock()
+	store.projects[projectID].runtime.leases["lease://task-reopen-guard/verify/1"] = phaseLease{
+		LeaseRef:   "lease://task-reopen-guard/verify/1",
+		Endpoint:   ref("task-reopen-guard", EndpointVerify),
+		Generation: 1,
+		BindingRef: "binding://task-reopen-guard/verify/1",
+		State:      "active",
+	}
+	store.mu.Unlock()
+	registerTransition(t, decisions, "active-lease-reopen-round", GraphTransition{
+		TargetKind:        TargetTask,
+		TaskID:            "task-reopen-guard",
+		Action:            "reopen_round",
+		ExecuteBindingRef: "binding://task-reopen-guard/execute/2",
+		VerifyBindingRef:  "binding://task-reopen-guard/verify/2",
+	})
+	if _, err := graph.Transition(ctx, revision, "active-lease-reopen-round"); !kernel.IsCode(err, kernel.CodeEndpointInFlight) {
+		t.Fatalf("active lease reopen_round err = %v, want endpoint_in_flight", err)
+	}
+}
+
+func TestEnabledPendingReopenRequiresExactFailedInvocationObservation(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	ctx := context.Background()
+	revision := createTask(t, graph, decisions, "task-failed-reopen")
+	controller := &recordingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+	if err := runtime.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	command := controller.lastCommand()
+	if command.Action != CommandStart {
+		t.Fatalf("run command = %#v, want start", command)
+	}
+
+	registerTransition(t, decisions, "reopen-without-failure", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: command.Endpoint, Action: "reopened", Generation: command.Generation,
+		NewBindingRef: "binding://task-failed-reopen/plan/2", EvidenceRefs: []string{"phase-failure:missing"},
+	})
+	if _, err := graph.Transition(ctx, revision, "reopen-without-failure"); !kernel.IsCode(err, kernel.CodeTransitionRejected) {
+		t.Fatalf("reopen without failure observation = %v, want transition_rejected", err)
+	}
+	if err := store.RecordPhaseInvocationFailed(ctx, projectID, command); err != nil {
+		t.Fatalf("record failed invocation: %v", err)
+	}
+	registerTransition(t, decisions, "reopen-with-failure", GraphTransition{
+		TargetKind: TargetPhaseEndpoint, Endpoint: command.Endpoint, Action: "reopened", Generation: command.Generation,
+		NewBindingRef: "binding://task-failed-reopen/plan/2", EvidenceRefs: []string{"phase-failure:" + command.ID},
+	})
+	revision = mustTransition(t, graph, revision, "reopen-with-failure")
+	endpoint := mustEndpoint(t, mustSnapshot(t, graph, revision), command.Endpoint)
+	if endpoint.State != EndpointPending || endpoint.RunPolicy != RunEnabled || endpoint.Generation != 2 || endpoint.BindingRef != "binding://task-failed-reopen/plan/2" {
+		t.Fatalf("endpoint after failed reopen = %#v, want pending enabled generation 2", endpoint)
+	}
+}
+
 func TestStoppedTransitionRequiresEvidenceAndRollsGenerationWithoutPersistentStoppedState(t *testing.T) {
 	graph, decisions, _ := newGraphHarness()
 	ctx := context.Background()
@@ -497,6 +790,43 @@ func TestStoppedTransitionRequiresEvidenceAndRollsGenerationWithoutPersistentSto
 	_, err = graph.Transition(ctx, revision, "old-generation-output")
 	if !kernel.IsCode(err, kernel.CodeTransitionRejected) {
 		t.Fatalf("old generation output err = %v, want transition_rejected", err)
+	}
+}
+
+func TestHeldEndpointAcceptsRuntimeOutputThatWonTheTerminalRace(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	revision := createTask(t, graph, decisions, "task-output-won")
+	controller := &recordingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := controller.lastCommand()
+	if start.Action != CommandStart {
+		t.Fatalf("command = %#v, want start", start)
+	}
+
+	registerTransition(t, decisions, "hold-output-winner", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   start.Endpoint,
+		Action:     "held",
+		Generation: start.Generation,
+	})
+	revision = mustTransition(t, graph, revision, "hold-output-winner")
+	if err := store.RecordPhaseOutputSubmitted(context.Background(), projectID, start); err != nil {
+		t.Fatalf("RecordPhaseOutputSubmitted: %v", err)
+	}
+
+	registerTransition(t, decisions, "submit-output-winner", GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   start.Endpoint,
+		Action:     string(EndpointSubmitted),
+		Generation: start.Generation,
+	})
+	revision = mustTransition(t, graph, revision, "submit-output-winner")
+	endpoint := mustEndpoint(t, mustSnapshot(t, graph, revision), start.Endpoint)
+	if endpoint.State != EndpointSubmitted || endpoint.RunPolicy != RunHeld {
+		t.Fatalf("endpoint = %#v, want submitted and still held", endpoint)
 	}
 }
 
@@ -793,6 +1123,35 @@ func mustSnapshot(t *testing.T, graph *Service, revision kernel.Revision) GraphS
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func satisfyTaskRound(t *testing.T, graph *Service, decisions *MemoryDecisionLog, revision kernel.Revision, taskID kernel.TaskID, generation int) kernel.Revision {
+	t.Helper()
+	for _, endpointID := range []EndpointID{EndpointPlan, EndpointExecute, EndpointVerify} {
+		submitRef := fmt.Sprintf("submit-%s-%s-%d", taskID, endpointID, generation)
+		registerTransition(t, decisions, submitRef, GraphTransition{
+			TargetKind: TargetPhaseEndpoint,
+			Endpoint:   ref(taskID, endpointID),
+			Action:     string(EndpointSubmitted),
+			Generation: generation,
+		})
+		revision = mustTransition(t, graph, revision, submitRef)
+		satisfyRef := fmt.Sprintf("satisfy-%s-%s-%d", taskID, endpointID, generation)
+		registerTransition(t, decisions, satisfyRef, GraphTransition{
+			TargetKind: TargetPhaseEndpoint,
+			Endpoint:   ref(taskID, endpointID),
+			Action:     string(EndpointSatisfied),
+			Generation: generation,
+			Result: PhaseResult{
+				ID:         fmt.Sprintf("result-%s-%s-%d", taskID, endpointID, generation),
+				Endpoint:   ref(taskID, endpointID),
+				BindingRef: kernel.BindingRef(fmt.Sprintf("binding://%s/%s/%d", taskID, endpointID, generation)),
+				OutputRef:  fmt.Sprintf("artifact://phase-output/%s/%s/%d", taskID, endpointID, generation),
+			},
+		})
+		revision = mustTransition(t, graph, revision, satisfyRef)
+	}
+	return revision
 }
 
 func mustEndpoint(t *testing.T, snapshot GraphSnapshot, ref PhaseEndpointRef) PhaseEndpoint {

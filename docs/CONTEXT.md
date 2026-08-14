@@ -69,7 +69,7 @@ _Avoid_: Orchestrator、Task runner
 _Avoid_: Sandbox、checkout
 
 **Merge Queue（合并队列）**:
-main 的唯一写入口；对 verify passed 的候选做 latest-main 机械应用检查、targeted verify 与串行合入。不修冲突、不写 Coordination/Context Graph。
+main 的唯一写入口；对 verify passed 的候选做 latest-main 机械应用检查与串行合入。无 main drift 时复用原 verify；有 drift 或冲突时才启动 Targeted Verifier。Targeted Verifier 只能在 allowed/conflict paths 内解冲突；不能 commit/push 或写 Coordination/Context Graph，无法安全处理时向 Manager 提案重新编排。
 _Avoid_: PR bot、auto-merge tool
 
 ## 证据和上下文

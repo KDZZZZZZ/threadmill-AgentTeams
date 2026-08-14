@@ -18,6 +18,7 @@ tags:
   - name: Decisions
   - name: Tasks
   - name: Coordination UI
+  - name: Context Graph
   - name: Manager
   - name: Events
   - name: Health
@@ -180,6 +181,26 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/context/snapshot:
+    get:
+      tags: [Context Graph]
+      summary: Read a project context graph snapshot with node usage heat.
+      operationId: getContextSnapshot
+      parameters:
+        - $ref: "#/components/parameters/ProjectID"
+      responses:
+        "200":
+          description: Read-only project context graph snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextGraphSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /v1/coordination/endpoints/{task_id}/{endpoint_id}/inspector:
     get:
       tags: [Coordination UI]
@@ -713,7 +734,15 @@ components:
     TaskProjection:
       type: object
       additionalProperties: false
-      required: [task_id, project_id, status, graph_revision, endpoints, delivery_policy]
+      required:
+        [
+          task_id,
+          project_id,
+          status,
+          graph_revision,
+          endpoints,
+          delivery_policy,
+        ]
       properties:
         task_id:
           $ref: "#/components/schemas/TaskID"
@@ -731,7 +760,8 @@ components:
           type: string
         delivery_policy:
           type: string
-          enum: [code_merge, non_code_artifact, human_acceptance, external_delivery]
+          enum:
+            [code_merge, non_code_artifact, human_acceptance, external_delivery]
         endpoints:
           type: array
           items:
@@ -760,7 +790,19 @@ components:
           minimum: 1
         state:
           type: string
-          enum: [pending, runnable, starting, running, waiting, submitted, satisfied, rejected, stopped, invalidated]
+          enum:
+            [
+              pending,
+              runnable,
+              starting,
+              running,
+              waiting,
+              submitted,
+              satisfied,
+              rejected,
+              stopped,
+              invalidated,
+            ]
         run_policy:
           type: string
           enum: [enabled, held]
@@ -846,6 +888,101 @@ components:
             $ref: "#/components/schemas/GraphEdge"
         capacity:
           $ref: "#/components/schemas/CapacityState"
+    ContextGraphSnapshot:
+      type: object
+      additionalProperties: false
+      required: [project_id, revision, nodes, edges, subgraphs]
+      properties:
+        project_id:
+          $ref: "#/components/schemas/ProjectID"
+        revision:
+          type: integer
+          format: int64
+          minimum: 0
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContextSnapshotNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContextSnapshotEdge"
+        subgraphs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContextSnapshotSubgraph"
+    ContextSnapshotNode:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          node_id,
+          kind,
+          statement,
+          status,
+          source_refs,
+          subgraph_ids,
+          usage_count,
+          last_used_at,
+        ]
+      properties:
+        node_id:
+          type: string
+        kind:
+          type: string
+          enum: [directive, fact, hypothesis]
+        statement:
+          type: string
+        status:
+          type: string
+          enum: [accepted, disputed, superseded, outdated]
+        source_refs:
+          type: array
+          items:
+            type: string
+        subgraph_ids:
+          type: array
+          items:
+            type: string
+        usage_count:
+          type: integer
+          minimum: 0
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+    ContextSnapshotEdge:
+      type: object
+      additionalProperties: false
+      required: [from_ref, to_node_id, kind]
+      properties:
+        from_ref:
+          type: string
+        to_node_id:
+          type: string
+        kind:
+          type: string
+          enum: [logical_adjacent, derives_from_subgraph]
+    ContextSnapshotSubgraph:
+      type: object
+      additionalProperties: false
+      required: [subgraph_id, name, summary, revision, kind]
+      properties:
+        subgraph_id:
+          type: string
+        name:
+          type: string
+        summary:
+          type: string
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        kind:
+          type: string
+          enum: [general, task]
+        task_id:
+          $ref: "#/components/schemas/TaskID"
     TaskSummary:
       type: object
       additionalProperties: false
@@ -1094,6 +1231,11 @@ components:
           type: string
           minLength: 1
           maxLength: 50000
+        intent:
+          type: string
+          default: orchestrate
+          enum: [orchestrate, hold, resume]
+          description: Explicit lifecycle intent. Omitted means orchestration; selected_endpoint alone never authorizes hold or resume.
         selected_endpoint:
           $ref: "#/components/schemas/EndpointRef"
         observed_graph_revision:
@@ -1213,7 +1355,14 @@ components:
             $ref: "#/components/schemas/PendingInput"
         terminal_reason:
           type: string
-          enum: [source_failed, source_cancelled, input_stale, lease_expired, deadline_exceeded]
+          enum:
+            [
+              source_failed,
+              source_cancelled,
+              input_stale,
+              lease_expired,
+              deadline_exceeded,
+            ]
         join_token:
           type: string
           description: Runtime-issued opaque token for the current wait, never supplied by the Agent as authority.
@@ -1221,7 +1370,14 @@ components:
           $ref: "#/components/schemas/Timestamp"
         error_code:
           type: string
-          enum: [input_not_declared, input_already_terminal, wait_conflict, deadline_exceeded, lease_expired]
+          enum:
+            [
+              input_not_declared,
+              input_already_terminal,
+              wait_conflict,
+              deadline_exceeded,
+              lease_expired,
+            ]
     InputDelivery:
       type: object
       additionalProperties: false
@@ -1256,7 +1412,8 @@ components:
       properties:
         kind:
           type: string
-          enum: [submitted_plan, implementation_candidate, verify_result, custom]
+          enum:
+            [submitted_plan, implementation_candidate, verify_result, custom]
         required_artifact_kinds:
           type: array
           items:

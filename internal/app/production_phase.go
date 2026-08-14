@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -34,14 +37,16 @@ type productionPhaseBundleOptions struct {
 	ProjectID   kernel.ProjectID
 	Graph       *coordination.PostgresStore
 	Assembler   *runtimepkg.Assembler
-	Adapter     agentteams.AgentTeamsHostAdapter
+	Adapter     phasepkg.AgentTeamsPhaseAdapter
 	Ingress     *productionIngress
 	ObjectStore objectstore.Store
+	Workspaces  *workspace.Service
 	Now         func() time.Time
 }
 
 type productionInvocationSource struct {
 	taskManager agentteams.InvocationSource
+	context     agentteams.InvocationSource
 	phase       agentteams.InvocationSource
 }
 
@@ -51,6 +56,12 @@ func (s productionInvocationSource) LoadPreparedInvocation(ctx context.Context, 
 			return agentteams.PreparedInvocation{}, kernel.Error{Code: kernel.CodeNotFound, Message: "phase invocation source is not configured"}
 		}
 		return s.phase.LoadPreparedInvocation(ctx, invocationRef)
+	}
+	if strings.HasPrefix(invocationRef, "context-invocation:") {
+		if s.context == nil {
+			return agentteams.PreparedInvocation{}, kernel.Error{Code: kernel.CodeNotFound, Message: "Context Agent invocation source is not configured"}
+		}
+		return s.context.LoadPreparedInvocation(ctx, invocationRef)
 	}
 	if s.taskManager == nil {
 		return agentteams.PreparedInvocation{}, kernel.Error{Code: kernel.CodeNotFound, Message: "task manager invocation source is not configured"}
@@ -72,7 +83,10 @@ func buildProductionPhaseSeams(options productionPhaseBundleOptions) (production
 	contexts := contextgraph.NewPostgresStore(options.DB, now)
 	taskResolver := productionTaskEndpointResolver{projectID: options.ProjectID, graph: options.Graph}
 	contexts.SetTaskEndpointResolver(taskResolver)
-	workspaces := workspace.NewPostgresService(options.DB)
+	workspaces := options.Workspaces
+	if workspaces == nil {
+		workspaces = workspace.NewPostgresService(options.DB)
+	}
 	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(options.DB)
 	contracts := taskmanager.NewPostgresStore(options.DB, options.ProjectID, options.Graph)
 	artifacts := evidence.NewPostgresArtifactRegistry(options.DB, options.ObjectStore, options.Config.ObjectStoreBucket)
@@ -94,7 +108,7 @@ func buildProductionPhaseSeams(options productionPhaseBundleOptions) (production
 	}
 	phaseRuntime := &productionPhaseRuntime{
 		db: options.DB, projectID: options.ProjectID, graph: options.Graph, ingress: options.Ingress,
-		invocations: invocations, workspaces: workspaces, artifacts: artifacts, source: phaseBindings, now: now,
+		invocations: invocations, workspaces: workspaces, artifacts: artifacts, source: phaseBindings, workspaceSync: host, now: now,
 	}
 	recovery := phasepkg.NewPostgresRecoveryStoreFromSQL(options.DB, invocations)
 	controller := phasepkg.NewController(phasepkg.Config{
@@ -118,10 +132,18 @@ func buildProductionPhaseSeams(options productionPhaseBundleOptions) (production
 	phaseRuntime.recovery = recovery
 	return productionPhaseSeams{
 		Controller:     controller,
+		Failures:       controller,
 		Runtime:        phaseRuntime,
 		Orchestration:  phaseRuntime,
 		TaskWorkspaces: phaseBindings,
 		TaskContexts:   phaseBindings,
+		Host:           host,
+		WorkspaceSync:  host,
+		Recovery:       recovery,
+		Contexts:       contexts,
+		TaskSubgraphs:  contexts,
+		Contracts:      contracts,
+		ArtifactRouter: productionPhaseArtifactRouter{registry: artifacts},
 		Readiness: productionPhaseReadiness{
 			db: options.DB, repositoryPath: options.Config.RepositoryPath, worktreeParent: options.Config.WorktreeParent,
 			projectID: options.ProjectID, graph: options.Graph, contexts: contexts, artifacts: artifacts,
@@ -231,6 +253,20 @@ func (s *productionPhaseBindingSource) resolve(ctx context.Context, command coor
 	if err != nil {
 		return phasepkg.BindingSnapshot{}, nil, err
 	}
+	workspaceJSON, err := stableProductionJSON(struct {
+		WorkspaceRef      kernel.BindingRef  `json:"workspace_ref"`
+		WorkspaceRevision string             `json:"workspace_revision"`
+		Phase             workspace.Phase    `json:"phase"`
+		AllowedDirs       []string           `json:"allowed_dirs"`
+		DeclaredWrites    workspace.WriteSet `json:"declared_writes"`
+	}{
+		WorkspaceRef: workspaceBinding.ID, WorkspaceRevision: workspaceBinding.CurrentRevision,
+		Phase: workspacePhase(command.Endpoint.EndpointID), AllowedDirs: append([]string(nil), workspaceBinding.AllowedDirs...),
+		DeclaredWrites: workspaceBinding.DeclaredWrites,
+	})
+	if err != nil {
+		return phasepkg.BindingSnapshot{}, nil, err
+	}
 	rollbackLease = false
 	return phasepkg.BindingSnapshot{
 		ProjectID:         s.projectID,
@@ -242,6 +278,7 @@ func (s *productionPhaseBindingSource) resolve(ctx context.Context, command coor
 		LeaseRef:          command.LeaseRef,
 		WorkspaceRef:      string(workspaceBinding.ID),
 		WorkspaceRevision: workspaceBinding.CurrentRevision,
+		WorkspaceBinding:  string(workspaceJSON),
 		TaskContract:      string(contractJSON),
 		PhaseSpec:         string(specJSON),
 		Inputs:            inputs,
@@ -254,11 +291,40 @@ func (s *productionPhaseBindingSource) EnsureTaskWorkspace(ctx context.Context, 
 	if err := kernel.RequireID("task_id", req.TaskID); err != nil {
 		return "", err
 	}
-	if req.Generation <= 0 {
-		return "", kernel.InvalidArgument("generation must be positive")
+	if req.Generation < 0 {
+		return "", kernel.InvalidArgument("generation cannot be negative")
+	}
+	generation := req.Generation
+	baseRevision := strings.TrimSpace(req.BaseRevision)
+	if generation == 0 {
+		latest, ok, err := s.workspaces.GetLatestByTask(ctx, req.TaskID)
+		if err != nil {
+			return "", err
+		}
+		if ok && baseRevision != "" && latest.BaseRevision == baseRevision &&
+			latest.ActiveInvocation == "" && latest.PhaseLeases[workspace.PhasePlan] != "" &&
+			latest.PhaseLeases[workspace.PhaseExecute] == "" && latest.PhaseLeases[workspace.PhaseVerify] == "" {
+			// Crash-safe replay of the same Manager-approved fresh round.
+			return latest.ID, nil
+		} else if ok {
+			generation = latest.Generation + 1
+		} else {
+			generation = 1
+		}
+	}
+	if baseRevision == "" && generation > 1 {
+		previous, ok, err := s.workspaces.GetByRound(ctx, req.TaskID, generation-1)
+		if err != nil {
+			return "", err
+		}
+		if !ok || previous.CurrentRevision == "" {
+			return "", kernel.StaleBinding("previous Task workspace generation is unavailable")
+		}
+		baseRevision = previous.CurrentRevision
 	}
 	binding, err := s.workspaces.CreateGitWorktree(ctx, workspace.CreateRequest{
-		TaskID: req.TaskID, Generation: req.Generation, RepoPath: s.repositoryPath, WorktreeParent: s.worktreeParent,
+		TaskID: req.TaskID, Generation: generation, RepoPath: s.repositoryPath, WorktreeParent: s.worktreeParent,
+		BaseRevision: baseRevision,
 	})
 	if err != nil {
 		return "", err
@@ -267,7 +333,66 @@ func (s *productionPhaseBindingSource) EnsureTaskWorkspace(ctx context.Context, 
 	if err != nil {
 		return "", err
 	}
+	// A Manager-approved reopened round starts from the exact latest-main
+	// revision observed by targeted verify. Project the completed plan marker
+	// into that fresh round so workspaceForStart selects it for execute instead
+	// of treating it as an unused speculative shell.
+	if strings.TrimSpace(req.BaseRevision) != "" && generation > 1 {
+		previous, ok, err := s.workspaces.GetByRound(ctx, req.TaskID, generation-1)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", kernel.StaleBinding("previous Task workspace generation is unavailable")
+		}
+		if previous.PhaseLeases[workspace.PhasePlan] == "" {
+			return "", kernel.TransitionRejected("reopen_round requires a completed plan workspace prerequisite")
+		}
+		binding, err = s.workspaces.InheritPlanPrerequisite(ctx, binding.ID, previous.ID)
+		if err != nil {
+			return "", err
+		}
+	}
 	return binding.ID, nil
+}
+
+// EnsureMergedVerifyWorkspace materializes the exact revision Merge Queue
+// wrote to main and projects only the completed plan/execute prerequisites
+// into that read-only verification round. This is the sole bridge from the
+// internal merge lifecycle back to normal Phase scheduling.
+func (s *productionPhaseBindingSource) EnsureMergedVerifyWorkspace(ctx context.Context, taskID kernel.TaskID, sourceRef kernel.BindingRef, mergedRevision string) (kernel.BindingRef, error) {
+	if err := kernel.RequireID("task_id", taskID); err != nil {
+		return "", err
+	}
+	if sourceRef == "" || strings.TrimSpace(mergedRevision) == "" {
+		return "", kernel.InvalidArgument("source workspace and merged revision are required")
+	}
+	source, err := s.workspaces.Get(ctx, sourceRef)
+	if err != nil {
+		return "", err
+	}
+	if source.TaskID != taskID {
+		return "", kernel.StaleBinding("merge source workspace belongs to another task")
+	}
+	if latest, ok, err := s.workspaces.GetLatestByTask(ctx, taskID); err != nil {
+		return "", err
+	} else if ok && latest.Generation == source.Generation+1 && latest.BaseRevision == mergedRevision &&
+		latest.CurrentRevision == mergedRevision && latest.PhaseLeases[workspace.PhasePlan] != "" &&
+		latest.PhaseLeases[workspace.PhaseExecute] != "" && latest.PhaseLeases[workspace.PhaseVerify] == "" {
+		return latest.ID, nil
+	}
+	target, err := s.workspaces.CreateGitWorktree(ctx, workspace.CreateRequest{
+		TaskID: taskID, Generation: source.Generation + 1,
+		RepoPath: s.repositoryPath, WorktreeParent: s.worktreeParent, BaseRevision: mergedRevision,
+	})
+	if err != nil {
+		return "", err
+	}
+	target, err = s.workspaces.InheritMergedVerifyPrerequisites(ctx, target.ID, source.ID)
+	if err != nil {
+		return "", err
+	}
+	return target.ID, nil
 }
 
 func (s *productionPhaseBindingSource) EnsureTaskContext(ctx context.Context, req productionTaskContextRequest) error {
@@ -299,30 +424,79 @@ func (s *productionPhaseBindingSource) EnsureTaskContext(ctx context.Context, re
 	for _, endpointID := range endpointIDs {
 		endpoints = append(endpoints, contextgraph.PhaseEndpointRef{TaskID: req.TaskID, EndpointID: coordination.EndpointID(endpointID)})
 	}
-	sourceRefs := []string{"contract:" + req.Contract.ContractRef}
-	if req.InputRef != "" {
-		sourceRefs = append(sourceRefs, "requirement:"+req.InputRef)
+	for _, projection := range productionTaskContextProjections(s.projectID, req, binding.SubgraphID, endpoints) {
+		if _, err := s.contexts.ProjectTaskContext(ctx, principal, contextgraph.ProjectTaskContextRequest{Projection: projection}); err != nil {
+			return err
+		}
 	}
-	statement, err := stableProductionJSON(map[string]any{
-		"requirement": req.Requirement,
-		"contract":    req.Contract,
+	return nil
+}
+
+// productionTaskContextProjections keeps Context Graph statements atomic. A
+// requirement or contract is authoritative as a whole in its source store,
+// but copying that whole object into one ContextNode makes retrieval coarse and
+// prevents later agents from citing the exact constraint or decision they
+// reused. Each stable semantic unit therefore becomes one independently
+// addressable task projection with the same source revision.
+func productionTaskContextProjections(projectID kernel.ProjectID, req productionTaskContextRequest, subgraphID string, endpoints []contextgraph.PhaseEndpointRef) []contextgraph.TaskContextProjection {
+	allRecipients := []contextgraph.TaskContextRecipient{{TaskID: string(req.TaskID), EndpointRefs: append([]contextgraph.PhaseEndpointRef(nil), endpoints...)}}
+	requirementRefs := []string{"requirement:" + req.InputRef}
+	requirementRefs = uniqueProductionStrings(append(requirementRefs, req.Requirement.EvidenceRefs...))
+	contractRef := "contract:" + req.Contract.ContractRef
+	sourceRevision := fmt.Sprint(req.GraphRevision)
+	projections := make([]contextgraph.TaskContextProjection, 0, 8+len(req.Requirement.Constraints)+len(req.Contract.PhaseSpecs))
+	appendProjection := func(category string, statement string, sourceRefs []string, recipients []contextgraph.TaskContextRecipient) {
+		statement = strings.TrimSpace(statement)
+		if statement == "" {
+			return
+		}
+		projections = append(projections, contextgraph.TaskContextProjection{
+			// Projection identity follows the semantic unit, not its position in a
+			// sorted input list. Adding a new constraint must never make an existing
+			// NodeRef silently change meaning.
+			ProjectionID:   stableRuntimeRef("task-context", projectID, req.TaskID, category, statement),
+			SourceRevision: sourceRevision,
+			Statement:      statement,
+			Kind:           string(contextgraph.NodeKindDirective),
+			SourceRefs:     append([]string(nil), sourceRefs...),
+			SubgraphIDs:    []string{subgraphID},
+			Recipients:     cloneProductionContextRecipients(recipients),
+		})
+	}
+
+	for _, statement := range productionAtomicContextStatements(req.Requirement.Text) {
+		appendProjection("requirement", statement, requirementRefs, allRecipients)
+	}
+	for _, statement := range productionAtomicContextStatements(req.Requirement.Goal) {
+		appendProjection("goal", statement, requirementRefs, allRecipients)
+	}
+	for _, constraint := range req.Requirement.Constraints {
+		for _, statement := range productionAtomicContextStatements(constraint) {
+			appendProjection("constraint", statement, requirementRefs, allRecipients)
+		}
+	}
+	appendProjection("delivery-policy", fmt.Sprintf("交付策略要求 %s。", req.Contract.DeliveryPolicy), []string{contractRef}, allRecipients)
+	return projections
+}
+
+func productionAtomicContextStatements(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		switch r {
+		case '\n', '\r', '。', '！', '？', '；', ';':
+			return true
+		default:
+			return false
+		}
 	})
-	if err != nil {
-		return err
+	return uniqueProductionStrings(parts)
+}
+
+func cloneProductionContextRecipients(input []contextgraph.TaskContextRecipient) []contextgraph.TaskContextRecipient {
+	cloned := make([]contextgraph.TaskContextRecipient, len(input))
+	for index, recipient := range input {
+		cloned[index] = contextgraph.TaskContextRecipient{TaskID: recipient.TaskID, EndpointRefs: append([]contextgraph.PhaseEndpointRef(nil), recipient.EndpointRefs...)}
 	}
-	_, err = s.contexts.ProjectTaskContext(ctx, principal, contextgraph.ProjectTaskContextRequest{Projection: contextgraph.TaskContextProjection{
-		ProjectionID:   stableRuntimeRef("task-context", s.projectID, req.TaskID),
-		SourceRevision: fmt.Sprint(req.GraphRevision),
-		Statement:      string(statement),
-		Kind:           string(contextgraph.NodeKindDirective),
-		SourceRefs:     sourceRefs,
-		SubgraphIDs:    []string{binding.SubgraphID},
-		Recipients: []contextgraph.TaskContextRecipient{{
-			TaskID:       string(req.TaskID),
-			EndpointRefs: endpoints,
-		}},
-	}})
-	return err
+	return cloned
 }
 
 func (s *productionPhaseBindingSource) authorizeEndpoint(ctx context.Context, snapshot coordination.GraphSnapshot, command coordination.PhaseCommand) (coordination.Task, coordination.PhaseEndpoint, error) {
@@ -362,12 +536,7 @@ func (s *productionPhaseBindingSource) materializeWorkspace(ctx context.Context,
 	case command.Action == coordination.CommandResume && command.Generation > 1:
 		binding, err = s.workspaceForResume(ctx, command)
 	default:
-		binding, err = s.workspaces.CreateGitWorktree(ctx, workspace.CreateRequest{
-			TaskID:         command.Endpoint.TaskID,
-			Generation:     command.Generation,
-			RepoPath:       s.repositoryPath,
-			WorktreeParent: s.worktreeParent,
-		})
+		binding, err = s.workspaceForStart(ctx, command, invocationID)
 	}
 	if err != nil {
 		return workspace.Binding{}, err
@@ -376,10 +545,123 @@ func (s *productionPhaseBindingSource) materializeWorkspace(ctx context.Context,
 	if err != nil {
 		return workspace.Binding{}, err
 	}
+	phase := workspacePhase(command.Endpoint.EndpointID)
+	alreadyBound := binding.ActivePhase == phase && binding.ActiveInvocation == invocationID
+	if lease && command.Action == coordination.CommandStart && phase == workspace.PhaseExecute && !alreadyBound {
+		binding, err = s.promotePlannerWriteAuthority(ctx, binding)
+		if err != nil {
+			return workspace.Binding{}, err
+		}
+	}
 	if !lease || command.Action == coordination.CommandStop {
 		return binding, nil
 	}
-	return s.workspaces.BindPhase(ctx, binding.ID, workspacePhase(command.Endpoint.EndpointID), invocationID, binding.Revision)
+	return s.workspaces.BindPhase(ctx, binding.ID, phase, invocationID, binding.Revision)
+}
+
+// workspaceForStart resolves the Task-owned round independently from the
+// endpoint control generation. Plan, execute, and verify reuse the same round;
+// a higher endpoint generation only creates a new Workspace when the latest
+// round has already completed the phase being retried.
+func (s *productionPhaseBindingSource) workspaceForStart(ctx context.Context, command coordination.PhaseCommand, invocationID kernel.InvocationID) (workspace.Binding, error) {
+	phase := workspacePhase(command.Endpoint.EndpointID)
+	latest, ok, err := s.workspaces.GetLatestByTask(ctx, command.Endpoint.TaskID)
+	if err != nil {
+		return workspace.Binding{}, err
+	}
+	if !ok {
+		return s.workspaces.CreateGitWorktree(ctx, workspace.CreateRequest{
+			TaskID: command.Endpoint.TaskID, Generation: 1,
+			RepoPath: s.repositoryPath, WorktreeParent: s.worktreeParent,
+		})
+	}
+	for generation := latest.Generation; generation > 0; generation-- {
+		candidate := latest
+		if generation != latest.Generation {
+			candidate, ok, err = s.workspaces.GetByRound(ctx, command.Endpoint.TaskID, generation)
+			if err != nil {
+				return workspace.Binding{}, err
+			}
+			if !ok {
+				continue
+			}
+		}
+		if candidate.ActiveInvocation != "" &&
+			(candidate.ActiveInvocation != invocationID || candidate.ActivePhase != phase) {
+			return workspace.Binding{}, kernel.LeaseConflict("another phase holds the Task workspace write lease")
+		}
+		if !productionWorkspacePrerequisitesMet(candidate, phase) {
+			// Older binaries could pre-create the next round from repository
+			// HEAD before a failed endpoint was reopened. Such a never-leased,
+			// unchanged shell is not an execution lineage and must not hide the
+			// previous usable Task round.
+			if productionWorkspaceRoundUnused(candidate) {
+				continue
+			}
+			return workspace.Binding{}, kernel.TransitionRejected("latest Task workspace phase prerequisites are not complete")
+		}
+		if candidate.PhaseLeases[phase] == "" {
+			return candidate, nil
+		}
+		latest = candidate
+		break
+	}
+	next, err := s.workspaces.CreateGitWorktree(ctx, workspace.CreateRequest{
+		TaskID: command.Endpoint.TaskID, Generation: latest.Generation + 1,
+		RepoPath: s.repositoryPath, WorktreeParent: s.worktreeParent, BaseRevision: latest.CurrentRevision,
+	})
+	if err != nil {
+		return workspace.Binding{}, err
+	}
+	return s.workspaces.InheritPhasePrerequisites(ctx, next.ID, latest.ID, phase, invocationID)
+}
+
+func productionWorkspacePrerequisitesMet(binding workspace.Binding, phase workspace.Phase) bool {
+	switch phase {
+	case workspace.PhasePlan:
+		return true
+	case workspace.PhaseExecute:
+		return binding.PhaseLeases[workspace.PhasePlan] != ""
+	case workspace.PhaseVerify:
+		return binding.PhaseLeases[workspace.PhasePlan] != "" && binding.PhaseLeases[workspace.PhaseExecute] != ""
+	default:
+		return false
+	}
+}
+
+func productionWorkspaceRoundUnused(binding workspace.Binding) bool {
+	return binding.ActiveInvocation == "" && len(binding.PhaseLeases) == 0 &&
+		binding.BaseRevision == binding.CurrentRevision && productionWriteSetEmpty(binding.DeclaredWrites) &&
+		productionWriteSetEmpty(binding.ObservedWrites)
+}
+
+func productionWriteSetEmpty(set workspace.WriteSet) bool {
+	return len(set.Files) == 0 && len(set.Modules) == 0 && len(set.Symbols) == 0 &&
+		len(set.Contracts) == 0 && len(set.Tests) == 0 && len(set.Owners) == 0
+}
+
+func (s *productionPhaseBindingSource) promotePlannerWriteAuthority(ctx context.Context, binding workspace.Binding) (workspace.Binding, error) {
+	raw, err := os.ReadFile(filepath.Join(binding.Root, "plan", "declared-writes.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// A fresh Manager-approved round may deliberately start from a newer
+			// main revision that does not contain Task-local plan artifacts. In
+			// that case Workspace Service has already inherited the completed-plan
+			// marker and its normalized write authority from the prior round.
+			if binding.Generation > 1 && binding.PhaseLeases[workspace.PhasePlan] != "" {
+				return binding, nil
+			}
+			return workspace.Binding{}, kernel.TransitionRejected("execute requires plan/declared-writes.json from the completed planner phase")
+		}
+		return workspace.Binding{}, fmt.Errorf("read planner declared write set: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var declared workspace.WriteSet
+	if err := decoder.Decode(&declared); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return workspace.Binding{}, kernel.InvalidArgument("plan/declared-writes.json is invalid")
+	}
+	return s.workspaces.AuthorizeExecuteWrites(ctx, binding.ID, declared, binding.Revision)
 }
 
 func (s *productionPhaseBindingSource) workspaceForStop(ctx context.Context, command coordination.PhaseCommand) (workspace.Binding, error) {
@@ -845,17 +1127,20 @@ func (l productionPhaseLifecycle) finishWorkspace(ctx context.Context, invocatio
 }
 
 type productionPhaseRuntime struct {
-	controller  *phasepkg.Controller
-	db          *sql.DB
-	projectID   kernel.ProjectID
-	graph       *coordination.PostgresStore
-	ingress     *productionIngress
-	invocations runtimepkg.InvocationStore
-	workspaces  *workspace.Service
-	artifacts   *evidence.PostgresArtifactRegistry
-	source      *productionPhaseBindingSource
-	recovery    phasepkg.RecoveryStore
-	now         func() time.Time
+	controller    *phasepkg.Controller
+	db            *sql.DB
+	projectID     kernel.ProjectID
+	graph         *coordination.PostgresStore
+	ingress       *productionIngress
+	invocations   runtimepkg.InvocationStore
+	workspaces    *workspace.Service
+	artifacts     *evidence.PostgresArtifactRegistry
+	source        *productionPhaseBindingSource
+	recovery      phasepkg.RecoveryStore
+	workspaceSync interface {
+		SyncWorkspace(context.Context, kernel.InvocationID) (agentteams.ExecutionWorkspaceCheckpoint, error)
+	}
+	now func() time.Time
 }
 
 func (p *productionPhaseRuntime) AwaitInputs(ctx context.Context, invocationID kernel.InvocationID, req phasepkg.AwaitInputsRequest) (phasepkg.InputWaitResult, error) {
@@ -863,6 +1148,9 @@ func (p *productionPhaseRuntime) AwaitInputs(ctx context.Context, invocationID k
 }
 
 func (p *productionPhaseRuntime) SubmitPhaseOutput(ctx context.Context, invocationID kernel.InvocationID, output phasepkg.PhaseOutput) (phasepkg.OutputReceipt, error) {
+	if err := p.syncOutputWorkspace(ctx, invocationID, output); err != nil {
+		return phasepkg.OutputReceipt{}, err
+	}
 	requestID, err := p.persistOutputIntent(ctx, invocationID, output)
 	if err != nil {
 		return phasepkg.OutputReceipt{}, err
@@ -881,6 +1169,28 @@ func (p *productionPhaseRuntime) SubmitPhaseOutput(ctx context.Context, invocati
 		return receipt, err
 	}
 	return receipt, nil
+}
+
+func (p *productionPhaseRuntime) syncOutputWorkspace(ctx context.Context, invocationID kernel.InvocationID, output phasepkg.PhaseOutput) error {
+	if recovered, ok, err := p.recoveredOutputReceipt(ctx, invocationID); err != nil {
+		return err
+	} else if ok {
+		if !productionPhaseReceiptMatchesOutput(recovered, output) {
+			return kernel.IdempotencyConflict()
+		}
+		return nil
+	}
+	if p.workspaceSync == nil {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "phase native workspace synchronization is not configured", Recoverable: true}
+	}
+	checkpoint, err := p.workspaceSync.SyncWorkspace(ctx, invocationID)
+	if err != nil {
+		return fmt.Errorf("phase native workspace synchronization: %w", err)
+	}
+	if strings.TrimSpace(checkpoint.WorkspaceRevision) == "" {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "phase native workspace synchronization returned no revision", Recoverable: true}
+	}
+	return nil
 }
 
 func (p *productionPhaseRuntime) persistOutputIntent(ctx context.Context, invocationID kernel.InvocationID, output phasepkg.PhaseOutput) (string, error) {
@@ -909,9 +1219,9 @@ func (p *productionPhaseRuntime) persistOutputIntent(ctx context.Context, invoca
 
 func (p *productionPhaseRuntime) deliverOutputReceipt(ctx context.Context, receipt phasepkg.OutputReceipt, requestID string, intentOutput phasepkg.PhaseOutput) error {
 	outbox := productionPhaseTerminalOutbox{db: p.db, projectID: p.projectID, ingress: p.ingress, now: p.now}
-	if delivered, err := outbox.deliverExistingFinal(ctx, "phase_output", requestID); err != nil {
+	if exists, err := outbox.finalExists(ctx, "phase_output", requestID); err != nil {
 		return err
-	} else if delivered {
+	} else if exists {
 		return nil
 	}
 	outputRef, err := p.persistOutput(ctx, receipt)
@@ -933,7 +1243,7 @@ func (p *productionPhaseRuntime) deliverOutputReceipt(ctx context.Context, recei
 		Payload:        payload, SeenRevision: snapshot.Revision, SelectedEndpoint: &receipt.Endpoint,
 		TargetKind: "phase_output", TargetRef: outputRef,
 	}
-	return outbox.promoteAndDeliver(ctx, productionPhaseTerminalDelivery{
+	return outbox.promote(ctx, productionPhaseTerminalDelivery{
 		Input: input, InvocationID: receipt.InvocationID, CommandID: receipt.CommandID,
 		CommandAction: receipt.CommandAction, Endpoint: receipt.Endpoint, Generation: receipt.Generation, IntentOutput: intentOutput,
 	})
@@ -941,15 +1251,205 @@ func (p *productionPhaseRuntime) deliverOutputReceipt(ctx context.Context, recei
 
 func (p *productionPhaseRuntime) ReplayTerminalDeliveries(ctx context.Context) error {
 	outbox := productionPhaseTerminalOutbox{db: p.db, projectID: p.projectID, ingress: p.ingress, now: p.now}
-	if err := p.replayOutputIntents(ctx, outbox); err != nil {
+	return errors.Join(
+		p.recoverActivePhaseInvocations(ctx),
+		p.recoverPersistedOutputReceipts(ctx),
+		p.replayOutputIntents(ctx, outbox),
+		outbox.replay(ctx),
+	)
+}
+
+// recoverActivePhaseInvocations reconstructs the Controller's process-local
+// active index before replaying output intents. AgentTeams workers and their
+// MCP calls can outlive a Threadmill process restart; the persisted invocation,
+// command, and recovery obligation therefore remain authoritative even though
+// the new Controller has an empty in-memory active map.
+func (p *productionPhaseRuntime) recoverActivePhaseInvocations(ctx context.Context) error {
+	if p.controller == nil {
+		return nil
+	}
+	abandoned, err := p.unrecoverablePhaseInvocations(ctx)
+	if err != nil {
 		return err
 	}
-	return outbox.replay(ctx)
+	var errs []error
+	for _, command := range abandoned {
+		if err := p.controller.AbandonInvocation(ctx, command); err != nil && !kernel.IsCode(err, kernel.CodeStaleCommand) {
+			errs = append(errs, err)
+		}
+	}
+	rows, err := p.db.QueryContext(ctx, `
+SELECT c.command_id, c.task_id, c.endpoint_id, c.generation, c.binding_ref,
+       c.lease_ref, c.action, COALESCE(c.cause_ref, '')
+FROM phase_recovery_obligations o
+JOIN coordination_phase_commands c
+  ON c.project_id=$1
+ AND c.command_id=o.run_command_id
+JOIN runtime_invocations r
+  ON r.project_id=c.project_id
+ AND r.task_id=c.task_id
+ AND r.endpoint_id=c.endpoint_id
+ AND r.generation=c.generation
+ AND r.binding_ref=c.binding_ref
+ AND r.lease_id=c.lease_ref
+JOIN coordination_phase_leases l
+  ON l.project_id=c.project_id
+ AND l.lease_ref=c.lease_ref
+WHERE o.active=TRUE
+  AND o.output_receipt IS NULL
+  AND r.status IN ('prepared','running','waiting')
+  AND c.accepted_at IS NOT NULL
+  AND c.not_executable=FALSE
+  AND l.state='active'
+  AND l.expires_at > now()
+ORDER BY c.command_id`, p.projectID)
+	if err != nil {
+		return errors.Join(errors.Join(errs...), err)
+	}
+	var commands []coordination.PhaseCommand
+	for rows.Next() {
+		var command coordination.PhaseCommand
+		if err := rows.Scan(
+			&command.ID, &command.Endpoint.TaskID, &command.Endpoint.EndpointID,
+			&command.Generation, &command.BindingRef, &command.LeaseRef,
+			&command.Action, &command.CauseRef,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+		commands = append(commands, command)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, command := range commands {
+		if err := p.controller.Apply(ctx, command); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// unrecoverablePhaseInvocations returns active Runtime invocations whose
+// persisted command can no longer authorize execution. These are cleanup
+// obligations, not graph transitions: command rejection or lease expiry is
+// already authoritative in the Coordination Graph.
+func (p *productionPhaseRuntime) unrecoverablePhaseInvocations(ctx context.Context) ([]coordination.PhaseCommand, error) {
+	rows, err := p.db.QueryContext(ctx, `
+SELECT c.command_id, c.task_id, c.endpoint_id, c.generation, c.binding_ref,
+       c.lease_ref, c.action, COALESCE(c.cause_ref, '')
+FROM phase_recovery_obligations o
+JOIN coordination_phase_commands c
+  ON c.project_id=$1
+ AND c.command_id=o.run_command_id
+JOIN runtime_invocations r
+  ON r.project_id=c.project_id
+ AND r.task_id=c.task_id
+ AND r.endpoint_id=c.endpoint_id
+ AND r.generation=c.generation
+ AND r.binding_ref=c.binding_ref
+ AND r.lease_id=c.lease_ref
+LEFT JOIN coordination_phase_leases l
+  ON l.project_id=c.project_id
+ AND l.lease_ref=c.lease_ref
+WHERE o.active=TRUE
+  AND o.output_receipt IS NULL
+  AND r.status IN ('prepared','running','waiting')
+  AND c.action IN ('start','resume')
+  AND (
+    c.not_executable=TRUE
+    OR l.lease_ref IS NULL
+    OR l.state <> 'active'
+    OR l.expires_at <= now()
+  )
+ORDER BY c.command_id`, p.projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commands := make([]coordination.PhaseCommand, 0)
+	for rows.Next() {
+		var command coordination.PhaseCommand
+		if err := rows.Scan(
+			&command.ID, &command.Endpoint.TaskID, &command.Endpoint.EndpointID,
+			&command.Generation, &command.BindingRef, &command.LeaseRef,
+			&command.Action, &command.CauseRef,
+		); err != nil {
+			return nil, err
+		}
+		commands = append(commands, command)
+	}
+	return commands, rows.Err()
 }
 
 type productionPhaseOutputIntent struct {
 	InvocationID kernel.InvocationID  `json:"invocation_id"`
 	Output       phasepkg.PhaseOutput `json:"output"`
+}
+
+func (p *productionPhaseRuntime) recoverPersistedOutputReceipts(ctx context.Context) error {
+	if p.controller == nil {
+		return nil
+	}
+	rows, err := p.db.QueryContext(ctx, `
+SELECT r.invocation_id, o.output_receipt
+FROM phase_recovery_obligations o
+JOIN coordination_phase_commands c
+  ON c.project_id=$1
+ AND c.command_id=o.run_command_id
+JOIN runtime_invocations r
+  ON r.project_id=c.project_id
+ AND r.task_id=c.task_id
+ AND r.endpoint_id=c.endpoint_id
+ AND r.generation=c.generation
+ AND r.binding_ref=c.binding_ref
+ AND r.lease_id=c.lease_ref
+WHERE o.active=TRUE
+  AND o.output_receipt IS NOT NULL
+  AND r.status IN ('running','completed')
+ORDER BY o.updated_at, o.run_command_id`, p.projectID)
+	if err != nil {
+		return err
+	}
+	type persistedOutput struct {
+		invocationID kernel.InvocationID
+		receipt      phasepkg.OutputReceipt
+	}
+	var pending []persistedOutput
+	for rows.Next() {
+		var invocationID kernel.InvocationID
+		var raw []byte
+		if err := rows.Scan(&invocationID, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		var receipt phasepkg.OutputReceipt
+		if err := json.Unmarshal(raw, &receipt); err != nil {
+			rows.Close()
+			return err
+		}
+		if receipt.InvocationID != invocationID {
+			rows.Close()
+			return kernel.Error{Code: kernel.CodeInternalError, Message: "persisted phase output receipt invocation identity changed", Recoverable: true}
+		}
+		pending = append(pending, persistedOutput{invocationID: invocationID, receipt: receipt})
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var errs []error
+	for _, item := range pending {
+		if _, err := p.controller.SubmitPhaseOutput(ctx, item.invocationID, item.receipt.Output); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (p *productionPhaseRuntime) replayOutputIntents(ctx context.Context, outbox productionPhaseTerminalOutbox) error {
@@ -970,7 +1470,8 @@ func (p *productionPhaseRuntime) replayOutputIntents(ctx context.Context, outbox
 			errs = append(errs, err)
 			continue
 		}
-		if _, err := p.phaseOutputIntentInvocation(ctx, intent.InvocationID); err != nil {
+		invocation, err := p.phaseOutputIntentInvocation(ctx, intent.InvocationID)
+		if err != nil {
 			if kernel.IsCode(err, kernel.CodeForbidden) || kernel.IsCode(err, kernel.CodeStaleCommand) {
 				if abandonErr := outbox.abandonIntent(ctx, "phase_output", requestID, err); abandonErr != nil {
 					errs = append(errs, abandonErr)
@@ -978,6 +1479,13 @@ func (p *productionPhaseRuntime) replayOutputIntents(ctx context.Context, outbox
 				continue
 			}
 			errs = append(errs, err)
+			continue
+		}
+		if invocation.Status == runtimepkg.InvocationFailed || invocation.Status == runtimepkg.InvocationStopped {
+			cause := kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase output intent arrived after invocation termination", Recoverable: false}
+			if abandonErr := outbox.abandonIntent(ctx, "phase_output", requestID, cause); abandonErr != nil {
+				errs = append(errs, abandonErr)
+			}
 			continue
 		}
 		receipt, deliver, abandoned, err := p.resolveOutputIntentReceipt(ctx, intent.InvocationID, requestID, intent.Output)
@@ -1049,7 +1557,29 @@ func (p *productionPhaseRuntime) resolveOutputIntentReceipt(ctx context.Context,
 	if ok && productionPhaseReceiptMatchesOutput(recovered, output) {
 		return recovered, true, false, nil
 	}
+	// The MCP request context may be cancelled by the provider as soon as its
+	// streaming turn closes. Preserve the exact internal stage on a fresh,
+	// bounded context so operators and the GUI can distinguish binding,
+	// artifact, receipt and lifecycle failures without exposing those details
+	// through the Agent-facing transport error.
+	if recordErr := p.recordOutputIntentFailure(ctx, requestID, err); recordErr != nil {
+		return phasepkg.OutputReceipt{}, false, false, errors.Join(err, recordErr)
+	}
 	return phasepkg.OutputReceipt{}, false, false, err
+}
+
+func (p *productionPhaseRuntime) recordOutputIntentFailure(ctx context.Context, requestID string, cause error) error {
+	if p.db == nil || requestID == "" || cause == nil {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, err := p.db.ExecContext(cleanupCtx, `
+UPDATE production_phase_terminal_obligations
+SET attempts=attempts+1, last_error=$4, updated_at=$5
+WHERE project_id=$1 AND input_kind=$2 AND request_id=$3 AND status='intent'`,
+		p.projectID, "phase_output", requestID, cause.Error(), p.now().UTC())
+	return err
 }
 
 func (p *productionPhaseRuntime) abandonOutputIntent(ctx context.Context, invocationID kernel.InvocationID, requestID string, output phasepkg.PhaseOutput, cause error) error {
@@ -1229,13 +1759,56 @@ func (w productionPhaseObservationWriter) RecordPhaseOutputSubmitted(ctx context
 }
 
 func (w productionPhaseObservationWriter) RecordPhaseInvocationFailed(ctx context.Context, projectID kernel.ProjectID, command coordination.PhaseCommand) error {
-	return w.graph.RecordPhaseInvocationFailed(ctx, projectID, command)
+	snapshot, err := w.ingress.graph.Latest(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(productionPhaseFailedBoundary{
+		CommandID: command.ID, CommandAction: command.Action, Endpoint: command.Endpoint,
+		Generation: command.Generation, BindingRef: command.BindingRef, LeaseRef: command.LeaseRef,
+	})
+	input := productionInput{
+		Kind: "phase_failed", RequestID: stableProductionSuffix(command.ID, "failed"),
+		ConversationID: "runtime:" + string(command.Endpoint.TaskID),
+		Body:           fmt.Sprintf("phase failed %s/%s", command.Endpoint.TaskID, command.Endpoint.EndpointID),
+		Payload:        payload, SeenRevision: snapshot.Revision, SelectedEndpoint: &command.Endpoint,
+		TargetKind: "phase_failed", TargetRef: command.ID,
+	}
+	outbox := productionPhaseTerminalOutbox{db: w.ingress.db, projectID: projectID, ingress: w.ingress, now: w.now}
+	if _, err := outbox.enqueue(ctx, productionPhaseTerminalDelivery{
+		Input: input, InvocationID: deterministicPhaseInvocationID(command.ID), CommandID: command.ID,
+		CommandAction: command.Action, Endpoint: command.Endpoint, Generation: command.Generation,
+	}); err != nil {
+		return err
+	}
+	if err := w.graph.RecordPhaseInvocationFailed(ctx, projectID, command); err != nil {
+		return err
+	}
+	obligationID := stableRuntimeRef("phase-terminal", projectID, input.Kind, input.RequestID)
+	return outbox.deliver(ctx, obligationID)
 }
 
 func (w productionPhaseObservationWriter) RecordPhaseInvocationStopped(ctx context.Context, projectID kernel.ProjectID, command coordination.PhaseCommand, checkpointRef string, nonResumable bool) error {
 	snapshot, err := w.ingress.graph.Latest(ctx, projectID)
 	if err != nil {
 		return err
+	}
+	// Only an operator/Task Manager hold creates a graph-control obligation.
+	// Runtime-driven stops (for example an expired execution lease) merely end
+	// the current invocation; the still-enabled endpoint remains eligible for a
+	// fresh start and must not be sent through the held-only "stopped" graph
+	// transition.
+	held := false
+	for _, endpoint := range snapshot.Endpoints {
+		if endpoint.Ref == command.Endpoint &&
+			endpoint.Generation == command.Generation &&
+			endpoint.BindingRef == command.BindingRef {
+			held = endpoint.RunPolicy == coordination.RunHeld
+			break
+		}
+	}
+	if !held {
+		return w.graph.RecordPhaseInvocationStopped(ctx, projectID, command, checkpointRef, nonResumable)
 	}
 	payload, _ := json.Marshal(struct {
 		CommandID     string                        `json:"command_id"`
@@ -1293,15 +1866,28 @@ func (o productionPhaseTerminalOutbox) enqueueAndDeliver(ctx context.Context, de
 }
 
 func (o productionPhaseTerminalOutbox) promoteAndDeliver(ctx context.Context, delivery productionPhaseTerminalDelivery) error {
+	obligationID, err := o.promoteFinal(ctx, delivery)
+	if err != nil {
+		return err
+	}
+	return o.deliver(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) promote(ctx context.Context, delivery productionPhaseTerminalDelivery) error {
+	_, err := o.promoteFinal(ctx, delivery)
+	return err
+}
+
+func (o productionPhaseTerminalOutbox) promoteFinal(ctx context.Context, delivery productionPhaseTerminalDelivery) (string, error) {
 	obligationID := stableRuntimeRef("phase-terminal", o.projectID, delivery.Input.Kind, delivery.Input.RequestID)
 	payloadHash := hashProductionBytes(delivery.Input.Payload)
 	identityHash, err := o.identityHash(delivery, payloadHash)
 	if err != nil {
-		return err
+		return "", err
 	}
 	intentPayloadHash, intentIdentityHash, intentFound, err := o.intentHashesForReceiptDelivery(ctx, obligationID, delivery)
 	if err != nil {
-		return err
+		return "", err
 	}
 	now := o.timestamp()
 	affected := int64(0)
@@ -1311,7 +1897,7 @@ UPDATE production_phase_terminal_obligations
 SET invocation_id=$2, command_id=$3, command_action=$4, task_id=$5, endpoint_id=$6,
     generation=$7, conversation_id=$8, body=$9, payload=$10::jsonb, payload_hash=$11,
     identity_hash=$12, seen_revision=$13, target_kind=$14, target_ref=$15,
-    status='pending', last_error='', updated_at=$16
+    dispatch_request_id=request_id, status='pending', last_error='', updated_at=$16
 WHERE obligation_id=$1 AND project_id=$17 AND status='intent'
   AND intent_payload_hash=$18 AND intent_identity_hash=$19`,
 			obligationID, delivery.InvocationID, delivery.CommandID, delivery.CommandAction,
@@ -1319,21 +1905,21 @@ WHERE obligation_id=$1 AND project_id=$17 AND status='intent'
 			delivery.Input.Body, string(delivery.Input.Payload), payloadHash, identityHash, delivery.Input.SeenRevision,
 			delivery.Input.TargetKind, delivery.Input.TargetRef, now, o.projectID, intentPayloadHash, intentIdentityHash)
 		if err != nil {
-			return err
+			return "", err
 		}
 		affected, _ = result.RowsAffected()
 	}
 	if affected == 0 {
-		if delivered, err := o.deliverExistingFinalByID(ctx, obligationID); err != nil {
-			return err
-		} else if delivered {
-			return nil
+		if exists, err := o.finalExistsByID(ctx, obligationID); err != nil {
+			return "", err
+		} else if exists {
+			return obligationID, nil
 		}
 		if _, err := o.enqueue(ctx, delivery); err != nil {
-			return err
+			return "", err
 		}
 	}
-	return o.deliver(ctx, obligationID)
+	return obligationID, nil
 }
 
 func (o productionPhaseTerminalOutbox) abandonIntent(ctx context.Context, kind, requestID string, cause error) error {
@@ -1366,9 +1952,9 @@ func (o productionPhaseTerminalOutbox) enqueueIntent(ctx context.Context, delive
 	_, err = o.db.ExecContext(ctx, `
 INSERT INTO production_phase_terminal_obligations (
   obligation_id, project_id, invocation_id, command_id, command_action, task_id, endpoint_id,
-  generation, input_kind, request_id, conversation_id, body, payload, payload_hash,
+  generation, input_kind, request_id, dispatch_request_id, conversation_id, body, payload, payload_hash,
   identity_hash, intent_payload_hash, intent_identity_hash, seen_revision, target_kind, target_ref, status, created_at, updated_at
-) VALUES ($1,$2,$3,'',$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$13,$14,$15,$16,'','intent',$17,$17)
+) VALUES ($1,$2,$3,'',$4,$5,$6,$7,$8,$9,$9,$10,$11,$12::jsonb,$13,$14,$13,$14,$15,$16,'','intent',$17,$17)
 ON CONFLICT (obligation_id) DO NOTHING`,
 		obligationID, o.projectID, delivery.InvocationID, delivery.CommandAction, delivery.Endpoint.TaskID,
 		delivery.Endpoint.EndpointID, positiveGeneration(delivery.Generation), delivery.Input.Kind, delivery.Input.RequestID,
@@ -1400,9 +1986,9 @@ func (o productionPhaseTerminalOutbox) enqueue(ctx context.Context, delivery pro
 	_, err = o.db.ExecContext(ctx, `
 INSERT INTO production_phase_terminal_obligations (
   obligation_id, project_id, invocation_id, command_id, command_action, task_id, endpoint_id,
-  generation, input_kind, request_id, conversation_id, body, payload, payload_hash,
+  generation, input_kind, request_id, dispatch_request_id, conversation_id, body, payload, payload_hash,
   identity_hash, intent_payload_hash, intent_identity_hash, seen_revision, target_kind, target_ref, created_at, updated_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,'','',$16,$17,$18,$19,$19)
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12,$13::jsonb,$14,$15,'','',$16,$17,$18,$19,$19)
 ON CONFLICT (obligation_id) DO NOTHING`,
 		obligationID, o.projectID, delivery.InvocationID, delivery.CommandID, delivery.CommandAction,
 		delivery.Endpoint.TaskID, delivery.Endpoint.EndpointID, delivery.Generation, delivery.Input.Kind,
@@ -1446,6 +2032,14 @@ func (o productionPhaseTerminalOutbox) deliver(ctx context.Context, obligationID
 	}
 	stored, err := o.ingress.persistAndDispatch(ctx, delivery.Input)
 	if err != nil {
+		rotated, rotateErr := o.rotateFailedDispatch(ctx, obligationID, delivery.Input.RequestID, err)
+		if rotateErr != nil {
+			_ = o.recordFailure(ctx, obligationID, errors.Join(err, rotateErr))
+			return errors.Join(err, rotateErr)
+		}
+		if rotated {
+			return nil
+		}
 		_ = o.recordFailure(ctx, obligationID, err)
 		return err
 	}
@@ -1458,6 +2052,19 @@ func (o productionPhaseTerminalOutbox) deliverExistingFinal(ctx context.Context,
 }
 
 func (o productionPhaseTerminalOutbox) deliverExistingFinalByID(ctx context.Context, obligationID string) (bool, error) {
+	exists, err := o.finalExistsByID(ctx, obligationID)
+	if !exists || err != nil {
+		return exists, err
+	}
+	return true, o.deliver(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) finalExists(ctx context.Context, kind, requestID string) (bool, error) {
+	obligationID := stableRuntimeRef("phase-terminal", o.projectID, kind, requestID)
+	return o.finalExistsByID(ctx, obligationID)
+}
+
+func (o productionPhaseTerminalOutbox) finalExistsByID(ctx context.Context, obligationID string) (bool, error) {
 	var status string
 	if err := o.db.QueryRowContext(ctx, `SELECT status FROM production_phase_terminal_obligations WHERE obligation_id=$1 AND project_id=$2`, obligationID, o.projectID).Scan(&status); errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -1467,7 +2074,7 @@ func (o productionPhaseTerminalOutbox) deliverExistingFinalByID(ctx context.Cont
 	if status != "pending" && status != "delivered" {
 		return false, nil
 	}
-	return true, o.deliver(ctx, obligationID)
+	return true, nil
 }
 
 func (o productionPhaseTerminalOutbox) replay(ctx context.Context) error {
@@ -1499,7 +2106,7 @@ func (o productionPhaseTerminalOutbox) load(ctx context.Context, obligationID st
 	var status string
 	err := o.db.QueryRowContext(ctx, `
 SELECT invocation_id, command_id, command_action, task_id, endpoint_id, generation,
-       input_kind, request_id, conversation_id, body, payload, seen_revision, target_kind, target_ref, status
+       input_kind, dispatch_request_id, conversation_id, body, payload, seen_revision, target_kind, target_ref, status
 FROM production_phase_terminal_obligations
 WHERE obligation_id=$1 AND project_id=$2`, obligationID, o.projectID).Scan(
 		&delivery.InvocationID, &delivery.CommandID, &delivery.CommandAction, &delivery.Endpoint.TaskID, &endpointID,
@@ -1512,6 +2119,59 @@ WHERE obligation_id=$1 AND project_id=$2`, obligationID, o.projectID).Scan(
 	delivery.Input.Payload = payload
 	delivery.Input.SelectedEndpoint = &delivery.Endpoint
 	return delivery, status, nil
+}
+
+func (o productionPhaseTerminalOutbox) rotateFailedDispatch(ctx context.Context, obligationID, dispatchRequestID string, cause error) (bool, error) {
+	tx, err := o.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var logicalRequestID, currentDispatchRequestID, inputKind string
+	var attempts int
+	err = tx.QueryRowContext(ctx, `
+SELECT request_id, dispatch_request_id, input_kind, attempts
+FROM production_phase_terminal_obligations
+WHERE obligation_id=$1 AND project_id=$2 AND status='pending'
+FOR UPDATE`, obligationID, o.projectID).Scan(&logicalRequestID, &currentDispatchRequestID, &inputKind, &attempts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	if currentDispatchRequestID != dispatchRequestID {
+		return true, tx.Commit()
+	}
+	var inputStatus string
+	err = tx.QueryRowContext(ctx, `
+SELECT status
+FROM production_manager_inputs
+WHERE project_id=$1 AND input_kind=$2 AND request_id=$3`, o.projectID, inputKind, currentDispatchRequestID).Scan(&inputStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	if inputStatus != "failed" {
+		return false, tx.Commit()
+	}
+	nextDispatchRequestID := stableProductionSuffix(logicalRequestID, "dispatch-retry", attempts+1)
+	result, err := tx.ExecContext(ctx, `
+UPDATE production_phase_terminal_obligations
+SET dispatch_request_id=$2, attempts=attempts+1, last_error=$3, updated_at=$4
+WHERE obligation_id=$1 AND project_id=$5 AND status='pending' AND dispatch_request_id=$6`,
+		obligationID, nextDispatchRequestID, cause.Error(), o.timestamp(), o.projectID, currentDispatchRequestID)
+	if err != nil {
+		return false, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return false, err
+	} else if affected != 1 {
+		return false, kernel.Error{Code: kernel.CodeRevisionConflict, Message: "phase terminal dispatch retry changed concurrently", Recoverable: true}
+	}
+	return true, tx.Commit()
 }
 
 func (o productionPhaseTerminalOutbox) recordFailure(ctx context.Context, obligationID string, cause error) error {

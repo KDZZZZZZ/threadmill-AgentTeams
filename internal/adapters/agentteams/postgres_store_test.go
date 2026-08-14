@@ -160,6 +160,7 @@ func TestPostgresExecutionStoreRealPostgresLifecycle(t *testing.T) {
 	if err := store.MarkTerminated(ctx, first.Execution.AgentTeamsTaskID, adapter.TerminateReleaseWait); err != nil {
 		t.Fatalf("release_wait first: %v", err)
 	}
+	assertRealPostgresTerminatedReleased(t, ctx, db.SQL(), first.Execution.AgentTeamsTaskID)
 	second, created, err := store.Reserve(ctx, ref, "fp-a", adapter.AgentTeamsExecutionRef{
 		InvocationID: "inv-real",
 		HostRef:      "worker-b",
@@ -174,11 +175,31 @@ func TestPostgresExecutionStoreRealPostgresLifecycle(t *testing.T) {
 	if err := store.MarkTerminated(ctx, second.Execution.AgentTeamsTaskID, adapter.TerminateCancel); err != nil {
 		t.Fatalf("cancel second: %v", err)
 	}
+	assertRealPostgresTerminatedReleased(t, ctx, db.SQL(), second.Execution.AgentTeamsTaskID)
+	if err := store.MarkTerminated(ctx, second.Execution.AgentTeamsTaskID, adapter.TerminateCancel); err != nil {
+		t.Fatalf("idempotent cancel second: %v", err)
+	}
+	assertRealPostgresTerminatedReleased(t, ctx, db.SQL(), second.Execution.AgentTeamsTaskID)
 	if _, _, err := store.Reserve(ctx, ref, "fp-b", adapter.AgentTeamsExecutionRef{InvocationID: "inv-real", HostRef: "worker-c"}); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("Reserve different fingerprint = %v, want idempotency_conflict", err)
 	}
 	if err := store.MarkDispatched(ctx, first.Execution.AgentTeamsTaskID); !kernel.IsCode(err, kernel.CodeStaleCommand) {
 		t.Fatalf("MarkDispatched(old terminated) = %v, want stale_command", err)
+	}
+}
+
+func assertRealPostgresTerminatedReleased(t *testing.T, ctx context.Context, db *sql.DB, taskID string) {
+	t.Helper()
+	var state string
+	var revoked, released bool
+	if err := db.QueryRowContext(ctx, `
+SELECT state, mcp_revoked_at IS NOT NULL, host_slot_released_at IS NOT NULL
+FROM agentteams_execution_refs
+WHERE agentteams_task_id=$1`, taskID).Scan(&state, &revoked, &released); err != nil {
+		t.Fatal(err)
+	}
+	if state != "terminated" || !revoked || !released {
+		t.Fatalf("execution %q state=%q revoked=%v released=%v, want terminated/revoked/released", taskID, state, revoked, released)
 	}
 }
 

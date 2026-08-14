@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
@@ -12,6 +13,7 @@ import (
 type MemoryStore struct {
 	mu       sync.Mutex
 	projects map[kernel.ProjectID]*projectState
+	now      func() time.Time
 }
 
 type projectState struct {
@@ -30,7 +32,10 @@ type graphState struct {
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{projects: make(map[kernel.ProjectID]*projectState)}
+	return &MemoryStore{
+		projects: make(map[kernel.ProjectID]*projectState),
+		now:      time.Now,
+	}
 }
 
 func (s *MemoryStore) Latest(_ context.Context, projectID kernel.ProjectID) (GraphSnapshot, error) {
@@ -77,7 +82,7 @@ func (s *MemoryStore) ReplacePending(_ context.Context, projectID kernel.Project
 		return GraphSnapshot{}, err
 	}
 	state := project.current.clone()
-	if err := validatePendingSubgraph(project.current, next); err != nil {
+	if err := validatePendingSubgraph(project.current, project.runtime, next); err != nil {
 		return GraphSnapshot{}, err
 	}
 	if err := validatePendingSubgraphRuntime(project.runtime, next); err != nil {
@@ -91,6 +96,17 @@ func (s *MemoryStore) ReplacePending(_ context.Context, projectID kernel.Project
 }
 
 func (s *MemoryStore) Transition(_ context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, transition GraphTransition) (GraphSnapshot, error) {
+	return s.transition(projectID, expectedRevision, transition)
+}
+
+func (s *MemoryStore) TransitionWithDecisionRef(_ context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, decisionRef string, transition GraphTransition) (GraphSnapshot, error) {
+	if decisionRef == "" {
+		return GraphSnapshot{}, kernel.InvalidArgument("decision_ref is required")
+	}
+	return s.transition(projectID, expectedRevision, transition)
+}
+
+func (s *MemoryStore) transition(projectID kernel.ProjectID, expectedRevision kernel.Revision, transition GraphTransition) (GraphSnapshot, error) {
 	if kernel.IsZeroID(projectID) {
 		return GraphSnapshot{}, kernel.InvalidArgument("project_id is required")
 	}
@@ -110,6 +126,14 @@ func (s *MemoryStore) Transition(_ context.Context, projectID kernel.ProjectID, 
 				return GraphSnapshot{}, kernel.TransitionRejected("released transition requires the phase lease to be terminally released")
 			}
 		}
+	}
+	if transition.TargetKind == TargetTask && transition.Action == "reopen_round" {
+		if err := validateReopenRoundRuntime(project.runtime, transition.TaskID); err != nil {
+			return GraphSnapshot{}, err
+		}
+	}
+	if err := validateRuntimeBackedTransition(project.current, project.runtime, transition); err != nil {
+		return GraphSnapshot{}, err
 	}
 	state := project.current.clone()
 	if err := applyTransition(&state, transition); err != nil {

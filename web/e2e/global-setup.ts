@@ -3,7 +3,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const readyURL = "http://127.0.0.1:18080/readyz";
+const e2ePort = process.env.THREADMILL_E2E_PORT ?? "28080";
+const readyURL = `http://127.0.0.1:${e2ePort}/readyz`;
 
 function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -47,7 +48,14 @@ export default async function globalSetup(_config: FullConfig) {
   );
   const server = spawn(
     binary,
-    ["serve", "--fake", "--http-addr", "127.0.0.1:18080", "--web-dist", "dist"],
+    [
+      "serve",
+      "--fake",
+      "--http-addr",
+      `127.0.0.1:${e2ePort}`,
+      "--web-dist",
+      "dist",
+    ],
     { cwd: webRoot, stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
   );
   let output = "";

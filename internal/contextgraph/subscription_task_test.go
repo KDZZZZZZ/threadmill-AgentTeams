@@ -2,6 +2,7 @@ package contextgraph
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -154,6 +155,123 @@ func TestEnsureInitialSliceIsAtomicAndIdempotentInMemory(t *testing.T) {
 	}
 	if activeInitial != 1 {
 		t.Fatalf("active initial subscriptions = %d, inspected=%#v", activeInitial, inspected)
+	}
+}
+
+func TestInitialSliceRemainsImmutableAfterDynamicChangesAndInvocationEnd(t *testing.T) {
+	store := seededStore()
+	phase := principal(auth.RoleExecutor, "phase-agent", "task-1", auth.ToolSet(auth.ToolContextSubscribe))
+	initial, err := store.EnsureInitialSlice(context.Background(), phase, []string{"general-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.SubscriptionIDs) != 1 {
+		t.Fatalf("initial slice = %#v, want one automatic subscription", initial)
+	}
+
+	ctxAgent := contextPrincipal(auth.ToolContextCreateNode)
+	if _, err := store.CreateNode(context.Background(), ctxAgent, CreateGeneralNodeRequest{
+		Statement:   "created after invocation startup",
+		Kind:        string(NodeKindFact),
+		SourceRefs:  []string{"source:after-start"},
+		SubgraphIDs: []string{"general-a"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dynamic, err := store.MaterializeRuntimeContext(context.Background(), phase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dynamic.Nodes) <= len(initial.Nodes) || dynamic.GraphRevision <= initial.GraphRevision {
+		t.Fatalf("dynamic slice = %#v, want later graph contents than initial %#v", dynamic, initial)
+	}
+	replayed, err := store.EnsureInitialSlice(context.Background(), phase, []string{"general-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(replayed, initial) {
+		t.Fatalf("replayed initial slice changed:\n got %#v\nwant %#v", replayed, initial)
+	}
+
+	if err := store.EndInvocation(context.Background(), phase, phase.InvocationID); err != nil {
+		t.Fatal(err)
+	}
+	dynamic, err = store.MaterializeRuntimeContext(context.Background(), phase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dynamic.Nodes) != 0 || len(dynamic.SubscriptionIDs) != 0 {
+		t.Fatalf("ended invocation dynamic context = %#v, want empty active union", dynamic)
+	}
+	operator := auth.Principal{ActorPrincipalID: "operator-1", Kind: auth.PrincipalOperator, ProjectID: phase.ProjectID, Role: auth.RoleOperator}
+	inspected, err := store.InspectInitialSlice(context.Background(), operator, phase.InvocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(inspected, initial) {
+		t.Fatalf("persisted initial slice = %#v, want %#v", inspected, initial)
+	}
+}
+
+func TestMemoryCandidateRejectsObviousRuntimePointersAndEphemeralState(t *testing.T) {
+	statements := []string{
+		"inv_abcd1234 completed the check",
+		"context-invocation:abcd1234 returned two nodes",
+		"subscription_id=sub-123 is active",
+		"The task uses task-contract:deadbeef",
+		"The endpoint must use phase-spec:deadbeef",
+		"binding_ref=binding-deadbeef is current",
+		"threadmill-scale-task-01 is currently waiting",
+		"当前队列里还有四个 endpoint",
+	}
+	for _, statement := range statements {
+		err := validateMemoryCandidate(MemoryCandidate{Statement: statement, Kind: string(NodeKindFact), SourceRefs: []string{"evidence:test"}})
+		if !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+			t.Fatalf("validateMemoryCandidate(%q) error = %v, want invalid_request", statement, err)
+		}
+	}
+	if err := validateMemoryCandidate(MemoryCandidate{
+		Statement: "PostgreSQL advisory locking prevents two schedulers from claiming the same durable lease.",
+		Kind:      string(NodeKindFact), SourceRefs: []string{"evidence:concurrency-test"},
+	}); err != nil {
+		t.Fatalf("durable reusable assertion was rejected: %v", err)
+	}
+}
+
+func TestMemoryCandidateNodeRefsMustBeGeneralAndInActiveInvocationContext(t *testing.T) {
+	store := seededStore()
+	curator := contextPrincipal(auth.ToolContextSubmitReview)
+	general := createNode(t, store, curator, "general-reused", "context-reviewer", "", []string{"general-a"}).Nodes[0]
+	phase := principal(auth.RoleExecutor, "phase-node-refs", "task-1", auth.ToolSet(auth.ToolAgentSubmitMemoryCandidate, auth.ToolContextSubscribe))
+	candidate := MemoryCandidate{
+		Statement:  "The reused constraint changes the downstream decision.",
+		Kind:       string(NodeKindFact),
+		SourceRefs: []string{"evidence:downstream-decision", "node:" + general.ID},
+	}
+
+	if _, err := store.SubmitCandidate(context.Background(), phase, SubmitCandidateRequest{Candidate: candidate}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("candidate referenced an unsubscribed node: %v, want not_found", err)
+	}
+	if _, err := store.Subscribe(context.Background(), phase, SubscribeRequest{SubgraphIDs: []string{"general-a"}}); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := store.SubmitCandidate(context.Background(), phase, SubmitCandidateRequest{Candidate: candidate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(accepted.Candidate.SourceRefs, []string{"evidence:downstream-decision", "node:" + general.ID}) {
+		t.Fatalf("persisted source_refs = %#v", accepted.Candidate.SourceRefs)
+	}
+
+	taskNode := ContextNode{ID: "task-only-node", Kind: string(NodeKindDirective), Statement: "task-only", Status: string(NodeStatusAccepted), SubgraphIDs: []string{"task-1-context"}, SourceRefs: []string{"requirement:task-1"}}
+	store.nodes[taskNode.ID] = NodeRecord{Node: taskNode, ProjectID: phase.ProjectID}
+	if _, err := store.Subscribe(context.Background(), phase, SubscribeRequest{SubgraphIDs: []string{"task-1-context"}}); err != nil {
+		t.Fatal(err)
+	}
+	candidate.Statement = "A task-only directive must not masquerade as reused general knowledge."
+	candidate.SourceRefs = []string{"evidence:downstream-decision", "node:" + taskNode.ID}
+	if _, err := store.SubmitCandidate(context.Background(), phase, SubmitCandidateRequest{Candidate: candidate}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("candidate referenced a task-only node: %v, want not_found", err)
 	}
 }
 

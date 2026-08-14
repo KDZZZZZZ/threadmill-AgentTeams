@@ -147,7 +147,7 @@ type PendingSubgraph struct {
 | --- | --- |
 | Phase Endpoint | submitted、satisfied、rejected、reopened、held、released、stopped |
 | Blocker | resolved、denied、obsolete |
-| Task | done、canceled、failed |
+| Task | done、canceled、failed、reopen_round（仅可信 targeted boundary，可原子重开 execute+verify） |
 
 Runtime 观察先进入 Event Log，再由 Task Manager 结合证据产生 transitionRef。`PhaseInvocationStarted` 同时记录本次来源是 start 还是 resume，只用于审计和恢复；`PhaseOutputSubmitted`、`PhaseInvocationFailed`、`PhaseInvocationStopped` 分别成为 submitted、reopened/failed、stopped 转换的 evidence。PhaseOutput submitted、PhaseResult satisfied 和 Task done 始终是三个独立转换。
 

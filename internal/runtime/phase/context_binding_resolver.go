@@ -122,16 +122,10 @@ func (r *ContextBindingResolver) bindContextWithAbort(ctx context.Context, req B
 		_ = r.Base.AbortResolvedPhaseBinding(ctx, req, binding)
 		return BindingSnapshot{}, err
 	}
-	subscriptions, err := r.Contexts.InspectSubscriptions(ctx, principal, req.InvocationID)
-	if err != nil {
-		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
-	}
-	if !hasActiveSubscription(subscriptions) && len(initialSubgraphIDs) > 0 {
-		if _, err := r.ensureInitialSlice(ctx, principal, initialSubgraphIDs); err != nil {
-			return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
-		}
-	}
-	slice, err := r.Contexts.MaterializeRuntimeContext(ctx, principal)
+	// Start bindings always reference the immutable startup baseline. Dynamic
+	// context assembled from the current active subscription union is a separate
+	// runtime read and must never rewrite ContextSliceRef on refresh or replay.
+	slice, err := r.ensureInitialSlice(ctx, principal, initialSubgraphIDs)
 	if err != nil {
 		return BindingSnapshot{}, r.abortResolvedBinding(ctx, req, binding, principal, err)
 	}
@@ -277,15 +271,6 @@ func (r *ContextBindingResolver) ensureInitialSlice(ctx context.Context, princip
 	delete(r.initialOnce, key)
 	r.mu.Unlock()
 	return call.slice, call.err
-}
-
-func hasActiveSubscription(subscriptions []contextgraph.SubscriptionInspection) bool {
-	for _, subscription := range subscriptions {
-		if subscription.Active {
-			return true
-		}
-	}
-	return false
 }
 
 func stableJSON(v any) ([]byte, error) {

@@ -44,10 +44,6 @@ func TestInvocationBundlesAndToolIntersection(t *testing.T) {
 		auth.ToolContextAgentRetrieve,
 		auth.ToolEvidenceRegister,
 		auth.ToolRuntimeAwaitInputs,
-		auth.ToolWorkspaceDiff,
-		auth.ToolWorkspaceList,
-		auth.ToolWorkspaceRead,
-		auth.ToolWorkspaceWritePlan,
 	}
 	if !reflect.DeepEqual(planner.EffectiveTools, wantPlannerTools) {
 		t.Fatalf("planner tools = %v, want %v", planner.EffectiveTools, wantPlannerTools)
@@ -99,6 +95,112 @@ func TestPhaseRenderInjectsStartOrResumeInput(t *testing.T) {
 	}
 	if strings.Contains(rendered.Text, "{{START_OR_RESUME_INPUT}}") {
 		t.Fatal("phase prompt retained Start/Resume placeholder")
+	}
+}
+
+func TestRenderedPromptsRequireAtomicContextReuseAndMemoryExternalization(t *testing.T) {
+	catalog := loadTestCatalog(t)
+	planner, err := catalog.Bundle(auth.RolePlanner, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerText := planner.Render(RenderData{}).Text
+	for _, required := range []string{
+		"Context 不是装饰信息",
+		"一个阶段通常会产生多个候选",
+		"一条 Candidate 只写一个可独立判断真假的陈述",
+		"不要只在结尾提交一条总括候选",
+		"删除测试",
+		"默认在首次写入计划产物或提交新知识证据前",
+		"两张图是独立的权威资源边界",
+		"不得用原生文件、shell、数据库、HTTP",
+		"node:<NodeID>",
+		"当前有效订阅并集",
+		"统一使用宿主提供的原生工具",
+		"不要调用 Threadmill `workspace.*` MCP 文件工具形成第二条工作区版本线",
+	} {
+		if !strings.Contains(plannerText, required) {
+			t.Fatalf("planner prompt is missing atomic memory rule %q", required)
+		}
+	}
+
+	manager, err := catalog.Bundle(auth.RoleTaskManager, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerText := manager.Render(RenderData{}).Text
+	for _, required := range []string{
+		"一个巨型节点", "每条约束、验收项", "Context 写工具不暴露给你", "task_policies", "稳定 ProjectionID",
+		"plan→execute→verify 是 Runtime 内建顺序", "只表达跨 Task 依赖", "不得扫描 AgentTeams 历史任务",
+		"phase_output -> submitted", "selected_endpoint", "ArtifactRef、output ref、command ID",
+	} {
+		if !strings.Contains(managerText, required) {
+			t.Fatalf("task manager prompt is missing context lifecycle rule %q", required)
+		}
+	}
+	for _, forbidden := range []auth.Tool{auth.ToolContextRegisterTaskSubgraph, auth.ToolContextProjectTaskContext, auth.ToolContextFinalizeTaskMemory} {
+		for _, tool := range manager.EffectiveTools {
+			if tool == forbidden {
+				t.Fatalf("task manager agent unexpectedly exposes Runtime-internal context write tool %s", forbidden)
+			}
+		}
+	}
+
+	retriever, err := catalog.Bundle(auth.RoleContext, "retrieve")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := retriever.Render(RenderData{}).Text
+	for _, required := range []string{
+		"不能用空关键词退化成整图返回",
+		"不得选择 TaskID、ProjectID、InvocationID",
+		"显式给出“机械关键词”",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("context retrieve prompt is missing lexical-search rule %q", required)
+		}
+	}
+}
+
+func TestTaskManagerPromptRoutesFailedMergeToReopenRound(t *testing.T) {
+	catalog := loadTestCatalog(t)
+	bundle, err := catalog.Bundle(auth.RoleTaskManager, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := bundle.Render(RenderData{}).Text
+	for _, required := range []string{
+		"Targeted Verify 重编排动作约束",
+		"verify 也可以仍是 `pending`",
+		"Runtime 原子重开同一 Task 的 execute+verify",
+		"不能用来重启已经 satisfied/rejected 的 execute",
+		"正常 Verify 判断",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("task manager prompt is missing targeted verify rule %q", required)
+		}
+	}
+}
+
+func TestVerifierPromptRequiresGeneratedReportRegistrationForTargetedVerify(t *testing.T) {
+	catalog := loadTestCatalog(t)
+	bundle, err := catalog.Bundle(auth.RoleVerifier, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := bundle.Render(RenderData{PhaseSpec: `{"schema":"threadmill.targeted_verify.v1"}`}).Text
+	for _, required := range []string{
+		"evidence.register(type=generated_report",
+		"content_type=application/json",
+		"body=<strict threadmill.targeted_verify.v1 JSON>",
+		"type=json",
+		"type=tool_output",
+		"agent.submitPhaseOutput.report_ref",
+		"不得再提交 verdict=fail 的 PhaseOutput",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("verifier prompt is missing targeted generated_report rule %q", required)
+		}
 	}
 }
 

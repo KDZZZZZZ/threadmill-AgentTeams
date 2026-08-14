@@ -64,6 +64,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/human-decisions", s.handleHumanDecisions)
 	mux.HandleFunc("/v1/tasks/", s.handleTask)
 	mux.HandleFunc("/v1/coordination/snapshot", s.handleCoordinationSnapshot)
+	mux.HandleFunc("/v1/context/snapshot", s.handleContextSnapshot)
 	mux.HandleFunc("/v1/coordination/endpoints/", s.handleEndpointInspector)
 	mux.HandleFunc("/v1/manager/messages", s.handleManagerMessages)
 	mux.HandleFunc("/v1/manager/conversations/", s.handleManagerConversation)
@@ -206,6 +207,19 @@ func (s *Server) handleCoordinationSnapshot(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	resp, err := s.query.ProjectSnapshot(r.Context(), principal, projectID, revision)
+	writeResult(w, resp, err, http.StatusOK)
+}
+
+func (s *Server) handleContextSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	projectID := kernel.ProjectID(r.URL.Query().Get("project_id"))
+	principal, ok := s.authenticateRead(w, r, projectID)
+	if !ok {
+		return
+	}
+	resp, err := s.query.ContextSnapshot(r.Context(), principal, projectID)
 	writeResult(w, resp, err, http.StatusOK)
 }
 
@@ -457,6 +471,13 @@ func (r ManagerMessageRequest) validate() error {
 	if err := validateLength("body", r.Body, 50000); err != nil {
 		return err
 	}
+	intent := r.Intent
+	if intent == "" {
+		intent = ManagerIntentOrchestrate
+	}
+	if intent != ManagerIntentOrchestrate && intent != ManagerIntentHold && intent != ManagerIntentResume {
+		return kernel.InvalidArgument("intent must be orchestrate, hold, or resume")
+	}
 	if r.SelectedEndpoint != nil {
 		if strings.TrimSpace(string(r.SelectedEndpoint.TaskID)) == "" || !validEndpointID(r.SelectedEndpoint.EndpointID) {
 			return kernel.InvalidArgument("selected_endpoint requires a task_id and plan, execute, or verify endpoint_id")
@@ -464,6 +485,9 @@ func (r ManagerMessageRequest) validate() error {
 		if err := validateLength("selected_endpoint.task_id", string(r.SelectedEndpoint.TaskID), 128); err != nil {
 			return err
 		}
+	}
+	if (intent == ManagerIntentHold || intent == ManagerIntentResume) && r.SelectedEndpoint == nil {
+		return kernel.InvalidArgument("hold and resume intents require selected_endpoint")
 	}
 	return nil
 }

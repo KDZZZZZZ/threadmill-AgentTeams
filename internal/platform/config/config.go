@@ -28,6 +28,9 @@ const (
 	envAgentTeamsContainers       = "THREADMILL_AGENTTEAMS_CONTAINERS"
 	envAgentTeamsSharedBucket     = "THREADMILL_AGENTTEAMS_SHARED_BUCKET"
 	envAgentTeamsSharedPrefix     = "THREADMILL_AGENTTEAMS_SHARED_PREFIX"
+	envAgentTeamsSharedAccessKey  = "THREADMILL_AGENTTEAMS_SHARED_ACCESS_KEY"
+	envAgentTeamsSharedSecretKey  = "THREADMILL_AGENTTEAMS_SHARED_SECRET_KEY"
+	envRuntimeAssetsRoot          = "THREADMILL_RUNTIME_ASSETS_ROOT"
 	envRepositoryPath             = "THREADMILL_REPOSITORY_PATH"
 	envWorktreeParent             = "THREADMILL_WORKTREE_PARENT"
 	envRuntimeTokenKey            = "THREADMILL_RUNTIME_TOKEN_KEY"
@@ -51,6 +54,9 @@ type Config struct {
 	AgentTeamsContainers       map[string]string
 	AgentTeamsSharedBucket     string
 	AgentTeamsSharedPrefix     string
+	AgentTeamsSharedAccessKey  string
+	AgentTeamsSharedSecretKey  string
+	RuntimeAssetsRoot          string
 	RepositoryPath             string
 	WorktreeParent             string
 	RuntimeTokenKey            []byte
@@ -102,6 +108,9 @@ func Load(env Environment) (Config, error) {
 		AgentTeamsRoomID:           lookup(env, envAgentTeamsRoomID),
 		AgentTeamsSharedBucket:     lookup(env, envAgentTeamsSharedBucket),
 		AgentTeamsSharedPrefix:     lookup(env, envAgentTeamsSharedPrefix),
+		AgentTeamsSharedAccessKey:  lookup(env, envAgentTeamsSharedAccessKey),
+		AgentTeamsSharedSecretKey:  lookup(env, envAgentTeamsSharedSecretKey),
+		RuntimeAssetsRoot:          lookup(env, envRuntimeAssetsRoot),
 		RepositoryPath:             lookup(env, envRepositoryPath),
 		WorktreeParent:             lookup(env, envWorktreeParent),
 	}
@@ -174,6 +183,9 @@ func Load(env Environment) (Config, error) {
 		{envAgentTeamsRoomID, cfg.AgentTeamsRoomID},
 		{envAgentTeamsSharedBucket, cfg.AgentTeamsSharedBucket},
 		{envAgentTeamsSharedPrefix, cfg.AgentTeamsSharedPrefix},
+		{envAgentTeamsSharedAccessKey, cfg.AgentTeamsSharedAccessKey},
+		{envAgentTeamsSharedSecretKey, cfg.AgentTeamsSharedSecretKey},
+		{envRuntimeAssetsRoot, cfg.RuntimeAssetsRoot},
 		{envRepositoryPath, cfg.RepositoryPath},
 		{envWorktreeParent, cfg.WorktreeParent},
 	} {
@@ -216,7 +228,7 @@ func Check(cfg Config) Diagnostic {
 	return Diagnostic{
 		OK:          true,
 		Code:        "ok",
-		Message:     fmt.Sprintf("configuration valid; http address %s; project %s; web dist %s; object store endpoint %s bucket %s secure %t; allowed origins %d; AgentTeams controller %s room %s host mappings %d; container MCP %s; shared objects %s/%s; repository %s; worktrees %s", cfg.HTTPAddr, cfg.ProjectID, cfg.WebDistDir, cfg.ObjectStoreEndpoint, cfg.ObjectStoreBucket, cfg.ObjectStoreSecure, len(cfg.AllowedOrigins), cfg.AgentTeamsControllerURL, cfg.AgentTeamsRoomID, len(cfg.AgentTeamsContainers), cfg.ContainerMCPURL, cfg.AgentTeamsSharedBucket, cfg.AgentTeamsSharedPrefix, cfg.RepositoryPath, cfg.WorktreeParent),
+		Message:     fmt.Sprintf("configuration valid; http address %s; project %s; web dist %s; object store endpoint %s bucket %s secure %t; allowed origins %d; AgentTeams controller %s room %s host mappings %d; container MCP %s; shared objects %s/%s; runtime assets %s; repository %s; worktrees %s", cfg.HTTPAddr, cfg.ProjectID, cfg.WebDistDir, cfg.ObjectStoreEndpoint, cfg.ObjectStoreBucket, cfg.ObjectStoreSecure, len(cfg.AllowedOrigins), cfg.AgentTeamsControllerURL, cfg.AgentTeamsRoomID, len(cfg.AgentTeamsContainers), cfg.ContainerMCPURL, cfg.AgentTeamsSharedBucket, cfg.AgentTeamsSharedPrefix, cfg.RuntimeAssetsRoot, cfg.RepositoryPath, cfg.WorktreeParent),
 		Recoverable: true,
 	}
 }
@@ -298,6 +310,7 @@ func validateProductionConfig(cfg Config) error {
 		key   string
 		value string
 	}{
+		{envRuntimeAssetsRoot, cfg.RuntimeAssetsRoot},
 		{envRepositoryPath, cfg.RepositoryPath},
 		{envWorktreeParent, cfg.WorktreeParent},
 	} {

@@ -235,7 +235,7 @@ func controllerManagerHost(manager controllerManager) HostStatus {
 
 func parseControllerTime(value string) time.Time {
 	if value == "" {
-		return time.Now().UTC()
+		return time.Time{}
 	}
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
 		parsed, err := time.Parse(layout, value)

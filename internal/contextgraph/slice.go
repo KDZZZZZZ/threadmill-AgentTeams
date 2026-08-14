@@ -21,16 +21,51 @@ func (s *MemoryStore) EnsureInitialSlice(ctx context.Context, principal auth.Pri
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if active := s.activeSubscriptionIDsLocked(principal.ProjectID, consumerInvocationID(principal)); len(active) > 0 {
-		return s.materializeInvocationSliceLocked(principal, consumerInvocationID(principal)), nil
+	key := invocationScopeKey{ProjectID: principal.ProjectID, InvocationID: consumerInvocationID(principal)}
+	if initial, ok := s.initialSlices[key]; ok {
+		return cloneContextSlice(initial), nil
 	}
-	sub, err := s.createSubscription(s.now().UTC(), principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, subscriptionSourceInitial)
+	var initialSubscription ContextSubscription
+	for _, record := range s.subscriptions {
+		if record.ProjectID == principal.ProjectID &&
+			record.Subscription.ConsumerInvocationID == string(consumerInvocationID(principal)) &&
+			record.Source == subscriptionSourceInitial && record.Active {
+			initialSubscription = record.Subscription
+			break
+		}
+	}
+	if initialSubscription.ID == "" {
+		var err error
+		initialSubscription, err = s.createSubscription(s.now().UTC(), principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, subscriptionSourceInitial)
+		if err != nil {
+			return ContextSlice{}, err
+		}
+	}
+	slice := s.materializeInvocationSliceLocked(principal, consumerInvocationID(principal))
+	slice.SubscriptionIDs = []string{initialSubscription.ID}
+	s.initialSlices[key] = cloneContextSlice(slice)
+	return cloneContextSlice(slice), nil
+}
+
+// InspectInitialSlice returns the immutable startup baseline captured by
+// EnsureInitialSlice. It deliberately does not recompute the active
+// subscription union; EndInvocation may expire every subscription while this
+// snapshot remains available for provenance and GUI inspection.
+func (s *MemoryStore) InspectInitialSlice(ctx context.Context, principal auth.Principal, invocationID kernel.InvocationID) (ContextSlice, error) {
+	if err := ctx.Err(); err != nil {
+		return ContextSlice{}, err
+	}
+	invocationID, err := authorizeInitialSliceInspection(principal, invocationID)
 	if err != nil {
 		return ContextSlice{}, err
 	}
-	slice := s.materializeInvocationSliceLocked(principal, consumerInvocationID(principal))
-	slice.SubscriptionIDs = []string{sub.ID}
-	return slice, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	initial, ok := s.initialSlices[invocationScopeKey{ProjectID: principal.ProjectID, InvocationID: invocationID}]
+	if !ok {
+		return ContextSlice{}, kernel.Error{Code: kernel.CodeNotFound, Message: "initial context slice not found"}
+	}
+	return cloneContextSlice(initial), nil
 }
 
 func (s *MemoryStore) EffectiveSubgraphs(ctx context.Context, principal auth.Principal) ([]string, error) {
@@ -119,4 +154,38 @@ func (s *MemoryStore) activeSubscriptionIDsLocked(projectID kernel.ProjectID, in
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func authorizeInitialSliceInspection(principal auth.Principal, invocationID kernel.InvocationID) (kernel.InvocationID, error) {
+	if principal.ProjectID == "" {
+		return "", kernel.Forbidden("initial slice inspection requires project principal")
+	}
+	if invocationID == "" {
+		invocationID = consumerInvocationID(principal)
+	}
+	switch principal.Kind {
+	case auth.PrincipalAgent:
+		if invocationID == "" || invocationID != principal.InvocationID {
+			return "", kernel.Forbidden("agent initial slice inspection is limited to the authenticated invocation")
+		}
+	case auth.PrincipalOperator:
+		if principal.Role != auth.RoleOperator || invocationID == "" {
+			return "", kernel.Forbidden("operator initial slice inspection requires an invocation")
+		}
+	default:
+		return "", kernel.Forbidden("initial slice inspection requires an authenticated principal")
+	}
+	return invocationID, nil
+}
+
+func cloneContextSlice(slice ContextSlice) ContextSlice {
+	out := ContextSlice{
+		SubscriptionIDs: append([]string(nil), slice.SubscriptionIDs...),
+		GraphRevision:   slice.GraphRevision,
+		Nodes:           make([]ContextNode, len(slice.Nodes)),
+	}
+	for i, node := range slice.Nodes {
+		out.Nodes[i] = cloneNode(node)
+	}
+	return out
 }

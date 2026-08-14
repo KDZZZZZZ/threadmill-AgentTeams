@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/adapters/agentteams"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextgraph"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mergequeue"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/config"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/objectstore"
@@ -39,11 +41,26 @@ const productionReconcileInterval = 2 * time.Second
 // ingress, AgentTeams, or GraphRuntime wiring.
 type productionPhaseSeams struct {
 	Controller     coordination.PhaseController
+	Failures       productionPhaseFailureReporter
 	Runtime        mcpapi.PhaseRuntime
 	Orchestration  mcpapi.OrchestrationProposalRuntime
 	Readiness      productionReadinessProbe
 	TaskWorkspaces productionTaskWorkspaceProvisioner
 	TaskContexts   productionTaskContextProjector
+
+	// The fields below are internal assembly parts, never external ports. They
+	// let production wire the Merge Queue's latest-main Verifier through the
+	// same persisted invocation/controller/AgentTeams carrier as normal phases
+	// without rebuilding a second, subtly different runtime stack.
+	Host          phasepkg.Host
+	WorkspaceSync interface {
+		SyncWorkspace(context.Context, kernel.InvocationID) (agentteams.ExecutionWorkspaceCheckpoint, error)
+	}
+	Recovery       phasepkg.RecoveryStore
+	Contexts       phasepkg.ContextRuntime
+	TaskSubgraphs  targetedVerifyTaskSubgraphRegistrar
+	Contracts      targetedVerifyContractStore
+	ArtifactRouter phasepkg.ArtifactRouter
 }
 
 func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, db *postgres.DB, phaseSeams productionPhaseSeams) (productionRuntimeDependencies, error) {
@@ -59,7 +76,11 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	sharedStore, err := objectstore.NewMinIOStore(objectstore.MinIOConfig{Endpoint: cfg.ObjectStoreEndpoint, AccessKey: cfg.ObjectStoreAccessKey, SecretKey: cfg.ObjectStoreSecretKey, Bucket: cfg.AgentTeamsSharedBucket, Secure: cfg.ObjectStoreSecure})
+	evidenceStore, err := productionEvidenceObjectStore(cfg, store)
+	if err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	sharedStore, err := objectstore.NewMinIOStore(objectstore.MinIOConfig{Endpoint: cfg.ObjectStoreEndpoint, AccessKey: cfg.AgentTeamsSharedAccessKey, SecretKey: cfg.AgentTeamsSharedSecretKey, Bucket: cfg.AgentTeamsSharedBucket, Secure: cfg.ObjectStoreSecure})
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
@@ -67,7 +88,7 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	for _, tool := range auth.CanonicalTools() {
 		availableTools[tool] = struct{}{}
 	}
-	catalog, err := promptcatalog.Load(cfg.RepositoryPath, availableTools)
+	catalog, err := promptcatalog.Load(cfg.RuntimeAssetsRoot, availableTools)
 	if err != nil {
 		return productionRuntimeDependencies{}, fmt.Errorf("load production runtime assets: %w", err)
 	}
@@ -76,6 +97,10 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 		return productionRuntimeDependencies{}, err
 	}
 	coordStore := coordination.NewPostgresStore(sqlDB)
+	contextStore := contextgraph.NewPostgresStore(sqlDB, time.Now)
+	contextStore.SetTaskEndpointResolver(productionTaskEndpointResolver{projectID: projectID, graph: coordStore})
+	artifactRegistry := evidence.NewPostgresArtifactRegistry(sqlDB, evidenceStore, cfg.ObjectStoreBucket)
+	eventStore := evidence.NewPostgresEventStore(sqlDB, 1<<20)
 	ingress, err := newProductionIngress(sqlDB, projectID, cfg.AgentTeamsRoomID, assembler, coordStore, time.Now)
 	if err != nil {
 		return productionRuntimeDependencies{}, err
@@ -84,10 +109,15 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	if err := taskManagerRuntime.setProductionEventStore(evidence.NewPostgresEventStore(sqlDB, 1<<20)); err != nil {
+	if err := taskManagerRuntime.setProductionEventStore(eventStore); err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	contextRuntime, err := newProductionContextRuntime(sqlDB, projectID, cfg.AgentTeamsRoomID, assembler, contextStore, time.Now)
+	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
 	invocationStore := runtimepkg.NewPostgresInvocationStoreFromSQL(sqlDB)
+	workspaces := workspace.NewPostgresService(sqlDB)
 
 	controller, err := agentteams.NewAgentTeamsControllerClient(cfg.AgentTeamsControllerURL, cfg.AgentTeamsControllerBearer, nil)
 	if err != nil {
@@ -97,10 +127,7 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	for host, container := range cfg.AgentTeamsContainers {
 		containers[host] = container
 	}
-	managerWorkers := map[string]string{}
-	if container := containers["default"]; strings.HasPrefix(container, "agentteams-worker-") {
-		managerWorkers["default"] = strings.TrimPrefix(container, "agentteams-worker-")
-	}
+	managerWorkers := productionManagerWorkerAliases(containers)
 	const dedicatedTaskflowHostRef = "threadmill-dispatcher"
 	taskflowHostRef := ""
 	if _, ok := containers[dedicatedTaskflowHostRef]; ok {
@@ -126,6 +153,7 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 		MCPResolver:     mcpResolver,
 		QwenPaw:         agentteams.DockerQwenPawProvider{Containers: containers},
 		Taskflow:        taskflow,
+		SharedFiles:     taskflow,
 		Containers:      containers,
 		ManagerWorkers:  managerWorkers,
 		TaskflowHostRef: taskflowHostRef,
@@ -133,37 +161,88 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	files, err := agentteams.NewSharedObjectFileTransport(sharedStore, cfg.AgentTeamsSharedBucket, cfg.AgentTeamsSharedPrefix)
+	workspaceProjector := productionExecutionWorkspaceProjector{invocations: invocationStore, workspaces: workspaces}
+	targetedRegistry := newProductionTargetedVerifyRegistry()
+	targetedProjector := &productionTargetedVerifyWorkspaceProjector{registry: targetedRegistry}
+	projectorRouter := productionTargetedVerifyProjectorRouter{Regular: workspaceProjector, Targeted: targetedProjector}
+	files, err := agentteams.NewSharedObjectFileTransport(sharedStore, cfg.AgentTeamsSharedBucket, cfg.AgentTeamsSharedPrefix, projectorRouter)
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	adapter, err := agentteams.NewAdapter(client, productionInvocationSource{taskManager: ingress, phase: phaseHostStore}, files, agentteams.NewPostgresExecutionStore(sqlDB), time.Now, 30*time.Second)
+	adapter, err := agentteams.NewAdapter(client, productionInvocationSource{taskManager: ingress, context: contextRuntime, phase: phaseHostStore}, files, agentteams.NewPostgresExecutionStore(sqlDB), time.Now, 30*time.Second)
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
 	if err := ingress.setDispatcher(adapter); err != nil {
 		return productionRuntimeDependencies{}, err
 	}
-	taskManagerCleanup, err := newProductionTaskManagerExecutionCleanup(sqlDB, projectID, adapter)
+	if err := contextRuntime.setDispatcher(adapter); err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	taskManagerCleanup, err := newProductionTaskManagerExecutionCleanup(sqlDB, adapter, contextStore, time.Now)
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
 	if err := ingress.setTaskManagerExecutionCleaner(taskManagerCleanup); err != nil {
 		return productionRuntimeDependencies{}, err
 	}
+	if err := ingress.setPersistedDecisionRecoverer(taskManagerRuntime); err != nil {
+		return productionRuntimeDependencies{}, err
+	}
 	if phaseSeams.Controller == nil || phaseSeams.Runtime == nil || phaseSeams.Orchestration == nil || phaseSeams.Readiness == nil {
 		phaseSeams, err = buildProductionPhaseSeams(productionPhaseBundleOptions{
 			Config: cfg, DB: sqlDB, ProjectID: projectID, Graph: coordStore, Assembler: assembler,
-			Adapter: adapter, Ingress: ingress, ObjectStore: store, Now: time.Now,
+			Adapter: adapter, Ingress: ingress, ObjectStore: evidenceStore, Workspaces: workspaces, Now: time.Now,
 		})
 		if err != nil {
 			return productionRuntimeDependencies{}, err
 		}
 	}
+	targetedConfigured := phaseSeams.Host != nil && phaseSeams.WorkspaceSync != nil && phaseSeams.Recovery != nil && phaseSeams.Contexts != nil && phaseSeams.Contracts != nil && phaseSeams.ArtifactRouter != nil
+	if !targetedConfigured {
+		return productionRuntimeDependencies{}, errors.New("production targeted verify requires the complete internal Phase runtime assembly")
+	}
+	targetedBundle, err := buildProductionTargetedVerifyBundle(productionTargetedVerifyBundleOptions{
+		ProjectID: projectID, Graph: coordStore, Proposals: ingress,
+		Contracts: phaseSeams.Contracts, Invocations: invocationStore,
+		Assembler: assembler, Host: phaseSeams.Host, Recovery: phaseSeams.Recovery,
+		Contexts: phaseSeams.Contexts, TaskSubgraphs: phaseSeams.TaskSubgraphs,
+		ArtifactRouter:  phaseSeams.ArtifactRouter,
+		OutputValidator: productionTargetedVerifyResultAcceptor{projectID: projectID, artifacts: artifactRegistry},
+		Registry:        targetedRegistry, Projector: targetedProjector,
+		WorkspaceSync: phaseSeams.WorkspaceSync, Now: time.Now,
+	})
+	if err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	phaseRuntimeRouter := productionTargetedVerifyRuntimeRouter{
+		Regular: phaseSeams.Runtime, RegularProposal: phaseSeams.Orchestration,
+		Targeted: targetedBundle.Runtime, Registry: targetedBundle.Registry,
+	}
+	mergeQueue := &productionMergeQueue{
+		db: sqlDB, projectID: projectID, repositoryPath: cfg.RepositoryPath,
+		graph: coordStore, workspaces: workspaces, artifacts: artifactRegistry,
+	}
+	provider, ok := phaseSeams.TaskWorkspaces.(productionMergedVerifyWorkspaceProvisioner)
+	if !ok {
+		return productionRuntimeDependencies{}, errors.New("production code_merge requires merged-revision Verify workspace provisioning")
+	}
+	mergeQueue.verifySpaces = provider
+	mergeQueue.queue = mergequeue.NewReconciler(
+		mergequeue.NewPostgresStore(sqlDB), workspaces,
+		productionAgentTeamsMergeVerifier(projectID, targetedBundle.Bindings, targetedBundle.Runtime, artifactRegistry),
+		mergequeue.GitBackend{TempParent: cfg.WorktreeParent}, artifactRegistry, eventStore,
+	)
+	if err := taskManagerRuntime.setProductionMergeQueue(mergeQueue, mergeQueue); err != nil {
+		return productionRuntimeDependencies{}, err
+	}
 	phaseBoundary := &productionUnavailablePhaseBoundary{invocations: invocationStore}
-	phaseConfigured := phaseSeams.Controller != nil && phaseSeams.Runtime != nil && phaseSeams.Orchestration != nil && phaseSeams.Readiness != nil
+	phaseConfigured := phaseSeams.Controller != nil && phaseSeams.Failures != nil && phaseSeams.Runtime != nil && phaseSeams.Orchestration != nil && phaseSeams.Readiness != nil
 	if phaseSeams.Controller == nil {
 		phaseSeams.Controller = phaseBoundary
+	}
+	if phaseSeams.Failures == nil {
+		phaseSeams.Failures = phaseBoundary
 	}
 	if phaseSeams.Runtime == nil {
 		phaseSeams.Runtime = phaseBoundary
@@ -179,20 +258,46 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 			return productionRuntimeDependencies{}, err
 		}
 	}
+	if err := taskManagerRuntime.setProductionMemoryFinalizer(contextRuntime); err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	baseSelection := scheduler.New(scheduler.BudgetPolicy{VerifyLevel: scheduler.VerifyStandard, ExplorationLevel: scheduler.ExplorationTargeted})
 	graphRuntime, err := coordination.NewRuntime(coordination.RuntimeOptions{
 		ProjectID: projectID, Store: coordStore, PhaseController: phaseSeams.Controller,
-		Selection:  scheduler.New(scheduler.BudgetPolicy{VerifyLevel: scheduler.VerifyStandard, ExplorationLevel: scheduler.ExplorationTargeted}),
+		Selection:  productionMergeAwareSelection{db: sqlDB, projectID: projectID, inner: baseSelection},
 		Scheduling: scheduler.NewPostgresSchedulingStateProvider(sqlDB, projectID),
 	})
 	if err != nil {
 		return productionRuntimeDependencies{}, err
 	}
 	loop := newProductionRuntimeLoop(client, scheduler.NewPostgresCapacityLedger(sqlDB, projectID), graphRuntime, phaseSeams.Readiness, phaseConfigured, time.Now)
+	phaseFailures, err := newProductionPhaseExecutionMonitor(sqlDB, projectID, adapter, phaseSeams.Failures, time.Now)
+	if err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	targetedFailures, err := newProductionTargetedVerifyExecutionMonitor(sqlDB, projectID, targetedBundle.Registry, adapter, targetedBundle.Runtime, time.Now)
+	if err != nil {
+		return productionRuntimeDependencies{}, err
+	}
+	loop.phaseFailures = func(ctx context.Context) error {
+		return errors.Join(phaseFailures.Reconcile(ctx), targetedFailures.Reconcile(ctx))
+	}
+	loop.executionCleanup = func(ctx context.Context) error {
+		return errors.Join(
+			taskManagerCleanup.CleanupTaskManagerInvocations(ctx),
+			ingress.RetryFailedTaskManagerInputs(ctx),
+			taskManagerRuntime.ReconcileCompletedTransitionFollowups(ctx),
+			contextRuntime.Reconcile(ctx),
+		)
+	}
+	mergeWorker := newProductionAsyncReconciler(mergeQueue.Reconcile)
+	loop.mergeQueue = mergeWorker.Poll
+	loop.mergeQueueWait = mergeWorker.Wait
 	if runtime, ok := phaseSeams.Runtime.(*productionPhaseRuntime); ok {
 		loop.terminalRetry = runtime.ReplayTerminalDeliveries
 	}
 	loop.Start(ctx)
-	workspaceTools := workspace.NewAgentTools(workspace.NewPostgresService(sqlDB))
+	workspaceTools := workspace.NewAgentTools(workspaces)
 	objectProbe, err := newProductionMinIOReadiness(cfg.ObjectStoreEndpoint, cfg.ObjectStoreSecure)
 	if err != nil {
 		loop.Close(context.Background())
@@ -200,11 +305,22 @@ func buildProductionRuntimeDependencies(ctx context.Context, cfg config.Config, 
 	}
 	return productionRuntimeDependencies{
 		requirements: ingress, human: ingress, manager: ingress,
-		phaseController: phaseSeams.Controller, phase: phaseSeams.Runtime,
-		requirement: productionRequirementSubmitter{ingress: ingress}, orchestration: phaseSeams.Orchestration,
+		phaseController: phaseSeams.Controller, phase: phaseRuntimeRouter,
+		requirement: productionRequirementSubmitter{ingress: ingress}, orchestration: phaseRuntimeRouter,
 		taskManager: taskManagerRuntime, workspace: workspaceTools,
+		contextRetrieve: contextRuntime, contextSearcher: productionContextSearcher{searcher: contextStore, runtime: contextRuntime}, memoryFinalizer: contextRuntime,
 		objectStoreDriver: store, objectStore: objectProbe, agentTeams: client, runtime: loop, background: loop,
 	}, nil
+}
+
+func productionManagerWorkerAliases(containers agentteams.StaticContainerResolver) map[string]string {
+	aliases := map[string]string{}
+	for _, logicalHost := range []string{"default", "context"} {
+		if container := containers[logicalHost]; strings.HasPrefix(container, "agentteams-worker-") {
+			aliases[logicalHost] = strings.TrimPrefix(container, "agentteams-worker-")
+		}
+	}
+	return aliases
 }
 
 func validateProductionWorkspacePaths(repositoryPath, worktreeParent string) error {
@@ -312,7 +428,15 @@ func (r *productionMCPResolver) RevokeInvocationMCP(ctx context.Context, invocat
 	}
 	r.tokenMu.Lock()
 	defer r.tokenMu.Unlock()
-	return r.authStore.RevokeToken(ctx, auth.HashOpaqueSecret(r.token(invocationID)), r.now().UTC())
+	err := r.authStore.RevokeToken(ctx, auth.HashOpaqueSecret(r.token(invocationID)), r.now().UTC())
+	// Revocation is idempotent at the authority boundary. PrepareHost can fail
+	// before the deterministic bearer row is inserted; cleanup must still be
+	// able to close the reserved execution and release its slot. A missing row
+	// means there is no credential to revoke, never that one should be created.
+	if kernel.IsCode(err, kernel.CodeUnauthorized) {
+		return nil
+	}
+	return err
 }
 
 func (r *productionMCPResolver) token(invocationID kernel.InvocationID) string {
@@ -323,6 +447,10 @@ func (r *productionMCPResolver) token(invocationID kernel.InvocationID) string {
 
 type productionUnavailablePhaseBoundary struct {
 	invocations runtimepkg.InvocationStore
+}
+
+func (p *productionUnavailablePhaseBoundary) FailInvocation(context.Context, coordination.PhaseCommand) error {
+	return phaseUnavailable("phase failure runtime is not configured")
 }
 
 func (p *productionUnavailablePhaseBoundary) Apply(ctx context.Context, command coordination.PhaseCommand) error {
@@ -388,18 +516,22 @@ type productionCapacityObserver interface {
 }
 
 type productionRuntimeLoop struct {
-	hosts         productionHostLister
-	capacity      productionCapacityObserver
-	runtime       coordination.RuntimeRunner
-	phase         productionReadinessProbe
-	terminalRetry func(context.Context) error
-	phaseReady    bool
-	now           func() time.Time
-	cancel        context.CancelFunc
-	done          chan struct{}
-	mu            sync.RWMutex
-	lastErr       error
-	reconciled    bool
+	hosts            productionHostLister
+	capacity         productionCapacityObserver
+	runtime          coordination.RuntimeRunner
+	phase            productionReadinessProbe
+	terminalRetry    func(context.Context) error
+	executionCleanup func(context.Context) error
+	phaseFailures    func(context.Context) error
+	mergeQueue       func(context.Context) error
+	mergeQueueWait   func()
+	phaseReady       bool
+	now              func() time.Time
+	cancel           context.CancelFunc
+	done             chan struct{}
+	mu               sync.RWMutex
+	lastErr          error
+	reconciled       bool
 }
 
 func newProductionRuntimeLoop(hosts productionHostLister, capacity productionCapacityObserver, runtime coordination.RuntimeRunner, phase productionReadinessProbe, phaseReady bool, now func() time.Time) *productionRuntimeLoop {
@@ -416,7 +548,12 @@ func (l *productionRuntimeLoop) Start(parent context.Context) {
 }
 
 func (l *productionRuntimeLoop) run(ctx context.Context) {
-	defer close(l.done)
+	defer func() {
+		if l.mergeQueueWait != nil {
+			l.mergeQueueWait()
+		}
+		close(l.done)
+	}()
 	l.step(ctx)
 	ticker := time.NewTicker(productionReconcileInterval)
 	defer ticker.Stop()
@@ -430,12 +567,76 @@ func (l *productionRuntimeLoop) run(ctx context.Context) {
 	}
 }
 
+// productionAsyncReconciler keeps long external workflows (notably
+// latest-main verification and conflict resolution) out of the two-second
+// graph-control loop. Poll starts at most one run, reports the most recently
+// completed infrastructure error for readiness, and lets the next poll retry.
+// The run receives the loop's lifetime context so Close cancels it and Wait
+// joins it before the production host reports shutdown complete.
+type productionAsyncReconciler struct {
+	run func(context.Context) error
+
+	mu      sync.Mutex
+	running bool
+	lastErr error
+	wg      sync.WaitGroup
+}
+
+func newProductionAsyncReconciler(run func(context.Context) error) *productionAsyncReconciler {
+	return &productionAsyncReconciler{run: run}
+}
+
+func (r *productionAsyncReconciler) Poll(ctx context.Context) error {
+	if r == nil || r.run == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	lastErr := r.lastErr
+	if r.running {
+		r.mu.Unlock()
+		return lastErr
+	}
+	r.running = true
+	r.wg.Add(1)
+	r.mu.Unlock()
+	go func() {
+		defer r.wg.Done()
+		err := r.run(ctx)
+		r.mu.Lock()
+		r.lastErr = err
+		r.running = false
+		r.mu.Unlock()
+	}()
+	return lastErr
+}
+
+func (r *productionAsyncReconciler) Wait() {
+	if r != nil {
+		r.wg.Wait()
+	}
+}
+
 func (l *productionRuntimeLoop) step(ctx context.Context) {
-	hosts, err := l.hosts.ListHosts(ctx)
-	if err == nil {
+	var stepErr error
+	if l.executionCleanup != nil {
+		stepErr = errors.Join(stepErr, l.executionCleanup(ctx))
+	}
+	if l.phaseFailures != nil {
+		stepErr = errors.Join(stepErr, l.phaseFailures(ctx))
+	}
+	if l.mergeQueue != nil {
+		stepErr = errors.Join(stepErr, l.mergeQueue(ctx))
+	}
+	hosts, hostErr := l.hosts.ListHosts(ctx)
+	if hostErr != nil {
+		stepErr = errors.Join(stepErr, hostErr)
+	} else {
 		healthy, active := 0, 0
 		for _, host := range hosts {
-			if host.Kind != agentteams.HostWorker || host.Phase != "Running" || host.LastHeartbeat.IsZero() || l.now().Sub(host.LastHeartbeat) > 30*time.Second {
+			if !productionPhaseHostReady(host, l.now()) {
 				continue
 			}
 			healthy += host.Capacity
@@ -444,20 +645,75 @@ func (l *productionRuntimeLoop) step(ctx context.Context) {
 		if active > healthy {
 			active = healthy
 		}
-		_, err = l.capacity.Observe(ctx, healthy, active)
+		_, observeErr := l.capacity.Observe(ctx, healthy, active)
+		stepErr = errors.Join(stepErr, observeErr)
 	}
-	if err == nil {
-		if l.terminalRetry != nil {
-			err = l.terminalRetry(ctx)
+	if l.terminalRetry != nil {
+		retryErr := l.terminalRetry(ctx)
+		if !productionTerminalDeliveryWaitsForCapacity(retryErr) {
+			stepErr = errors.Join(stepErr, retryErr)
 		}
 	}
-	if err == nil {
-		err = l.runtime.Reconcile(ctx)
-	}
+	// Graph lifecycle control is independent of provider cleanup, readiness,
+	// and terminal-delivery recovery. In particular, a held endpoint must still
+	// emit stop while an unrelated Context invocation is unhealthy.
+	stepErr = errors.Join(stepErr, l.runtime.Reconcile(ctx))
 	l.mu.Lock()
-	l.lastErr = err
-	l.reconciled = err == nil
+	l.lastErr = stepErr
+	l.reconciled = stepErr == nil
 	l.mu.Unlock()
+}
+
+// A durable terminal obligation that cannot acquire a Task Manager host is
+// pending business work, not a broken runtime dependency. The outbox retains
+// the exact obligation and retries it on the next reconcile tick. Readiness
+// must still fail for persistence, protocol, or mixed failures so operators do
+// not lose infrastructure faults behind one retryable capacity error.
+func productionTerminalDeliveryWaitsForCapacity(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if child == nil || !productionTerminalDeliveryWaitsForCapacity(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if cause := wrapped.Unwrap(); cause != nil {
+			return productionTerminalDeliveryWaitsForCapacity(cause)
+		}
+	}
+	return kernel.IsCode(err, kernel.CodeExecutorUnavailable)
+}
+
+func productionPhaseHostReady(host agentteams.HostStatus, now time.Time) bool {
+	if host.Kind != agentteams.HostWorker {
+		return false
+	}
+	phase := strings.ToLower(strings.TrimSpace(host.Phase))
+	if phase != "running" && phase != "sleeping" {
+		return false
+	}
+	// Sleeping is an intentional zero-cost carrier state. It remains available
+	// capacity because Dispatch selects it and PrepareHost wakes it before MCP
+	// installation. Requiring a live heartbeat from a sleeping process would
+	// make the next phase permanently unschedulable after the first idle sleep.
+	if phase == "running" && (host.LastHeartbeat.IsZero() || now.Sub(host.LastHeartbeat) > 30*time.Second) {
+		return false
+	}
+	for _, capability := range host.Capabilities {
+		if capability == "shell" {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *productionRuntimeLoop) Check(ctx context.Context) error {

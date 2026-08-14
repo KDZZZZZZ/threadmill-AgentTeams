@@ -1,10 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
 	"github.com/agentscope-ai/AgentTeams/agentteams-controller/internal/backend"
@@ -135,10 +138,22 @@ func (h *LifecycleHandler) EnsureReady(w http.ResponseWriter, r *http.Request) {
 		// Directly operate on backend for immediate response
 		b := h.registry.DetectWorkerBackend(r.Context())
 		if b != nil {
-			if err := b.Start(r.Context(), name); err != nil {
-				// Start may fail if container/pod was removed (Stopped state on K8s).
-				// The reconciler will handle recreation.
-				log.Printf("[WARN] ensure-ready start worker %s: %v (reconciler will retry)", name, err)
+			result, statusErr := b.Status(r.Context(), name)
+			if statusErr == nil && result != nil && backend.ImageChanged(r.Context(), b, worker.Spec.Image, result) {
+				if err := b.Delete(r.Context(), name); err != nil {
+					// Delete may fail if the reconciler already removed it. The
+					// declarative spec.state update above remains the source of truth.
+					log.Printf("[WARN] ensure-ready delete stale worker %s: %v (reconciler will retry)", name, err)
+				}
+			} else {
+				if statusErr != nil {
+					log.Printf("[WARN] ensure-ready status worker %s: %v (falling back to start)", name, statusErr)
+				}
+				if err := b.Start(r.Context(), name); err != nil {
+					// Start may fail if container/pod was removed (Stopped state on K8s).
+					// The reconciler will handle recreation.
+					log.Printf("[WARN] ensure-ready start worker %s: %v (reconciler will retry)", name, err)
+				}
 			}
 		}
 
@@ -146,9 +161,20 @@ func (h *LifecycleHandler) EnsureReady(w http.ResponseWriter, r *http.Request) {
 
 		// Refresh and update status
 		_ = h.k8s.Get(r.Context(), client.ObjectKey{Name: name, Namespace: h.namespace}, &worker)
+		now := time.Now().UTC().Format(time.RFC3339)
 		worker.Status.Phase = "Running"
 		worker.Status.Message = ""
+		worker.Status.LastHeartbeat = now
+		worker.Status.LastActiveAt = now
 		_ = h.k8s.Status().Update(r.Context(), &worker)
+	} else if worker.Status.Phase == "Running" {
+		now := time.Now().UTC().Format(time.RFC3339)
+		worker.Status.LastHeartbeat = now
+		worker.Status.LastActiveAt = now
+		if err := h.k8s.Status().Update(r.Context(), &worker); err != nil {
+			writeK8sError(w, "update worker heartbeat", err)
+			return
+		}
 	}
 
 	phase := worker.Status.Phase
@@ -164,6 +190,44 @@ func (h *LifecycleHandler) Ready(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
 		httputil.WriteError(w, http.StatusBadRequest, "worker name is required")
+		return
+	}
+	var payload struct {
+		LastActiveAt string `json:"lastActiveAt"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&payload); err != nil {
+			httputil.WriteError(w, http.StatusBadRequest, "invalid ready payload")
+			return
+		}
+		if dec.Decode(&struct{}{}) != io.EOF {
+			httputil.WriteError(w, http.StatusBadRequest, "invalid ready payload")
+			return
+		}
+	}
+	if payload.LastActiveAt != "" {
+		if _, err := time.Parse(time.RFC3339, payload.LastActiveAt); err != nil {
+			httputil.WriteError(w, http.StatusBadRequest, "lastActiveAt must be RFC3339")
+			return
+		}
+	}
+
+	var worker v1beta1.Worker
+	if err := h.k8s.Get(r.Context(), client.ObjectKey{Name: name, Namespace: h.namespace}, &worker); err != nil {
+		writeK8sError(w, "get worker", err)
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	worker.Status.LastHeartbeat = now
+	if payload.LastActiveAt != "" {
+		if isLastActiveNewer(payload.LastActiveAt, worker.Status.LastActiveAt) {
+			worker.Status.LastActiveAt = payload.LastActiveAt
+		}
+	}
+	if err := h.k8s.Status().Update(r.Context(), &worker); err != nil {
+		writeK8sError(w, "update worker heartbeat", err)
 		return
 	}
 

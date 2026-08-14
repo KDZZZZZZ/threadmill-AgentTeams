@@ -140,6 +140,52 @@ func TestGitWorktreeBindingPhaseReuseLeasesGuardWritesAndSeal(t *testing.T) {
 	}
 }
 
+func TestAuthorizeExecuteWritesPromotesPlannerArtifactBeforeLease(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	service := NewService()
+	binding, err := service.CreateGitWorktree(ctx, CreateRequest{
+		TaskID: "task-authority", Generation: 1, RepoPath: seedBareRepo(t), WorktreeParent: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AuthorizeExecuteWrites(ctx, binding.ID, WriteSet{Files: []string{"internal/app.go"}}); !kernel.IsCode(err, kernel.CodeTransitionRejected) {
+		t.Fatalf("authorize before plan completion = %v, want transition_rejected", err)
+	}
+	if _, err := service.BindPhase(ctx, binding.ID, PhasePlan, "inv-plan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompletePhase(ctx, binding.ID, PhasePlan, "inv-plan"); err != nil {
+		t.Fatal(err)
+	}
+	authorized, err := service.AuthorizeExecuteWrites(ctx, binding.ID, WriteSet{
+		Files: []string{"internal/app.go", "internal/app_test.go"}, Modules: []string{"internal"}, Tests: []string{"go test ./internal"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(authorized.AllowedDirs, []string{"internal/app.go", "internal/app_test.go"}) || len(authorized.DeclaredWrites.Files) != 2 {
+		t.Fatalf("promoted authority = %#v", authorized)
+	}
+	if _, err := service.BindPhase(ctx, binding.ID, PhaseExecute, "inv-execute", authorized.Revision); err != nil {
+		t.Fatal(err)
+	}
+	assertAllowed(t, authorized, PhaseExecute, "internal/app.go")
+	assertDenied(t, authorized, PhaseExecute, "internal/other.go")
+	for _, invalid := range []WriteSet{
+		{},
+		{Files: []string{"../escape.go"}},
+		{Files: []string{".git/config"}},
+		{Files: []string{"plan/rewrite.json"}},
+	} {
+		if _, err := service.AuthorizeExecuteWrites(ctx, binding.ID, invalid); err == nil {
+			t.Fatalf("invalid declared write set accepted: %#v", invalid)
+		}
+	}
+}
+
 func TestGitWorktreeSupportsNonBareRepository(t *testing.T) {
 	t.Parallel()
 
@@ -156,6 +202,157 @@ func TestGitWorktreeSupportsNonBareRepository(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(binding.Root, "README.md")); err != nil {
 		t.Fatalf("non-bare worktree missing README: %v", err)
+	}
+}
+
+func TestNewGenerationInheritsOnlyCompletedPhasePrerequisites(t *testing.T) {
+	ctx := context.Background()
+	repo := seedBareRepo(t)
+	parent := t.TempDir()
+	service := NewService()
+	first, err := service.CreateGitWorktree(ctx, CreateRequest{TaskID: "task-reopen", Generation: 1, RepoPath: repo, WorktreeParent: parent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BindPhase(ctx, first.ID, PhasePlan, "inv-plan-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompletePhase(ctx, first.ID, PhasePlan, "inv-plan-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BindPhase(ctx, first.ID, PhaseExecute, "inv-execute-1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err = service.CompletePhase(ctx, first.ID, PhaseExecute, "inv-execute-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.CreateGitWorktree(ctx, CreateRequest{
+		TaskID: "task-reopen", Generation: 2, RepoPath: repo, WorktreeParent: parent, BaseRevision: first.CurrentRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err = service.InheritPhasePrerequisites(ctx, second.ID, first.ID, PhaseVerify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.PhaseLeases[PhasePlan] != "inv-plan-1" || second.PhaseLeases[PhaseExecute] != "inv-execute-1" || second.PhaseLeases[PhaseVerify] != "" {
+		t.Fatalf("inherited phase leases = %#v", second.PhaseLeases)
+	}
+	if _, err := service.BindPhase(ctx, second.ID, PhaseVerify, "inv-verify-2"); err != nil {
+		t.Fatalf("bind reopened verify: %v", err)
+	}
+	if _, err := service.InheritPhasePrerequisites(ctx, second.ID, first.ID, PhaseVerify); !kernel.IsCode(err, kernel.CodeLeaseConflict) {
+		t.Fatalf("inherit while target active = %v, want lease_conflict", err)
+	}
+	replayed, err := service.InheritPhasePrerequisites(ctx, second.ID, first.ID, PhaseVerify, "inv-verify-2")
+	if err != nil {
+		t.Fatalf("inherit replay for the active invocation: %v", err)
+	}
+	if replayed.ActivePhase != PhaseVerify || replayed.ActiveInvocation != "inv-verify-2" || replayed.PhaseLeases[PhasePlan] != "inv-plan-1" || replayed.PhaseLeases[PhaseExecute] != "inv-execute-1" {
+		t.Fatalf("active inheritance replay changed authority: %#v", replayed)
+	}
+	if _, err := service.InheritPhasePrerequisites(ctx, second.ID, first.ID, PhaseVerify, "inv-verify-other"); !kernel.IsCode(err, kernel.CodeLeaseConflict) {
+		t.Fatalf("inherit replay for another invocation = %v, want lease_conflict", err)
+	}
+	third, err := service.CreateGitWorktree(ctx, CreateRequest{
+		TaskID: "task-reopen", Generation: 3, RepoPath: repo, WorktreeParent: parent, BaseRevision: second.CurrentRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.InheritPhasePrerequisites(ctx, third.ID, second.ID, PhaseVerify); !kernel.IsCode(err, kernel.CodeLeaseConflict) {
+		t.Fatalf("inherit from active prior generation = %v, want lease_conflict", err)
+	}
+}
+
+func TestFreshMainRoundInheritsOnlyPlanPrerequisite(t *testing.T) {
+	ctx := context.Background()
+	repo := seedBareRepo(t)
+	parent := t.TempDir()
+	service := NewService()
+	first, err := service.CreateGitWorktree(ctx, CreateRequest{TaskID: "task-replan", Generation: 1, RepoPath: repo, WorktreeParent: parent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BindPhase(ctx, first.ID, PhasePlan, "inv-plan-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompletePhase(ctx, first.ID, PhasePlan, "inv-plan-1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err = service.AuthorizeExecuteWrites(ctx, first.ID, WriteSet{Files: []string{"workspace/feature.go"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BindPhase(ctx, first.ID, PhaseExecute, "inv-execute-1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err = service.CompletePhase(ctx, first.ID, PhaseExecute, "inv-execute-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainRevision := advanceBareRepo(t, repo)
+	second, err := service.CreateGitWorktree(ctx, CreateRequest{
+		TaskID: "task-replan", Generation: 2, RepoPath: repo, WorktreeParent: parent, BaseRevision: mainRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err = service.InheritPlanPrerequisite(ctx, second.ID, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BaseRevision != mainRevision || second.PhaseLeases[PhasePlan] != "inv-plan-1" || second.PhaseLeases[PhaseExecute] != "" || second.PhaseLeases[PhaseVerify] != "" ||
+		!writeSetsEqual(second.DeclaredWrites, first.DeclaredWrites) || !stringSlicesEqual(second.AllowedDirs, first.AllowedDirs) {
+		t.Fatalf("fresh main round = %#v", second)
+	}
+	if _, err := service.BindPhase(ctx, second.ID, PhaseExecute, "inv-execute-2"); err != nil {
+		t.Fatalf("bind execute on fresh main round: %v", err)
+	}
+	replayed, err := service.InheritPlanPrerequisite(ctx, second.ID, first.ID)
+	if !kernel.IsCode(err, kernel.CodeLeaseConflict) || replayed.ID != "" {
+		t.Fatalf("inherit while active = %#v, %v, want lease_conflict", replayed, err)
+	}
+}
+
+func TestMergedVerifyRoundInheritsPlanAndExecuteOnly(t *testing.T) {
+	ctx := context.Background()
+	repo := seedBareRepo(t)
+	parent := t.TempDir()
+	service := NewService()
+	first, err := service.CreateGitWorktree(ctx, CreateRequest{TaskID: "task-post-merge-verify", Generation: 1, RepoPath: repo, WorktreeParent: parent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BindPhase(ctx, first.ID, PhasePlan, "inv-plan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompletePhase(ctx, first.ID, PhasePlan, "inv-plan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.BindPhase(ctx, first.ID, PhaseExecute, "inv-execute"); err != nil {
+		t.Fatal(err)
+	}
+	first, err = service.CompletePhase(ctx, first.ID, PhaseExecute, "inv-execute")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainRevision := advanceBareRepo(t, repo)
+	second, err := service.CreateGitWorktree(ctx, CreateRequest{TaskID: first.TaskID, Generation: 2, RepoPath: repo, WorktreeParent: parent, BaseRevision: mainRevision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err = service.InheritMergedVerifyPrerequisites(ctx, second.ID, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BaseRevision != mainRevision || second.CurrentRevision != mainRevision || second.PhaseLeases[PhasePlan] != "inv-plan" || second.PhaseLeases[PhaseExecute] != "inv-execute" || second.PhaseLeases[PhaseVerify] != "" || len(second.ObservedWrites.Files) != 0 {
+		t.Fatalf("merged Verify workspace = %#v", second)
+	}
+	if _, err := service.BindPhase(ctx, second.ID, PhaseVerify, "inv-verify"); err != nil {
+		t.Fatalf("bind post-merge Verify: %v", err)
 	}
 }
 
@@ -278,6 +475,23 @@ func seedBareRepo(t *testing.T) string {
 	bare := filepath.Join(t.TempDir(), "repo.git")
 	git(t, work, "clone", "--bare", work, bare)
 	return bare
+}
+
+func advanceBareRepo(t *testing.T, bare string) string {
+	t.Helper()
+	work := filepath.Join(t.TempDir(), "advance")
+	git(t, filepath.Dir(work), "clone", bare, work)
+	writeFile(t, filepath.Join(work, "main-drift.txt"), "latest main\n")
+	git(t, work, "add", "main-drift.txt")
+	git(t, work, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "advance main")
+	git(t, work, "push", "origin", "HEAD")
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = work
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read advanced revision: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func seedWorkingRepo(t *testing.T) string {

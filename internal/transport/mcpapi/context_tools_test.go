@@ -222,11 +222,11 @@ func TestMemoryAndTaskContextToolsUseFormalRequestTypes(t *testing.T) {
 	if !memory.listTaskInvoked || memory.principal.TaskID != "task-a" {
 		t.Fatalf("list memory principal=%#v invoked=%v", memory.principal, memory.listTaskInvoked)
 	}
-	candidateReq := contextgraph.SubmitCandidateRequest{Candidate: contextgraph.MemoryCandidate{Statement: "fact", Kind: "fact", SourceRefs: []string{"evidence:1"}}}
+	candidateReq := contextgraph.SubmitCandidateRequest{Candidate: contextgraph.MemoryCandidate{Statement: "fact", Kind: "fact", SourceRefs: []string{"evidence:1", "node:node-reused"}}}
 	if _, err := registry.Invoke(context.Background(), phase, auth.ToolAgentSubmitMemoryCandidate, auth.Scope{ProjectID: "project-a", TaskID: "task-a"}, mustJSON(t, candidateReq)); err != nil {
 		t.Fatal(err)
 	}
-	if memory.submitReq.Candidate.Statement != "fact" {
+	if memory.submitReq.Candidate.Statement != "fact" || !reflect.DeepEqual(memory.submitReq.Candidate.SourceRefs, []string{"evidence:1", "node:node-reused"}) {
 		t.Fatalf("submit candidate req = %#v", memory.submitReq)
 	}
 	tm := principalWithTools(auth.RoleTaskManager, auth.ToolContextRegisterTaskSubgraph, auth.ToolContextProjectTaskContext, auth.ToolContextFinalizeTaskMemory)

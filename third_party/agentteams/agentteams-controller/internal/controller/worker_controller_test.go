@@ -1419,6 +1419,227 @@ func TestStoppedDockerWorkerStartsBeforeTokenRefresh(t *testing.T) {
 	}
 }
 
+func TestDockerWorkerImageDriftDeletesBeforeStartOrTokenRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status backend.WorkerStatus
+	}{
+		{"running", backend.StatusRunning},
+		{"stopped", backend.StatusStopped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dockerBackend := mocks.NewMockWorkerBackend()
+			dockerBackend.NameOverride = "docker"
+			dockerBackend.StatusFn = func(context.Context, string) (*backend.WorkerResult, error) {
+				return &backend.WorkerResult{
+					Backend: "docker",
+					Status:  tc.status,
+					Image:   "agentteams/qwenpaw-worker:v1.2.1",
+				}, nil
+			}
+
+			mctx := MemberContext{
+				Name:                 "docker-image-drift-worker",
+				RuntimeName:          "docker-image-drift-worker",
+				Namespace:            "default",
+				Spec:                 v1beta1.WorkerSpec{Model: "qwen-plus", Image: "agentteams/qwenpaw-worker:current"},
+				BackendRuntime:       v1beta1.BackendRuntimePod,
+				StatusBackendRuntime: v1beta1.BackendRuntimePod,
+				AppliedSpecHash:      "hash",
+				CurrentSpecHash:      "hash",
+			}
+			deps := MemberDeps{
+				Provisioner: mocks.NewMockProvisioner(),
+				Deployer:    mocks.NewMockDeployer(),
+				EnvBuilder:  mocks.NewMockEnvBuilder(),
+				Backend:     backend.NewRegistry([]backend.WorkerBackend{dockerBackend}),
+			}
+			state := &MemberState{
+				ProvResult: &service.WorkerProvisionResult{MatrixToken: "matrix-token", GatewayKey: "gateway-key"},
+			}
+
+			res, err := ensureMemberContainerPresent(context.Background(), deps, mctx, state)
+			if err != nil {
+				t.Fatalf("ensureMemberContainerPresent: %v", err)
+			}
+			if res.RequeueAfter != reconcileRetryDelay {
+				t.Fatalf("RequeueAfter=%v, want %v", res.RequeueAfter, reconcileRetryDelay)
+			}
+			if len(dockerBackend.Calls.Delete) != 1 {
+				t.Fatalf("delete calls=%v, want exactly one stale container delete", dockerBackend.Calls.Delete)
+			}
+			if len(dockerBackend.Calls.Start) != 0 {
+				t.Fatalf("stale container was started: %v", dockerBackend.Calls.Start)
+			}
+			if len(dockerBackend.Calls.ProjectAuthToken) != 0 {
+				t.Fatalf("stale container had token projected: %v", dockerBackend.Calls.ProjectAuthToken)
+			}
+			if state.ContainerState != "stopping" {
+				t.Fatalf("ContainerState=%q, want stopping", state.ContainerState)
+			}
+		})
+	}
+}
+
+func TestDockerWorkerSameTagDigestDriftDeletesBeforeStart(t *testing.T) {
+	dockerBackend := &digestAwareWorkerBackend{
+		MockWorkerBackend: mocks.NewMockWorkerBackend(),
+		ids: map[string]string{
+			"agentteams/qwenpaw-worker:threadmill-current": "sha256:new",
+		},
+	}
+	dockerBackend.NameOverride = "docker"
+	dockerBackend.StatusFn = func(context.Context, string) (*backend.WorkerResult, error) {
+		return &backend.WorkerResult{
+			Backend: "docker",
+			Status:  backend.StatusStopped,
+			Image:   "agentteams/qwenpaw-worker:threadmill-current",
+			ImageID: "sha256:old",
+		}, nil
+	}
+
+	mctx := MemberContext{
+		Name:                 "docker-digest-drift-worker",
+		RuntimeName:          "docker-digest-drift-worker",
+		Namespace:            "default",
+		Spec:                 v1beta1.WorkerSpec{Model: "qwen-plus", Image: "agentteams/qwenpaw-worker:threadmill-current"},
+		BackendRuntime:       v1beta1.BackendRuntimePod,
+		StatusBackendRuntime: v1beta1.BackendRuntimePod,
+		AppliedSpecHash:      "hash",
+		CurrentSpecHash:      "hash",
+	}
+	deps := MemberDeps{
+		Provisioner: mocks.NewMockProvisioner(),
+		Deployer:    mocks.NewMockDeployer(),
+		EnvBuilder:  mocks.NewMockEnvBuilder(),
+		Backend:     backend.NewRegistry([]backend.WorkerBackend{dockerBackend}),
+	}
+	state := &MemberState{
+		ProvResult: &service.WorkerProvisionResult{MatrixToken: "matrix-token", GatewayKey: "gateway-key"},
+	}
+
+	res, err := ensureMemberContainerPresent(context.Background(), deps, mctx, state)
+	if err != nil {
+		t.Fatalf("ensureMemberContainerPresent: %v", err)
+	}
+	if res.RequeueAfter != reconcileRetryDelay {
+		t.Fatalf("RequeueAfter=%v, want %v", res.RequeueAfter, reconcileRetryDelay)
+	}
+	if len(dockerBackend.Calls.Delete) != 1 {
+		t.Fatalf("delete calls=%v, want stale digest delete", dockerBackend.Calls.Delete)
+	}
+	if len(dockerBackend.Calls.Start) != 0 {
+		t.Fatalf("stale digest container was started: %v", dockerBackend.Calls.Start)
+	}
+}
+
+func TestDockerWorkerSameTagSameDigestStartsStopped(t *testing.T) {
+	dockerBackend := &digestAwareWorkerBackend{
+		MockWorkerBackend: mocks.NewMockWorkerBackend(),
+		ids: map[string]string{
+			"agentteams/qwenpaw-worker:threadmill-current": "sha256:same",
+		},
+	}
+	dockerBackend.NameOverride = "docker"
+	dockerBackend.StatusFn = func(context.Context, string) (*backend.WorkerResult, error) {
+		return &backend.WorkerResult{
+			Backend: "docker",
+			Status:  backend.StatusStopped,
+			Image:   "agentteams/qwenpaw-worker:threadmill-current",
+			ImageID: "sha256:same",
+		}, nil
+	}
+
+	mctx := MemberContext{
+		Name:                 "docker-digest-same-worker",
+		RuntimeName:          "docker-digest-same-worker",
+		Namespace:            "default",
+		Spec:                 v1beta1.WorkerSpec{Model: "qwen-plus", Image: "agentteams/qwenpaw-worker:threadmill-current"},
+		BackendRuntime:       v1beta1.BackendRuntimePod,
+		StatusBackendRuntime: v1beta1.BackendRuntimePod,
+		AppliedSpecHash:      "hash",
+		CurrentSpecHash:      "hash",
+	}
+	deps := MemberDeps{
+		Provisioner: mocks.NewMockProvisioner(),
+		Deployer:    mocks.NewMockDeployer(),
+		EnvBuilder:  mocks.NewMockEnvBuilder(),
+		Backend:     backend.NewRegistry([]backend.WorkerBackend{dockerBackend}),
+	}
+	state := &MemberState{
+		ProvResult: &service.WorkerProvisionResult{MatrixToken: "matrix-token", GatewayKey: "gateway-key"},
+	}
+
+	if _, err := ensureMemberContainerPresent(context.Background(), deps, mctx, state); err != nil {
+		t.Fatalf("ensureMemberContainerPresent: %v", err)
+	}
+	if len(dockerBackend.Calls.Delete) != 0 {
+		t.Fatalf("same digest should not delete: %v", dockerBackend.Calls.Delete)
+	}
+	if len(dockerBackend.Calls.Start) != 1 {
+		t.Fatalf("same digest stopped container should start, calls=%v", dockerBackend.Calls.Start)
+	}
+}
+
+func TestDockerWorkerUnknownDesiredDigestDoesNotDelete(t *testing.T) {
+	dockerBackend := &digestAwareWorkerBackend{
+		MockWorkerBackend: mocks.NewMockWorkerBackend(),
+		resolveErr:        errors.New("not found"),
+	}
+	dockerBackend.NameOverride = "docker"
+	dockerBackend.StatusFn = func(context.Context, string) (*backend.WorkerResult, error) {
+		return &backend.WorkerResult{
+			Backend: "docker",
+			Status:  backend.StatusStopped,
+			Image:   "agentteams/qwenpaw-worker:threadmill-current",
+			ImageID: "sha256:old",
+		}, nil
+	}
+
+	mctx := MemberContext{
+		Name:                 "docker-digest-unknown-worker",
+		RuntimeName:          "docker-digest-unknown-worker",
+		Namespace:            "default",
+		Spec:                 v1beta1.WorkerSpec{Model: "qwen-plus", Image: "agentteams/qwenpaw-worker:threadmill-current"},
+		BackendRuntime:       v1beta1.BackendRuntimePod,
+		StatusBackendRuntime: v1beta1.BackendRuntimePod,
+		AppliedSpecHash:      "hash",
+		CurrentSpecHash:      "hash",
+	}
+	deps := MemberDeps{
+		Provisioner: mocks.NewMockProvisioner(),
+		Deployer:    mocks.NewMockDeployer(),
+		EnvBuilder:  mocks.NewMockEnvBuilder(),
+		Backend:     backend.NewRegistry([]backend.WorkerBackend{dockerBackend}),
+	}
+	state := &MemberState{
+		ProvResult: &service.WorkerProvisionResult{MatrixToken: "matrix-token", GatewayKey: "gateway-key"},
+	}
+
+	if _, err := ensureMemberContainerPresent(context.Background(), deps, mctx, state); err != nil {
+		t.Fatalf("ensureMemberContainerPresent: %v", err)
+	}
+	if len(dockerBackend.Calls.Delete) != 0 {
+		t.Fatalf("unknown desired digest should not delete: %v", dockerBackend.Calls.Delete)
+	}
+	if len(dockerBackend.Calls.Start) != 1 {
+		t.Fatalf("unknown desired digest should fall back to start, calls=%v", dockerBackend.Calls.Start)
+	}
+}
+
+type digestAwareWorkerBackend struct {
+	*mocks.MockWorkerBackend
+	ids        map[string]string
+	resolveErr error
+}
+
+func (b *digestAwareWorkerBackend) ResolveImageID(_ context.Context, image string) (string, error) {
+	if b.resolveErr != nil {
+		return "", b.resolveErr
+	}
+	return b.ids[image], nil
+}
+
 func TestSandboxClaimRefreshWritesEnvWhenTokenNotDue(t *testing.T) {
 	sandboxBackend := mocks.NewMockWorkerBackend()
 	sandboxBackend.NameOverride = "sandbox"

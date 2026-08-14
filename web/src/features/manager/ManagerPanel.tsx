@@ -16,6 +16,14 @@ interface Props {
   refreshCursor?: string;
 }
 
+type ManagerIntent = "orchestrate" | "hold" | "resume";
+
+const managerIntents: Array<{ value: ManagerIntent; label: string }> = [
+  { value: "orchestrate", label: "调整编排" },
+  { value: "hold", label: "暂停 Phase" },
+  { value: "resume", label: "恢复 Phase" },
+];
+
 export function ManagerPanel({
   projectID,
   conversationID,
@@ -25,6 +33,7 @@ export function ManagerPanel({
 }: Props) {
   const [conversation, setConversation] = useState<ManagerConversation>();
   const [body, setBody] = useState("");
+  const [intent, setIntent] = useState<ManagerIntent>("orchestrate");
   const [pending, setPending] = useState(false);
   const [feedback, setFeedback] = useState<string>();
 
@@ -57,6 +66,7 @@ export function ManagerPanel({
         projectID,
         conversationID,
         body: message,
+        intent,
         selectedEndpoint,
         observedGraphRevision: graphRevision,
       });
@@ -147,6 +157,34 @@ export function ManagerPanel({
       </div>
 
       <form className="manager-composer" onSubmit={submit}>
+        <fieldset className="manager-intents">
+          <legend>操作意图</legend>
+          <div role="radiogroup" aria-label="Manager 操作意图">
+            {managerIntents.map((option) => {
+              const requiresEndpoint = option.value !== "orchestrate";
+              return (
+                <label
+                  key={option.value}
+                  className={intent === option.value ? "is-active" : undefined}
+                >
+                  <input
+                    type="radio"
+                    name="manager-intent"
+                    value={option.value}
+                    checked={intent === option.value}
+                    disabled={requiresEndpoint && !selectedEndpoint}
+                    onChange={() => setIntent(option.value)}
+                  />
+                  {option.label}
+                </label>
+              );
+            })}
+          </div>
+          <small>
+            暂停与恢复只作用于当前选中的
+            Phase；自然语言不会被推断成生命周期控制。
+          </small>
+        </fieldset>
         <label htmlFor="manager-message">给 Task Manager 的消息</label>
         <textarea
           id="manager-message"
@@ -161,7 +199,11 @@ export function ManagerPanel({
           <button
             className="primary-button"
             type="submit"
-            disabled={pending || !body.trim()}
+            disabled={
+              pending ||
+              !body.trim() ||
+              (intent !== "orchestrate" && !selectedEndpoint)
+            }
           >
             <ArrowUp size={16} aria-hidden="true" />
             {pending ? "Sending" : "Send"}

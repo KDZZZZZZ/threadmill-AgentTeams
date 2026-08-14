@@ -15,14 +15,64 @@ type coordinationSnapshotRequest struct {
 	Revision kernel.Revision `json:"revision,omitempty"`
 }
 
-// PendingSubgraphIntent is the Agent-visible portion of PendingSubgraph.
-// Runtime injects BaseRevision and RequestID from the current persisted
-// TaskManagerDecision; neither value can be supplied in MCP JSON.
+// PendingEndpointIntent contains only scheduling intent. Runtime derives the
+// Task set from endpoint refs and injects contract/spec/binding/generation and
+// state authority from the invocation-bound decision.
+type PendingEndpointIntent struct {
+	Ref       coordination.PhaseEndpointRef `json:"ref"`
+	RunPolicy coordination.RunPolicy        `json:"run_policy"`
+}
+
+// PendingBlockerIntent excludes blocker state because new graph-control gates
+// always enter as active; later state changes require a persisted transition.
+type PendingBlockerIntent struct {
+	ID         string                        `json:"id"`
+	Target     coordination.PhaseEndpointRef `json:"target"`
+	RequiredBy coordination.RequiredBy       `json:"required_by"`
+	OnFalse    coordination.OnFalse          `json:"on_false"`
+}
+
+// PendingTaskPolicyIntent carries the one TaskContract choice that cannot be
+// derived from endpoint refs. Runtime still injects the authoritative Task,
+// contract ref, PhaseSpecs, binding, generation, and state.
+type PendingTaskPolicyIntent struct {
+	TaskID         kernel.TaskID              `json:"task_id"`
+	DeliveryPolicy taskmanager.DeliveryPolicy `json:"delivery_policy"`
+}
+
+// PendingSubgraphIntent is the minimal Agent-visible graph intent. Runtime
+// injects RequestID, BaseRevision, Tasks, endpoint authority fields, and
+// blocker state from the current persisted TaskManagerDecision.
 type PendingSubgraphIntent struct {
-	Tasks     []coordination.Task          `json:"tasks,omitempty"`
-	Endpoints []coordination.PhaseEndpoint `json:"endpoints"`
-	Edges     []coordination.Edge          `json:"edges"`
-	Blockers  []coordination.Blocker       `json:"blockers"`
+	TaskPolicies []PendingTaskPolicyIntent `json:"task_policies,omitempty"`
+	Endpoints    []PendingEndpointIntent   `json:"endpoints"`
+	Edges        []coordination.Edge       `json:"edges,omitempty"`
+	Blockers     []PendingBlockerIntent    `json:"blockers,omitempty"`
+}
+
+// TaskManagerDeliveryState is the minimal Runtime-owned delivery view needed
+// to distinguish graph readiness from code-merge readiness. Agents cannot
+// author these fields; Snapshot derives them from persisted contracts, merge
+// candidates, and production deliveries.
+type TaskManagerDeliveryState struct {
+	TaskID                   kernel.TaskID              `json:"task_id"`
+	DeliveryPolicy           taskmanager.DeliveryPolicy `json:"delivery_policy"`
+	LatestCandidateID        string                     `json:"latest_candidate_id,omitempty"`
+	LatestCandidateStatus    string                     `json:"latest_candidate_status,omitempty"`
+	LatestDeliveryStatus     string                     `json:"latest_delivery_status,omitempty"`
+	LatestFailureReason      string                     `json:"latest_failure_reason,omitempty"`
+	LatestFailureEvidenceRef string                     `json:"latest_failure_evidence_ref,omitempty"`
+	LatestReplanProposalRef  string                     `json:"latest_replan_proposal_ref,omitempty"`
+	ReopenRoundAvailable     bool                       `json:"reopen_round_available"`
+	ReadyForVerify           bool                       `json:"ready_for_verify"`
+}
+
+// TaskManagerSnapshot keeps the Coordination Graph as the authoritative graph
+// object while attaching a read-only delivery projection for Manager
+// decisions. Embedding preserves the existing top-level graph JSON contract.
+type TaskManagerSnapshot struct {
+	coordination.GraphSnapshot
+	Deliveries []TaskManagerDeliveryState `json:"deliveries"`
 }
 
 // TaskManagerAgentRuntime is an internal transport port, not a second graph
@@ -30,7 +80,7 @@ type PendingSubgraphIntent struct {
 // coordination.TaskManagerGraph, persists decisions, injects DecisionRef and
 // expected revision, and delegates exactly one mutation to that graph seam.
 type TaskManagerAgentRuntime interface {
-	Snapshot(context.Context, auth.Principal, auth.BoundScope, kernel.Revision) (coordination.GraphSnapshot, error)
+	Snapshot(context.Context, auth.Principal, auth.BoundScope, kernel.Revision) (TaskManagerSnapshot, error)
 	SubmitTaskManagerDecision(context.Context, auth.Principal, auth.BoundScope, taskmanager.TaskManagerDecision) (string, error)
 	ReplacePending(context.Context, auth.Principal, auth.BoundScope, PendingSubgraphIntent) (kernel.Revision, error)
 	Transition(context.Context, auth.Principal, auth.BoundScope) (kernel.Revision, error)
@@ -93,7 +143,7 @@ func validateTaskManagerDecision(decision taskmanager.TaskManagerDecision) error
 		return nil
 	}
 	switch action {
-	case "submitted", "satisfied", "rejected", "reopened", "held", "released", "stopped",
+	case "submitted", "satisfied", "rejected", "reopened", "reopen_round", "held", "released", "stopped",
 		"resolved", "denied", "obsolete", "done", "canceled", "failed":
 	default:
 		return kernel.InvalidArgument("action is not a Coordination Graph transition")

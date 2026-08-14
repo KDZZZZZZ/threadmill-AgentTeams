@@ -13,6 +13,7 @@ import types
 import zipfile
 
 import pytest
+import yaml
 
 from qwenpaw_worker.config import WorkerConfig
 from qwenpaw_worker.update import MemberRuntimeConfig
@@ -92,10 +93,14 @@ def _config(tmp_path: Path) -> WorkerConfig:
     )
 
 
-def _write_plugin_zip(tmp_path: Path, plugin_id: str, package_name: str, zip_name: str) -> Path:
+def _write_plugin_zip(
+    tmp_path: Path, plugin_id: str, package_name: str, zip_name: str
+) -> Path:
     package_root = tmp_path / f"package-{plugin_id}" / package_name
     package_root.mkdir(parents=True)
-    (package_root / "plugin.json").write_text(json.dumps({"id": plugin_id}) + "\n", encoding="utf-8")
+    (package_root / "plugin.json").write_text(
+        json.dumps({"id": plugin_id}) + "\n", encoding="utf-8"
+    )
     (package_root / "plugin.py").write_text("plugin = object()\n", encoding="utf-8")
     zip_path = tmp_path / zip_name
     with zipfile.ZipFile(zip_path, "w") as archive:
@@ -121,7 +126,8 @@ def _write_builtin_plugin(root: Path, plugin_id: str, apply_name: str) -> Path:
     plugin_dir = root / plugin_id
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "plugin.json").write_text(
-        json.dumps({"id": plugin_id, "name": plugin_id.title(), "version": "1.0.0"}) + "\n",
+        json.dumps({"id": plugin_id, "name": plugin_id.title(), "version": "1.0.0"})
+        + "\n",
         encoding="utf-8",
     )
     (plugin_dir / "plugin.py").write_text(
@@ -152,7 +158,9 @@ def test_link_workspace_shared_points_to_canonical_shared(tmp_path: Path) -> Non
     task_note.parent.mkdir(parents=True)
     task_note.write_text("ready\n", encoding="utf-8")
 
-    assert (config.shared_dir / "tasks" / "task-1" / "workspace" / "note.txt").read_text(encoding="utf-8") == "ready\n"
+    assert (
+        config.shared_dir / "tasks" / "task-1" / "workspace" / "note.txt"
+    ).read_text(encoding="utf-8") == "ready\n"
 
 
 def test_runtime_storage_change_relinks_shared_and_refreshes_builtin_mcp(
@@ -169,8 +177,16 @@ def test_runtime_storage_change_relinks_shared_and_refreshes_builtin_mcp(
     worker._prepare_env()
     worker._workspace_shared_dir = config.shared_dir
     worker._link_workspace_shared()
-    monkeypatch.setattr(worker, "_configure_builtin_plugin_mcp_clients", lambda: refreshed.append("clients"))
-    monkeypatch.setattr(worker, "_configure_builtin_plugin_mcp_policies", lambda: refreshed.append("policies"))
+    monkeypatch.setattr(
+        worker,
+        "_configure_builtin_plugin_mcp_clients",
+        lambda: refreshed.append("clients"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_configure_builtin_plugin_mcp_policies",
+        lambda: refreshed.append("policies"),
+    )
     runtime = MemberRuntimeConfig(
         path=config.runtime_config_path,
         raw={
@@ -202,7 +218,9 @@ def _legacy_configure_qwenpaw_runtime_uses_workspace_teams_prompt(
         ),
         security=types.SimpleNamespace(
             file_guard=types.SimpleNamespace(enabled=False, sensitive_files=[]),
-            tool_guard=types.SimpleNamespace(enabled=False, guarded_tools=None, auto_denied_rules=[]),
+            tool_guard=types.SimpleNamespace(
+                enabled=False, guarded_tools=None, auto_denied_rules=[]
+            ),
         ),
     )
     saved_agents = {}
@@ -226,20 +244,26 @@ def _legacy_configure_qwenpaw_runtime_uses_workspace_teams_prompt(
             self.description = description
             self.workspace_dir = workspace_dir
             self.system_prompt_files = []
-            self.running = types.SimpleNamespace(shell_command_executable="custom-shell")
+            self.running = types.SimpleNamespace(
+                shell_command_executable="custom-shell"
+            )
 
     config_module = types.ModuleType("qwenpaw.config.config")
     config_module.AgentProfileConfig = AgentProfileConfig
     config_module.AgentProfileRef = AgentProfileRef
     config_module.load_agent_config = lambda _agent_id: agent_config
-    config_module.save_agent_config = lambda agent_id, config: saved_agents.update({agent_id: config})
+    config_module.save_agent_config = lambda agent_id, config: saved_agents.update(
+        {agent_id: config}
+    )
 
     utils_module = types.ModuleType("qwenpaw.config.utils")
     utils_module.load_config = lambda: root
     utils_module.save_config = lambda _root: None
 
     monkeypatch.setitem(sys.modules, "qwenpaw", types.ModuleType("qwenpaw"))
-    monkeypatch.setitem(sys.modules, "qwenpaw.config", types.ModuleType("qwenpaw.config"))
+    monkeypatch.setitem(
+        sys.modules, "qwenpaw.config", types.ModuleType("qwenpaw.config")
+    )
     monkeypatch.setitem(sys.modules, "qwenpaw.config.config", config_module)
     monkeypatch.setitem(sys.modules, "qwenpaw.config.utils", utils_module)
 
@@ -250,7 +274,12 @@ def _legacy_configure_qwenpaw_runtime_uses_workspace_teams_prompt(
     workspace = tmp_path / "agents" / "worker-a" / ".qwenpaw" / "workspaces" / "default"
     assert saved.workspace_dir == str(workspace)
     assert saved.approval_level == "AUTO"
-    assert saved.system_prompt_files == ["AGENTS.md", "SOUL.md", "TEAMS.md", "IDENTITY.md"]
+    assert saved.system_prompt_files == [
+        "AGENTS.md",
+        "SOUL.md",
+        "TEAMS.md",
+        "IDENTITY.md",
+    ]
     assert not any("shared" in prompt for prompt in saved.system_prompt_files)
     assert saved.running.shell_command_executable == "custom-shell"
 
@@ -270,7 +299,12 @@ def _legacy_configure_qwenpaw_runtime_disables_existing_builtin_qa_agent(
             self.enabled = enabled
 
     qa_workspace = (
-        tmp_path / "agents" / "worker-a" / ".qwenpaw" / "workspaces" / "QwenPaw_QA_Agent_0.2"
+        tmp_path
+        / "agents"
+        / "worker-a"
+        / ".qwenpaw"
+        / "workspaces"
+        / "QwenPaw_QA_Agent_0.2"
     )
     root = types.SimpleNamespace(
         agents=types.SimpleNamespace(
@@ -286,7 +320,9 @@ def _legacy_configure_qwenpaw_runtime_disables_existing_builtin_qa_agent(
         ),
         security=types.SimpleNamespace(
             file_guard=types.SimpleNamespace(enabled=False, sensitive_files=[]),
-            tool_guard=types.SimpleNamespace(enabled=False, guarded_tools=None, auto_denied_rules=[]),
+            tool_guard=types.SimpleNamespace(
+                enabled=False, guarded_tools=None, auto_denied_rules=[]
+            ),
         ),
     )
     saved_agents = {}
@@ -308,14 +344,18 @@ def _legacy_configure_qwenpaw_runtime_disables_existing_builtin_qa_agent(
     config_module.AgentProfileConfig = AgentProfileConfig
     config_module.AgentProfileRef = AgentProfileRef
     config_module.load_agent_config = lambda _agent_id: agent_config
-    config_module.save_agent_config = lambda agent_id, config: saved_agents.update({agent_id: config})
+    config_module.save_agent_config = lambda agent_id, config: saved_agents.update(
+        {agent_id: config}
+    )
 
     utils_module = types.ModuleType("qwenpaw.config.utils")
     utils_module.load_config = lambda: root
     utils_module.save_config = lambda _root: None
 
     monkeypatch.setitem(sys.modules, "qwenpaw", types.ModuleType("qwenpaw"))
-    monkeypatch.setitem(sys.modules, "qwenpaw.config", types.ModuleType("qwenpaw.config"))
+    monkeypatch.setitem(
+        sys.modules, "qwenpaw.config", types.ModuleType("qwenpaw.config")
+    )
     monkeypatch.setitem(sys.modules, "qwenpaw.config.config", config_module)
     monkeypatch.setitem(sys.modules, "qwenpaw.config.utils", utils_module)
 
@@ -323,7 +363,9 @@ def _legacy_configure_qwenpaw_runtime_disables_existing_builtin_qa_agent(
 
     assert root.agents.active_agent == "default"
     assert root.agents.profiles["QwenPaw_QA_Agent_0.2"].enabled is False
-    assert root.agents.profiles["QwenPaw_QA_Agent_0.2"].workspace_dir == str(qa_workspace)
+    assert root.agents.profiles["QwenPaw_QA_Agent_0.2"].workspace_dir == str(
+        qa_workspace
+    )
 
 
 def _legacy_configure_qwenpaw_runtime_protects_session_directory(
@@ -332,7 +374,9 @@ def _legacy_configure_qwenpaw_runtime_protects_session_directory(
 ) -> None:
     existing_sensitive = "/var/run/agentteams/credential.json"
     existing_auto_deny_rule = "CUSTOM_RULE"
-    file_guard = types.SimpleNamespace(enabled=False, sensitive_files=[existing_sensitive])
+    file_guard = types.SimpleNamespace(
+        enabled=False, sensitive_files=[existing_sensitive]
+    )
     tool_guard = types.SimpleNamespace(
         enabled=False,
         guarded_tools=["execute_shell_command"],
@@ -375,14 +419,18 @@ def _legacy_configure_qwenpaw_runtime_protects_session_directory(
     config_module.AgentProfileConfig = AgentProfileConfig
     config_module.AgentProfileRef = AgentProfileRef
     config_module.load_agent_config = lambda _agent_id: agent_config
-    config_module.save_agent_config = lambda agent_id, config: saved_agents.update({agent_id: config})
+    config_module.save_agent_config = lambda agent_id, config: saved_agents.update(
+        {agent_id: config}
+    )
 
     utils_module = types.ModuleType("qwenpaw.config.utils")
     utils_module.load_config = lambda: root
     utils_module.save_config = lambda saved_root: saved_roots.append(saved_root)
 
     monkeypatch.setitem(sys.modules, "qwenpaw", types.ModuleType("qwenpaw"))
-    monkeypatch.setitem(sys.modules, "qwenpaw.config", types.ModuleType("qwenpaw.config"))
+    monkeypatch.setitem(
+        sys.modules, "qwenpaw.config", types.ModuleType("qwenpaw.config")
+    )
     monkeypatch.setitem(sys.modules, "qwenpaw.config.config", config_module)
     monkeypatch.setitem(sys.modules, "qwenpaw.config.utils", utils_module)
 
@@ -396,7 +444,9 @@ def _legacy_configure_qwenpaw_runtime_protects_session_directory(
     assert root.security.file_guard.sensitive_files.count(existing_sensitive) == 1
     assert root.security.file_guard.sensitive_files.count(f"{sessions_dir}/") == 1
     assert root.security.tool_guard.guarded_tools == []
-    assert root.security.tool_guard.auto_denied_rules.count(existing_auto_deny_rule) == 1
+    assert (
+        root.security.tool_guard.auto_denied_rules.count(existing_auto_deny_rule) == 1
+    )
     assert root.security.tool_guard.auto_denied_rules.count("SENSITIVE_FILE_BLOCK") == 1
     assert len(saved_roots) == 2
 
@@ -415,9 +465,59 @@ def test_session_file_prompt_policy_is_appended_idempotently(tmp_path: Path) -> 
 
     for prompt_file in (agents, soul):
         content = prompt_file.read_text(encoding="utf-8")
-        assert "Do not read, list, grep, glob, summarize, copy, or expose files under sessions/." in content
-        assert "This rule applies to all channels, users, and sessions, not only DingTalk." in content
+        assert (
+            "Do not read, list, grep, glob, summarize, copy, or expose files under sessions/."
+            in content
+        )
+        assert (
+            "This rule applies to all channels, users, and sessions, not only DingTalk."
+            in content
+        )
+        assert (
+            "native read/search/shell filesystem access is limited to the current shared/tasks/<task-id>/ subtree"
+            in content
+        )
+        assert "Runtime owns taskflow SUCCESS finalization" in content
+        assert "Only submit BLOCKED or FAILED manually" in content
         assert content.count("Session files are runtime-private state") == 1
+
+
+def test_clear_restored_conversation_state_removes_chat_and_session_history(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    workspace = config.default_workspace_dir
+    (workspace / "sessions" / "matrix").mkdir(parents=True)
+    (workspace / "sessions" / "matrix" / "room.json").write_text(
+        "session", encoding="utf-8"
+    )
+    (workspace / "tool_results").mkdir()
+    (workspace / "tool_results" / "call.json").write_text("tool", encoding="utf-8")
+    (workspace / "chats.json").write_text("chat", encoding="utf-8")
+    (workspace / "history.db").write_text("history", encoding="utf-8")
+    (workspace / "history.db-wal").write_text("wal", encoding="utf-8")
+    (workspace / "history.db.corrupt-old").write_text("corrupt", encoding="utf-8")
+    (workspace / "notes").mkdir()
+    (workspace / "notes" / "old-task.md").write_text("old note", encoding="utf-8")
+    (workspace / "memory").mkdir()
+    (workspace / "memory" / "2026-08-13.md").write_text("old memory", encoding="utf-8")
+    (workspace / "mem_metadata").mkdir()
+    (workspace / "mem_metadata" / "index.json").write_text("{}", encoding="utf-8")
+    (workspace / "shared" / "tasks" / "task-a").mkdir(parents=True)
+
+    cleared = Worker(config)._clear_restored_conversation_state()
+
+    assert cleared == 9
+    assert not (workspace / "sessions").exists()
+    assert not (workspace / "tool_results").exists()
+    assert not (workspace / "chats.json").exists()
+    assert not (workspace / "history.db").exists()
+    assert not (workspace / "history.db-wal").exists()
+    assert not (workspace / "history.db.corrupt-old").exists()
+    assert not (workspace / "notes").exists()
+    assert not (workspace / "memory").exists()
+    assert not (workspace / "mem_metadata").exists()
+    assert (workspace / "shared" / "tasks" / "task-a").is_dir()
 
 
 def test_file_guard_blocks_explicit_session_file_paths(
@@ -425,7 +525,9 @@ def test_file_guard_blocks_explicit_session_file_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("QWENPAW_WORKING_DIR", str(tmp_path / ".qwenpaw"))
-    file_guardian = pytest.importorskip("qwenpaw.security.tool_guard.guardians.file_guardian")
+    file_guardian = pytest.importorskip(
+        "qwenpaw.security.tool_guard.guardians.file_guardian"
+    )
     models = pytest.importorskip("qwenpaw.security.tool_guard.models")
 
     sessions_dir = tmp_path / "workspace" / "sessions"
@@ -445,12 +547,18 @@ def test_file_guard_blocks_explicit_session_file_paths(
         assert findings
         assert findings[0].category == models.GuardThreatCategory.SENSITIVE_FILE_ACCESS
 
-    shell_findings = guard.guard("execute_shell_command", {"command": f"cat {session_files[0]}"})
+    shell_findings = guard.guard(
+        "execute_shell_command", {"command": f"cat {session_files[0]}"}
+    )
     assert shell_findings
-    assert shell_findings[0].category == models.GuardThreatCategory.SENSITIVE_FILE_ACCESS
+    assert (
+        shell_findings[0].category == models.GuardThreatCategory.SENSITIVE_FILE_ACCESS
+    )
 
 
-def _legacy_worker_configured_active_tool_guard_auto_denies_session_files(tmp_path: Path) -> None:
+def _legacy_worker_configured_active_tool_guard_auto_denies_session_files(
+    tmp_path: Path,
+) -> None:
     if importlib.util.find_spec("qwenpaw") is None:
         pytest.skip("qwenpaw package unavailable")
     pytest.importorskip("qwenpaw.agents.tool_guard_mixin")
@@ -528,7 +636,9 @@ def _legacy_worker_configured_active_tool_guard_auto_denies_session_files(tmp_pa
 
     env = os.environ.copy()
     qwenpaw_src = str(Path(__file__).resolve().parents[1] / "src")
-    env["PYTHONPATH"] = os.pathsep.join(part for part in (qwenpaw_src, env.get("PYTHONPATH", "")) if part)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (qwenpaw_src, env.get("PYTHONPATH", "")) if part
+    )
     env["QWENPAW_WORKING_DIR"] = str(tmp_path / ".qwenpaw")
     env["QWENPAW_SECRET_DIR"] = str(tmp_path / ".qwenpaw.secret")
     env.pop("COPAW_WORKING_DIR", None)
@@ -562,7 +672,9 @@ def test_migrate_legacy_copaw_working_dir_to_qwenpaw(tmp_path: Path) -> None:
             return []
 
         def push_paths(self, paths):
-            pushed.append([path.relative_to(cfg.worker_home).as_posix() for path in paths])
+            pushed.append(
+                [path.relative_to(cfg.worker_home).as_posix() for path in paths]
+            )
             return pushed[-1]
 
     worker.sync = Sync()
@@ -571,8 +683,12 @@ def test_migrate_legacy_copaw_working_dir_to_qwenpaw(tmp_path: Path) -> None:
     assert not legacy.exists()
     assert not legacy_secret.exists()
     assert cfg.qwenpaw_working_dir.exists()
-    assert (cfg.qwenpaw_working_dir / "workspaces" / "default").read_text(encoding="utf-8") == "state"
-    assert (cfg.worker_home / ".qwenpaw.secret" / "providers.json").read_text(encoding="utf-8") == "legacy-provider"
+    assert (cfg.qwenpaw_working_dir / "workspaces" / "default").read_text(
+        encoding="utf-8"
+    ) == "state"
+    assert (cfg.worker_home / ".qwenpaw.secret" / "providers.json").read_text(
+        encoding="utf-8"
+    ) == "legacy-provider"
     assert pushed[-1] == [".qwenpaw/.copaw-migrated"]
 
 
@@ -601,7 +717,9 @@ def test_migrate_legacy_copaw_secret_to_configured_absolute_dir(
     worker.sync = Sync()
 
     assert worker._migrate_legacy_state() is True
-    assert (target_secret / "providers.json").read_text(encoding="utf-8") == "legacy-provider"
+    assert (target_secret / "providers.json").read_text(
+        encoding="utf-8"
+    ) == "legacy-provider"
     assert not (cfg.worker_home / ".qwenpaw.secret").exists()
     assert pushed[0] == [target_secret]
 
@@ -629,7 +747,9 @@ def test_migrate_legacy_copaw_secret_to_configured_relative_dir(
 
     assert os.environ["QWENPAW_SECRET_DIR"] == "../../../qwenpaw-secret"
     assert worker._migrate_legacy_state() is True
-    assert (target_secret / "providers.json").read_text(encoding="utf-8") == "legacy-provider"
+    assert (target_secret / "providers.json").read_text(
+        encoding="utf-8"
+    ) == "legacy-provider"
     assert not (cfg.worker_home / ".qwenpaw.secret").exists()
 
 
@@ -651,12 +771,18 @@ def test_migrate_legacy_copaw_secret_rejects_dir_outside_worker_home(
         "Sync",
         (),
         {
-            "push_directories": lambda _self, _directories: pytest.fail("must reject before persistence"),
-            "push_paths": lambda _self, _paths: pytest.fail("must not persist a migration marker"),
+            "push_directories": lambda _self, _directories: pytest.fail(
+                "must reject before persistence"
+            ),
+            "push_paths": lambda _self, _paths: pytest.fail(
+                "must not persist a migration marker"
+            ),
         },
     )()
 
-    with pytest.raises(ValueError, match="QWENPAW_SECRET_DIR is outside worker storage root"):
+    with pytest.raises(
+        ValueError, match="QWENPAW_SECRET_DIR is outside worker storage root"
+    ):
         worker._migrate_legacy_state()
 
     assert (legacy_secret / "providers.json").is_file()
@@ -664,7 +790,9 @@ def test_migrate_legacy_copaw_secret_rejects_dir_outside_worker_home(
     assert not cfg.qwenpaw_working_dir.exists()
 
 
-def test_migrate_legacy_copaw_state_recovers_existing_qwenpaw_dir(tmp_path: Path) -> None:
+def test_migrate_legacy_copaw_state_recovers_existing_qwenpaw_dir(
+    tmp_path: Path,
+) -> None:
     cfg = _config(tmp_path)
     legacy = cfg.install_dir / "worker-a" / ".copaw"
     legacy_workspace = legacy / "workspaces" / "default"
@@ -680,7 +808,9 @@ def test_migrate_legacy_copaw_state_recovers_existing_qwenpaw_dir(tmp_path: Path
             {
                 "agents": {
                     "profiles": {
-                        "default": {"workspace_dir": f"{legacy_root}/workspaces/default"},
+                        "default": {
+                            "workspace_dir": f"{legacy_root}/workspaces/default"
+                        },
                     },
                 },
             },
@@ -707,14 +837,18 @@ def test_migrate_legacy_copaw_state_recovers_existing_qwenpaw_dir(tmp_path: Path
 
     assert worker._migrate_legacy_state() is True
     assert not legacy.exists()
-    assert (target_workspace / "chats.json").read_text(encoding="utf-8") == "legacy-session"
+    assert (target_workspace / "chats.json").read_text(
+        encoding="utf-8"
+    ) == "legacy-session"
     assert (target_workspace / "qwenpaw-only.txt").read_text(encoding="utf-8") == "keep"
-    assert json.loads((target_workspace / "agent.json").read_text(encoding="utf-8"))["workspace_dir"] == str(
+    assert json.loads((target_workspace / "agent.json").read_text(encoding="utf-8"))[
+        "workspace_dir"
+    ] == str(
         target_workspace,
     )
-    assert json.loads((cfg.qwenpaw_working_dir / "config.json").read_text(encoding="utf-8"))["agents"][
-        "profiles"
-    ]["default"]["workspace_dir"] == str(target_workspace)
+    assert json.loads(
+        (cfg.qwenpaw_working_dir / "config.json").read_text(encoding="utf-8")
+    )["agents"]["profiles"]["default"]["workspace_dir"] == str(target_workspace)
 
     # Object storage may still contain the legacy prefix. Once the marker is
     # restored, a later cold start removes that duplicate without clobbering
@@ -723,7 +857,9 @@ def test_migrate_legacy_copaw_state_recovers_existing_qwenpaw_dir(tmp_path: Path
     (legacy_workspace / "chats.json").write_text("stale-legacy", encoding="utf-8")
     assert worker._migrate_legacy_state() is False
     assert not legacy.exists()
-    assert (target_workspace / "chats.json").read_text(encoding="utf-8") == "legacy-session"
+    assert (target_workspace / "chats.json").read_text(
+        encoding="utf-8"
+    ) == "legacy-session"
     assert len(calls) == 2
 
 
@@ -742,7 +878,9 @@ def test_migrate_legacy_copaw_working_dir_noop_without_legacy(tmp_path: Path) ->
     assert not cfg.qwenpaw_working_dir.exists()
 
 
-def test_migrate_legacy_copaw_state_retries_when_persistence_fails(tmp_path: Path) -> None:
+def test_migrate_legacy_copaw_state_retries_when_persistence_fails(
+    tmp_path: Path,
+) -> None:
     cfg = _config(tmp_path)
     legacy = cfg.worker_home / ".copaw" / "workspaces" / "default"
     legacy.mkdir(parents=True)
@@ -754,13 +892,17 @@ def test_migrate_legacy_copaw_state_retries_when_persistence_fails(tmp_path: Pat
             raise RuntimeError("storage unavailable")
 
         def push_paths(self, _paths):
-            raise AssertionError("marker must not be pushed after directory persistence fails")
+            raise AssertionError(
+                "marker must not be pushed after directory persistence fails"
+            )
 
     worker.sync = FailingSync()
     with pytest.raises(RuntimeError, match="storage unavailable"):
         worker._migrate_legacy_state()
 
-    assert (cfg.worker_home / ".copaw" / "workspaces" / "default" / "state.txt").is_file()
+    assert (
+        cfg.worker_home / ".copaw" / "workspaces" / "default" / "state.txt"
+    ).is_file()
     assert not (cfg.qwenpaw_working_dir / ".copaw-migrated").exists()
 
     calls = []
@@ -801,7 +943,9 @@ def test_migrate_legacy_copaw_state_removes_local_marker_when_marker_upload_fail
     with pytest.raises(RuntimeError, match="marker upload failed"):
         worker._migrate_legacy_state()
 
-    assert (cfg.worker_home / ".copaw" / "workspaces" / "default" / "state.txt").is_file()
+    assert (
+        cfg.worker_home / ".copaw" / "workspaces" / "default" / "state.txt"
+    ).is_file()
     assert not (cfg.qwenpaw_working_dir / ".copaw-migrated").exists()
 
 
@@ -829,14 +973,21 @@ async def test_start_migrates_copaw_state_restored_by_mirror_before_qwenpaw_init
         return rels
 
     def fake_push_directories(_sync, directories):
-        rels = [directory.relative_to(cfg.worker_home).as_posix() for directory in directories]
+        rels = [
+            directory.relative_to(cfg.worker_home).as_posix()
+            for directory in directories
+        ]
         events.append(("mirror-push", rels))
         return rels
 
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", fake_mirror)
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.push_paths", fake_push)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.push_directories", fake_push_directories)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: False)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.push_directories", fake_push_directories
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: False
+    )
 
     worker = Worker(cfg)
     assert not cfg.qwenpaw_working_dir.exists()
@@ -844,13 +995,17 @@ async def test_start_migrates_copaw_state_restored_by_mirror_before_qwenpaw_init
 
     assert events[0] == "mirror"
     assert events[-1] == ("push", [".qwenpaw/.copaw-migrated"])
-    assert (cfg.default_workspace_dir / "chats.json").read_text(encoding="utf-8") == "restored-session"
-    assert (cfg.worker_home / ".qwenpaw.secret" / "providers.json").read_text(encoding="utf-8") == "restored-provider"
+    assert not (cfg.default_workspace_dir / "chats.json").exists()
+    assert (cfg.worker_home / ".qwenpaw.secret" / "providers.json").read_text(
+        encoding="utf-8"
+    ) == "restored-provider"
     assert not (cfg.worker_home / ".copaw").exists()
     assert not (cfg.worker_home / ".copaw.secret").exists()
 
 
-def test_prepare_env_exposes_agent_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prepare_env_exposes_agent_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = _config(tmp_path)
     monkeypatch.delenv("AGENT_WORKSPACE", raising=False)
 
@@ -872,7 +1027,12 @@ def test_builtin_plugin_mcp_is_reconciled_through_api(
 
     class Api:
         def list_mcp(self):
-            return []
+            raise AssertionError(
+                "builtin MCP reconciliation must not call global list_mcp"
+            )
+
+        def get_mcp_if_present(self, key):
+            return None
 
         def create_mcp(self, key, payload):
             created[key] = payload
@@ -902,8 +1062,12 @@ def test_builtin_plugin_mcp_is_reconciled_through_api(
     ]
     assert all(policy["default_effect"] == "allow" for policy in policies.values())
     assert created["teamharness"]["transport"] == "stdio"
-    assert created["teamharness"]["args"][0].endswith(
-        "/plugins/teamharness/teamharness/mcp/server.py"
+    assert Path(created["teamharness"]["args"][0]).parts[-5:] == (
+        "plugins",
+        "teamharness",
+        "teamharness",
+        "mcp",
+        "server.py",
     )
     expected_storage_env = {
         "TEAMHARNESS_RUNTIME_CONFIG": str(worker.config.runtime_config_path),
@@ -918,7 +1082,141 @@ def test_builtin_plugin_mcp_is_reconciled_through_api(
     assert expected_storage_env.items() <= created["teamharness"]["env"].items()
 
 
+def test_builtin_plugin_mcp_updates_with_targeted_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = Worker(_config(tmp_path))
+    monkeypatch.setenv("AGENTTEAMS_STORAGE_PREFIX", "agentteams/agentteams-storage")
+    worker._prepare_env()
+    updated = {}
+
+    class Api:
+        def list_mcp(self):
+            raise AssertionError(
+                "builtin MCP reconciliation must not call global list_mcp"
+            )
+
+        def get_mcp_if_present(self, key):
+            return {"key": key, "name": key}
+
+        def create_mcp(self, key, payload):
+            raise AssertionError(f"unexpected create: {key} {payload}")
+
+        def update_mcp(self, key, payload):
+            updated[key] = payload
+
+    worker.api_client = Api()
+
+    worker._configure_builtin_plugin_mcp_clients()
+
+    assert set(updated) == {"teamharness", "workerflow"}
+
+
+def _write_mcp_card(
+    workspace: Path, key: str, *, credential_ref: str | None = None
+) -> Path:
+    card_path = workspace / "drivers" / "mcp" / f"{key}.yaml"
+    card_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "name": key,
+        "protocol": "mcp",
+        "endpoint": {
+            "transport": "streamable_http",
+            "url": "http://threadmill.example.test/mcp",
+        },
+        "enabled": True,
+    }
+    if credential_ref is not None:
+        payload["credentials"] = {
+            "static": {
+                "kind": "static",
+                "ref": credential_ref,
+            },
+        }
+    card_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return card_path
+
+
+def test_prune_stale_threadmill_mcp_removes_all_runtime_owned_non_desired_entries(
+    tmp_path: Path,
+) -> None:
+    worker = Worker(_config(tmp_path))
+    workspace = worker.config.default_workspace_dir
+    current = "threadmill-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    stale_missing = "threadmill-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    stale_attempt = "threadmill-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-attempt-335"
+    managed_stale = "threadmill-cccccccccccccccccccccccccccccccc"
+    stale_with_credential = "threadmill-dddddddddddddddddddddddddddddddd"
+    noncanonical = "threadmill-not-owned"
+
+    _write_mcp_card(workspace, "teamharness", credential_ref="mcp/teamharness")
+    _write_mcp_card(workspace, current, credential_ref=f"mcp/{current}")
+    _write_mcp_card(workspace, stale_missing, credential_ref=f"mcp/{stale_missing}")
+    _write_mcp_card(workspace, stale_attempt, credential_ref=f"mcp/{stale_attempt}")
+    _write_mcp_card(workspace, managed_stale, credential_ref=f"mcp/{managed_stale}")
+    _write_mcp_card(workspace, stale_with_credential, credential_ref=f"mcp/{stale_with_credential}")
+    _write_mcp_card(workspace, noncanonical, credential_ref=f"mcp/{noncanonical}")
+    (worker.config.qwenpaw_working_dir / ".agentteams-managed-mcp.json").parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    (worker.config.qwenpaw_working_dir / ".agentteams-managed-mcp.json").write_text(
+        json.dumps([managed_stale, "not-threadmill", "teamharness"]) + "\n",
+        encoding="utf-8",
+    )
+    credentials_path = workspace / "credentials.yaml"
+    credentials_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "credentials": {
+                    f"mcp/{current}": {"kind": "static"},
+                    f"mcp/{managed_stale}": {"kind": "static"},
+                    f"mcp/{stale_with_credential}": {"kind": "static"},
+                    f"mcp/{noncanonical}": {"kind": "static"},
+                    "mcp/teamharness": {"kind": "static"},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    runtime_config = MemberRuntimeConfig(
+        path=worker.config.runtime_config_path,
+        raw={
+            "metadata": {"generation": "1"},
+            "member": {"runtime": "qwenpaw"},
+            "desired": {
+                "mcpServers": [
+                    {"name": current, "url": "http://threadmill.example.test/mcp"},
+                ],
+            },
+        },
+    )
+
+    assert worker._prune_stale_threadmill_mcp(runtime_config) == 4
+
+    driver_dir = workspace / "drivers" / "mcp"
+    assert (driver_dir / "teamharness.yaml").is_file()
+    assert (driver_dir / f"{current}.yaml").is_file()
+    assert not (driver_dir / f"{stale_missing}.yaml").exists()
+    assert not (driver_dir / f"{stale_attempt}.yaml").exists()
+    assert not (driver_dir / f"{managed_stale}.yaml").exists()
+    assert not (driver_dir / f"{stale_with_credential}.yaml").exists()
+    assert (driver_dir / f"{noncanonical}.yaml").is_file()
+    credentials = yaml.safe_load(credentials_path.read_text(encoding="utf-8"))[
+        "credentials"
+    ]
+    assert f"mcp/{current}" in credentials
+    assert f"mcp/{managed_stale}" not in credentials
+    assert f"mcp/{stale_with_credential}" not in credentials
+    assert f"mcp/{noncanonical}" in credentials
+    assert "mcp/teamharness" in credentials
+
+
 @pytest.mark.anyio
+@pytest.mark.parametrize("anyio_backend", ["asyncio"])
 async def test_builtin_mcp_policy_is_persisted_before_desired_state_reload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -953,7 +1251,10 @@ async def test_builtin_mcp_policy_is_persisted_before_desired_state_reload(
     async def idle_heartbeat_probe_loop():
         await asyncio.Event().wait()
 
-    monkeypatch.setattr("qwenpaw_worker.worker.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
     monkeypatch.setattr(worker, "_wait_for_qwenpaw_api", api_ready)
     monkeypatch.setattr(
         worker,
@@ -969,6 +1270,14 @@ async def test_builtin_mcp_policy_is_persisted_before_desired_state_reload(
     monkeypatch.setattr(worker, "_heartbeat_probe_loop", idle_heartbeat_probe_loop)
     worker.api_client = FakeApi()
     worker.updater.apply_once = lambda *_args, **_kwargs: events.append("desired")
+    heartbeat_updates = []
+    original_heartbeat_update = worker.heartbeat.update
+
+    def record_heartbeat(status, message="", details=None):
+        heartbeat_updates.append((status, message, details or {}))
+        original_heartbeat_update(status, message, details)
+
+    monkeypatch.setattr(worker.heartbeat, "update", record_heartbeat)
     worker._initial_runtime_config = MemberRuntimeConfig(
         path=worker.config.runtime_config_path,
         raw={"metadata": {"generation": "1"}, "member": {"runtime": "qwenpaw"}},
@@ -978,6 +1287,11 @@ async def test_builtin_mcp_policy_is_persisted_before_desired_state_reload(
     await worker.stop()
 
     assert events.index("policies") < events.index("desired")
+    assert (
+        "ready",
+        "qwenpaw worker startup complete",
+        {"operation": "startup", "generation": "1"},
+    ) in heartbeat_updates
 
 
 def test_runtime_updater_uses_default_workspace_for_package_materialization(
@@ -997,7 +1311,9 @@ def test_install_teamharness_plugin_unpacks_zip_before_qwenpaw_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    zip_path = _write_plugin_zip(tmp_path, "teamharness", "teamharness-qwenpaw-0.1.0", "teamharness-qwenpaw.zip")
+    zip_path = _write_plugin_zip(
+        tmp_path, "teamharness", "teamharness-qwenpaw-0.1.0", "teamharness-qwenpaw.zip"
+    )
     calls: list[list[str]] = []
 
     def fake_run(command, check):
@@ -1008,7 +1324,9 @@ def test_install_teamharness_plugin_unpacks_zip_before_qwenpaw_install(
         calls.append(command)
 
     monkeypatch.setenv("AGENTTEAMS_TEAMHARNESS_QWENPAW_PLUGIN_PACKAGE", str(zip_path))
-    monkeypatch.setattr("qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw")
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw"
+    )
     monkeypatch.setattr("qwenpaw_worker.worker.subprocess.run", fake_run)
 
     Worker(_config(tmp_path))._install_teamharness_plugin()
@@ -1023,7 +1341,9 @@ def test_plugin_install_logs_package_summary_without_sensitive_values(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    zip_path = _write_plugin_zip(tmp_path, "teamharness", "teamharness-qwenpaw-0.1.0", "teamharness-qwenpaw.zip")
+    zip_path = _write_plugin_zip(
+        tmp_path, "teamharness", "teamharness-qwenpaw-0.1.0", "teamharness-qwenpaw.zip"
+    )
     config = _config(tmp_path)
     config.fs_secret_key = "credential-secret-value"
 
@@ -1031,14 +1351,20 @@ def test_plugin_install_logs_package_summary_without_sensitive_values(
         assert check is True
 
     monkeypatch.setenv("AGENTTEAMS_AUTH_TOKEN", "worker-auth-token")
-    monkeypatch.setattr("qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw")
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw"
+    )
     monkeypatch.setattr("qwenpaw_worker.worker.subprocess.run", fake_run)
     caplog.set_level(logging.INFO, logger="qwenpaw_worker.worker")
 
-    Worker(config)._install_qwenpaw_plugin_package("teamharness", zip_path, "teamharness-qwenpaw-plugin-")
+    Worker(config)._install_qwenpaw_plugin_package(
+        "teamharness", zip_path, "teamharness-qwenpaw-plugin-"
+    )
 
     assert "component=plugin plugin=teamharness step=install event=begin" in caplog.text
-    assert "component=plugin plugin=teamharness step=install event=complete" in caplog.text
+    assert (
+        "component=plugin plugin=teamharness step=install event=complete" in caplog.text
+    )
     assert "package_type=zip" in caplog.text
     assert "duration_ms=" in caplog.text
     assert "credential-secret-value" not in caplog.text
@@ -1069,9 +1395,15 @@ def test_install_default_plugins_installs_teamharness_and_workerflow(
         manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
         installed.append(manifest["id"])
 
-    monkeypatch.setenv("AGENTTEAMS_TEAMHARNESS_QWENPAW_PLUGIN_PACKAGE", str(teamharness_zip))
-    monkeypatch.setenv("AGENTTEAMS_WORKERFLOW_QWENPAW_PLUGIN_PACKAGE", str(workerflow_zip))
-    monkeypatch.setattr("qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw")
+    monkeypatch.setenv(
+        "AGENTTEAMS_TEAMHARNESS_QWENPAW_PLUGIN_PACKAGE", str(teamharness_zip)
+    )
+    monkeypatch.setenv(
+        "AGENTTEAMS_WORKERFLOW_QWENPAW_PLUGIN_PACKAGE", str(workerflow_zip)
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw"
+    )
     monkeypatch.setattr("qwenpaw_worker.worker.subprocess.run", fake_run)
 
     Worker(_config(tmp_path))._install_default_plugins()
@@ -1109,17 +1441,27 @@ async def test_start_uses_image_builtin_plugins_without_runtime_install(
         install_commands.append(command)
 
     monkeypatch.setenv("AGENTTEAMS_BUILTIN_QWENPAW_PLUGINS_DIR", str(builtin_plugins))
-    monkeypatch.setenv("AGENTTEAMS_TEAMHARNESS_QWENPAW_PLUGIN_PACKAGE", str(teamharness_zip))
-    monkeypatch.setenv("AGENTTEAMS_WORKERFLOW_QWENPAW_PLUGIN_PACKAGE", str(workerflow_zip))
-    monkeypatch.setattr("qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw")
+    monkeypatch.setenv(
+        "AGENTTEAMS_TEAMHARNESS_QWENPAW_PLUGIN_PACKAGE", str(teamharness_zip)
+    )
+    monkeypatch.setenv(
+        "AGENTTEAMS_WORKERFLOW_QWENPAW_PLUGIN_PACKAGE", str(workerflow_zip)
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.shutil.which", lambda _name: "/usr/bin/qwenpaw"
+    )
     monkeypatch.setattr("qwenpaw_worker.worker.subprocess.run", fake_run)
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: None)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True
+    )
 
     def fake_apply_once(self, runtime_config=None, force=False, reapply_adapter=True):
         self.current_config = runtime_config or self.load()
 
-    monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once)
+    monkeypatch.setattr(
+        "qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once
+    )
 
     async def fake_push_loop(sync, check_interval=5, heartbeat=None):
         await asyncio.Event().wait()
@@ -1137,8 +1479,12 @@ async def test_start_uses_image_builtin_plugins_without_runtime_install(
     await worker.stop()
 
     assert install_commands == []
-    assert (config.qwenpaw_working_dir / "plugins" / "teamharness" / "plugin.py").is_file()
-    assert (config.qwenpaw_working_dir / "plugins" / "workerflow" / "plugin.py").is_file()
+    assert (
+        config.qwenpaw_working_dir / "plugins" / "teamharness" / "plugin.py"
+    ).is_file()
+    assert (
+        config.qwenpaw_working_dir / "plugins" / "workerflow" / "plugin.py"
+    ).is_file()
 
 
 def test_install_teamharness_plugin_rejects_zip_path_traversal(tmp_path: Path) -> None:
@@ -1147,7 +1493,9 @@ def test_install_teamharness_plugin_rejects_zip_path_traversal(tmp_path: Path) -
         archive.writestr("../target-evil/plugin.json", "{}\n")
 
     try:
-        Worker(_config(tmp_path))._extract_qwenpaw_plugin_zip(zip_path, tmp_path / "target")
+        Worker(_config(tmp_path))._extract_qwenpaw_plugin_zip(
+            zip_path, tmp_path / "target"
+        )
     except RuntimeError as exc:
         assert "unsafe qwenpaw plugin package path" in str(exc)
     else:
@@ -1177,20 +1525,35 @@ def test_runtime_adapter_reapplies_builtin_assets_without_runtime_install(
     worker = Worker(config)
     synced: list[str] = []
     worker._configure_builtin_plugin_mcp_clients = lambda: synced.append("mcp-clients")
-    worker._configure_builtin_plugin_mcp_policies = lambda: synced.append("mcp-policies")
+    worker._configure_builtin_plugin_mcp_policies = lambda: synced.append(
+        "mcp-policies"
+    )
     worker._apply_runtime_adapter()
 
     assert install_commands == []
     assert synced == ["mcp-clients", "mcp-policies"]
-    assert (config.qwenpaw_working_dir / "plugins" / "agentteams-matrix-channel" / "plugin.py").is_file()
-    assert (config.qwenpaw_working_dir / "plugins" / "teamharness" / "plugin.py").is_file()
-    assert (config.qwenpaw_working_dir / "plugins" / "workerflow" / "plugin.py").is_file()
+    assert (
+        config.qwenpaw_working_dir
+        / "plugins"
+        / "agentteams-matrix-channel"
+        / "plugin.py"
+    ).is_file()
+    assert (
+        config.qwenpaw_working_dir / "plugins" / "teamharness" / "plugin.py"
+    ).is_file()
+    assert (
+        config.qwenpaw_working_dir / "plugins" / "workerflow" / "plugin.py"
+    ).is_file()
 
 
-def test_prepare_builtin_plugin_repairs_partial_target_with_matching_marker(tmp_path: Path) -> None:
+def test_prepare_builtin_plugin_repairs_partial_target_with_matching_marker(
+    tmp_path: Path,
+) -> None:
     config = _config(tmp_path)
     worker = Worker(config)
-    source_dir = _write_builtin_plugin(tmp_path / "image-builtin" / "plugins", "teamharness", "apply_teamharness")
+    source_dir = _write_builtin_plugin(
+        tmp_path / "image-builtin" / "plugins", "teamharness", "apply_teamharness"
+    )
     target_dir = config.qwenpaw_working_dir / "plugins" / "teamharness"
     shutil.copytree(source_dir, target_dir)
 
@@ -1200,7 +1563,9 @@ def test_prepare_builtin_plugin_repairs_partial_target_with_matching_marker(tmp_
 
     worker._prepare_builtin_plugin("teamharness", source_dir)
 
-    assert (target_dir / "assets" / "builtin.txt").read_text(encoding="utf-8") == "teamharness asset\n"
+    assert (target_dir / "assets" / "builtin.txt").read_text(
+        encoding="utf-8"
+    ) == "teamharness asset\n"
 
 
 @pytest.mark.anyio
@@ -1212,16 +1577,26 @@ async def test_start_reads_runtime_config_installs_adapter_and_starts_loops(
     _runtime_yaml(config.runtime_config_path)
     calls: list[str] = []
 
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: calls.append("mirror"))
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: calls.append("pull"))
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", lambda self: calls.append("plugins"))
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: calls.append("mirror")
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config",
+        lambda _self, _path: calls.append("pull"),
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._prepare_default_plugins",
+        lambda self: calls.append("plugins"),
+    )
 
     def fake_apply_once(self, runtime_config=None, force=False, reapply_adapter=True):
         runtime_config = runtime_config or self.load()
         self.current_config = runtime_config
         calls.append(f"update:{runtime_config.generation}:{force}:{reapply_adapter}")
 
-    monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once)
+    monkeypatch.setattr(
+        "qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once
+    )
 
     async def fake_push_loop(sync, check_interval=5, heartbeat=None):
         calls.append(f"push:{check_interval}")
@@ -1265,16 +1640,26 @@ async def test_start_logs_worker_stage_durations_without_sensitive_values(
     monkeypatch.setenv("AGENTTEAMS_AUTH_TOKEN", "worker-auth-token")
     calls: list[str] = []
 
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: calls.append("mirror"))
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: calls.append("pull"))
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", lambda self: calls.append("plugins"))
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: calls.append("mirror")
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config",
+        lambda _self, _path: calls.append("pull"),
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._prepare_default_plugins",
+        lambda self: calls.append("plugins"),
+    )
 
     def fake_apply_once(self, runtime_config=None, force=False, reapply_adapter=True):
         runtime_config = runtime_config or self.load()
         self.current_config = runtime_config
         calls.append(f"update:{runtime_config.generation}:{force}:{reapply_adapter}")
 
-    monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once)
+    monkeypatch.setattr(
+        "qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once
+    )
 
     async def fake_push_loop(sync, check_interval=5, heartbeat=None):
         calls.append(f"push:{check_interval}")
@@ -1319,22 +1704,34 @@ async def test_start_links_workspace_shared_to_runtime_team_shared_prefix(
     calls: list[str] = []
 
     monkeypatch.delenv("AGENTTEAMS_SHARED_STORAGE_PREFIX", raising=False)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: calls.append("mirror"))
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: calls.append("pull"))
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: calls.append("mirror")
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config",
+        lambda _self, _path: calls.append("pull"),
+    )
 
     def fake_mirror_prefix(_self, remote_prefix, local_dir):
         local_dir.mkdir(parents=True, exist_ok=True)
         calls.append(f"mirror-prefix:{remote_prefix}:{local_dir}")
 
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_prefix", fake_mirror_prefix)
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", lambda self: calls.append("plugins"))
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.mirror_prefix", fake_mirror_prefix
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._prepare_default_plugins",
+        lambda self: calls.append("plugins"),
+    )
 
     def fake_apply_once(self, runtime_config=None, force=False, reapply_adapter=True):
         runtime_config = runtime_config or self.load()
         self.current_config = runtime_config
         calls.append(f"update:{runtime_config.generation}:{force}:{reapply_adapter}")
 
-    monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once)
+    monkeypatch.setattr(
+        "qwenpaw_worker.update.RuntimeUpdater.apply_once", fake_apply_once
+    )
 
     async def fake_push_loop(sync, check_interval=5, heartbeat=None):
         calls.append(f"push:{check_interval}")
@@ -1356,7 +1753,10 @@ async def test_start_links_workspace_shared_to_runtime_team_shared_prefix(
     workspace_shared = config.default_workspace_dir / "shared"
     assert workspace_shared.is_symlink()
     assert workspace_shared.resolve() == team_shared.resolve()
-    assert config.runtime_config_path == tmp_path / "agents" / "worker-a" / "runtime" / "runtime.yaml"
+    assert (
+        config.runtime_config_path
+        == tmp_path / "agents" / "worker-a" / "runtime" / "runtime.yaml"
+    )
     assert os.environ["TEAMHARNESS_SHARED_DIR"] == str(team_shared)
     assert os.environ["AGENTTEAMS_SHARED_STORAGE_PREFIX"] == "teams/demo-team/shared"
     assert f"mirror-prefix:teams/demo-team/shared:{team_shared}" in calls
@@ -1371,13 +1771,17 @@ async def test_start_fails_when_runtime_config_missing(
 ) -> None:
     config = _config(tmp_path)
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: None)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: False)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: False
+    )
 
     worker = Worker(config)
 
     assert await worker.start() is False
 
-    data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        (config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
     assert data["status"] == "not_ready"
     assert "runtime config missing" in data["message"]
 
@@ -1391,18 +1795,24 @@ async def test_builtin_plugin_prepare_failure_marks_worker_unready(
     _runtime_yaml(config.runtime_config_path)
 
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: None)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True
+    )
 
     def fail_prepare(_self):
         raise RuntimeError("plugin prepare failed")
 
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", fail_prepare)
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._prepare_default_plugins", fail_prepare
+    )
 
     worker = Worker(config)
 
     assert await worker.start() is False
 
-    data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        (config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
     assert data["status"] == "not_ready"
     assert data["message"] == "plugin prepare failed"
 
@@ -1416,18 +1826,24 @@ async def test_plugin_prepare_failure_marks_worker_unready(
     _runtime_yaml(config.runtime_config_path)
 
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: None)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True
+    )
 
     def fail_config(_self):
         raise RuntimeError("plugin prepare failed")
 
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", fail_config)
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._prepare_default_plugins", fail_config
+    )
 
     worker = Worker(config)
 
     assert await worker.start() is False
 
-    data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        (config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
     assert data["status"] == "not_ready"
     assert data["message"] == "plugin prepare failed"
 
@@ -1442,11 +1858,17 @@ async def test_desired_state_is_not_applied_before_qwenpaw_api_is_ready(
     _runtime_yaml(config.runtime_config_path)
 
     monkeypatch.setattr("qwenpaw_worker.sync.FileSync.mirror_all", lambda _self: None)
-    monkeypatch.setattr("qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True)
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._prepare_default_plugins", lambda _self: None)
+    monkeypatch.setattr(
+        "qwenpaw_worker.sync.FileSync.pull_runtime_config", lambda _self, _path: True
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._prepare_default_plugins", lambda _self: None
+    )
 
     def fail_update(_self, runtime_config=None, force=False, reapply_adapter=True):
-        raise RuntimeError("fetch oss agent package failed: Access Denied secret-token-value")
+        raise RuntimeError(
+            "fetch oss agent package failed: Access Denied secret-token-value"
+        )
 
     monkeypatch.setattr("qwenpaw_worker.update.RuntimeUpdater.apply_once", fail_update)
     caplog.set_level(logging.INFO, logger="qwenpaw_worker.worker")
@@ -1517,13 +1939,20 @@ async def test_qwenpaw_process_exit_marks_runtime_not_ready(
     async def idle_heartbeat_probe_loop(self):
         await asyncio.Event().wait()
 
-    monkeypatch.setattr("qwenpaw_worker.worker.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
-    monkeypatch.setattr("qwenpaw_worker.worker.Worker._heartbeat_probe_loop", idle_heartbeat_probe_loop)
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.asyncio.create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.Worker._heartbeat_probe_loop", idle_heartbeat_probe_loop
+    )
 
     await worker._run_qwenpaw()
     await worker.stop()
 
-    data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        (config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
     assert data["status"] == "not_ready"
     assert data["details"]["returncode"] == 7
     assert "component=worker stage=start_qwenpaw_app event=begin" in caplog.text
@@ -1581,12 +2010,17 @@ async def test_qwenpaw_process_start_failure_marks_runtime_not_ready(
     async def fail_create_subprocess_exec(*_args, **_kwargs):
         raise FileNotFoundError("qwenpaw not found secret-token-value")
 
-    monkeypatch.setattr("qwenpaw_worker.worker.asyncio.create_subprocess_exec", fail_create_subprocess_exec)
+    monkeypatch.setattr(
+        "qwenpaw_worker.worker.asyncio.create_subprocess_exec",
+        fail_create_subprocess_exec,
+    )
 
     with pytest.raises(FileNotFoundError):
         await worker._run_qwenpaw()
 
-    data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        (config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
     assert data["status"] == "not_ready"
     assert data["message"] == "qwenpaw app failed to start"
     assert data["details"]["error_type"] == "FileNotFoundError"
@@ -1614,7 +2048,9 @@ async def test_heartbeat_probe_loop_delegates_to_heartbeat_module(
     with pytest.raises(asyncio.CancelledError):
         await worker._heartbeat_probe_loop()
 
-    data = json.loads((config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8"))
+    data = json.loads(
+        (config.qwenpaw_working_dir / "heartbeat.json").read_text(encoding="utf-8")
+    )
     assert data["status"] == "ready"
     assert data["message"] == "qwenpaw ready"
     assert calls == [("worker-a-cr", config.console_port)]

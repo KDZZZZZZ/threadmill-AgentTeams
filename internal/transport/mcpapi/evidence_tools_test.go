@@ -3,6 +3,7 @@ package mcpapi
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
@@ -58,5 +59,19 @@ func TestEvidenceToolRejectsCallerSuppliedOwnership(t *testing.T) {
 	}
 	if registrar.calls != 0 {
 		t.Fatalf("spoofed evidence reached registrar %d times", registrar.calls)
+	}
+}
+
+func TestEvidenceToolDescriptionGuidesTargetedVerifyGeneratedReport(t *testing.T) {
+	description := toolDescription(auth.ToolEvidenceRegister)
+	for _, required := range []string{
+		"type=generated_report",
+		"content_type=application/json",
+		"threadmill.targeted_verify.v1",
+		"report_ref",
+	} {
+		if !strings.Contains(description, required) {
+			t.Fatalf("evidence.register description missing %q: %s", required, description)
+		}
 	}
 }

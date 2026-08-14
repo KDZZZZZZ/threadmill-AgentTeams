@@ -81,6 +81,40 @@ type ContextEdge struct {
 	Kind     string `json:"kind"`
 }
 
+type ContextGraphSnapshot struct {
+	ProjectID kernel.ProjectID          `json:"project_id"`
+	Revision  kernel.Revision           `json:"revision"`
+	Nodes     []ContextSnapshotNode     `json:"nodes"`
+	Edges     []ContextSnapshotEdge     `json:"edges"`
+	Subgraphs []ContextSnapshotSubgraph `json:"subgraphs"`
+}
+
+type ContextSnapshotNode struct {
+	NodeID      string     `json:"node_id"`
+	Kind        string     `json:"kind"`
+	Statement   string     `json:"statement"`
+	Status      string     `json:"status"`
+	SourceRefs  []string   `json:"source_refs"`
+	SubgraphIDs []string   `json:"subgraph_ids"`
+	UsageCount  int        `json:"usage_count"`
+	LastUsedAt  *time.Time `json:"last_used_at"`
+}
+
+type ContextSnapshotEdge struct {
+	FromRef  string `json:"from_ref"`
+	ToNodeID string `json:"to_node_id"`
+	Kind     string `json:"kind"`
+}
+
+type ContextSnapshotSubgraph struct {
+	SubgraphID string        `json:"subgraph_id"`
+	Name       string        `json:"name"`
+	Summary    string        `json:"summary"`
+	Revision   int64         `json:"revision"`
+	Kind       string        `json:"kind"`
+	TaskID     kernel.TaskID `json:"task_id,omitempty"`
+}
+
 type ContextSubgraph struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -207,6 +241,11 @@ type ContextSlice struct {
 	Nodes           []ContextNode `json:"nodes"`
 	SubscriptionIDs []string      `json:"subscription_ids"`
 	GraphRevision   int64         `json:"graph_revision"`
+}
+
+type invocationScopeKey struct {
+	ProjectID    kernel.ProjectID
+	InvocationID kernel.InvocationID
 }
 
 type SubscriptionInspection struct {

@@ -144,6 +144,20 @@ func (s *PostgresStore) GetByRound(ctx context.Context, taskID kernel.TaskID, ge
 	return binding, true, nil
 }
 
+func (s *PostgresStore) GetLatestByTask(ctx context.Context, taskID kernel.TaskID) (Binding, bool, error) {
+	if err := s.ready(); err != nil {
+		return Binding{}, false, err
+	}
+	binding, err := scanBinding(s.db.QueryRowContext(ctx, `SELECT `+bindingSelectColumns+` FROM workspace_bindings WHERE task_id = $1 ORDER BY generation DESC LIMIT 1`, taskID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Binding{}, false, nil
+	}
+	if err != nil {
+		return Binding{}, false, fmt.Errorf("get latest workspace binding by task: %w", err)
+	}
+	return binding, true, nil
+}
+
 func (s *PostgresStore) GetByInvocation(ctx context.Context, invocationID kernel.InvocationID) (Binding, bool, error) {
 	if err := s.ready(); err != nil {
 		return Binding{}, false, err
@@ -175,6 +189,8 @@ SET current_revision = $2,
     active_phase = NULLIF($5, ''),
     active_invocation = NULLIF($6, ''),
     status = $7,
+	allowed_dirs = ARRAY(SELECT jsonb_array_elements_text($9::jsonb)),
+	declared_writes = $10::jsonb,
     binding_revision = binding_revision + 1,
     updated_at = now()
 WHERE id = $1 AND binding_revision = $8
@@ -187,6 +203,8 @@ RETURNING `+bindingSelectColumns,
 		next.ActiveInvocation,
 		next.Status,
 		expected,
+		stringArrayJSON(next.AllowedDirs),
+		mustJSON(next.DeclaredWrites),
 	))
 	if err == nil {
 		return updated, nil

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -68,6 +69,61 @@ GROUP BY host_ref`)
 		return nil, err
 	}
 	return counts, tx.Commit()
+}
+
+// StaleMCPClientKeysByHost returns historical provider client keys that are no
+// longer backed by an active host-slot claim. The provider adapter performs a
+// second, strict key-shape check before deleting anything from QwenPaw.
+func (s *HostSlotStore) StaleMCPClientKeysByHost(ctx context.Context, hostRef string) ([]string, error) {
+	if strings.TrimSpace(hostRef) == "" {
+		return nil, kernel.InvalidArgument("host_ref is required")
+	}
+	tx, err := s.begin(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+SELECT DISTINCT historical.mcp_client_key
+FROM agentteams_execution_refs AS historical
+WHERE historical.host_ref = $1
+  AND historical.mcp_client_key IS NOT NULL
+  AND historical.mcp_client_key <> ''
+  AND (
+    historical.host_slot_released_at IS NOT NULL
+    OR historical.mcp_revoked_at IS NOT NULL
+    OR historical.state = 'terminated'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM agentteams_execution_refs AS active
+    WHERE active.host_ref = historical.host_ref
+      AND active.mcp_client_key = historical.mcp_client_key
+      AND active.host_slot_claimed_at IS NOT NULL
+      AND active.host_slot_released_at IS NULL
+      AND active.mcp_revoked_at IS NULL
+      AND active.state IN ('reserved', 'dispatched')
+  )
+ORDER BY historical.mcp_client_key`, hostRef)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	keys := make([]string, 0)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 func (s *HostSlotStore) Claim(ctx context.Context, hostRef string, invocationID kernel.InvocationID, mcpClientKey string, tokenHash []byte, tokenIdentifier string) error {

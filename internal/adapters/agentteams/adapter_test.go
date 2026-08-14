@@ -2,6 +2,8 @@ package agentteams_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"go/parser"
 	"go/token"
@@ -19,6 +21,32 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 )
+
+func testStableTaskID(invocationRef string) string {
+	sum := sha256.Sum256([]byte(invocationRef))
+	return "threadmill-" + hex.EncodeToString(sum[:16])
+}
+
+type failOnceFileTransport struct {
+	err   error
+	calls int
+}
+
+func (f *failOnceFileTransport) PrepareExecution(context.Context, adapter.AgentTeamsExecutionRef, adapter.PreparedInvocation) error {
+	f.calls++
+	if f.calls == 1 {
+		return f.err
+	}
+	return nil
+}
+
+func (*failOnceFileTransport) PullExecution(context.Context, adapter.AgentTeamsExecutionRef) (adapter.ExecutionWorkspaceCheckpoint, error) {
+	return adapter.ExecutionWorkspaceCheckpoint{}, nil
+}
+
+func (*failOnceFileTransport) ReadResult(context.Context, string) ([]byte, error) {
+	return []byte("result"), nil
+}
 
 func TestDispatchIsStableAndCreatesOnlyOneEffectiveTask(t *testing.T) {
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
@@ -61,6 +89,8 @@ func TestDispatchIsStableAndCreatesOnlyOneEffectiveTask(t *testing.T) {
 	}
 	if preparations := host.Preparations(); len(preparations) != 1 {
 		t.Fatalf("PrepareHost calls = %d, want 1", len(preparations))
+	} else if preparations[0].AgentTeamsTaskID != first.AgentTeamsTaskID {
+		t.Fatalf("PrepareHost AgentTeams task id = %q, want %q", preparations[0].AgentTeamsTaskID, first.AgentTeamsTaskID)
 	}
 	before := host.DelegateCalls()
 	replayed, err := service.Dispatch(context.Background(), "execution://inv-a/1")
@@ -157,14 +187,54 @@ func TestDifferentInvocationDispatchDoesNotOversellCapacityOneHost(t *testing.T)
 	if host.TaskCount() != 1 || host.ActiveExecutions("worker-one") != 1 {
 		t.Fatalf("task/active counts = %d/%d, want 1/1", host.TaskCount(), host.ActiveExecutions("worker-one"))
 	}
+	if terminal, err := service.ExecutionTerminal(context.Background(), execution); err != nil || terminal {
+		t.Fatalf("ExecutionTerminal before result = %v, %v, want false", terminal, err)
+	}
 	if err := host.SetResult(execution.AgentTeamsTaskID, adapter.TaskCheck{ResultStatus: "SUCCESS", Effective: true}, []byte("done"), now); err != nil {
 		t.Fatal(err)
+	}
+	if terminal, err := service.ExecutionTerminal(context.Background(), execution); err != nil || !terminal {
+		t.Fatalf("ExecutionTerminal after result = %v, %v, want true", terminal, err)
 	}
 	if _, err := service.Collect(context.Background(), execution); err != nil {
 		t.Fatal(err)
 	}
 	if host.ActiveExecutions("worker-one") != 0 {
 		t.Fatalf("active executions after terminal Collect = %d, want 0", host.ActiveExecutions("worker-one"))
+	}
+}
+
+func TestExecutionObservationRecoversClaimedHostAfterProviderRestart(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := &recoveringExecutionClient{Client: fake.NewClient()}
+	host.AddHost(adapter.HostStatus{
+		Ref:           "worker-a",
+		Kind:          adapter.HostWorker,
+		Phase:         "Running",
+		LastHeartbeat: now,
+		Capacity:      1,
+		Capabilities:  []string{"shell"},
+	})
+	source := fake.NewInvocationSource()
+	source.Put("execution://recover/1", prepared("inv-recover", auth.RoleExecutor, ""))
+	service, err := adapter.NewAdapter(host, source, host, adapter.NewMemoryExecutionStore(), func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := service.Dispatch(context.Background(), "execution://recover/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.failNextCheck = true
+	if terminal, err := service.ExecutionTerminal(context.Background(), execution); err != nil || terminal {
+		t.Fatalf("ExecutionTerminal after restart = %v, %v, want false after recovery", terminal, err)
+	}
+	host.failNextActivity = true
+	if _, err := service.ExecutionActivity(context.Background(), execution); err != nil {
+		t.Fatalf("ExecutionActivity after restart: %v", err)
+	}
+	if host.recoverCalls != 2 {
+		t.Fatalf("RecoverExecutionHost calls = %d, want 2", host.recoverCalls)
 	}
 }
 
@@ -206,6 +276,30 @@ func TestDispatchSelectsHealthyMatchingCapacityAndRoleHost(t *testing.T) {
 	}
 }
 
+func TestDispatchCanSelectSleepingWorkerForWakeOnPrepare(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := fake.NewClient()
+	host.AddHost(adapter.HostStatus{Ref: "worker-starting", Kind: adapter.HostWorker, Phase: "Starting", LastHeartbeat: now, Capacity: 1, Capabilities: []string{"shell"}})
+	// A genuinely sleeping carrier has no live process and no heartbeat yet.
+	// Dispatch may select it; PrepareHost owns the strict wake/readiness fence.
+	host.AddHost(adapter.HostStatus{Ref: "worker-sleeping", Kind: adapter.HostWorker, Phase: "Sleeping", Capacity: 1, Capabilities: []string{"shell"}})
+	source := fake.NewInvocationSource()
+	executor := prepared("inv-sleeping-worker", auth.RoleExecutor, "")
+	executor.RequiredCapabilities = []string{"shell"}
+	source.Put("execution://sleeping-worker/1", executor)
+	service, err := adapter.NewAdapter(host, source, host, adapter.NewMemoryExecutionStore(), func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution, err := service.Dispatch(context.Background(), "execution://sleeping-worker/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.HostRef != "worker-sleeping" {
+		t.Fatalf("Dispatch host = %q, want sleeping worker", execution.HostRef)
+	}
+}
+
 func TestTerminateSupportsThreeModesAndFencesBeforeCancel(t *testing.T) {
 	for _, mode := range []string{"release_wait", "recoverable_stop", "cancel"} {
 		t.Run(mode, func(t *testing.T) {
@@ -242,6 +336,265 @@ func TestTerminateSupportsThreeModesAndFencesBeforeCancel(t *testing.T) {
 				t.Fatalf("redispatch stopped/cancelled execution = %v, want stale_command", err)
 			}
 		})
+	}
+}
+
+func TestTerminateReleasesTerminalProviderTaskWithoutCancellingIt(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host, source, service := newHarness(t, now)
+	ref := "execution://terminate/terminal-provider-task"
+	source.Put(ref, prepared("inv-terminal-provider-task", auth.RoleExecutor, ""))
+	execution, err := service.Dispatch(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := host.SetResult(execution.AgentTeamsTaskID, adapter.TaskCheck{
+		ResultStatus: "SUCCESS",
+		Summary:      "provider task already submitted",
+		Effective:    true,
+	}, []byte("submitted"), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := host.Calls(); indexWithPrefix(calls, "cancel:") >= 0 {
+		t.Fatalf("terminal provider task was cancelled: %v", calls)
+	}
+	if host.ActiveExecutions("worker-a") != 0 {
+		t.Fatalf("active executions after terminal cleanup = %d, want 0", host.ActiveExecutions("worker-a"))
+	}
+}
+
+func TestTerminateClosesPreparedReservationWhenProviderTaskIsAbsent(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := fake.NewClient()
+	host.AddHost(adapter.HostStatus{
+		Ref: "worker-a", Kind: adapter.HostWorker, Phase: "Running", LastHeartbeat: now,
+		Capacity: 1, Capabilities: []string{"shell"},
+	})
+	client := &missingProviderTaskClient{Client: host}
+	source := fake.NewInvocationSource()
+	invocationRef := "execution://provider-absent/1"
+	source.Put(invocationRef, prepared("inv-provider-absent", auth.RoleExecutor, ""))
+	service, err := adapter.NewAdapter(client, source, host, adapter.NewMemoryExecutionStore(), func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !errors.Is(err, errProviderTaskAbsent) {
+		t.Fatalf("Dispatch error=%v, want provider creation failure", err)
+	}
+	execution := adapter.AgentTeamsExecutionRef{
+		InvocationID: "inv-provider-absent", AgentTeamsTaskID: testStableTaskID(invocationRef), HostRef: "worker-a",
+	}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatalf("Terminate provider-absent reservation: %v", err)
+	}
+	if client.cancelCalls != 0 {
+		t.Fatalf("provider-absent termination called CancelTask %d times", client.cancelCalls)
+	}
+	if host.ActiveExecutions("worker-a") != 0 {
+		t.Fatalf("active executions after provider-absent termination=%d, want 0", host.ActiveExecutions("worker-a"))
+	}
+}
+
+func TestFenceExecutionRevokesAuthorityWithoutCancellingOrReleasingProvider(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host, source, service := newHarness(t, now)
+	ref := "execution://fence/provider-finalization"
+	source.Put(ref, prepared("inv-fence-provider-finalization", auth.RoleExecutor, ""))
+	execution, err := service.Dispatch(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.FenceExecution(context.Background(), execution); err != nil {
+		t.Fatal(err)
+	}
+	calls := host.Calls()
+	if indexWithPrefix(calls, "fence:") < 0 || indexWithPrefix(calls, "revoke:") >= 0 || indexWithPrefix(calls, "cancel:") >= 0 {
+		t.Fatalf("fence calls = %v, want authority fence without MCP revoke or cancel", calls)
+	}
+	if host.ActiveExecutions("worker-a") != 1 {
+		t.Fatalf("active executions after fence = %d, want provider slot retained", host.ActiveExecutions("worker-a"))
+	}
+}
+
+func TestTerminateClosesReservationThatNeverClaimedAHost(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := fake.NewClient()
+	host.FailRevoke = kernel.Error{Code: kernel.CodeNotFound, Message: "invocation slot was never claimed"}
+	host.AddHost(adapter.HostStatus{
+		Ref:           "worker-a",
+		Kind:          adapter.HostWorker,
+		Phase:         "Running",
+		LastHeartbeat: now,
+		Capacity:      1,
+		Capabilities:  []string{"shell"},
+	})
+	source := fake.NewInvocationSource()
+	invocationRef := "execution://expired-before-prepare/1"
+	source.Put(invocationRef, prepared("inv-expired-before-prepare", auth.RoleExecutor, ""))
+	store := adapter.NewMemoryExecutionStore()
+	prepareErr := errors.New("expired before host preparation")
+	service, err := adapter.NewAdapter(
+		poisonPrepareClient{Client: host, err: prepareErr},
+		source,
+		host,
+		store,
+		func() time.Time { return now },
+		30*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !errors.Is(err, prepareErr) {
+		t.Fatalf("Dispatch error = %v, want preparation failure", err)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("redispatch after definitive preparation failure = %v, want stale_command", err)
+	}
+	execution := adapter.AgentTeamsExecutionRef{
+		InvocationID:     "inv-expired-before-prepare",
+		AgentTeamsTaskID: testStableTaskID(invocationRef),
+		HostRef:          "worker-a",
+	}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatalf("Terminate unclaimed reservation: %v", err)
+	}
+	if calls := host.Calls(); indexWithPrefix(calls, "force-stop:") >= 0 || indexWithPrefix(calls, "cancel:") >= 0 {
+		t.Fatalf("unclaimed reservation touched external host/task: %v", calls)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("redispatch terminated reservation = %v, want stale_command", err)
+	}
+}
+
+func TestTerminateForceFencesReservedHostWhenLogicalRevokeCannotBeProved(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := fake.NewClient()
+	host.FailRevoke = kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "AgentTeams host not found", Recoverable: true}
+	host.AddHost(adapter.HostStatus{
+		Ref:           "worker-a",
+		Kind:          adapter.HostWorker,
+		Phase:         "Running",
+		LastHeartbeat: now,
+		Capacity:      1,
+		Capabilities:  []string{"shell"},
+	})
+	source := fake.NewInvocationSource()
+	invocationRef := "execution://expired-after-logical-revoke/1"
+	source.Put(invocationRef, prepared("inv-expired-after-logical-revoke", auth.RoleExecutor, ""))
+	store := adapter.NewMemoryExecutionStore()
+	prepareErr := errors.New("expired after logical token revoke before provider driver cleanup")
+	service, err := adapter.NewAdapter(
+		poisonPrepareClient{Client: host, err: prepareErr},
+		source,
+		host,
+		store,
+		func() time.Time { return now },
+		30*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !errors.Is(err, prepareErr) {
+		t.Fatalf("Dispatch error = %v, want preparation failure", err)
+	}
+	execution := adapter.AgentTeamsExecutionRef{
+		InvocationID:     "inv-expired-after-logical-revoke",
+		AgentTeamsTaskID: testStableTaskID(invocationRef),
+		HostRef:          "worker-a",
+	}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatalf("Terminate reserved host-missing cleanup: %v", err)
+	}
+	if calls := host.Calls(); indexWithPrefix(calls, "force-stop:") < 0 || indexWithPrefix(calls, "cancel:") >= 0 {
+		t.Fatalf("unproved reserved revocation calls = %v, want host fence without provider cancel", calls)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("redispatch terminated host-missing reservation = %v, want stale_command", err)
+	}
+}
+
+func TestTerminateReleasesReservedSlotWhenProviderCheckHostMissingAfterRevoke(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	base := fake.NewClient()
+	base.AddHost(adapter.HostStatus{
+		Ref:           "worker-a",
+		Kind:          adapter.HostWorker,
+		Phase:         "Running",
+		LastHeartbeat: now,
+		Capacity:      1,
+		Capabilities:  []string{"shell"},
+	})
+	host := &reservedHostMissingAfterRevokeClient{
+		Client:   base,
+		checkErr: kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "AgentTeams host not found", Recoverable: true},
+	}
+	source := fake.NewInvocationSource()
+	invocationRef := "execution://expired-after-token-revoke/1"
+	source.Put(invocationRef, prepared("inv-expired-after-token-revoke", auth.RoleExecutor, ""))
+	store := adapter.NewMemoryExecutionStore()
+	service, err := adapter.NewAdapter(host, source, host, store, func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !errors.Is(err, errReservedCleanupPrepareFailed) {
+		t.Fatalf("Dispatch error = %v, want reserved cleanup preparation failure", err)
+	}
+	execution := adapter.AgentTeamsExecutionRef{
+		InvocationID:     "inv-expired-after-token-revoke",
+		AgentTeamsTaskID: testStableTaskID(invocationRef),
+		HostRef:          "worker-a",
+	}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatalf("Terminate revoked reserved host-missing cleanup: %v", err)
+	}
+	if len(host.released) != 1 || host.released[0] != execution.AgentTeamsTaskID {
+		t.Fatalf("released slots = %#v, want %q", host.released, execution.AgentTeamsTaskID)
+	}
+	if calls := base.Calls(); indexWithPrefix(calls, "force-stop:") >= 0 || indexWithPrefix(calls, "cancel:") >= 0 {
+		t.Fatalf("revoked reserved cleanup touched external host/task: %v", calls)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("redispatch terminated revoked reservation = %v, want stale_command", err)
+	}
+}
+
+func TestWorkspacePreparationFailureCanRetryBeforeOneLifetimeMCPIsMinted(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	host := fake.NewClient()
+	host.AddHost(adapter.HostStatus{
+		Ref:           "worker-a",
+		Kind:          adapter.HostWorker,
+		Phase:         "Running",
+		LastHeartbeat: now,
+		Capacity:      1,
+		Capabilities:  []string{"shell"},
+	})
+	source := fake.NewInvocationSource()
+	invocationRef := "execution://workspace-retry/1"
+	source.Put(invocationRef, prepared("inv-workspace-retry", auth.RoleExecutor, ""))
+	files := &failOnceFileTransport{err: errors.New("shared object storage denied")}
+	service, err := adapter.NewAdapter(host, source, files, adapter.NewMemoryExecutionStore(), func() time.Time { return now }, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(context.Background(), invocationRef); !errors.Is(err, files.err) {
+		t.Fatalf("first Dispatch error = %v, want workspace preparation failure", err)
+	}
+	if got := len(host.Preparations()); got != 0 {
+		t.Fatalf("PrepareHost calls after workspace failure = %d, want 0", got)
+	}
+	execution, err := service.Dispatch(context.Background(), invocationRef)
+	if err != nil {
+		t.Fatalf("retry Dispatch: %v", err)
+	}
+	if got := len(host.Preparations()); got != 1 {
+		t.Fatalf("PrepareHost calls after retry = %d, want 1", got)
+	}
+	if files.calls != 2 || !strings.HasSuffix(execution.AgentTeamsTaskID, "-attempt-2") {
+		t.Fatalf("workspace calls/task = %d/%q, want 2 and attempt-2", files.calls, execution.AgentTeamsTaskID)
 	}
 }
 
@@ -412,15 +765,40 @@ func TestTerminateForceStopsHostWhenRevocationCannotBeProved(t *testing.T) {
 		t.Fatal(err)
 	}
 	host.FailRevoke = errors.New("revoke failed")
+	host.FailRelease = kernel.Forbidden("AgentTeams host slot cannot be released before invocation MCP revocation or host fencing")
 	if err := service.Terminate(context.Background(), execution, "cancel"); err == nil {
 		t.Fatal("Terminate succeeded despite failed revocation")
 	}
 	calls := host.Calls()
-	if indexWithPrefix(calls, "force-stop:") < 0 || indexWithPrefix(calls, "cancel:") >= 0 {
+	if indexWithPrefix(calls, "force-stop:") < 0 || indexWithPrefix(calls, "release:") < 0 || indexWithPrefix(calls, "cancel:") >= 0 {
 		t.Fatalf("failed fencing calls = %v", calls)
 	}
+	if host.ActiveExecutions("worker-a") != 1 {
+		t.Fatalf("active executions after refused durable release = %d, want 1", host.ActiveExecutions("worker-a"))
+	}
+}
+
+func TestTerminateReleasesDispatchedExecutionWhenProviderCheckUnavailableAfterRevocation(t *testing.T) {
+	now := time.Date(2026, 8, 14, 16, 0, 0, 0, time.UTC)
+	host, source, service := newHarness(t, now)
+	source.Put("execution://provider-missing-after-revoke/1", prepared("inv-provider-missing-after-revoke", auth.RoleExecutor, ""))
+	execution, err := service.Dispatch(context.Background(), "execution://provider-missing-after-revoke/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.FailCheck = kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "worker not found", Recoverable: true}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatalf("Terminate provider-missing after revoke: %v", err)
+	}
+	calls := host.Calls()
+	if indexWithPrefix(calls, "cancel:") >= 0 || indexWithPrefix(calls, "release:") < 0 {
+		t.Fatalf("provider-missing terminate calls = %v, want no cancel and durable release", calls)
+	}
 	if host.ActiveExecutions("worker-a") != 0 {
-		t.Fatalf("active executions after force stop = %d, want 0", host.ActiveExecutions("worker-a"))
+		t.Fatalf("active executions after provider-missing release = %d, want 0", host.ActiveExecutions("worker-a"))
+	}
+	if err := service.Terminate(context.Background(), execution, "cancel"); err != nil {
+		t.Fatalf("idempotent terminate after provider-missing release: %v", err)
 	}
 }
 
@@ -690,6 +1068,37 @@ func newHarness(t *testing.T, now time.Time) (*fake.Client, *fake.InvocationSour
 	return host, source, service
 }
 
+type recoveringExecutionClient struct {
+	*fake.Client
+	failNextCheck    bool
+	failNextActivity bool
+	recoverCalls     int
+}
+
+func (c *recoveringExecutionClient) CheckTask(ctx context.Context, taskID string) (adapter.TaskCheck, error) {
+	if c.failNextCheck {
+		c.failNextCheck = false
+		return adapter.TaskCheck{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "provider carrier stopped", Recoverable: true}
+	}
+	return c.Client.CheckTask(ctx, taskID)
+}
+
+func (c *recoveringExecutionClient) HostActivity(context.Context, string) (adapter.HostActivity, error) {
+	if c.failNextActivity {
+		c.failNextActivity = false
+		return adapter.HostActivity{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "provider carrier stopped", Recoverable: true}
+	}
+	return adapter.HostActivity{Status: "idle"}, nil
+}
+
+func (c *recoveringExecutionClient) RecoverExecutionHost(_ context.Context, prep adapter.HostPreparation) error {
+	if prep.InvocationID != "inv-recover" || prep.AgentTeamsTaskID == "" || prep.HostRef != "worker-a" || prep.Role != auth.RoleExecutor {
+		return errors.New("unexpected recovery preparation")
+	}
+	c.recoverCalls++
+	return nil
+}
+
 func prepared(invocationID string, role auth.Role, operation string) adapter.PreparedInvocation {
 	return adapter.PreparedInvocation{
 		InvocationID:     kernel.InvocationID(invocationID),
@@ -758,6 +1167,50 @@ func (c *blockingDelegateClient) release() {
 type poisonPrepareClient struct {
 	adapter.Client
 	err error
+}
+
+var errReservedCleanupPrepareFailed = errors.New("reserved cleanup preparation failed")
+
+type reservedHostMissingAfterRevokeClient struct {
+	*fake.Client
+	checkErr error
+	released []string
+}
+
+func (c *reservedHostMissingAfterRevokeClient) PrepareHost(context.Context, adapter.HostPreparation) error {
+	return errReservedCleanupPrepareFailed
+}
+
+func (c *reservedHostMissingAfterRevokeClient) CheckTask(context.Context, string) (adapter.TaskCheck, error) {
+	return adapter.TaskCheck{}, c.checkErr
+}
+
+func (c *reservedHostMissingAfterRevokeClient) ReleaseHostSlot(_ context.Context, taskID string, _ string) error {
+	c.released = append(c.released, taskID)
+	return nil
+}
+
+var errProviderTaskAbsent = errors.New("provider task was not created")
+
+type missingProviderTaskClient struct {
+	adapter.Client
+	cancelCalls int
+}
+
+func (c *missingProviderTaskClient) DelegateTask(ctx context.Context, request adapter.DelegateTaskRequest) (adapter.TaskSnapshot, error) {
+	if _, err := c.Client.DelegateTask(ctx, request); err != nil {
+		return adapter.TaskSnapshot{}, err
+	}
+	return adapter.TaskSnapshot{}, errProviderTaskAbsent
+}
+
+func (c *missingProviderTaskClient) CheckTask(context.Context, string) (adapter.TaskCheck, error) {
+	return adapter.TaskCheck{}, kernel.Error{Code: kernel.CodeNotFound, Message: "provider task absent"}
+}
+
+func (c *missingProviderTaskClient) CancelTask(context.Context, string, string) error {
+	c.cancelCalls++
+	return nil
 }
 
 func (c poisonPrepareClient) PrepareHost(context.Context, adapter.HostPreparation) error {

@@ -58,6 +58,12 @@ func TestAgentTeamsControllerClientListsHostsAndUsesBearer(t *testing.T) {
 	}
 }
 
+func TestParseControllerTimeLeavesMissingHeartbeatUnknown(t *testing.T) {
+	if got := parseControllerTime(""); !got.IsZero() {
+		t.Fatalf("missing heartbeat parsed as %v, want zero", got)
+	}
+}
+
 func TestAgentTeamsControllerClientLifecycleAndFailureRedaction(t *testing.T) {
 	const token = "secret-controller-token"
 	var calls []string

@@ -201,13 +201,25 @@ FOR UPDATE`, taskID))
 	}
 	if record.State == executionTerminated {
 		if record.TerminationMode == mode {
+			if _, err := tx.ExecContext(ctx, `
+UPDATE agentteams_execution_refs
+SET mcp_revoked_at = COALESCE(mcp_revoked_at, now()),
+    host_slot_released_at = COALESCE(host_slot_released_at, now()),
+    updated_at = now()
+WHERE agentteams_task_id = $1`, taskID); err != nil {
+				return err
+			}
 			return tx.Commit()
 		}
 		return kernel.IdempotencyConflict()
 	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE agentteams_execution_refs
-SET state = 'terminated', termination_mode = $2, updated_at = now()
+SET state = 'terminated',
+    termination_mode = $2,
+    mcp_revoked_at = COALESCE(mcp_revoked_at, now()),
+    host_slot_released_at = COALESCE(host_slot_released_at, now()),
+    updated_at = now()
 WHERE agentteams_task_id = $1 AND state <> 'terminated'`, taskID, mode)
 	if err != nil {
 		return err

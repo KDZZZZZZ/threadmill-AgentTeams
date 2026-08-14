@@ -31,11 +31,20 @@ type AgentTokenAuthenticator interface {
 	AuthenticateAgentToken(context.Context, string) (auth.Principal, error)
 }
 
+// ToolCallGuard is evaluated after bearer authentication but before a
+// Threadmill tool handler runs. It keeps MCP transport alive for provider
+// finalization while a terminal Runtime invocation can no longer mutate or
+// read either authoritative graph.
+type ToolCallGuard interface {
+	AuthorizeToolCall(context.Context, auth.Principal) error
+}
+
 type HTTPOptions struct {
 	AllowedOrigins []string
 	MaxRequestSize int64
 	ServerName     string
 	ServerVersion  string
+	ToolCallGuard  ToolCallGuard
 }
 
 type httpServer struct {
@@ -45,6 +54,7 @@ type httpServer struct {
 	maxBody       int64
 	serverName    string
 	serverVersion string
+	toolCallGuard ToolCallGuard
 }
 
 // NewHTTPHandler exposes the invocation-scoped Registry through MCP
@@ -88,6 +98,7 @@ func NewHTTPHandler(authenticator AgentTokenAuthenticator, registry *Registry, o
 		maxBody:       maxBody,
 		serverName:    serverName,
 		serverVersion: serverVersion,
+		toolCallGuard: options.ToolCallGuard,
 	}, nil
 }
 
@@ -346,6 +357,12 @@ func (s *httpServer) handleToolsCall(ctx context.Context, w http.ResponseWriter,
 	if err != nil {
 		writeRPCError(w, request.ID, -32602, "tool arguments must be a JSON object", nil)
 		return
+	}
+	if s.toolCallGuard != nil {
+		if err := s.toolCallGuard.AuthorizeToolCall(ctx, principal); err != nil {
+			writeRPCResult(w, request.ID, errorToolResult(err))
+			return
+		}
 	}
 	result, err := s.registry.Invoke(ctx, principal, tool, auth.Scope{}, arguments)
 	if err != nil {

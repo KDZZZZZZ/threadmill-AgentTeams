@@ -13,6 +13,9 @@ type HostKind string
 const (
 	HostManager HostKind = "manager"
 	HostWorker  HostKind = "worker"
+
+	CapabilityTaskManager  = "threadmill.task_manager"
+	CapabilityContextAgent = "threadmill.context_agent"
 )
 
 type HostStatus struct {
@@ -40,6 +43,7 @@ type PreparedInvocation struct {
 type HostPreparation struct {
 	HostRef          string
 	InvocationID     kernel.InvocationID
+	AgentTeamsTaskID string
 	Role             auth.Role
 	Operation        string
 	RuntimeConfigRef string
@@ -82,6 +86,16 @@ type RawObservation struct {
 	ObservedAt      time.Time
 }
 
+// HostActivity is a provider observation used only to decide whether a
+// bounded execution has actually quiesced. It is not a Threadmill graph or
+// invocation state and therefore cannot complete work by itself.
+type HostActivity struct {
+	Status           string
+	RunningTaskCount int
+	LastRunAt        time.Time
+	LastFinishAt     time.Time
+}
+
 // Client is the minimal AgentTeams/QwenPaw/taskflow provider seam. It does not
 // expose projectflow, AgentTeams DAGs, Matrix messages, or any Threadmill graph.
 type Client interface {
@@ -89,6 +103,11 @@ type Client interface {
 	PrepareHost(context.Context, HostPreparation) error
 	DelegateTask(context.Context, DelegateTaskRequest) (TaskSnapshot, error)
 	ReleaseHostSlot(context.Context, string, string) error
+	// FenceInvocation confirms the durable provider claim while Runtime closes
+	// the invocation status used by the MCP tools/call authority guard. It must
+	// not revoke the bearer, remove the provider MCP client, cancel its task, or
+	// release its host slot while terminal response/finalization is in flight.
+	FenceInvocation(context.Context, string, kernel.InvocationID) error
 	RevokeInvocation(context.Context, string, kernel.InvocationID) error
 	ForceStopHost(context.Context, string) error
 	CancelTask(context.Context, string, string) error

@@ -22,6 +22,8 @@ type GitBackend interface {
 	CurrentRevision(context.Context, Binding) (string, error)
 	ObservedWrites(context.Context, Binding) ([]string, error)
 	Diff(context.Context, Binding, string) (string, error)
+	DiffPaths(context.Context, Binding, []string) (string, error)
+	Checkpoint(context.Context, Binding, string) (string, error)
 }
 
 type LocalGitBackend struct{}
@@ -154,17 +156,37 @@ func (LocalGitBackend) ObservedWrites(ctx context.Context, binding Binding) ([]s
 }
 
 func (LocalGitBackend) Diff(ctx context.Context, binding Binding, relativePath string) (string, error) {
-	args := []string{"diff", "--binary", binding.BaseRevision, "--"}
+	paths := []string(nil)
 	if relativePath != "" {
-		args = append(args, filepath.ToSlash(relativePath))
+		paths = []string{relativePath}
 	}
+	return LocalGitBackend{}.DiffPaths(ctx, binding, paths)
+}
+
+// DiffPaths returns a patch restricted to Runtime-authorized candidate paths.
+// Plan and verify artifacts may share the physical Task workspace, but they
+// are not part of the merge candidate unless Planner explicitly declared them
+// as execute writes (which Workspace Service forbids for reserved paths).
+func (LocalGitBackend) DiffPaths(ctx context.Context, binding Binding, paths []string) (string, error) {
+	cleanPaths := make([]string, 0, len(paths))
+	for _, candidate := range paths {
+		clean, err := cleanRelativePath(candidate)
+		if err != nil {
+			return "", err
+		}
+		cleanPaths = append(cleanPaths, filepath.ToSlash(clean))
+	}
+	cleanPaths = normalizedStrings(cleanPaths)
+	args := []string{"diff", "--binary", binding.BaseRevision, "--"}
+	args = append(args, cleanPaths...)
 	tracked, err := gitOutput(ctx, binding.Root, args...)
 	if err != nil {
 		return "", err
 	}
 	untrackedArgs := []string{"ls-files", "--others", "--exclude-standard"}
-	if relativePath != "" {
-		untrackedArgs = append(untrackedArgs, "--", filepath.ToSlash(relativePath))
+	if len(cleanPaths) > 0 {
+		untrackedArgs = append(untrackedArgs, "--")
+		untrackedArgs = append(untrackedArgs, cleanPaths...)
 	}
 	untracked, err := gitOutput(ctx, binding.Root, untrackedArgs...)
 	if err != nil {
@@ -183,6 +205,33 @@ func (LocalGitBackend) Diff(ctx context.Context, binding Binding, relativePath s
 		patches = append(patches, patch)
 	}
 	return strings.TrimSpace(strings.Join(nonEmptyStrings(patches), "\n")), nil
+}
+
+// Checkpoint commits the already-validated authoritative worktree. Agents are
+// never granted git commit/push; Runtime alone creates phase checkpoints after
+// Workspace Service has enforced the active lease and phase write boundary.
+func (LocalGitBackend) Checkpoint(ctx context.Context, binding Binding, label string) (string, error) {
+	if strings.TrimSpace(label) == "" {
+		return "", fmt.Errorf("workspace checkpoint label is required")
+	}
+	if err := gitRun(ctx, binding.Root, "add", "-A"); err != nil {
+		return "", err
+	}
+	status, err := gitOutput(ctx, binding.Root, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	if status == "" {
+		return LocalGitBackend{}.CurrentRevision(ctx, binding)
+	}
+	if err := gitRun(ctx, binding.Root,
+		"-c", "user.name=Threadmill Runtime",
+		"-c", "user.email=threadmill-runtime@localhost",
+		"commit", "--no-gpg-sign", "-m", "threadmill checkpoint: "+label,
+	); err != nil {
+		return "", err
+	}
+	return LocalGitBackend{}.CurrentRevision(ctx, binding)
 }
 
 func validateExistingWorktree(ctx context.Context, repositoryAbs string, binding Binding) (string, error) {

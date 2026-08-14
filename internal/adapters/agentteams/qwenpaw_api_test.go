@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,6 +62,254 @@ func TestQwenPawAPIInstallsAndRevokesInvocationMCP(t *testing.T) {
 	state.mu.Unlock()
 	if stillPresent {
 		t.Fatal("revoked MCP client is still present")
+	}
+}
+
+func TestQwenPawAPIDeletesCanonicalInvocationMCPWithoutListing(t *testing.T) {
+	const existing = "threadmill-0123456789abcdef01234567"
+	var listCalls atomic.Int32
+	var deleteCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/mcp":
+			listCalls.Add(1)
+			http.Error(w, "collection is blocked by stale credentials", http.StatusGatewayTimeout)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/mcp/"+existing:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/mcp/threadmill-89abcdef0123456789abcdef":
+			deleteCalls.Add(1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := api.DeleteInvocationMCPIfPresent(context.Background(), existing); err != nil {
+		t.Fatalf("delete existing invocation MCP: %v", err)
+	}
+	if err := api.DeleteInvocationMCPIfPresent(context.Background(), "threadmill-89abcdef0123456789abcdef"); err != nil {
+		t.Fatalf("delete missing invocation MCP: %v", err)
+	}
+	if err := api.DeleteInvocationMCPIfPresent(context.Background(), "operator-owned-client"); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+		t.Fatalf("delete non-Threadmill MCP error = %v, want invalid_request", err)
+	}
+	if got := listCalls.Load(); got != 0 {
+		t.Fatalf("GET /api/mcp calls = %d, want 0", got)
+	}
+	if got := deleteCalls.Load(); got != 2 {
+		t.Fatalf("DELETE invocation MCP calls = %d, want 2", got)
+	}
+}
+
+func TestQwenPawAPIPrunesOnlyHistoricalInvocationMCP(t *testing.T) {
+	state := newQwenPawContractState()
+	current := "threadmill-0123456789abcdef0123456789abcdef"
+	stale24 := "threadmill-89abcdef0123456789abcdef"
+	stale32 := "threadmill-fedcba9876543210fedcba9876543210"
+	staleAttempt := "threadmill-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-attempt-335"
+	state.clients[current] = qwenPawContractClient{Enabled: true}
+	state.clients[stale24] = qwenPawContractClient{Enabled: true}
+	state.clients[stale32] = qwenPawContractClient{Enabled: true}
+	state.clients[staleAttempt] = qwenPawContractClient{Enabled: true}
+	state.clients["teamharness"] = qwenPawContractClient{Enabled: true}
+	state.clients["operator-threadmill-client"] = qwenPawContractClient{Enabled: true}
+	server := httptest.NewServer(state)
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := api.PruneInvocationMCPExcept(context.Background(), current); err != nil {
+		t.Fatal(err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if _, ok := state.clients[current]; !ok {
+		t.Fatal("current invocation MCP was pruned")
+	}
+	if _, ok := state.clients["teamharness"]; !ok {
+		t.Fatal("package MCP was pruned")
+	}
+	if _, ok := state.clients["operator-threadmill-client"]; !ok {
+		t.Fatal("operator MCP was pruned")
+	}
+	if _, ok := state.clients[stale24]; ok {
+		t.Fatal("24-character stale invocation MCP remains")
+	}
+	if _, ok := state.clients[stale32]; ok {
+		t.Fatal("32-character stale invocation MCP remains")
+	}
+	if _, ok := state.clients[staleAttempt]; ok {
+		t.Fatal("retry-attempt stale invocation MCP remains")
+	}
+}
+
+func TestInvocationMCPRecoveryKeyShape(t *testing.T) {
+	for _, key := range []string{
+		"threadmill-0123456789abcdef01234567",
+		"threadmill-0123456789abcdef0123456789abcdef",
+		"threadmill-0123456789abcdef0123456789abcdef-attempt-335",
+	} {
+		if !isInvocationMCPKey(key) {
+			t.Fatalf("canonical invocation MCP key %q was rejected", key)
+		}
+	}
+	for _, key := range []string{
+		"threadmill-invocation-name",
+		"threadmill-0123456789ABCDEF01234567",
+		"threadmill-0123456789abcdef0123456g",
+		"threadmill-0123456789abcdef0123456789abcdef-attempt-",
+		"threadmill-0123456789abcdef0123456789abcdef-attempt-x",
+		"other-0123456789abcdef01234567",
+	} {
+		if isInvocationMCPKey(key) {
+			t.Fatalf("non-canonical invocation MCP key %q was accepted", key)
+		}
+	}
+}
+
+func TestQwenPawAPIReturnsAuthoritativeAgentActivity(t *testing.T) {
+	lastRun := time.Date(2026, time.August, 11, 10, 0, 0, 0, time.UTC)
+	lastFinish := lastRun.Add(2 * time.Minute)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/agents/default/agent-status" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":             "running",
+			"running_task_count": 0,
+			"last_run_at":        lastRun,
+			"last_finish_at":     lastFinish,
+		})
+	}))
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	activity, err := api.AgentActivity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity.Status != "running" || activity.RunningTaskCount != 0 || !activity.LastRunAt.Equal(lastRun) || !activity.LastFinishAt.Equal(lastFinish) {
+		t.Fatalf("activity = %#v", activity)
+	}
+}
+
+func TestQwenPawAPIWaitsForAnUninterruptedIdleWindowAfterHotReload(t *testing.T) {
+	state := newQwenPawContractState()
+	const key = "threadmill-0123456789abcdef01234567"
+	state.clients[key] = qwenPawContractClient{Enabled: true, Tools: []string{"phase.submit"}}
+	for name := range state.builtinTools {
+		if _, required := qwenPawNativeProjectTools[name]; required {
+			state.builtinTools[name] = true
+		}
+	}
+	var statusCalls atomic.Int32
+	var reloadFailureAt atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/agents/default/agent-status" {
+			call := statusCalls.Add(1)
+			if call == 3 {
+				reloadFailureAt.Store(time.Now().UnixNano())
+				http.Error(w, "workspace is reloading", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		state.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.pollInterval = 2 * time.Millisecond
+	api.stableWindow = 10 * time.Millisecond
+
+	if err := api.WaitInvocationReady(context.Background(), key, []string{"phase.submit"}); err != nil {
+		t.Fatalf("WaitInvocationReady() error = %v", err)
+	}
+	failedAt := reloadFailureAt.Load()
+	if failedAt == 0 {
+		t.Fatal("agent-status never observed the simulated hot reload failure")
+	}
+	if elapsed := time.Since(time.Unix(0, failedAt)); elapsed < api.stableWindow {
+		t.Fatalf("returned %s after reload failure, want a fresh stable window of at least %s", elapsed, api.stableWindow)
+	}
+}
+
+func TestQwenPawAPIWaitStartupReadyWaitsBeyondVersion(t *testing.T) {
+	state := newQwenPawContractState()
+	var toolCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/agents/default/tools" {
+			if toolCalls.Add(1) <= 2 {
+				http.Error(w, "wrapper desired state is still applying", http.StatusServiceUnavailable)
+				return
+			}
+		}
+		state.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.pollInterval = 2 * time.Millisecond
+
+	if err := api.WaitStartupReady(context.Background()); err != nil {
+		t.Fatalf("WaitStartupReady() error = %v", err)
+	}
+	if got := toolCalls.Load(); got < 3 {
+		t.Fatalf("tool readiness probes = %d, want retries after version was already reachable", got)
+	}
+}
+
+func TestQwenPawAPIEnablesNativeProjectToolsWithoutChangingOtherTools(t *testing.T) {
+	state := newQwenPawContractState()
+	server := httptest.NewServer(state)
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := api.EnsureNativeProjectTools(context.Background()); err != nil {
+		t.Fatalf("EnsureNativeProjectTools failed: %v", err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	for _, name := range []string{"read_file", "write_file", "edit_file", "grep_search", "glob_search", "execute_shell_command", "web_search"} {
+		if !state.builtinTools[name] {
+			t.Fatalf("native project tool %s was not enabled", name)
+		}
+	}
+	if state.builtinTools["spawn_subagent"] {
+		t.Fatal("unrelated sub-agent tool was changed")
+	}
+}
+
+func TestQwenPawAPIFailsClosedWhenNativeProjectToolReadbackStaysDisabled(t *testing.T) {
+	state := newQwenPawContractState()
+	state.ignoreBuiltinToggle = true
+	server := httptest.NewServer(state)
+	t.Cleanup(server.Close)
+	api, err := NewQwenPawAPI(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = api.EnsureNativeProjectTools(context.Background())
+	if !kernel.IsCode(err, kernel.CodeExecutorUnavailable) {
+		t.Fatalf("native project tool error = %v, want executor_unavailable", err)
 	}
 }
 
@@ -195,20 +444,20 @@ func TestQwenPawAPIRejectsUnsafeURLsAndUnexpectedVersion(t *testing.T) {
 	}
 }
 
-func TestInvocationMCPKeyIsStableAndOpaque(t *testing.T) {
-	first, err := InvocationMCPKey("invocation-visible-name")
+func TestInvocationMCPKeyMatchesOpaqueProviderTask(t *testing.T) {
+	first, err := InvocationMCPKey("threadmill-0123456789abcdef0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := InvocationMCPKey("invocation-visible-name")
+	second, err := InvocationMCPKey("threadmill-0123456789abcdef0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != second || !strings.HasPrefix(first, "threadmill-") {
+	if first != second || first != "threadmill-0123456789abcdef0123456789abcdef" {
 		t.Fatalf("keys = %q/%q", first, second)
 	}
-	if strings.Contains(first, "visible-name") {
-		t.Fatalf("key exposes invocation id: %q", first)
+	if _, err := InvocationMCPKey("invocation-visible-name"); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+		t.Fatalf("non-provider task MCP key error = %v", err)
 	}
 }
 
@@ -218,6 +467,9 @@ type qwenPawContractState struct {
 	policies             map[string]qwenPawContractPolicy
 	failPolicy           bool
 	injectPolicyOverride bool
+	builtinTools         map[string]bool
+	ignoreBuiltinToggle  bool
+	deleteCalls          []string
 }
 
 type qwenPawContractClient struct {
@@ -254,6 +506,11 @@ func newQwenPawContractState() *qwenPawContractState {
 	return &qwenPawContractState{
 		clients:  make(map[string]qwenPawContractClient),
 		policies: make(map[string]qwenPawContractPolicy),
+		builtinTools: map[string]bool{
+			"read_file": false, "write_file": false, "edit_file": false, "append_file": false,
+			"grep_search": false, "glob_search": false, "ast_search": false,
+			"execute_shell_command": false, "web_search": false, "spawn_subagent": false,
+		},
 	}
 }
 
@@ -265,6 +522,25 @@ func (s *qwenPawContractState) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/api/version":
 		_ = json.NewEncoder(w).Encode(map[string]string{"version": qwenPawAPIVersion})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/agents/default/agent-status":
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "idle", "running_task_count": 0})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/agents/default/tools":
+		items := make([]map[string]any, 0, len(s.builtinTools))
+		for name, enabled := range s.builtinTools {
+			items = append(items, map[string]any{"name": name, "enabled": enabled})
+		}
+		_ = json.NewEncoder(w).Encode(items)
+	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/agents/default/tools/") && strings.HasSuffix(r.URL.Path, "/toggle"):
+		name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/agents/default/tools/"), "/toggle")
+		enabled, ok := s.builtinTools[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if !s.ignoreBuiltinToggle {
+			s.builtinTools[name] = !enabled
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": name, "enabled": s.builtinTools[name]})
 	case r.Method == http.MethodGet && r.URL.Path == "/api/mcp":
 		items := make([]map[string]string, 0, len(s.clients))
 		for key := range s.clients {
@@ -350,6 +626,7 @@ func (s *qwenPawContractState) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			}
 			_, _ = w.Write([]byte(`{}`))
 		case http.MethodDelete:
+			s.deleteCalls = append(s.deleteCalls, key)
 			delete(s.clients, key)
 			w.WriteHeader(http.StatusNoContent)
 		}

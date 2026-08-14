@@ -209,6 +209,7 @@ func (d *DockerBackend) Create(ctx context.Context, req CreateRequest) (*WorkerR
 				DeploymentMode: DeployLocal,
 				Status:         StatusRunning,
 				ContainerID:    containerID,
+				Image:          req.Image,
 				RawStatus:      "running",
 			}
 			if consolePort != "" && hostPort > 0 {
@@ -220,10 +221,7 @@ func (d *DockerBackend) Create(ctx context.Context, req CreateRequest) (*WorkerR
 
 		// Check if start failed due to port conflict — retry with different port
 		errMsg := startErr.Error()
-		if consolePort != "" && attempt < maxPortRetries &&
-			(strings.Contains(errMsg, "already allocated") ||
-				strings.Contains(errMsg, "address already in use") ||
-				strings.Contains(errMsg, "port is already")) {
+		if consolePort != "" && attempt < maxPortRetries && retryableHostPortError(errMsg) {
 			log.Printf("[Docker] Host port %d in use, retrying with %d...", hostPort, hostPort+1)
 			hostPort++
 			// Clean up the container we just created
@@ -234,6 +232,17 @@ func (d *DockerBackend) Create(ctx context.Context, req CreateRequest) (*WorkerR
 
 		return nil, fmt.Errorf("start after create: %w", startErr)
 	}
+}
+
+func retryableHostPortError(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "already allocated") ||
+		strings.Contains(message, "address already in use") ||
+		strings.Contains(message, "port is already") ||
+		// Docker Desktop on Windows reports excluded/reserved host ports with
+		// WSAEACCES instead of the usual conflict wording. The mapping is chosen
+		// by the controller, so retrying another bounded port is safe.
+		strings.Contains(message, "forbidden by its access permissions")
 }
 
 func dockerAuthVolumeName(containerName string) string {
@@ -539,7 +548,11 @@ func (d *DockerBackend) Status(ctx context.Context, name string) (*WorkerResult,
 	}
 
 	var inspectResp struct {
-		ID    string `json:"Id"`
+		ID      string `json:"Id"`
+		ImageID string `json:"Image"`
+		Config  struct {
+			Image string `json:"Image"`
+		} `json:"Config"`
 		State struct {
 			Status string `json:"Status"`
 		} `json:"State"`
@@ -554,6 +567,8 @@ func (d *DockerBackend) Status(ctx context.Context, name string) (*WorkerResult,
 		DeploymentMode: DeployLocal,
 		Status:         normalizeDockerStatus(inspectResp.State.Status),
 		ContainerID:    inspectResp.ID,
+		Image:          inspectResp.Config.Image,
+		ImageID:        inspectResp.ImageID,
 		RawStatus:      inspectResp.State.Status,
 	}, nil
 }
@@ -611,6 +626,38 @@ func (d *DockerBackend) ensureImage(ctx context.Context, image string) error {
 	}
 	log.Printf("[Docker] Image pulled successfully: %s", image)
 	return nil
+}
+
+func (d *DockerBackend) ResolveImageID(ctx context.Context, image string) (string, error) {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return "", nil
+	}
+	u := "http://localhost/images/" + image + "/json"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", fmt.Errorf("build image inspect request: %w", err)
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("docker image inspect: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("docker image inspect failed (status %d): %s", resp.StatusCode, string(body))
+	}
+	var inspectResp struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal(body, &inspectResp); err != nil {
+		return "", fmt.Errorf("parse image inspect response: %w", err)
+	}
+	return inspectResp.ID, nil
 }
 
 func (d *DockerBackend) startContainer(ctx context.Context, nameOrID string) error {

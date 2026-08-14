@@ -289,6 +289,25 @@ def test_mcp_create_update_delete_each_reads_back(api_url):
     assert client.list_mcp() == []
 
 
+def test_get_mcp_if_present_maps_404_to_none(api_url):
+    client = QwenPawApiClient(api_url)
+
+    assert client.get_mcp_if_present("missing") is None
+
+
+def test_delete_mcp_uses_targeted_readback_not_global_list(api_url, monkeypatch):
+    client = QwenPawApiClient(api_url)
+    client.create_mcp("owned", {"name": "owned", "enabled": True})
+
+    def fail_global_list(*_args, **_kwargs):
+        raise AssertionError("delete_mcp must not call global /api/mcp")
+
+    monkeypatch.setattr(client, "list_mcp", fail_global_list)
+
+    client.delete_mcp("owned")
+    assert client.get_mcp_if_present("owned") is None
+
+
 def test_disable_agent_retries_startup_conflict(api_url):
     client = QwenPawApiClient(api_url)
     _ApiHandler.toggle_conflicts = 2

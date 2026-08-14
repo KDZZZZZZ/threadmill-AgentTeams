@@ -240,7 +240,23 @@ func TestSearchAuthorizesScopeAndAnchorsBeforeMatching(t *testing.T) {
 	reviewer := contextPrincipal(auth.ToolContextSubmitReview)
 	createNode(t, store, reviewer, "visible", "creator-1", "", nil)
 	ctxAgent := contextPrincipal(auth.ToolContextSearch)
+	ctxAgent.TaskID = "task-1"
 	ctxAgent.ConsumerInvocationID = "inv-search-caller"
+	store.nodes["task-private"] = NodeRecord{
+		Node: ContextNode{
+			ID: "task-private", Kind: string(NodeKindDirective), Statement: "needle private task directive",
+			Status: string(NodeStatusAccepted), SubgraphIDs: []string{"task-1-context"}, SourceRefs: []string{"source:task"}, CreatorAgentID: "task-projector",
+		},
+		Revision: 1, ProjectID: "project-a", Sequence: 2,
+	}
+
+	unscoped, err := store.Search(context.Background(), ctxAgent, SearchRequest{Keywords: []string{"needle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unscoped.Slice.Nodes) != 1 || unscoped.Slice.Nodes[0].ID != "visible" {
+		t.Fatalf("context search leaked task-only nodes: %#v", unscoped.Slice.Nodes)
+	}
 
 	search, err := store.Search(context.Background(), ctxAgent, SearchRequest{Keywords: []string{"needle"}, Scope: []string{"subgraph:general-a"}})
 	if err != nil {
@@ -253,7 +269,10 @@ func TestSearchAuthorizesScopeAndAnchorsBeforeMatching(t *testing.T) {
 		t.Fatalf("subscription IDs = %#v, want one search subscription", search.SubscriptionIDs)
 	}
 	if _, err := store.Search(context.Background(), ctxAgent, SearchRequest{Keywords: []string{"needle"}, Scope: []string{"task-1-context"}}); !kernel.IsCode(err, kernel.CodeNotFound) {
-		t.Fatalf("hidden scope err = %v, want not_found", err)
+		t.Fatalf("task scope err = %v, want not_found", err)
+	}
+	if _, err := store.Search(context.Background(), ctxAgent, SearchRequest{AnchorRefs: []string{"node:task-private"}}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("task node anchor err = %v, want not_found", err)
 	}
 	if _, err := store.Search(context.Background(), ctxAgent, SearchRequest{AnchorRefs: []string{"node:missing"}}); !kernel.IsCode(err, kernel.CodeNotFound) {
 		t.Fatalf("missing anchor err = %v, want not_found", err)

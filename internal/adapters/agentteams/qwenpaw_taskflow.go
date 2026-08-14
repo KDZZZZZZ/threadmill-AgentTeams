@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -110,14 +111,86 @@ response = json.loads(lines[-1])
 print(json.dumps(response, ensure_ascii=False))
 `
 
+// qwenPawWorkspaceManifestBridge runs inside the already-fenced worker and
+// scans only Threadmill's fixed task workspace. It preserves Runtime-owned
+// manifest payload, replaces the file inventory, rejects links/special files,
+// and never receives a caller-controlled filesystem path.
+const qwenPawWorkspaceManifestBridge = `
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from urllib.request import urlopen
+
+management_port = int(sys.argv[1])
+task_id = sys.argv[2]
+with urlopen(f"http://127.0.0.1:{management_port}/api/mcp/teamharness", timeout=10) as response:
+    client = json.load(response)
+
+cwd = Path(client["cwd"])
+working_dir = cwd.parents[2]
+task_root = working_dir / "workspaces" / "default" / "shared" / "tasks" / task_id
+workspace = task_root / "workspace"
+manifest_path = task_root / "threadmill" / "workspace.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if manifest.get("version") != "threadmill.agentteams.workspace.v1" or not manifest.get("payload"):
+    raise SystemExit(2)
+
+protected = {".git", ".env", "credentials", "sessions", "logs", "tool results", "tool-results", "auth.json", "id_rsa", "id_ed25519"}
+files = []
+total = 0
+for root, dirs, names in os.walk(workspace, topdown=True, followlinks=False):
+    root_path = Path(root)
+    kept_dirs = []
+    for name in sorted(dirs):
+        child = root_path / name
+        relative = child.relative_to(workspace).as_posix()
+        if name.strip().lower() in protected:
+            continue
+        if child.is_symlink():
+            raise SystemExit(3)
+        kept_dirs.append(name)
+    dirs[:] = kept_dirs
+    for name in sorted(names):
+        child = root_path / name
+        relative = child.relative_to(workspace).as_posix()
+        if any(part.strip().lower() in protected for part in Path(relative).parts):
+            continue
+        info = child.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit(3)
+        if info.st_size > 4 * 1024 * 1024:
+            raise SystemExit(4)
+        total += info.st_size
+        if total > 512 * 1024 * 1024:
+            raise SystemExit(4)
+        digest = hashlib.sha256()
+        with child.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files.append({"path": relative, "mode": stat.S_IMODE(info.st_mode), "sha256": digest.hexdigest(), "size": info.st_size})
+
+manifest["files"] = sorted(files, key=lambda item: item["path"])
+temporary = manifest_path.with_name("workspace.json.tmp")
+temporary.write_text(json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+temporary.replace(manifest_path)
+print(json.dumps({"ok": True, "files": len(files)}, separators=(",", ":")))
+`
+
 type TaskflowCall struct {
-	Action     string
-	ProjectID  string
-	TaskID     string
-	RoomID     string
-	AssignedTo string
-	Spec       string
-	Reason     string
+	Action       string
+	Role         string
+	ProjectID    string
+	TaskID       string
+	RoomID       string
+	AssignedTo   string
+	Spec         string
+	Reason       string
+	Status       string
+	Summary      string
+	Deliverables []string
 }
 
 type TaskflowCallResult struct {
@@ -176,12 +249,12 @@ func (c *QwenPawDockerTaskflow) Call(ctx context.Context, container string, call
 	if call.Action == "delegate_task" {
 		carrierID, err := c.ensureCarrier(ctx, container, call)
 		if err != nil {
-			return TaskflowCallResult{}, err
+			return TaskflowCallResult{}, fmt.Errorf("prepare AgentTeams task carrier: %w", err)
 		}
 		arguments["projectId"] = carrierID
 		taskRoomID, err := c.ensureTaskRoom(ctx, container, call, carrierID)
 		if err != nil {
-			return TaskflowCallResult{}, err
+			return TaskflowCallResult{}, fmt.Errorf("prepare AgentTeams task room: %w", err)
 		}
 		arguments["roomId"] = taskRoomID
 	}
@@ -191,12 +264,77 @@ func (c *QwenPawDockerTaskflow) Call(ctx context.Context, container string, call
 	}
 	result, err := parseTaskflowCallResult(raw)
 	if err != nil {
-		return TaskflowCallResult{}, err
+		return TaskflowCallResult{}, fmt.Errorf("execute AgentTeams taskflow %s: %w", call.Action, err)
 	}
 	if result.Action != call.Action || result.Task.TaskID != call.TaskID {
 		return TaskflowCallResult{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw TeamHarness returned a mismatched task identity", Recoverable: true}
 	}
 	return result, nil
+}
+
+// PushSharedPath uses the installed TeamHarness filesync MCP inside the
+// assigned worker. The path is fixed by Threadmill's execution identity; no
+// Agent-provided filesystem or object-store path reaches this method.
+func (c *QwenPawDockerTaskflow) PushSharedPath(ctx context.Context, container, sharedPath string) error {
+	container = strings.TrimSpace(container)
+	if !safeContainerName(container) {
+		return kernel.InvalidArgument("QwenPaw container name is invalid")
+	}
+	sharedPath = strings.TrimSpace(sharedPath)
+	if !strings.HasPrefix(sharedPath, "shared/tasks/threadmill-") || !strings.HasSuffix(sharedPath, "/") || strings.Contains(sharedPath, "\\") || strings.Contains(sharedPath, "..") {
+		return kernel.InvalidArgument("AgentTeams shared task path is invalid")
+	}
+	raw, err := c.executeMCP(ctx, container, "filesync", map[string]any{
+		"action": "push",
+		"path":   sharedPath,
+	})
+	if err != nil {
+		return err
+	}
+	text, err := mcpTextPayload(raw)
+	if err != nil {
+		return err
+	}
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.Unmarshal([]byte(text), &result); err != nil || !result.OK {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "TeamHarness filesync push failed", Recoverable: true}
+	}
+	return nil
+}
+
+// SnapshotSharedWorkspace refreshes the complete file inventory immediately
+// before TeamHarness mirrors the task directory back to object storage.
+func (c *QwenPawDockerTaskflow) SnapshotSharedWorkspace(ctx context.Context, container, taskID string) error {
+	container = strings.TrimSpace(container)
+	if !safeContainerName(container) || !safeProviderID(taskID) || !strings.HasPrefix(taskID, "threadmill-") {
+		return kernel.InvalidArgument("AgentTeams workspace snapshot identity is invalid")
+	}
+	cmd := exec.CommandContext(
+		ctx,
+		c.dockerBinary,
+		"exec", "-i", container,
+		c.pythonBinary, "-c", qwenPawWorkspaceManifestBridge, strconv.Itoa(qwenPawManagementPort(container)), taskID,
+	)
+	cmd.WaitDelay = 5 * time.Second
+	stdout := newCappedOutput(64 << 10)
+	stderr := newCappedOutput(64 << 10)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw workspace snapshot failed", Recoverable: true}
+	}
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if stdout.truncated || json.Unmarshal(stdout.Bytes(), &result) != nil || !result.OK {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw workspace snapshot response is invalid", Recoverable: true}
+	}
+	return nil
 }
 
 func (c *QwenPawDockerTaskflow) ensureTaskRoom(ctx context.Context, container string, call TaskflowCall, carrierID string) (string, error) {
@@ -387,14 +525,18 @@ func taskCarrierProjectID(projectID, taskID string) string {
 
 func taskflowArguments(call TaskflowCall) (map[string]any, error) {
 	call.Action = strings.TrimSpace(call.Action)
-	if call.Action != "delegate_task" && call.Action != "check_task" && call.Action != "cancel_task" {
+	if call.Action != "delegate_task" && call.Action != "check_task" && call.Action != "cancel_task" && call.Action != "submit_task" {
 		return nil, kernel.InvalidArgument("taskflow action is invalid")
 	}
 	if !safeProviderID(call.TaskID) {
 		return nil, kernel.InvalidArgument("taskflow task_id must be a safe provider id")
 	}
+	role := strings.TrimSpace(call.Role)
+	if role == "" {
+		role = "leader"
+	}
 	arguments := map[string]any{
-		"role":   "leader",
+		"role":   role,
 		"action": call.Action,
 		"taskId": call.TaskID,
 	}
@@ -419,6 +561,20 @@ func taskflowArguments(call TaskflowCall) (map[string]any, error) {
 			return nil, kernel.InvalidArgument("cancel_task reason exceeds the size limit")
 		}
 		arguments["reason"] = call.Reason
+	case "submit_task":
+		if role != "worker" && role != "remote-member" {
+			return nil, kernel.InvalidArgument("submit_task requires a worker role")
+		}
+		status := strings.TrimSpace(call.Status)
+		if status != "SUCCESS" && status != "BLOCKED" && status != "FAILED" {
+			return nil, kernel.InvalidArgument("submit_task status must be SUCCESS, BLOCKED, or FAILED")
+		}
+		if strings.TrimSpace(call.Summary) == "" || len(call.Summary) > 1<<16 {
+			return nil, kernel.InvalidArgument("submit_task summary is required and must fit the size limit")
+		}
+		arguments["status"] = status
+		arguments["summary"] = call.Summary
+		arguments["deliverables"] = append([]string(nil), call.Deliverables...)
 	}
 	return arguments, nil
 }
@@ -431,6 +587,7 @@ func parseTaskflowCallResult(raw []byte) (TaskflowCallResult, error) {
 	var payload struct {
 		OK        bool   `json:"ok"`
 		Action    string `json:"action"`
+		Error     string `json:"error"`
 		Retryable bool   `json:"retryable"`
 		Effective bool   `json:"effective"`
 		Task      struct {
@@ -478,6 +635,12 @@ func parseTaskflowCallResult(raw []byte) (TaskflowCallResult, error) {
 		Retryable:        payload.Retryable,
 	}
 	if !payload.OK {
+		if payload.Error == "task not found" {
+			return TaskflowCallResult{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution does not exist", Recoverable: false}
+		}
+		if payload.Action == "cancel_task" && strings.HasPrefix(payload.Error, "cannot cancel terminal task: ") {
+			return TaskflowCallResult{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "AgentTeams task is already terminal", Recoverable: false}
+		}
 		return TaskflowCallResult{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw TeamHarness rejected the taskflow action", Recoverable: payload.Retryable}
 	}
 	return result, nil

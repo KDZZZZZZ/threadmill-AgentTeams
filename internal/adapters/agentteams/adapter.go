@@ -330,6 +330,7 @@ func (a *Adapter) dispatchReserved(ctx context.Context, invocationRef string) (A
 	if err != nil {
 		return AgentTeamsExecutionRef{}, err
 	}
+	reservedByThisDispatch := false
 	if found {
 		if record.Fingerprint != fingerprint {
 			return AgentTeamsExecutionRef{}, kernel.IdempotencyConflict()
@@ -349,10 +350,12 @@ func (a *Adapter) dispatchReserved(ctx context.Context, invocationRef string) (A
 				InvocationID: prepared.InvocationID,
 				HostRef:      host.Ref,
 			}
-			record, _, err = a.store.Reserve(ctx, invocationRef, fingerprint, proposed)
+			var created bool
+			record, created, err = a.store.Reserve(ctx, invocationRef, fingerprint, proposed)
 			if err != nil {
 				return AgentTeamsExecutionRef{}, err
 			}
+			reservedByThisDispatch = created
 			if record.State == executionDispatched {
 				return record.Execution, nil
 			}
@@ -366,24 +369,49 @@ func (a *Adapter) dispatchReserved(ctx context.Context, invocationRef string) (A
 			InvocationID: prepared.InvocationID,
 			HostRef:      host.Ref,
 		}
-		record, _, err = a.store.Reserve(ctx, invocationRef, fingerprint, proposed)
+		var created bool
+		record, created, err = a.store.Reserve(ctx, invocationRef, fingerprint, proposed)
 		if err != nil {
 			return AgentTeamsExecutionRef{}, err
 		}
+		reservedByThisDispatch = created
 		if record.State == executionDispatched {
 			return record.Execution, nil
 		}
 	}
 
+	// Project the native workspace before minting the invocation's one-lifetime
+	// MCP credential. A storage failure is unambiguous and retryable: no host
+	// authority or provider task exists yet, so the same invocation ref may
+	// reserve a fresh AgentTeams attempt without reactivating a revoked bearer.
+	if err := a.files.PrepareExecution(ctx, record.Execution, prepared); err != nil {
+		if !reservedByThisDispatch {
+			return AgentTeamsExecutionRef{}, err
+		}
+		return AgentTeamsExecutionRef{}, errors.Join(err, a.store.MarkTerminated(ctx, record.Execution.AgentTeamsTaskID, TerminateReleaseWait))
+	}
 	if err := a.client.PrepareHost(ctx, HostPreparation{
 		HostRef:          record.Execution.HostRef,
 		InvocationID:     prepared.InvocationID,
+		AgentTeamsTaskID: record.Execution.AgentTeamsTaskID,
 		Role:             prepared.Role,
 		Operation:        prepared.Operation,
 		RuntimeConfigRef: prepared.RuntimeConfigRef,
 		EnvelopeRef:      prepared.EnvelopeRef,
 	}); err != nil {
-		return AgentTeamsExecutionRef{}, err
+		// PrepareHost is the last step before delegation. A failure here is
+		// unambiguous: no provider task was accepted, so retaining a reserved
+		// execution can only replay a partially-cleaned preparation (for example,
+		// a one-lifetime MCP bearer that has already been revoked). Close the
+		// durable reservation immediately. DelegateTask failures deliberately do
+		// not use this path because a lost response is ambiguous and must recover
+		// with the same stable AgentTeams task ID.
+		if !reservedByThisDispatch {
+			return AgentTeamsExecutionRef{}, err
+		}
+		cleanupCtx, cancel := boundedAdapterCleanupContext(ctx)
+		defer cancel()
+		return AgentTeamsExecutionRef{}, errors.Join(err, a.Terminate(cleanupCtx, record.Execution, string(TerminateCancel)))
 	}
 	task, err := a.client.DelegateTask(ctx, DelegateTaskRequest{
 		ProjectID: prepared.ProjectID,
@@ -405,6 +433,37 @@ func (a *Adapter) dispatchReserved(ctx context.Context, invocationRef string) (A
 	return record.Execution, nil
 }
 
+// SyncExecutionWorkspace imports the complete native workspace snapshot for a
+// trusted durable execution. It is an internal Runtime operation and is not
+// registered as an Agent-facing tool.
+func (a *Adapter) SyncExecutionWorkspace(ctx context.Context, execution AgentTeamsExecutionRef) (ExecutionWorkspaceCheckpoint, error) {
+	record, ok, err := a.store.GetByTaskID(ctx, execution.AgentTeamsTaskID)
+	if err != nil {
+		return ExecutionWorkspaceCheckpoint{}, err
+	}
+	if !ok || !reflect.DeepEqual(record.Execution, execution) {
+		return ExecutionWorkspaceCheckpoint{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
+	}
+	if record.State != executionDispatched {
+		return ExecutionWorkspaceCheckpoint{}, kernel.StaleBinding("AgentTeams execution is not active for workspace synchronization")
+	}
+	pusher, ok := a.client.(interface {
+		PushExecutionFiles(context.Context, AgentTeamsExecutionRef) error
+	})
+	if !ok {
+		return ExecutionWorkspaceCheckpoint{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "AgentTeams client cannot synchronize execution files", Recoverable: true}
+	}
+	if err := pusher.PushExecutionFiles(ctx, execution); err != nil {
+		return ExecutionWorkspaceCheckpoint{}, err
+	}
+	return a.files.PullExecution(ctx, execution)
+}
+
+func boundedAdapterCleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	const timeout = 5 * time.Second
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
 func (a *Adapter) Terminate(ctx context.Context, execution AgentTeamsExecutionRef, rawMode string) error {
 	mode := TerminateMode(rawMode)
 	if !validTerminateMode(mode) {
@@ -419,26 +478,173 @@ func (a *Adapter) Terminate(ctx context.Context, execution AgentTeamsExecutionRe
 	}
 	if record.State == executionTerminated {
 		if record.TerminationMode == mode {
-			return a.fenceAndRelease(ctx, execution)
+			return nil
 		}
 		return kernel.IdempotencyConflict()
 	}
 	if err := a.client.RevokeInvocation(ctx, execution.HostRef, execution.InvocationID); err != nil {
-		forceErr := a.client.ForceStopHost(ctx, execution.HostRef)
-		var releaseErr error
-		if forceErr == nil {
-			releaseErr = a.client.ReleaseHostSlot(context.Background(), execution.AgentTeamsTaskID, execution.HostRef)
+		// A reserved execution can fail before PrepareHost claims a physical
+		// host slot or creates an invocation credential. In that case there is
+		// no external authority to fence and the durable reservation itself is
+		// the only lifecycle state that must be closed.
+		if record.State == executionReserved && kernel.IsCode(err, kernel.CodeNotFound) {
+			return a.store.MarkTerminated(ctx, execution.AgentTeamsTaskID, mode)
 		}
-		return errors.Join(err, forceErr, releaseErr)
+		forceErr := a.client.ForceStopHost(ctx, execution.HostRef)
+		releaseErr := a.client.ReleaseHostSlot(context.Background(), execution.AgentTeamsTaskID, execution.HostRef)
+		if record.State == executionReserved && forceErr == nil && kernel.IsCode(releaseErr, kernel.CodeNotFound) {
+			// The provider never accepted this reservation, and the physical host
+			// has now been fenced. A missing provider slot is equivalent to an
+			// already-released slot; the durable execution can close safely.
+			releaseErr = nil
+		}
+		if releaseErr != nil {
+			return errors.Join(err, forceErr, releaseErr)
+		}
+		return a.store.MarkTerminated(ctx, execution.AgentTeamsTaskID, mode)
 	}
-	if err := a.client.CancelTask(ctx, execution.AgentTeamsTaskID, terminationReason(mode)); err != nil {
+	check, checkErr := a.client.CheckTask(ctx, execution.AgentTeamsTaskID)
+	if record.State == executionReserved && invocationCarrierCleanupUnavailable(checkErr) {
+		releaseErr := a.client.ReleaseHostSlot(context.Background(), execution.AgentTeamsTaskID, execution.HostRef)
+		markErr := a.store.MarkTerminated(ctx, execution.AgentTeamsTaskID, mode)
+		return errors.Join(releaseErr, markErr)
+	}
+	providerMissing := kernel.IsCode(checkErr, kernel.CodeNotFound) || invocationCarrierCleanupUnavailable(checkErr)
+	if !providerMissing && (checkErr != nil || !isTerminalTaskStatus(check.Task.Status)) {
+		if err := a.client.CancelTask(ctx, execution.AgentTeamsTaskID, terminationReason(mode)); err != nil {
+			return errors.Join(checkErr, err)
+		}
+	}
+	if err := a.client.ReleaseHostSlot(ctx, execution.AgentTeamsTaskID, execution.HostRef); err != nil {
 		return err
 	}
-	if err := a.store.MarkTerminated(ctx, execution.AgentTeamsTaskID, mode); err != nil {
-		_ = a.client.ReleaseHostSlot(context.Background(), execution.AgentTeamsTaskID, execution.HostRef)
+	return a.store.MarkTerminated(ctx, execution.AgentTeamsTaskID, mode)
+}
+
+// FenceExecution validates the durable carrier while Runtime transitions the
+// invocation status that fences subsequent Threadmill tools/call requests. It
+// deliberately keeps the bearer, provider MCP client, task, and occupied slot
+// alive: the bounded agent may still need native file tools and TeamHarness
+// submit_task to finish provider-level bookkeeping.
+func (a *Adapter) FenceExecution(ctx context.Context, execution AgentTeamsExecutionRef) error {
+	record, ok, err := a.store.GetByTaskID(ctx, execution.AgentTeamsTaskID)
+	if err != nil {
 		return err
 	}
-	return a.client.ReleaseHostSlot(ctx, execution.AgentTeamsTaskID, execution.HostRef)
+	if !ok || !reflect.DeepEqual(record.Execution, execution) {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
+	}
+	if record.State == executionTerminated {
+		return nil
+	}
+	return a.client.FenceInvocation(ctx, execution.HostRef, execution.InvocationID)
+}
+
+// ExecutionTerminal reports the provider lifecycle state for a durable
+// execution reference without accepting an untrusted task identifier from the
+// caller. It is used by the production cleanup loop to reclaim a bounded
+// invocation when the AgentTeams worker submitted a terminal result but the
+// invocation never completed its authoritative Threadmill mutation.
+func (a *Adapter) ExecutionTerminal(ctx context.Context, execution AgentTeamsExecutionRef) (bool, error) {
+	record, ok, err := a.store.GetByTaskID(ctx, execution.AgentTeamsTaskID)
+	if err != nil {
+		return false, err
+	}
+	if !ok || !reflect.DeepEqual(record.Execution, execution) {
+		return false, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
+	}
+	check, err := a.client.CheckTask(ctx, execution.AgentTeamsTaskID)
+	if err != nil && kernel.IsCode(err, kernel.CodeExecutorUnavailable) {
+		if _, ok := a.client.(interface {
+			RecoverExecutionHost(context.Context, HostPreparation) error
+		}); ok {
+			if recoverErr := a.recoverExecutionHost(ctx, record); recoverErr != nil {
+				return false, errors.Join(err, recoverErr)
+			}
+			check, err = a.client.CheckTask(ctx, execution.AgentTeamsTaskID)
+		}
+	}
+	if err != nil {
+		return false, err
+	}
+	return isTerminalTaskStatus(check.Task.Status), nil
+}
+
+// FinalizeExecution performs provider-only success bookkeeping after Runtime
+// has already accepted the bounded invocation's terminal mutation. It cannot
+// affect either Threadmill graph or reinterpret the submitted PhaseOutput.
+func (a *Adapter) FinalizeExecution(ctx context.Context, execution AgentTeamsExecutionRef, summary string) error {
+	record, ok, err := a.store.GetByTaskID(ctx, execution.AgentTeamsTaskID)
+	if err != nil {
+		return err
+	}
+	if !ok || !reflect.DeepEqual(record.Execution, execution) {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
+	}
+	finalizer, ok := a.client.(interface {
+		CompleteTask(context.Context, string, string) error
+	})
+	if !ok {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "AgentTeams client cannot finalize provider tasks", Recoverable: true}
+	}
+	return finalizer.CompleteTask(ctx, execution.AgentTeamsTaskID, summary)
+}
+
+// ExecutionActivity returns normalized host lifecycle facts for an already
+// authenticated durable execution reference. Runtime may use these facts with
+// its own persisted timestamps to detect an abandoned bounded invocation; the
+// adapter itself does not mutate Threadmill state or infer graph outcomes.
+func (a *Adapter) ExecutionActivity(ctx context.Context, execution AgentTeamsExecutionRef) (HostActivity, error) {
+	record, ok, err := a.store.GetByTaskID(ctx, execution.AgentTeamsTaskID)
+	if err != nil {
+		return HostActivity{}, err
+	}
+	if !ok || !reflect.DeepEqual(record.Execution, execution) {
+		return HostActivity{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
+	}
+	observer, ok := a.client.(interface {
+		HostActivity(context.Context, string) (HostActivity, error)
+	})
+	if !ok {
+		return HostActivity{}, kernel.Error{Code: kernel.CodeInternalError, Message: "AgentTeams client does not expose bounded execution activity", Recoverable: false}
+	}
+	activity, err := observer.HostActivity(ctx, execution.HostRef)
+	if err != nil && kernel.IsCode(err, kernel.CodeExecutorUnavailable) {
+		if _, ok := a.client.(interface {
+			RecoverExecutionHost(context.Context, HostPreparation) error
+		}); ok {
+			if recoverErr := a.recoverExecutionHost(ctx, record); recoverErr != nil {
+				return HostActivity{}, errors.Join(err, recoverErr)
+			}
+			return observer.HostActivity(ctx, execution.HostRef)
+		}
+	}
+	return activity, err
+}
+
+func (a *Adapter) recoverExecutionHost(ctx context.Context, record executionRecord) error {
+	recoverer, ok := a.client.(interface {
+		RecoverExecutionHost(context.Context, HostPreparation) error
+	})
+	if !ok {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "AgentTeams client cannot recover execution host", Recoverable: true}
+	}
+	prepared, err := a.source.LoadPreparedInvocation(ctx, record.InvocationRef)
+	if err != nil {
+		return err
+	}
+	if prepared.InvocationID != record.Execution.InvocationID {
+		return kernel.IdempotencyConflict()
+	}
+	return recoverer.RecoverExecutionHost(ctx, HostPreparation{
+		HostRef:          record.Execution.HostRef,
+		InvocationID:     prepared.InvocationID,
+		AgentTeamsTaskID: record.Execution.AgentTeamsTaskID,
+		Role:             prepared.Role,
+		Operation:        prepared.Operation,
+		RuntimeConfigRef: prepared.RuntimeConfigRef,
+		EnvelopeRef:      prepared.EnvelopeRef,
+	})
 }
 
 func (a *Adapter) Collect(ctx context.Context, execution AgentTeamsExecutionRef) (UntrustedExecutionResult, error) {
@@ -449,7 +655,7 @@ func (a *Adapter) Collect(ctx context.Context, execution AgentTeamsExecutionRef)
 	if !ok || !reflect.DeepEqual(record.Execution, execution) {
 		return UntrustedExecutionResult{}, kernel.Error{Code: kernel.CodeNotFound, Message: "AgentTeams execution not found"}
 	}
-	if err := a.files.PullExecution(ctx, execution.AgentTeamsTaskID); err != nil {
+	if _, err := a.files.PullExecution(ctx, execution); err != nil {
 		return UntrustedExecutionResult{}, err
 	}
 	check, err := a.client.CheckTask(ctx, execution.AgentTeamsTaskID)
@@ -514,10 +720,16 @@ func (a *Adapter) selectHost(ctx context.Context, prepared PreparedInvocation) (
 	now := a.now()
 	candidates := make([]HostStatus, 0, len(hosts))
 	for _, host := range hosts {
-		if host.Kind != wantKind || host.Phase != "Running" || host.Capacity <= host.ActiveExecutions {
+		if host.Kind != wantKind || !schedulableHostPhase(host.Phase) || host.Capacity <= host.ActiveExecutions {
 			continue
 		}
-		if host.LastHeartbeat.IsZero() || now.Sub(host.LastHeartbeat) > a.heartbeatMaxAge {
+		// Sleeping is a controller-managed, zero-cost carrier state. It has no
+		// live process and therefore cannot emit a heartbeat. Selecting it is
+		// safe because PrepareHost must wake the carrier and fail closed until a
+		// fresh controller heartbeat and the QwenPaw management surfaces are
+		// observed. Running/Ready carriers still require a fresh heartbeat here.
+		if !strings.EqualFold(strings.TrimSpace(host.Phase), "sleeping") &&
+			(host.LastHeartbeat.IsZero() || now.Sub(host.LastHeartbeat) > a.heartbeatMaxAge) {
 			continue
 		}
 		if !containsAll(host.Capabilities, prepared.RequiredCapabilities) {
@@ -535,6 +747,15 @@ func (a *Adapter) selectHost(ctx context.Context, prepared PreparedInvocation) (
 		return candidates[i].Ref < candidates[j].Ref
 	})
 	return candidates[0], nil
+}
+
+func schedulableHostPhase(phase string) bool {
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "running", "ready", "sleeping":
+		return true
+	default:
+		return false
+	}
 }
 
 func validatePreparedInvocation(prepared PreparedInvocation) error {
@@ -611,7 +832,7 @@ func terminationReason(mode TerminateMode) string {
 
 func isTerminalTaskStatus(status string) bool {
 	switch status {
-	case "submitted", "succeeded", "success", "failed", "cancelled", "canceled":
+	case "submitted", "succeeded", "success", "failed", "cancelled", "canceled", "released":
 		return true
 	default:
 		return false

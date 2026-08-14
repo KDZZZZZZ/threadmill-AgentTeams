@@ -99,12 +99,12 @@ func (s *PostgresStore) ReplacePending(ctx context.Context, projectID kernel.Pro
 	if err := kernel.CheckExpectedRevision(next.BaseRevision, current.Revision); err != nil {
 		return GraphSnapshot{}, err
 	}
-	currentState := stateFromSnapshot(current)
-	if err := validatePendingSubgraph(currentState, next); err != nil {
-		return GraphSnapshot{}, err
-	}
 	runtimeState, err := loadRuntimeState(ctx, tx, projectID)
 	if err != nil {
+		return GraphSnapshot{}, err
+	}
+	currentState := stateFromSnapshot(current)
+	if err := validatePendingSubgraph(currentState, runtimeState, next); err != nil {
 		return GraphSnapshot{}, err
 	}
 	if err := validatePendingSubgraphRuntime(runtimeState, next); err != nil {
@@ -126,6 +126,17 @@ func (s *PostgresStore) ReplacePending(ctx context.Context, projectID kernel.Pro
 }
 
 func (s *PostgresStore) Transition(ctx context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, transition GraphTransition) (GraphSnapshot, error) {
+	return s.transition(ctx, projectID, expectedRevision, transitionDecisionRef(transition), transition)
+}
+
+func (s *PostgresStore) TransitionWithDecisionRef(ctx context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, decisionRef string, transition GraphTransition) (GraphSnapshot, error) {
+	if decisionRef == "" {
+		return GraphSnapshot{}, kernel.InvalidArgument("decision_ref is required")
+	}
+	return s.transition(ctx, projectID, expectedRevision, decisionRef, transition)
+}
+
+func (s *PostgresStore) transition(ctx context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, decisionRef string, transition GraphTransition) (GraphSnapshot, error) {
 	if err := requireProject(projectID); err != nil {
 		return GraphSnapshot{}, err
 	}
@@ -156,7 +167,15 @@ func (s *PostgresStore) Transition(ctx context.Context, projectID kernel.Project
 			}
 		}
 	}
+	if transition.TargetKind == TargetTask && transition.Action == "reopen_round" {
+		if err := validateReopenRoundRuntime(runtimeState, transition.TaskID); err != nil {
+			return GraphSnapshot{}, err
+		}
+	}
 	state := stateFromSnapshot(current).clone()
+	if err := validateRuntimeBackedTransition(state, runtimeState, transition); err != nil {
+		return GraphSnapshot{}, err
+	}
 	if err := applyTransition(&state, transition); err != nil {
 		return GraphSnapshot{}, err
 	}
@@ -164,7 +183,7 @@ func (s *PostgresStore) Transition(ctx context.Context, projectID kernel.Project
 		return GraphSnapshot{}, err
 	}
 	updated := state.snapshot(current.Revision.Next())
-	if err := persistGraphSnapshot(ctx, tx, projectID, updated, transitionDecisionRef(transition)); err != nil {
+	if err := persistGraphSnapshot(ctx, tx, projectID, updated, decisionRef); err != nil {
 		return GraphSnapshot{}, err
 	}
 	if err := persistRuntimeBinding(ctx, tx, projectID, transition); err != nil {
@@ -360,7 +379,7 @@ func (s *PostgresStore) claimLeaseAndAppendCommand(ctx context.Context, projectI
 		Action:     action,
 		CauseRef:   causeRef,
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state) VALUES ($1, $2, $3, $4, $5, $6, 'active')`, projectID, leaseRef, endpoint.Ref.TaskID, endpoint.Ref.EndpointID, endpoint.Generation, endpoint.BindingRef); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at) VALUES ($1, $2, $3, $4, $5, $6, 'active', now() + interval '1 hour')`, projectID, leaseRef, endpoint.Ref.TaskID, endpoint.Ref.EndpointID, endpoint.Generation, endpoint.BindingRef); err != nil {
 		return PhaseCommand{}, false, mapPostgresError(err)
 	}
 	if err := insertCommand(ctx, tx, projectID, command); err != nil {
@@ -769,7 +788,7 @@ func loadRuntimeState(ctx context.Context, q postgresDBTX, projectID kernel.Proj
 	if err := rows.Err(); err != nil {
 		return state, mapPostgresError(err)
 	}
-	rows, err = q.QueryContext(ctx, `SELECT lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at IS NOT NULL AND expires_at <= now() FROM coordination_phase_leases WHERE project_id = $1`, projectID)
+	rows, err = q.QueryContext(ctx, `SELECT lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at IS NULL OR expires_at <= now() FROM coordination_phase_leases WHERE project_id = $1`, projectID)
 	if err != nil {
 		return state, mapPostgresError(err)
 	}

@@ -285,16 +285,29 @@ func TestPostgresStoreRuntimeCriticalContextGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unsubscribed, err := restarted.CreateNode(ctx, curator, CreateGeneralNodeRequest{
+		Statement: "general node outside the active subscription", Kind: string(NodeKindFact),
+		SourceRefs: []string{"source:unsubscribed"}, SubgraphIDs: []string{sgB.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.SubmitCandidate(ctx, phase, SubmitCandidateRequest{Candidate: MemoryCandidate{
+		Statement: "This candidate must not claim an unseen node.", Kind: string(NodeKindFact),
+		SourceRefs: []string{"artifact:unseen", "node:" + string(unsubscribed)},
+	}}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("candidate with unsubscribed node_ref = %v, want not_found", err)
+	}
 	candidate, err := restarted.SubmitCandidate(ctx, phase, SubmitCandidateRequest{Candidate: MemoryCandidate{
 		Statement:   "candidate fact",
 		Kind:        string(NodeKindFact),
-		SourceRefs:  []string{"artifact:candidate"},
+		SourceRefs:  []string{"artifact:candidate", "node:" + previousForCandidate.Nodes[0].ID},
 		SubgraphIDs: []string{sgA.ID},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view, err := restarted.ListTaskCandidates(ctx, phase); err != nil || len(view.Candidates) != 1 {
+	if view, err := restarted.ListTaskCandidates(ctx, phase); err != nil || len(view.Candidates) != 1 || !reflect.DeepEqual(view.Candidates[0].Candidate.SourceRefs, []string{"artifact:candidate", "node:" + previousForCandidate.Nodes[0].ID}) {
 		t.Fatalf("candidate view = %#v, %v", view, err)
 	}
 	var creationRaw string
@@ -387,6 +400,53 @@ func TestPostgresEnsureInitialSliceIsAtomicAcrossStores(t *testing.T) {
 	}
 	if activeInitial != 1 {
 		t.Fatalf("active initial subscriptions = %d, want 1", activeInitial)
+	}
+	initial, err := storeA.EnsureInitialSlice(ctx, phase, []string{sg.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.Nodes) != 1 || len(initial.SubscriptionIDs) != 1 {
+		t.Fatalf("persisted initial slice = %#v", initial)
+	}
+	if _, err := storeA.CreateNode(ctx, curator, CreateGeneralNodeRequest{
+		Statement:   "created after initial snapshot",
+		Kind:        string(NodeKindFact),
+		SourceRefs:  []string{"source:after-initial"},
+		SubgraphIDs: []string{sg.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dynamic, err := storeA.MaterializeRuntimeContext(ctx, phase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dynamic.Nodes) != 2 || dynamic.GraphRevision <= initial.GraphRevision {
+		t.Fatalf("dynamic slice = %#v, initial = %#v", dynamic, initial)
+	}
+	replayed, err := storeB.EnsureInitialSlice(ctx, phase, []string{sg.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(replayed, initial) {
+		t.Fatalf("replayed initial slice changed: got %#v want %#v", replayed, initial)
+	}
+	if err := storeA.EndInvocation(ctx, phase, phase.InvocationID); err != nil {
+		t.Fatal(err)
+	}
+	operator := auth.Principal{ActorPrincipalID: "operator-initial", Kind: auth.PrincipalOperator, ProjectID: phase.ProjectID, Role: auth.RoleOperator}
+	inspected, err := storeB.InspectInitialSlice(ctx, operator, phase.InvocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(inspected, initial) {
+		t.Fatalf("historical initial slice = %#v, want %#v", inspected, initial)
+	}
+	var storedSlices int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM context_invocation_initial_slices WHERE project_id=$1 AND consumer_invocation_id=$2`, phase.ProjectID, phase.InvocationID).Scan(&storedSlices); err != nil {
+		t.Fatal(err)
+	}
+	if storedSlices != 1 {
+		t.Fatalf("stored initial slices = %d, want 1", storedSlices)
 	}
 }
 
@@ -508,9 +568,34 @@ func TestPostgresStoreSearchHonorsAnchorRefs(t *testing.T) {
 	}
 
 	searcher := contextPrincipal(auth.ToolContextSearch)
+	searcher.TaskID = "task-anchor"
 	searcher.ConsumerInvocationID = "inv-anchor-consumer"
 	searcher.ConsumerTaskID = "task-anchor"
 	searcher.ConsumerRole = auth.RoleExecutor
+	if _, err := db.ExecContext(ctx, `INSERT INTO context_subgraphs(id, project_id, task_id, name, summary, kind) VALUES ('task-anchor-private', 'project-a', 'task-anchor', 'private', 'private', 'task')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO context_nodes(id, project_id, kind, statement, status, source_refs, creator_agent_id) VALUES ('node-task-private', 'project-a', 'directive', 'needle private task directive', 'accepted', '["source:task"]'::jsonb, 'task-projector')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO context_node_subgraph_memberships(node_id, subgraph_id) VALUES ('node-task-private', 'task-anchor-private')`); err != nil {
+		t.Fatal(err)
+	}
+	unscoped, err := store.Search(ctx, searcher, SearchRequest{Keywords: []string{"needle"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range unscoped.Slice.Nodes {
+		if node.ID == "node-task-private" {
+			t.Fatalf("Postgres context search leaked task node: %#v", unscoped.Slice.Nodes)
+		}
+	}
+	if _, err := store.Search(ctx, searcher, SearchRequest{Keywords: []string{"needle"}, Scope: []string{"subgraph:task-anchor-private"}}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("Postgres task scope err = %v, want not_found", err)
+	}
+	if _, err := store.Search(ctx, searcher, SearchRequest{AnchorRefs: []string{"node:node-task-private"}}); !kernel.IsCode(err, kernel.CodeNotFound) {
+		t.Fatalf("Postgres task node anchor err = %v, want not_found", err)
+	}
 
 	byNode, err := store.Search(ctx, searcher, SearchRequest{Keywords: []string{"needle"}, AnchorRefs: []string{"node:" + string(nodeA)}})
 	if err != nil {

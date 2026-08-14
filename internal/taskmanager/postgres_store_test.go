@@ -51,6 +51,28 @@ func TestPostgresStoreRealDecisionContractReplyRestartAndAuthorization(t *testin
 	if err := store.PersistRequirementContract(ctx, requirement, contractInput); err != nil {
 		t.Fatalf("PersistRequirementContract: %v", err)
 	}
+	secondRequirement := RequirementInput{
+		InputRef:    requirement.InputRef,
+		TaskID:      "pg-task-b",
+		ContractRef: "contract://pg-task-b",
+		Requirement: Requirement{Text: "ship pg task b", Goal: "persist a second task from the same manager input"},
+	}
+	secondContract := TaskContract{
+		TaskID:         secondRequirement.TaskID,
+		ContractRef:    secondRequirement.ContractRef,
+		DeliveryPolicy: DeliveryPolicyExternalDelivery,
+		PhaseSpecs: map[coordination.EndpointID]string{
+			coordination.EndpointPlan:    "artifact://pg-task-b/plan-spec",
+			coordination.EndpointExecute: "artifact://pg-task-b/execute-spec",
+			coordination.EndpointVerify:  "artifact://pg-task-b/verify-spec",
+		},
+	}
+	if err := store.PersistRequirementContract(ctx, secondRequirement, secondContract); err != nil {
+		t.Fatalf("PersistRequirementContract second task from same input: %v", err)
+	}
+	if stored, err := store.TaskContract(ctx, secondRequirement.TaskID); err != nil || stored.ContractRef != secondRequirement.ContractRef {
+		t.Fatalf("second task contract from same input = %#v, %v", stored, err)
+	}
 	result, err := manager.HandleRequirement(ctx, requirement)
 	if err != nil {
 		t.Fatalf("HandleRequirement: %v", err)

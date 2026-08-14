@@ -9,13 +9,14 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import time
 import tempfile
 import zipfile
-from typing import Optional
+from typing import Any, Optional
 
 from qwenpaw_worker.api import QwenPawApiClient
 from qwenpaw_worker.config import WorkerConfig, _relative_storage_prefix
@@ -24,16 +25,35 @@ from qwenpaw_worker.log import configure_worker_logging
 from qwenpaw_worker.sync import FileSync, push_loop
 from qwenpaw_worker.update import MemberRuntimeConfig, RuntimeUpdater
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_AGENT_ID = "default"
 DEFAULT_BUILTIN_QWENPAW_PLUGINS_DIR = Path("/opt/agentteams/qwenpaw-builtin/plugins")
 BUILTIN_QWENPAW_PLUGIN_MARKER = ".agentteams-builtin-plugin.sha256"
 COPAW_MIGRATION_MARKER = ".copaw-migrated"
+THREADMILL_INVOCATION_MCP_KEY = re.compile(
+    r"^threadmill-(?:[0-9a-f]{24}|[0-9a-f]{32})(?:-attempt-[0-9]+)?$"
+)
 SESSION_FILE_PROMPT_POLICY = """Do not read, list, grep, glob, summarize, copy, or expose files under sessions/.
 Session files are runtime-private state and may contain private conversation history.
-This rule applies to all channels, users, and sessions, not only DingTalk."""
+This rule applies to all channels, users, and sessions, not only DingTalk.
+For Threadmill bounded tasks, native read/search/shell filesystem access is limited to the current shared/tasks/<task-id>/ subtree. Do not list shared/tasks, inspect sibling task directories, or read foreign task files.
+After Threadmill accepts a successful terminal mutation, Runtime owns taskflow SUCCESS finalization and always submits empty TeamHarness deliverables. Do not call taskflow submit_task for success and do not place Threadmill artifact refs in TeamHarness deliverables. Only submit BLOCKED or FAILED manually when no authoritative Threadmill terminal mutation was accepted."""
 SESSION_FILE_PROMPT_POLICY_MARKER = "Session files are runtime-private state"
+RESTORED_CONVERSATION_STATE_PATHS = (
+    Path("chats.json"),
+    Path("history.db"),
+    Path("history.db-wal"),
+    Path("history.db-shm"),
+    Path("sessions"),
+    Path("tool_results"),
+    Path("tool-results"),
+    Path("notes"),
+    Path("memory"),
+    Path("mem_metadata"),
+)
 
 
 def _duration_ms(started_at: float) -> int:
@@ -142,17 +162,37 @@ class Worker:
         except Exception as exc:
             self._log_worker_stage_failed("migrate_copaw_state", stage_started, exc)
             return False
-        self._log_worker_stage_complete("migrate_copaw_state", stage_started, migrated=migrated)
+        self._log_worker_stage_complete(
+            "migrate_copaw_state", stage_started, migrated=migrated
+        )
+
+        try:
+            stage_started = self._log_worker_stage_begin(
+                "clear_restored_conversation_state"
+            )
+            cleared = self._clear_restored_conversation_state()
+        except Exception as exc:
+            self._log_worker_stage_failed(
+                "clear_restored_conversation_state", stage_started, exc
+            )
+            return False
+        self._log_worker_stage_complete(
+            "clear_restored_conversation_state", stage_started, cleared=cleared
+        )
 
         # These operations create .qwenpaw and therefore must happen only
         # after storage restore and CoPaw state migration.
         configure_worker_logging(self.config.qwenpaw_working_dir)
         self.config.default_workspace_dir.mkdir(parents=True, exist_ok=True)
         self.heartbeat.persist()
-        self.updater.runtime_config_pull = lambda: self.sync.pull_runtime_config(self.config.runtime_config_path)
+        self.updater.runtime_config_pull = lambda: self.sync.pull_runtime_config(
+            self.config.runtime_config_path
+        )
 
         try:
-            stage_started = self._log_worker_stage_begin("load_runtime_config", path=self.config.runtime_config_path)
+            stage_started = self._log_worker_stage_begin(
+                "load_runtime_config", path=self.config.runtime_config_path
+            )
             runtime_config = self.updater.load()
         except Exception as exc:
             self._log_worker_stage_failed("load_runtime_config", stage_started, exc)
@@ -181,6 +221,19 @@ class Worker:
         self._log_worker_stage_complete("prepare_qwenpaw_runtime", stage_started)
 
         try:
+            stage_started = self._log_worker_stage_begin("prune_stale_threadmill_mcp")
+            pruned = self._prune_stale_threadmill_mcp(runtime_config)
+        except Exception as exc:
+            self._log_worker_stage_failed(
+                "prune_stale_threadmill_mcp", stage_started, exc
+            )
+            self.heartbeat.update("not_ready", str(exc))
+            return False
+        self._log_worker_stage_complete(
+            "prune_stale_threadmill_mcp", stage_started, pruned=pruned
+        )
+
+        try:
             stage_started = self._log_worker_stage_begin("prepare_default_plugins")
             self._prepare_default_plugins()
         except Exception as exc:
@@ -189,12 +242,16 @@ class Worker:
             return False
         self._log_worker_stage_complete("prepare_default_plugins", stage_started)
 
-        stage_started = self._log_worker_stage_begin("start_push_loop", interval_seconds=5)
+        stage_started = self._log_worker_stage_begin(
+            "start_push_loop", interval_seconds=5
+        )
         self._push_task = asyncio.create_task(
             push_loop(self.sync, check_interval=5),
             name=f"qwenpaw-worker-{self.config.worker_name}-push-loop",
         )
-        self._log_worker_stage_complete("start_push_loop", stage_started, interval_seconds=5)
+        self._log_worker_stage_complete(
+            "start_push_loop", stage_started, interval_seconds=5
+        )
         logger.info(
             "qwenpaw worker preparation complete component=worker worker=%s",
             self.config.worker_name,
@@ -228,19 +285,31 @@ class Worker:
                         type(exc).__name__,
                     )
                 setattr(self, attr, None)
-                logger.info("background task stopped component=worker worker=%s task=%s", self.config.worker_name, attr)
+                logger.info(
+                    "background task stopped component=worker worker=%s task=%s",
+                    self.config.worker_name,
+                    attr,
+                )
 
         if self._process is not None and self._process.returncode is None:
             self._process.terminate()
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=10)
-                logger.info("qwenpaw app terminated component=worker worker=%s", self.config.worker_name)
+                logger.info(
+                    "qwenpaw app terminated component=worker worker=%s",
+                    self.config.worker_name,
+                )
             except asyncio.TimeoutError:
                 self._process.kill()
                 await self._process.wait()
-                logger.warning("qwenpaw app killed after stop timeout component=worker worker=%s", self.config.worker_name)
+                logger.warning(
+                    "qwenpaw app killed after stop timeout component=worker worker=%s",
+                    self.config.worker_name,
+                )
         self._process = None
-        logger.info("qwenpaw worker stopped component=worker worker=%s", self.config.worker_name)
+        logger.info(
+            "qwenpaw worker stopped component=worker worker=%s", self.config.worker_name
+        )
 
     def _log_worker_stage_begin(self, stage: str, **fields: object) -> float:
         started_at = time.monotonic()
@@ -252,7 +321,9 @@ class Worker:
         )
         return started_at
 
-    def _log_worker_stage_complete(self, stage: str, started_at: float, **fields: object) -> None:
+    def _log_worker_stage_complete(
+        self, stage: str, started_at: float, **fields: object
+    ) -> None:
         logger.info(
             "startup component=worker stage=%s event=complete worker=%s duration_ms=%s %s",
             stage,
@@ -261,7 +332,9 @@ class Worker:
             _log_fields(**fields),
         )
 
-    def _log_worker_stage_failed(self, stage: str, started_at: float, exc: Exception, **fields: object) -> None:
+    def _log_worker_stage_failed(
+        self, stage: str, started_at: float, exc: Exception, **fields: object
+    ) -> None:
         logger.warning(
             "startup component=worker stage=%s event=failed worker=%s duration_ms=%s error_type=%s error_code=%s %s",
             stage,
@@ -272,7 +345,9 @@ class Worker:
             _log_fields(**fields),
         )
 
-    def _log_plugin_step_begin(self, plugin_name: str, step: str, **fields: object) -> float:
+    def _log_plugin_step_begin(
+        self, plugin_name: str, step: str, **fields: object
+    ) -> float:
         started_at = time.monotonic()
         logger.info(
             "component=plugin plugin=%s step=%s event=begin worker=%s %s",
@@ -283,7 +358,9 @@ class Worker:
         )
         return started_at
 
-    def _log_plugin_step_complete(self, plugin_name: str, step: str, started_at: float, **fields: object) -> None:
+    def _log_plugin_step_complete(
+        self, plugin_name: str, step: str, started_at: float, **fields: object
+    ) -> None:
         logger.info(
             "component=plugin plugin=%s step=%s event=complete worker=%s duration_ms=%s %s",
             plugin_name,
@@ -293,7 +370,14 @@ class Worker:
             _log_fields(**fields),
         )
 
-    def _log_plugin_step_failed(self, plugin_name: str, step: str, started_at: float, exc: Exception, **fields: object) -> None:
+    def _log_plugin_step_failed(
+        self,
+        plugin_name: str,
+        step: str,
+        started_at: float,
+        exc: Exception,
+        **fields: object,
+    ) -> None:
         logger.warning(
             "component=plugin plugin=%s step=%s event=failed worker=%s duration_ms=%s error_type=%s %s",
             plugin_name,
@@ -342,7 +426,9 @@ class Worker:
             copied_paths.extend(self._copy_legacy_tree(legacy_dir, target_dir))
             migrated_directories.append(target_dir)
         if legacy_secret_dir.exists():
-            copied_paths.extend(self._copy_legacy_tree(legacy_secret_dir, target_secret_dir))
+            copied_paths.extend(
+                self._copy_legacy_tree(legacy_secret_dir, target_secret_dir)
+            )
             migrated_directories.append(target_secret_dir)
 
         if legacy_dir.exists():
@@ -402,7 +488,9 @@ class Worker:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(f"cannot rebase migrated workspace metadata: {path}") from exc
+                raise RuntimeError(
+                    f"cannot rebase migrated workspace metadata: {path}"
+                ) from exc
             if update(data):
                 path.write_text(
                     json.dumps(data, ensure_ascii=False, indent=2) + "\n",
@@ -449,9 +537,13 @@ class Worker:
             if source_path.is_symlink():
                 self._remove_path(target_path)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.symlink_to(os.readlink(source_path), target_is_directory=source_path.is_dir())
+                target_path.symlink_to(
+                    os.readlink(source_path), target_is_directory=source_path.is_dir()
+                )
                 if os.readlink(target_path) != os.readlink(source_path):
-                    raise RuntimeError(f"legacy symlink verification failed: {source_path}")
+                    raise RuntimeError(
+                        f"legacy symlink verification failed: {source_path}"
+                    )
                 return
             if source_path.is_dir():
                 if (target_path.exists() or target_path.is_symlink()) and (
@@ -470,7 +562,9 @@ class Worker:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, target_path)
                 if not filecmp.cmp(source_path, target_path, shallow=False):
-                    raise RuntimeError(f"legacy file verification failed: {source_path}")
+                    raise RuntimeError(
+                        f"legacy file verification failed: {source_path}"
+                    )
                 copied_paths.append(target_path)
                 return
             raise RuntimeError(f"unsupported legacy state entry: {source_path}")
@@ -489,6 +583,19 @@ class Worker:
         for path in (legacy_dir, legacy_secret_dir):
             if path.exists() or path.is_symlink():
                 self._remove_path(path)
+
+    def _clear_restored_conversation_state(self) -> int:
+        cleared = 0
+        for relative in RESTORED_CONVERSATION_STATE_PATHS:
+            target = self.config.default_workspace_dir / relative
+            if target.exists() or target.is_symlink():
+                self._remove_path(target)
+                cleared += 1
+        for target in self.config.default_workspace_dir.glob("history.db.corrupt-*"):
+            if target.exists() or target.is_symlink():
+                self._remove_path(target)
+                cleared += 1
+        return cleared
 
     def _prepare_env(self) -> None:
         os.environ["AGENTTEAMS_AGENT_NAME"] = self.config.agent_name
@@ -509,8 +616,85 @@ class Worker:
         os.environ["AGENTTEAMS_SHARED_DIR"] = str(self.config.shared_dir)
         os.environ["TEAMHARNESS_SHARED_DIR"] = str(self.config.shared_dir)
         os.environ["TEAMHARNESS_RUNTIME_CONFIG"] = str(self.config.runtime_config_path)
-        os.environ.setdefault("QWENPAW_SECRET_DIR", f"{self.config.qwenpaw_working_dir}.secret")
+        os.environ.setdefault(
+            "QWENPAW_SECRET_DIR", f"{self.config.qwenpaw_working_dir}.secret"
+        )
         os.environ.setdefault("QWENPAW_RUNNING_IN_CONTAINER", "true")
+
+    def _prune_stale_threadmill_mcp(self, runtime_config: MemberRuntimeConfig) -> int:
+        desired = self._desired_threadmill_mcp_keys(runtime_config)
+        credentials_path = self.config.default_workspace_dir / "credentials.yaml"
+        credentials_doc = self._load_yaml_mapping(credentials_path)
+        credentials = credentials_doc.get("credentials")
+        if not isinstance(credentials, dict):
+            credentials = {}
+
+        pruned = 0
+        driver_dir = self.config.default_workspace_dir / "drivers" / "mcp"
+        for card_path in sorted(driver_dir.glob("threadmill-*.yaml")):
+            key = card_path.stem
+            if not THREADMILL_INVOCATION_MCP_KEY.fullmatch(key) or key in desired:
+                continue
+            card = self._load_yaml_mapping(card_path)
+            credential_refs = self._mcp_card_credential_refs(card)
+            card_path.unlink(missing_ok=True)
+            for ref in credential_refs | {f"mcp/{key}"}:
+                credentials.pop(ref, None)
+            pruned += 1
+
+        if pruned:
+            credentials_doc["credentials"] = credentials
+            self._write_yaml_mapping(credentials_path, credentials_doc)
+        return pruned
+
+    def _desired_threadmill_mcp_keys(
+        self, runtime_config: MemberRuntimeConfig
+    ) -> set[str]:
+        try:
+            servers = self.updater._mcporter_servers(runtime_config)
+        except Exception:
+            return set()
+        return {
+            str(key)
+            for key in servers
+            if THREADMILL_INVOCATION_MCP_KEY.fullmatch(str(key))
+        }
+
+    def _managed_threadmill_mcp_keys(self, path: Path) -> set[str]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, TypeError):
+            return set()
+        if not isinstance(raw, list):
+            return set()
+        return {
+            str(item)
+            for item in raw
+            if THREADMILL_INVOCATION_MCP_KEY.fullmatch(str(item))
+        }
+
+    def _mcp_card_credential_refs(self, card: dict[str, Any]) -> set[str]:
+        refs: set[str] = set()
+        credentials = card.get("credentials")
+        if isinstance(credentials, dict):
+            for value in credentials.values():
+                if isinstance(value, dict) and isinstance(value.get("ref"), str):
+                    refs.add(value["ref"])
+        return refs
+
+    def _load_yaml_mapping(self, path: Path) -> dict[str, Any]:
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _write_yaml_mapping(self, path: Path, value: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            yaml.safe_dump(value, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
 
     def _link_workspace_shared(self) -> None:
         shared_dir = self._workspace_shared_dir or self.config.shared_dir
@@ -563,7 +747,10 @@ class Worker:
             self._apply_runtime_storage(runtime_config)
             self._link_workspace_shared()
             return
-        current_prefix = os.getenv("AGENTTEAMS_SHARED_STORAGE_PREFIX", "").strip() or self.config.shared_prefix
+        current_prefix = (
+            os.getenv("AGENTTEAMS_SHARED_STORAGE_PREFIX", "").strip()
+            or self.config.shared_prefix
+        )
         if self._workspace_shared_dir == shared_dir and current_prefix == shared_prefix:
             return
         self._apply_runtime_storage(runtime_config)
@@ -573,7 +760,11 @@ class Worker:
 
     def _runtime_shared_prefix(self, runtime_config) -> str:
         storage = getattr(runtime_config, "storage", {}) or {}
-        prefix = str(storage.get("sharedPrefix") or "").strip() if isinstance(storage, dict) else ""
+        prefix = (
+            str(storage.get("sharedPrefix") or "").strip()
+            if isinstance(storage, dict)
+            else ""
+        )
         if not prefix:
             return self.config.shared_prefix
         return _relative_storage_prefix(prefix, self.config.fs_bucket)
@@ -607,7 +798,9 @@ class Worker:
         self.config.default_workspace_dir.mkdir(parents=True, exist_ok=True)
         for file_name in ("AGENTS.md", "SOUL.md"):
             prompt_file = self.config.default_workspace_dir / file_name
-            existing = prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else ""
+            existing = (
+                prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else ""
+            )
             if SESSION_FILE_PROMPT_POLICY_MARKER in existing:
                 continue
             separator = "\n" if existing and not existing.endswith("\n") else ""
@@ -647,7 +840,9 @@ class Worker:
         try:
             self._validate_builtin_plugin(plugin_name, source_dir)
             if self._builtin_plugin_current(source_dir, target_dir):
-                self._log_plugin_step_complete(plugin_name, "prepare_builtin", step_started, action="unchanged")
+                self._log_plugin_step_complete(
+                    plugin_name, "prepare_builtin", step_started, action="unchanged"
+                )
                 return
             if target_dir.is_symlink() or target_dir.is_file():
                 target_dir.unlink()
@@ -656,17 +851,25 @@ class Worker:
             target_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(source_dir, target_dir)
         except Exception as exc:
-            self._log_plugin_step_failed(plugin_name, "prepare_builtin", step_started, exc)
+            self._log_plugin_step_failed(
+                plugin_name, "prepare_builtin", step_started, exc
+            )
             raise
-        self._log_plugin_step_complete(plugin_name, "prepare_builtin", step_started, action="copied")
+        self._log_plugin_step_complete(
+            plugin_name, "prepare_builtin", step_started, action="copied"
+        )
 
     def _validate_builtin_plugin(self, plugin_name: str, plugin_dir: Path) -> None:
         if not plugin_dir.is_dir():
-            raise RuntimeError(f"built-in {plugin_name} qwenpaw plugin missing: {plugin_dir}")
+            raise RuntimeError(
+                f"built-in {plugin_name} qwenpaw plugin missing: {plugin_dir}"
+            )
         for file_name in ("plugin.json", "plugin.py", BUILTIN_QWENPAW_PLUGIN_MARKER):
             path = plugin_dir / file_name
             if not path.is_file():
-                raise RuntimeError(f"built-in {plugin_name} qwenpaw plugin file missing: {path}")
+                raise RuntimeError(
+                    f"built-in {plugin_name} qwenpaw plugin file missing: {path}"
+                )
 
     def _builtin_plugin_current(self, source_dir: Path, target_dir: Path) -> bool:
         source_marker = source_dir / BUILTIN_QWENPAW_PLUGIN_MARKER
@@ -704,7 +907,9 @@ class Worker:
                 "/opt/agentteams/plugins/teamharness-qwenpaw.zip",
             )
         )
-        self._install_qwenpaw_plugin_package("teamharness", plugin_source, "teamharness-qwenpaw-plugin-")
+        self._install_qwenpaw_plugin_package(
+            "teamharness", plugin_source, "teamharness-qwenpaw-plugin-"
+        )
 
     def _install_workerflow_plugin(self) -> None:
         plugin_source = Path(
@@ -713,13 +918,17 @@ class Worker:
                 "/opt/agentteams/plugins/workerflow-qwenpaw.zip",
             )
         )
-        self._install_qwenpaw_plugin_package("workerflow", plugin_source, "workerflow-qwenpaw-plugin-")
+        self._install_qwenpaw_plugin_package(
+            "workerflow", plugin_source, "workerflow-qwenpaw-plugin-"
+        )
 
     def _install_default_plugins(self) -> None:
         self._install_teamharness_plugin()
         self._install_workerflow_plugin()
 
-    def _install_qwenpaw_plugin_package(self, plugin_name: str, plugin_source: Path, temp_prefix: str) -> None:
+    def _install_qwenpaw_plugin_package(
+        self, plugin_name: str, plugin_source: Path, temp_prefix: str
+    ) -> None:
         package_type = self._qwenpaw_plugin_package_type(plugin_source)
         step_started = self._log_plugin_step_begin(
             plugin_name,
@@ -729,20 +938,32 @@ class Worker:
         )
         try:
             if not plugin_source.exists():
-                raise RuntimeError(f"{plugin_name} qwenpaw plugin package missing: {plugin_source}")
-            qwenpaw_bin = shutil.which("qwenpaw") or str(Path(sys.executable).with_name("qwenpaw"))
+                raise RuntimeError(
+                    f"{plugin_name} qwenpaw plugin package missing: {plugin_source}"
+                )
+            qwenpaw_bin = shutil.which("qwenpaw") or str(
+                Path(sys.executable).with_name("qwenpaw")
+            )
             if plugin_source.is_dir():
                 self._run_qwenpaw_plugin_install(qwenpaw_bin, plugin_source)
             elif zipfile.is_zipfile(plugin_source):
                 with tempfile.TemporaryDirectory(prefix=temp_prefix) as tmp:
-                    package_dir = self._extract_qwenpaw_plugin_zip(plugin_source, Path(tmp))
+                    package_dir = self._extract_qwenpaw_plugin_zip(
+                        plugin_source, Path(tmp)
+                    )
                     self._run_qwenpaw_plugin_install(qwenpaw_bin, package_dir)
             else:
-                raise RuntimeError(f"{plugin_name} qwenpaw plugin package must be a directory or zip: {plugin_source}")
+                raise RuntimeError(
+                    f"{plugin_name} qwenpaw plugin package must be a directory or zip: {plugin_source}"
+                )
         except Exception as exc:
-            self._log_plugin_step_failed(plugin_name, "install", step_started, exc, package_type=package_type)
+            self._log_plugin_step_failed(
+                plugin_name, "install", step_started, exc, package_type=package_type
+            )
             raise
-        self._log_plugin_step_complete(plugin_name, "install", step_started, package_type=package_type)
+        self._log_plugin_step_complete(
+            plugin_name, "install", step_started, package_type=package_type
+        )
 
     def _qwenpaw_plugin_package_type(self, plugin_source: Path) -> str:
         if plugin_source.is_dir():
@@ -779,7 +1000,9 @@ class Worker:
         return packages[0]
 
     async def _run_qwenpaw(self) -> None:
-        qwenpaw_bin = shutil.which("qwenpaw") or str(Path(sys.executable).with_name("qwenpaw"))
+        qwenpaw_bin = shutil.which("qwenpaw") or str(
+            Path(sys.executable).with_name("qwenpaw")
+        )
         host = "0.0.0.0"
         log_level = os.getenv("QWENPAW_LOG_LEVEL", "info")
         command = [
@@ -854,6 +1077,14 @@ class Worker:
             )
             self._ensure_session_file_prompt_policy()
             self._log_worker_stage_complete("apply_desired_state", stage_started)
+            self.heartbeat.update(
+                "ready",
+                "qwenpaw worker startup complete",
+                {
+                    "operation": "startup",
+                    "generation": runtime_config.generation,
+                },
+            )
         except Exception as exc:
             if self._process.returncode is not None:
                 returncode = self._process.returncode
@@ -934,7 +1165,6 @@ class Worker:
         raise RuntimeError(f"qwenpaw API did not become ready: {last_error}")
 
     def _configure_builtin_plugin_mcp_clients(self) -> None:
-        existing = {str(item.get("key")) for item in self.api_client.list_mcp()}
         for plugin_id in ("teamharness", "workerflow"):
             plugin_dir = self.config.qwenpaw_working_dir / "plugins" / plugin_id
             asset_dir = plugin_dir / plugin_id
@@ -968,7 +1198,7 @@ class Worker:
                 },
                 "cwd": str(asset_dir),
             }
-            if plugin_id in existing:
+            if self.api_client.get_mcp_if_present(plugin_id) is not None:
                 self.api_client.update_mcp(plugin_id, payload)
             else:
                 self.api_client.create_mcp(plugin_id, payload)

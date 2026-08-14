@@ -39,6 +39,13 @@ func TestBuildSearchRequestExtractsKeywordsScopeAndAnchors(t *testing.T) {
 	}
 }
 
+func TestBuildSearchRequestKeepsBoundedChineseDomainPhrases(t *testing.T) {
+	req := BuildSearchRequest("请查找关于并发控制的关键判断")
+	if want := []string{"并发控制", "关键判断"}; !reflect.DeepEqual(req.Keywords, want) {
+		t.Fatalf("Chinese keywords = %#v, want %#v", req.Keywords, want)
+	}
+}
+
 func TestRetrieveRejectsEmptyQueryAndUntrustedPrincipalWithoutSearching(t *testing.T) {
 	searcher := &recordingSearcher{}
 	agent := Agent{Searcher: searcher}
@@ -47,6 +54,9 @@ func TestRetrieveRejectsEmptyQueryAndUntrustedPrincipalWithoutSearching(t *testi
 		if _, err := agent.Retrieve(context.Background(), trusted, ContextRetrieveRequest{Query: query}); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
 			t.Fatalf("empty query err = %v, want invalid_request", err)
 		}
+	}
+	if _, err := agent.Retrieve(context.Background(), trusted, ContextRetrieveRequest{Query: "请查找上下文节点"}); !kernel.IsCode(err, kernel.CodeInvalidRequest) {
+		t.Fatalf("unbounded navigation-only query err = %v, want invalid_request", err)
 	}
 	phase := auth.Principal{
 		Role:         auth.RoleExecutor,

@@ -4,9 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
+
+// defaultPhaseLeaseTTL matches the Phase Controller invocation TTL. The graph
+// lease is the scheduler-side lifetime boundary for that same execution.
+const defaultPhaseLeaseTTL = time.Hour
 
 type commandRecord struct {
 	Command           PhaseCommand
@@ -24,6 +29,7 @@ type phaseLease struct {
 	Generation int
 	BindingRef kernel.BindingRef
 	State      string
+	ExpiresAt  time.Time
 	Expired    bool
 }
 
@@ -70,7 +76,18 @@ func (s *MemoryStore) loadRuntimeView(ctx context.Context, projectID kernel.Proj
 	defer s.mu.Unlock()
 
 	project := s.ensureProject(projectID)
-	return newRuntimeView(project), nil
+	view := newRuntimeView(project)
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	for ref, lease := range view.leases {
+		// A missing deadline is legacy unbounded state and therefore cannot be
+		// trusted as a live execution after recovery.
+		lease.Expired = lease.Expired || lease.ExpiresAt.IsZero() || !lease.ExpiresAt.After(now)
+		view.leases[ref] = lease
+	}
+	return view, nil
 }
 
 func (s *MemoryStore) markCommandObserved(ctx context.Context, projectID kernel.ProjectID, observation phaseObservation) error {
@@ -240,9 +257,18 @@ func (s *MemoryStore) claimLeaseAndAppendCommand(ctx context.Context, projectID 
 		Generation: endpoint.Generation,
 		BindingRef: endpoint.BindingRef,
 		State:      "active",
+		ExpiresAt:  s.leaseDeadline(),
 	}
 	project.runtime.commands[command.ID] = commandRecord{Command: command}
 	return command, true, nil
+}
+
+func (s *MemoryStore) leaseDeadline() time.Time {
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	return now.Add(defaultPhaseLeaseTTL)
 }
 
 func existingRunCommand(project *projectState, ref PhaseEndpointRef, generation int) PhaseCommand {

@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextgraph"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mergequeue"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	phasepkg "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/taskmanager"
@@ -26,16 +29,25 @@ import (
 // row selected when the invocation was created. InputRef, graph revision,
 // endpoint and decision reference never come from Agent JSON.
 type productionTaskManagerRuntime struct {
-	db          *sql.DB
-	projectID   kernel.ProjectID
-	graphStore  *coordination.PostgresStore
-	decisions   *taskmanager.PostgresStore
-	idempotency kernel.IdempotencyStore
-	workspaces  productionTaskWorkspaceProvisioner
-	contexts    productionTaskContextProjector
-	followups   productionTaskManagerFollowupDispatcher
-	events      evidence.EventStore
-	now         func() time.Time
+	db            *sql.DB
+	projectID     kernel.ProjectID
+	graphStore    *coordination.PostgresStore
+	decisions     productionTaskManagerDecisionStore
+	idempotency   kernel.IdempotencyStore
+	workspaces    productionTaskWorkspaceProvisioner
+	contexts      productionTaskContextProjector
+	memory        contextgraph.TaskMemoryFinalizer
+	merge         productionTaskMergeScheduler
+	mergeEvidence productionTaskMergeEvidenceReader
+	followups     productionTaskManagerFollowupDispatcher
+	events        evidence.EventStore
+	now           func() time.Time
+}
+
+type productionTaskManagerDecisionStore interface {
+	SubmitDecision(context.Context, taskmanager.DecisionSubmission) (string, error)
+	PersistRequirementContract(context.Context, taskmanager.RequirementInput, taskmanager.TaskContract) error
+	TaskContract(context.Context, kernel.TaskID) (taskmanager.TaskContract, error)
 }
 
 // These ports deliberately expose only Runtime-owned provisioning and
@@ -53,9 +65,20 @@ type productionTaskManagerFollowupDispatcher interface {
 	DispatchTaskManagerFollowup(context.Context, productionInput) (persistedProductionInput, error)
 }
 
+type productionTaskMergeScheduler interface {
+	EnqueueExecutedTask(context.Context, productionPhaseEvaluationBoundary) error
+}
+
+type productionTaskMergeEvidenceReader interface {
+	CodeMergeEvidence(context.Context, kernel.TaskID, string) (taskmanager.DeliveryEvidence, []string, bool, error)
+}
+
 type productionTaskWorkspaceRequest struct {
 	TaskID     kernel.TaskID
 	Generation int
+	// BaseRevision is set only for a Manager-approved fresh round. Generation
+	// zero asks the provisioner to allocate/reuse the next unused Task round.
+	BaseRevision string
 }
 
 type productionTaskContextRequest struct {
@@ -111,6 +134,13 @@ type productionPhaseEvaluationBoundary struct {
 	BindingRef     kernel.BindingRef             `json:"binding_ref"`
 }
 
+type productionTaskCompletionBoundary struct {
+	SourceInputRef string                        `json:"source_input_ref"`
+	TaskID         kernel.TaskID                 `json:"task_id"`
+	VerifyEndpoint coordination.PhaseEndpointRef `json:"verify_endpoint"`
+	VerifyOutput   productionPhaseOutputBoundary `json:"verify_output"`
+}
+
 type productionPhaseStoppedBoundary struct {
 	CommandID     string                        `json:"command_id"`
 	Endpoint      coordination.PhaseEndpointRef `json:"endpoint"`
@@ -119,6 +149,15 @@ type productionPhaseStoppedBoundary struct {
 	LeaseRef      kernel.LeaseID                `json:"lease_ref"`
 	CheckpointRef string                        `json:"checkpoint_ref"`
 	NonResumable  bool                          `json:"non_resumable"`
+}
+
+type productionPhaseFailedBoundary struct {
+	CommandID     string                        `json:"command_id"`
+	CommandAction coordination.CommandAction    `json:"command_action"`
+	Endpoint      coordination.PhaseEndpointRef `json:"endpoint"`
+	Generation    int                           `json:"generation"`
+	BindingRef    kernel.BindingRef             `json:"binding_ref"`
+	LeaseRef      kernel.LeaseID                `json:"lease_ref"`
 }
 
 type productionStopReleaseBoundary struct {
@@ -148,6 +187,23 @@ func (p *productionTaskManagerRuntime) setProductionDependencies(workspaces prod
 	return nil
 }
 
+func (p *productionTaskManagerRuntime) setProductionMemoryFinalizer(finalizer contextgraph.TaskMemoryFinalizer) error {
+	if finalizer == nil {
+		return kernel.InvalidArgument("production Task Manager memory finalizer is required")
+	}
+	p.memory = finalizer
+	return nil
+}
+
+func (p *productionTaskManagerRuntime) setProductionMergeQueue(scheduler productionTaskMergeScheduler, evidence productionTaskMergeEvidenceReader) error {
+	if scheduler == nil || evidence == nil {
+		return kernel.InvalidArgument("production Task Manager merge queue dependencies are required")
+	}
+	p.merge = scheduler
+	p.mergeEvidence = evidence
+	return nil
+}
+
 func (p *productionTaskManagerRuntime) setProductionEventStore(events evidence.EventStore) error {
 	if events == nil {
 		return kernel.InvalidArgument("production Task Manager event store is required")
@@ -156,11 +212,154 @@ func (p *productionTaskManagerRuntime) setProductionEventStore(events evidence.E
 	return nil
 }
 
-func (p *productionTaskManagerRuntime) Snapshot(ctx context.Context, caller auth.Principal, scope auth.BoundScope, revision kernel.Revision) (coordination.GraphSnapshot, error) {
+func (p *productionTaskManagerRuntime) Snapshot(ctx context.Context, caller auth.Principal, scope auth.BoundScope, revision kernel.Revision) (mcpapi.TaskManagerSnapshot, error) {
 	if _, err := p.binding(ctx, caller, scope); err != nil {
-		return coordination.GraphSnapshot{}, err
+		return mcpapi.TaskManagerSnapshot{}, err
 	}
-	return p.graph(caller).Snapshot(ctx, revision)
+	snapshot, err := p.graph(caller).Snapshot(ctx, revision)
+	if err != nil {
+		return mcpapi.TaskManagerSnapshot{}, err
+	}
+	deliveries, err := p.taskManagerDeliveryStates(ctx, snapshot)
+	if err != nil {
+		return mcpapi.TaskManagerSnapshot{}, err
+	}
+	return mcpapi.TaskManagerSnapshot{GraphSnapshot: snapshot, Deliveries: deliveries}, nil
+}
+
+func (p *productionTaskManagerRuntime) taskManagerDeliveryStates(ctx context.Context, snapshot coordination.GraphSnapshot) ([]mcpapi.TaskManagerDeliveryState, error) {
+	activeTasks := make(map[kernel.TaskID]struct{}, len(snapshot.Tasks))
+	for _, task := range snapshot.Tasks {
+		activeTasks[task.ID] = struct{}{}
+	}
+	rows, err := p.db.QueryContext(ctx, `
+SELECT c.task_id,
+       c.delivery_policy,
+       COALESCE(latest.id, ''),
+       COALESCE(latest.status, ''),
+       COALESCE(delivery.status, ''),
+       COALESCE(latest.failure_reason, ''),
+       COALESCE(latest.failure_evidence_ref, ''),
+       COALESCE(replan.target_ref, ''),
+       CASE
+         WHEN c.delivery_policy <> $2 THEN TRUE
+         ELSE EXISTS (
+           SELECT 1
+           FROM merge_candidates merged
+           JOIN production_merge_deliveries delivered
+             ON delivered.project_id=merged.project_id
+            AND delivered.candidate_id=merged.id
+           WHERE merged.project_id=c.project_id
+             AND merged.task_id=c.task_id
+             AND merged.status='merged'
+             AND delivered.status='delivered'
+         )
+       END AS ready_for_verify
+FROM taskmanager_contracts c
+LEFT JOIN LATERAL (
+  SELECT candidate.id, candidate.status, candidate.failure_reason,
+         candidate.failure_evidence_ref
+  FROM merge_candidates candidate
+  WHERE candidate.project_id=c.project_id AND candidate.task_id=c.task_id
+  ORDER BY candidate.updated_at DESC, candidate.id DESC
+  LIMIT 1
+) latest ON TRUE
+LEFT JOIN production_merge_deliveries delivery
+  ON delivery.project_id=c.project_id AND delivery.candidate_id=latest.id
+LEFT JOIN LATERAL (
+  SELECT manager_input.target_ref
+  FROM production_manager_inputs manager_input
+  WHERE manager_input.project_id=c.project_id
+    AND manager_input.input_kind='phase_orchestration'
+    AND manager_input.target_kind='phase_orchestration'
+    AND manager_input.selected_task_id=c.task_id
+    AND manager_input.selected_endpoint_id=$3
+    AND manager_input.status='completed'
+    AND manager_input.payload->>'source_kind'=$4
+    AND manager_input.payload->>'candidate_id'=latest.id
+    AND manager_input.payload->>'orchestration_advice'=$5
+    AND manager_input.target_ref=manager_input.payload->>'proposal_id'
+  ORDER BY manager_input.created_at DESC, manager_input.input_ref DESC
+  LIMIT 1
+) replan ON TRUE
+WHERE c.project_id=$1
+ORDER BY c.task_id`, p.projectID, taskmanager.DeliveryPolicyCodeMerge, coordination.EndpointVerify, productionTargetedVerifyProposalSource, phasepkg.OrchestrationReplan)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	deliveries := make([]mcpapi.TaskManagerDeliveryState, 0, len(activeTasks))
+	for rows.Next() {
+		var state mcpapi.TaskManagerDeliveryState
+		if err := rows.Scan(
+			&state.TaskID,
+			&state.DeliveryPolicy,
+			&state.LatestCandidateID,
+			&state.LatestCandidateStatus,
+			&state.LatestDeliveryStatus,
+			&state.LatestFailureReason,
+			&state.LatestFailureEvidenceRef,
+			&state.LatestReplanProposalRef,
+			&state.ReadyForVerify,
+		); err != nil {
+			return nil, err
+		}
+		if _, exists := activeTasks[state.TaskID]; exists {
+			state.ReopenRoundAvailable = productionReopenRoundAvailable(snapshot, state)
+			deliveries = append(deliveries, state)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return deliveries, nil
+}
+
+// productionReopenRoundAvailable is a read-only recovery hint. It never
+// grants graph authority: trustedTargetedVerifyReopenRound still revalidates
+// the candidate, verifier invocation, binding, workspace, delivery and
+// proposal before registering a decision. Keeping the hint in the snapshot
+// lets Manager choose a recoverable task without searching unrelated memory.
+func productionReopenRoundAvailable(snapshot coordination.GraphSnapshot, state mcpapi.TaskManagerDeliveryState) bool {
+	if state.DeliveryPolicy != taskmanager.DeliveryPolicyCodeMerge || state.LatestReplanProposalRef == "" || state.ReadyForVerify {
+		return false
+	}
+	if (state.LatestCandidateStatus != string(mergequeue.StatusTargetedVerify) && state.LatestCandidateStatus != string(mergequeue.StatusFailed)) ||
+		(state.LatestDeliveryStatus != "queued" && state.LatestDeliveryStatus != "failed") {
+		return false
+	}
+	taskActive := false
+	for _, task := range snapshot.Tasks {
+		if task.ID == state.TaskID {
+			taskActive = task.Outcome == coordination.TaskActive
+			break
+		}
+	}
+	if !taskActive {
+		return false
+	}
+	var plan, execute, verify *coordination.PhaseEndpoint
+	for i := range snapshot.Endpoints {
+		endpoint := &snapshot.Endpoints[i]
+		if endpoint.Ref.TaskID != state.TaskID {
+			continue
+		}
+		switch endpoint.Ref.EndpointID {
+		case coordination.EndpointPlan:
+			plan = endpoint
+		case coordination.EndpointExecute:
+			execute = endpoint
+		case coordination.EndpointVerify:
+			verify = endpoint
+		}
+	}
+	if plan == nil || execute == nil || verify == nil || plan.State != coordination.EndpointSatisfied ||
+		execute.RunPolicy == coordination.RunHeld || verify.RunPolicy == coordination.RunHeld {
+		return false
+	}
+	executeComplete := execute.State == coordination.EndpointSatisfied || execute.State == coordination.EndpointRejected
+	verifyReopenable := verify.State == coordination.EndpointPending || verify.State == coordination.EndpointSatisfied || verify.State == coordination.EndpointRejected
+	return executeComplete && verifyReopenable
 }
 
 func (p *productionTaskManagerRuntime) SubmitTaskManagerDecision(ctx context.Context, caller auth.Principal, scope auth.BoundScope, decision taskmanager.TaskManagerDecision) (string, error) {
@@ -190,10 +389,13 @@ func (p *productionTaskManagerRuntime) SubmitTaskManagerDecision(ctx context.Con
 	if err != nil {
 		return "", err
 	}
-	if snapshot.Revision != binding.SeenRevision {
-		return "", kernel.RevisionConflict(binding.SeenRevision, snapshot.Revision)
-	}
-	kind, transition, err := trustedDecisionMutation(binding, snapshot, decision)
+	// The immutable boundary revision remains audit input, but it cannot become
+	// a permanent deadlock after the Agent follows the contract and re-reads the
+	// latest snapshot. The Agent never submits an expected revision: Runtime
+	// binds the decision and its one allowed mutation to this authoritative
+	// snapshot revision, then persists that base in taskmanager_decisions.
+	binding.SeenRevision = snapshot.Revision
+	kind, transition, err := p.trustedDecisionMutation(ctx, binding, snapshot, decision)
 	if err != nil {
 		return "", err
 	}
@@ -239,7 +441,7 @@ func (p *productionTaskManagerRuntime) ReplacePending(ctx context.Context, calle
 	if err != nil {
 		return 0, err
 	}
-	plan, err := p.normalizePending(binding, base, intent)
+	plan, err := p.normalizePending(ctx, binding, base, intent)
 	if err != nil {
 		return 0, err
 	}
@@ -298,6 +500,11 @@ func (p *productionTaskManagerRuntime) Transition(ctx context.Context, caller au
 		}
 		return revision, nil
 	}
+	if binding.DecisionAction == "reopen_round" {
+		if err := p.ensureTargetedVerifyReopenWorkspace(ctx, binding); err != nil {
+			return 0, err
+		}
+	}
 	revision, err := p.graph(caller).Transition(ctx, binding.SeenRevision, binding.DecisionRef)
 	if err != nil {
 		return 0, err
@@ -311,9 +518,55 @@ func (p *productionTaskManagerRuntime) Transition(ctx context.Context, caller au
 	return revision, nil
 }
 
-func (p *productionTaskManagerRuntime) normalizePending(binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, intent mcpapi.PendingSubgraphIntent) (productionPendingPlan, error) {
+// RecoverPersistedTaskManagerDecision mechanically retries a transition that
+// the Task Manager already decided and persisted before its bounded provider
+// execution failed. Re-dispatching the model here is both unnecessary and
+// unsafe: harmless wording variation would conflict with the immutable
+// decision even though the graph mutation is still pending.
+func (p *productionTaskManagerRuntime) RecoverPersistedTaskManagerDecision(ctx context.Context, invocationID kernel.InvocationID) (bool, error) {
+	if invocationID == "" {
+		return false, kernel.InvalidArgument("Task Manager invocation_id is required")
+	}
+	caller := auth.Principal{
+		ActorPrincipalID: kernel.ActorPrincipalID("production-task-manager:" + string(p.projectID)),
+		Kind:             auth.PrincipalAgent,
+		ProjectID:        p.projectID,
+		InvocationID:     invocationID,
+		Role:             auth.RoleTaskManager,
+		Tools: auth.ToolSet(
+			auth.ToolCoordinationSnapshot,
+			auth.ToolTaskManagerSubmitDecision,
+			auth.ToolCoordinationTransition,
+		),
+	}
+	scope := auth.BoundScope{ProjectID: p.projectID, InvocationID: invocationID}
+	binding, err := p.binding(ctx, caller, scope)
+	if err != nil {
+		return false, err
+	}
+	if binding.DecisionRef == "" || binding.DecisionKind != taskmanager.DecisionKindTransition {
+		return false, nil
+	}
+	_, err = p.Transition(ctx, caller, scope)
+	return true, err
+}
+
+func (p *productionTaskManagerRuntime) normalizePending(ctx context.Context, binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, intent mcpapi.PendingSubgraphIntent) (productionPendingPlan, error) {
 	if len(intent.Endpoints) == 0 {
 		return productionPendingPlan{}, kernel.InvalidArgument("pending subgraph endpoints are required")
+	}
+	taskPolicies := make(map[kernel.TaskID]taskmanager.DeliveryPolicy, len(intent.TaskPolicies))
+	for _, policy := range intent.TaskPolicies {
+		if err := kernel.RequireID("task_id", policy.TaskID); err != nil {
+			return productionPendingPlan{}, err
+		}
+		if !validProductionDeliveryPolicy(policy.DeliveryPolicy) {
+			return productionPendingPlan{}, kernel.InvalidArgument("task delivery_policy is unsupported")
+		}
+		if _, duplicate := taskPolicies[policy.TaskID]; duplicate {
+			return productionPendingPlan{}, kernel.InvalidArgument("duplicate task delivery policy")
+		}
+		taskPolicies[policy.TaskID] = policy.DeliveryPolicy
 	}
 	existingTasks := make(map[kernel.TaskID]coordination.Task, len(snapshot.Tasks))
 	for _, task := range snapshot.Tasks {
@@ -323,24 +576,14 @@ func (p *productionTaskManagerRuntime) normalizePending(binding productionTaskMa
 	for _, endpoint := range snapshot.Endpoints {
 		existingEndpoints[endpoint.Ref] = endpoint
 	}
-	semanticTasks := make(map[kernel.TaskID]coordination.Task, len(intent.Tasks))
-	for _, task := range intent.Tasks {
-		if err := validateProductionTaskID(task.ID); err != nil {
-			return productionPendingPlan{}, err
-		}
-		if _, duplicate := semanticTasks[task.ID]; duplicate {
-			return productionPendingPlan{}, kernel.InvalidGraph("duplicate task in pending subgraph")
-		}
-		semanticTasks[task.ID] = task
-	}
-	byTask := make(map[kernel.TaskID]map[coordination.EndpointID]coordination.PhaseEndpoint)
+	byTask := make(map[kernel.TaskID]map[coordination.EndpointID]mcpapi.PendingEndpointIntent)
 	for _, endpoint := range intent.Endpoints {
 		if err := validateProductionEndpointRef(endpoint.Ref); err != nil {
 			return productionPendingPlan{}, err
 		}
 		endpoints := byTask[endpoint.Ref.TaskID]
 		if endpoints == nil {
-			endpoints = make(map[coordination.EndpointID]coordination.PhaseEndpoint, 3)
+			endpoints = make(map[coordination.EndpointID]mcpapi.PendingEndpointIntent, 3)
 			byTask[endpoint.Ref.TaskID] = endpoints
 		}
 		if _, duplicate := endpoints[endpoint.Ref.EndpointID]; duplicate {
@@ -348,9 +591,9 @@ func (p *productionTaskManagerRuntime) normalizePending(binding productionTaskMa
 		}
 		endpoints[endpoint.Ref.EndpointID] = endpoint
 	}
-	for taskID := range semanticTasks {
-		if _, scoped := byTask[taskID]; !scoped {
-			return productionPendingPlan{}, kernel.InvalidArgument("pending task must include exactly plan, execute, and verify endpoints")
+	for taskID := range taskPolicies {
+		if _, known := byTask[taskID]; !known {
+			return productionPendingPlan{}, kernel.InvalidArgument("task delivery policy does not match a pending task")
 		}
 	}
 	taskIDs := make([]kernel.TaskID, 0, len(byTask))
@@ -362,73 +605,116 @@ func (p *productionTaskManagerRuntime) normalizePending(binding productionTaskMa
 		RequestID:    kernel.IdempotencyKey(binding.DecisionRef),
 		BaseRevision: binding.SeenRevision,
 		Edges:        append([]coordination.Edge(nil), intent.Edges...),
-		Blockers:     append([]coordination.Blocker(nil), intent.Blockers...),
 	}}
+	for _, blocker := range intent.Blockers {
+		plan.Subgraph.Blockers = append(plan.Subgraph.Blockers, coordination.Blocker{
+			ID: blocker.ID, Target: blocker.Target, RequiredBy: blocker.RequiredBy,
+			OnFalse: blocker.OnFalse, State: coordination.BlockerActive,
+		})
+	}
 	for _, taskID := range taskIDs {
 		endpointIntents := byTask[taskID]
-		if len(endpointIntents) != 3 {
-			return productionPendingPlan{}, kernel.InvalidArgument(fmt.Sprintf("task %s must include exactly plan, execute, and verify endpoints", taskID))
-		}
-		semanticTask, supplied := semanticTasks[taskID]
 		existingTask, exists := existingTasks[taskID]
-		if !exists && !supplied {
-			return productionPendingPlan{}, kernel.InvalidArgument("new pending task requires contract_ref")
-		}
-		contractRef := strings.TrimSpace(semanticTask.ContractRef)
+		contractRef := canonicalProductionContractRef(p.projectID, binding.InputRef, taskID)
+		var storedContract taskmanager.TaskContract
 		if exists {
 			if existingTask.Outcome != coordination.TaskActive {
 				return productionPendingPlan{}, kernel.TransitionRejected("pending replacement requires an active task")
 			}
-			if supplied && contractRef != "" && contractRef != existingTask.ContractRef {
-				return productionPendingPlan{}, kernel.StaleBinding("existing task contract_ref is immutable")
-			}
 			contractRef = existingTask.ContractRef
-		}
-		if contractRef == "" {
-			return productionPendingPlan{}, kernel.InvalidArgument("task.contract_ref is required")
+			if p.decisions == nil {
+				return productionPendingPlan{}, kernel.Error{Code: kernel.CodeInternalError, Message: "production Task Manager decision store is not configured", Recoverable: true}
+			}
+			var err error
+			storedContract, err = p.decisions.TaskContract(ctx, taskID)
+			if err != nil {
+				return productionPendingPlan{}, err
+			}
+			if storedContract.ContractRef != existingTask.ContractRef {
+				return productionPendingPlan{}, kernel.StaleBinding("stored TaskContract does not match graph task contract_ref")
+			}
+			if policy, ok := taskPolicies[taskID]; ok && policy != storedContract.DeliveryPolicy {
+				return productionPendingPlan{}, kernel.InvalidArgument("ReplacePending cannot rewrite task delivery policy")
+			}
+		} else {
+			if len(endpointIntents) != 3 {
+				return productionPendingPlan{}, kernel.InvalidArgument(fmt.Sprintf("task %s must include exactly plan, execute, and verify endpoints", taskID))
+			}
+			if _, ok := taskPolicies[taskID]; !ok {
+				return productionPendingPlan{}, kernel.InvalidArgument("new task requires an explicit delivery_policy")
+			}
 		}
 		canonicalTask := coordination.Task{ID: taskID, ContractRef: contractRef, Outcome: coordination.TaskActive}
 		plan.Subgraph.Tasks = append(plan.Subgraph.Tasks, canonicalTask)
+		deliveryPolicy := taskPolicies[taskID]
+		if exists {
+			deliveryPolicy = storedContract.DeliveryPolicy
+		} else if deliveryPolicy == "" {
+			deliveryPolicy = taskmanager.DeliveryPolicyCodeMerge
+		}
 		contract := taskmanager.TaskContract{
-			TaskID: taskID, ContractRef: contractRef, DeliveryPolicy: taskmanager.DeliveryPolicyCodeMerge,
+			TaskID: taskID, ContractRef: contractRef, DeliveryPolicy: deliveryPolicy,
 			PhaseSpecs: make(map[coordination.EndpointID]string, 3),
 		}
+		if exists {
+			contract = storedContract
+		}
+		// Endpoint generations are control-plane retry counters, not Task
+		// workspace rounds. Existing Tasks already own their workspace lineage;
+		// pre-provisioning a round whose number happens to match a pending
+		// endpoint generation can skip or depend on workspace rounds that never
+		// existed. Phase Runtime resolves/reuses the correct Task round when the
+		// endpoint actually starts. Only a newly introduced Task needs its first
+		// workspace provisioned before the graph mutation becomes visible.
 		generationSet := make(map[int]struct{})
-		for _, endpointID := range []coordination.EndpointID{coordination.EndpointPlan, coordination.EndpointExecute, coordination.EndpointVerify} {
-			candidate, ok := endpointIntents[endpointID]
-			if !ok {
-				return productionPendingPlan{}, kernel.InvalidArgument(fmt.Sprintf("task %s is missing %s endpoint", taskID, endpointID))
+		endpointIDs := []coordination.EndpointID{coordination.EndpointPlan, coordination.EndpointExecute, coordination.EndpointVerify}
+		if exists {
+			endpointIDs = make([]coordination.EndpointID, 0, len(endpointIntents))
+			for endpointID := range endpointIntents {
+				endpointIDs = append(endpointIDs, endpointID)
 			}
-			candidate.SpecRef = strings.TrimSpace(candidate.SpecRef)
-			if candidate.SpecRef == "" {
-				return productionPendingPlan{}, kernel.InvalidArgument("endpoint.spec_ref is required")
-			}
+			sort.Slice(endpointIDs, func(i, j int) bool { return endpointIDs[i] < endpointIDs[j] })
+		}
+		for _, endpointID := range endpointIDs {
+			candidate := endpointIntents[endpointID]
 			if candidate.RunPolicy != coordination.RunEnabled && candidate.RunPolicy != coordination.RunHeld {
 				return productionPendingPlan{}, kernel.InvalidArgument("endpoint.run_policy must be enabled or held")
 			}
 			canonical := coordination.PhaseEndpoint{
-				Ref: candidate.Ref, SpecRef: candidate.SpecRef, Generation: 1,
+				Ref: candidate.Ref, SpecRef: canonicalProductionSpecRef(p.projectID, binding.InputRef, candidate.Ref), Generation: 1,
 				BindingRef: canonicalProductionBindingRef(candidate.Ref, 1),
 				State:      coordination.EndpointPending, RunPolicy: candidate.RunPolicy,
 			}
 			if exists {
 				current, ok := existingEndpoints[candidate.Ref]
 				if !ok {
-					return productionPendingPlan{}, kernel.InvalidGraph("existing task is missing a fixed endpoint")
+					return productionPendingPlan{}, kernel.InvalidGraph("existing task is missing the selected endpoint")
 				}
 				if current.State != coordination.EndpointPending {
 					return productionPendingPlan{}, kernel.ScopeNotPending("only pending endpoints can be replaced")
-				}
-				if candidate.SpecRef != current.SpecRef {
-					return productionPendingPlan{}, kernel.StaleBinding("existing endpoint spec_ref is immutable")
 				}
 				if candidate.RunPolicy != current.RunPolicy {
 					return productionPendingPlan{}, kernel.InvalidArgument("ReplacePending cannot rewrite endpoint run policy")
 				}
 				canonical = current
+				rejected, err := p.pendingEndpointDispatchRejected(ctx, current)
+				if err != nil {
+					return productionPendingPlan{}, err
+				}
+				if rejected {
+					// The Agent submits only endpoint intent. Runtime derives the new
+					// generation from its own rejected command, released lease, and
+					// DispatchRejected observation; the caller cannot forge a retry.
+					canonical.Generation++
+					canonical.BindingRef = canonicalProductionBindingRef(canonical.Ref, canonical.Generation)
+				}
 			}
-			contract.PhaseSpecs[endpointID] = canonical.SpecRef
-			generationSet[canonical.Generation] = struct{}{}
+			if !exists {
+				contract.PhaseSpecs[endpointID] = canonical.SpecRef
+			}
+			if !exists {
+				generationSet[canonical.Generation] = struct{}{}
+			}
 			plan.Subgraph.Endpoints = append(plan.Subgraph.Endpoints, canonical)
 		}
 		requirement, err := trustedProductionRequirement(binding, taskID, contractRef)
@@ -449,6 +735,47 @@ func (p *productionTaskManagerRuntime) normalizePending(binding productionTaskMa
 		return productionPendingPlan{}, err
 	}
 	return plan, nil
+}
+
+func (p *productionTaskManagerRuntime) pendingEndpointDispatchRejected(ctx context.Context, endpoint coordination.PhaseEndpoint) (bool, error) {
+	// normalizePending is also used as a pure authority-normalization step in
+	// unit tests and recovery validation. Without a durable observation store
+	// there is no trusted DispatchRejected fact from which Runtime may derive a
+	// new generation, so preserve the current endpoint instead of dereferencing
+	// a missing database or inventing a retry.
+	if p.db == nil {
+		return false, nil
+	}
+	var rejected bool
+	err := p.db.QueryRowContext(ctx, `
+SELECT EXISTS (
+  SELECT 1
+  FROM coordination_phase_commands c
+  JOIN coordination_phase_leases l
+    ON l.project_id=c.project_id AND l.lease_ref=c.lease_ref
+  JOIN coordination_runtime_observations o
+    ON o.project_id=c.project_id AND o.event_id=c.completed_event_ref
+  WHERE c.project_id=$1
+    AND c.task_id=$2 AND c.endpoint_id=$3
+    AND c.generation=$4 AND c.binding_ref=$5
+    AND c.action IN ('start','resume')
+    AND c.not_executable=true
+    AND c.observed_event_ref IS NULL
+    AND l.state='released'
+    AND o.kind='DispatchRejected' AND o.folded=true
+    AND o.command_id=c.command_id AND o.lease_ref=c.lease_ref
+)`, p.projectID, endpoint.Ref.TaskID, endpoint.Ref.EndpointID, endpoint.Generation, endpoint.BindingRef).Scan(&rejected)
+	return rejected, err
+}
+
+func validProductionDeliveryPolicy(policy taskmanager.DeliveryPolicy) bool {
+	switch policy {
+	case taskmanager.DeliveryPolicyNonCodeArtifact, taskmanager.DeliveryPolicyCodeMerge,
+		taskmanager.DeliveryPolicyHumanAcceptance, taskmanager.DeliveryPolicyExternalDelivery:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *productionTaskManagerRuntime) ensurePendingPrerequisites(ctx context.Context, plan productionPendingPlan) error {
@@ -547,7 +874,8 @@ func (p *productionTaskManagerRuntime) verifyAppliedPending(ctx context.Context,
 }
 
 func (p *productionTaskManagerRuntime) finishTransition(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision) error {
-	if binding.DecisionAction == "submitted" || binding.DecisionAction == "stopped" {
+	needsFollowup := productionTransitionNeedsFollowup(binding)
+	if needsFollowup {
 		if p.followups == nil {
 			return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Task Manager follow-up dispatcher is not configured", Recoverable: true}
 		}
@@ -555,7 +883,28 @@ func (p *productionTaskManagerRuntime) finishTransition(ctx context.Context, bin
 		if err != nil {
 			return err
 		}
-		if _, err := p.followups.DispatchTaskManagerFollowup(ctx, followup); err != nil {
+		if followup.RequestID != "" {
+			if err := dispatchPersistedTaskManagerFollowup(ctx, p.followups, followup); err != nil {
+				return err
+			}
+		}
+	}
+	if binding.DecisionAction == string(coordination.TaskDone) {
+		if p.memory == nil {
+			return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Task Manager memory finalizer is not configured", Recoverable: true}
+		}
+		taskID := kernel.TaskID(binding.TargetRef)
+		principal := auth.Principal{
+			ActorPrincipalID: kernel.ActorPrincipalID("production-task-manager:" + string(p.projectID)),
+			Kind:             auth.PrincipalAgent, ProjectID: p.projectID, InvocationID: binding.InvocationID,
+			Role: auth.RoleTaskManager, TaskID: taskID, Tools: auth.ToolSet(auth.ToolContextFinalizeTaskMemory),
+		}
+		if _, err := p.memory.FinalizeTaskMemory(ctx, principal, taskID); err != nil {
+			return err
+		}
+	}
+	if binding.DecisionAction == "reopen_round" {
+		if err := p.ensureTargetedVerifyReopenContext(ctx, binding, revision); err != nil {
 			return err
 		}
 	}
@@ -563,6 +912,157 @@ func (p *productionTaskManagerRuntime) finishTransition(ctx context.Context, bin
 		return nil
 	}
 	return p.complete(ctx, binding.InvocationID, binding.DecisionRef, revision)
+}
+
+func productionTransitionNeedsFollowup(binding productionTaskManagerBinding) bool {
+	return binding.DecisionAction == "submitted" || binding.DecisionAction == "stopped" ||
+		(binding.DecisionAction == "satisfied" &&
+			(binding.SelectedEndpoint == coordination.EndpointExecute || binding.SelectedEndpoint == coordination.EndpointVerify))
+}
+
+// ReconcileCompletedTransitionFollowups closes the crash gap after a graph
+// transition has committed but before its Runtime-owned delivery side effect.
+// In particular, a satisfied code_merge Execute must enqueue its immutable
+// candidate before the existing Verify endpoint is allowed to run. The query
+// selects only authoritative, already-applied bindings whose output has no
+// durable merge delivery; EnqueueExecutedTask remains the idempotency owner.
+func (p *productionTaskManagerRuntime) ReconcileCompletedTransitionFollowups(ctx context.Context) error {
+	if p == nil {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Task Manager runtime is not configured", Recoverable: true}
+	}
+	rows, err := p.db.QueryContext(ctx, `
+SELECT b.invocation_id
+FROM production_taskmanager_bindings b
+JOIN production_manager_inputs i
+  ON i.project_id=b.project_id AND i.input_ref=b.input_ref
+JOIN taskmanager_contracts c
+  ON c.project_id=b.project_id AND c.task_id=i.selected_task_id
+LEFT JOIN production_merge_deliveries d
+  ON d.project_id=b.project_id AND d.task_id=i.selected_task_id AND d.verify_result_ref=i.target_ref
+WHERE b.project_id=$1
+  AND b.mutation_applied=TRUE
+  AND b.decision_action='satisfied'
+  AND i.selected_endpoint_id=$2
+  AND c.delivery_policy=$3
+  AND d.candidate_id IS NULL
+ORDER BY b.completed_at, b.invocation_id
+LIMIT 32`, p.projectID, coordination.EndpointExecute, taskmanager.DeliveryPolicyCodeMerge)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var invocations []kernel.InvocationID
+	for rows.Next() {
+		var invocationID kernel.InvocationID
+		if err := rows.Scan(&invocationID); err != nil {
+			return err
+		}
+		invocations = append(invocations, invocationID)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var reconcileErr error
+	for _, invocationID := range invocations {
+		caller := auth.Principal{
+			ActorPrincipalID: kernel.ActorPrincipalID("production-task-manager:" + string(p.projectID)),
+			Kind:             auth.PrincipalAgent, ProjectID: p.projectID, InvocationID: invocationID,
+			Role: auth.RoleTaskManager,
+		}
+		binding, err := p.binding(ctx, caller, auth.BoundScope{ProjectID: p.projectID, InvocationID: invocationID})
+		if err == nil {
+			err = p.finishTransition(ctx, binding, binding.AppliedRevision)
+		}
+		reconcileErr = errors.Join(reconcileErr, err)
+	}
+	return reconcileErr
+}
+
+func (p *productionTaskManagerRuntime) ensureTargetedVerifyReopenWorkspace(ctx context.Context, binding productionTaskManagerBinding) error {
+	if p.workspaces == nil {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Task Manager workspace provisioning is not configured", Recoverable: true}
+	}
+	taskID, err := p.persistedReopenRoundTarget(ctx, binding)
+	if err != nil {
+		return err
+	}
+	boundary, err := p.targetedVerifyReopenBoundary(ctx, binding, taskID)
+	if err != nil {
+		return err
+	}
+	if boundary.SourceKind != productionTargetedVerifyProposalSource || boundary.FromEndpoint.TaskID == "" || strings.TrimSpace(boundary.BasedOnWorkspaceRevision) == "" {
+		return kernel.Forbidden("reopen_round workspace requires a trusted targeted verify boundary")
+	}
+	workspaceRef, err := p.workspaces.EnsureTaskWorkspace(ctx, productionTaskWorkspaceRequest{
+		TaskID: boundary.FromEndpoint.TaskID, BaseRevision: boundary.BasedOnWorkspaceRevision,
+	})
+	if err != nil {
+		return err
+	}
+	if workspaceRef == "" {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "reopen_round workspace provisioner returned an empty binding", Recoverable: true}
+	}
+	return nil
+}
+
+func (p *productionTaskManagerRuntime) ensureTargetedVerifyReopenContext(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision) error {
+	if p.contexts == nil || p.decisions == nil {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Task Manager context projection is not configured", Recoverable: true}
+	}
+	taskID, err := p.persistedReopenRoundTarget(ctx, binding)
+	if err != nil {
+		return err
+	}
+	contract, err := p.decisions.TaskContract(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	requirement, err := trustedProductionRequirement(binding, taskID, contract.ContractRef)
+	if err != nil {
+		return err
+	}
+	return p.contexts.EnsureTaskContext(ctx, productionTaskContextRequest{
+		InvocationID: binding.InvocationID, InputRef: requirement.InputRef, TaskID: taskID,
+		GraphRevision: revision, Requirement: requirement.Requirement, Contract: contract,
+	})
+}
+
+func (p *productionTaskManagerRuntime) persistedReopenRoundTarget(ctx context.Context, binding productionTaskManagerBinding) (kernel.TaskID, error) {
+	if binding.DecisionRef == "" || binding.DecisionAction != "reopen_round" {
+		return "", kernel.Forbidden("reopen_round target requires a persisted reopen decision")
+	}
+	var targetRef string
+	err := p.db.QueryRowContext(ctx, `
+SELECT decision->>'target_ref'
+FROM taskmanager_decisions
+WHERE project_id=$1 AND decision_ref=$2 AND input_ref=$3`, p.projectID, binding.DecisionRef, binding.InputRef).Scan(&targetRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", kernel.Error{Code: kernel.CodeInternalError, Message: "persisted reopen_round decision is missing", Recoverable: true}
+	}
+	if err != nil {
+		return "", err
+	}
+	taskID := kernel.TaskID(targetRef)
+	if err := validateProductionTaskID(taskID); err != nil {
+		return "", trustedBoundaryError("persisted reopen_round target is invalid")
+	}
+	return taskID, nil
+}
+
+// A follow-up that is already durable may wait for the current Task Manager
+// invocation to release the only matching AgentTeams slot. Treat that exact
+// state as accepted business work: the production reconcile loop retries
+// pending manager inputs after the current provider task terminates. Other
+// executor errors remain visible because they may mean nothing was persisted.
+func dispatchPersistedTaskManagerFollowup(ctx context.Context, dispatcher productionTaskManagerFollowupDispatcher, followup productionInput) error {
+	stored, err := dispatcher.DispatchTaskManagerFollowup(ctx, followup)
+	if err == nil {
+		return nil
+	}
+	if stored.InputRef != "" && stored.InvocationID != "" && stored.Status == "pending" && productionTerminalDeliveryWaitsForCapacity(err) {
+		return nil
+	}
+	return err
 }
 
 func (p *productionTaskManagerRuntime) transitionFollowup(ctx context.Context, binding productionTaskManagerBinding, revision kernel.Revision) (productionInput, error) {
@@ -604,6 +1104,44 @@ func (p *productionTaskManagerRuntime) transitionFollowup(ctx context.Context, b
 		input.Payload = payload
 		input.TargetKind = "phase_evaluation"
 		input.TargetRef = output.OutputRef
+	case "satisfied":
+		var evaluation productionPhaseEvaluationBoundary
+		if err := json.Unmarshal(binding.InputPayload, &evaluation); err != nil {
+			return productionInput{}, trustedBoundaryError("phase_evaluation payload is invalid")
+		}
+		if evaluation.Endpoint != ref || evaluation.Output.Receipt.Endpoint != ref || evaluation.Output.OutputRef == "" {
+			return productionInput{}, trustedBoundaryError("satisfied phase identity changed before follow-up dispatch")
+		}
+		contract, err := p.decisions.TaskContract(ctx, ref.TaskID)
+		if err != nil {
+			return productionInput{}, err
+		}
+		if contract.DeliveryPolicy == taskmanager.DeliveryPolicyCodeMerge && ref.EndpointID == coordination.EndpointExecute {
+			if p.merge == nil {
+				return productionInput{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "production Merge Queue is not configured", Recoverable: true}
+			}
+			if err := p.merge.EnqueueExecutedTask(ctx, evaluation); err != nil {
+				return productionInput{}, err
+			}
+			// Verify is intentionally not a Merge Queue prerequisite. The queue
+			// writes the execute candidate first, then publishes the exact merged
+			// revision that makes the existing Verify endpoint runnable.
+			return productionInput{}, nil
+		}
+		if ref.EndpointID != coordination.EndpointVerify {
+			return productionInput{}, nil
+		}
+		boundary := productionTaskCompletionBoundary{
+			SourceInputRef: binding.InputRef, TaskID: ref.TaskID, VerifyEndpoint: ref, VerifyOutput: evaluation.Output,
+		}
+		payload, err := json.Marshal(boundary)
+		if err != nil {
+			return productionInput{}, err
+		}
+		input.Body = fmt.Sprintf("evaluate Task %s completion after verify satisfied", ref.TaskID)
+		input.Payload = payload
+		input.TargetKind = "task_completion"
+		input.TargetRef = string(ref.TaskID)
 	case "stopped":
 		var stopped productionPhaseStoppedBoundary
 		if err := json.Unmarshal(binding.InputPayload, &stopped); err != nil {
@@ -691,6 +1229,24 @@ func (p *productionTaskManagerRuntime) appendTransitionEvents(ctx context.Contex
 	if err != nil {
 		return err
 	}
+	if binding.DecisionAction == "reopen_round" {
+		taskID, err := p.persistedReopenRoundTarget(ctx, binding)
+		if err != nil {
+			return err
+		}
+		for _, endpointID := range []coordination.EndpointID{coordination.EndpointExecute, coordination.EndpointVerify} {
+			endpoint, err := productionSnapshotEndpoint(snapshot, coordination.PhaseEndpointRef{
+				TaskID: taskID, EndpointID: endpointID,
+			})
+			if err != nil {
+				return err
+			}
+			if err := p.appendEndpointUpdatedEvent(ctx, binding, revision, endpoint); err != nil {
+				return err
+			}
+		}
+		return p.appendGraphRevisionEvent(ctx, binding, revision)
+	}
 	ref, err := trustedEndpoint(binding)
 	if err != nil {
 		return err
@@ -760,13 +1316,18 @@ func productionPhaseInvocationForEvent(binding productionTaskManagerBinding) ker
 		if err := json.Unmarshal(binding.InputPayload, &evaluation); err == nil {
 			return evaluation.Output.Receipt.InvocationID
 		}
+	case "phase_failed":
+		var failed productionPhaseFailedBoundary
+		if err := json.Unmarshal(binding.InputPayload, &failed); err == nil && failed.CommandID != "" {
+			return deterministicPhaseInvocationID(failed.CommandID)
+		}
 	}
 	return ""
 }
 
 func productionPhaseInvocationStatusForEvent(action string) string {
 	switch action {
-	case "rejected":
+	case "rejected", "reopened", "failed":
 		return "failed"
 	case "stopped":
 		return "stopped"
@@ -791,7 +1352,7 @@ func (p *productionTaskManagerRuntime) binding(ctx context.Context, caller auth.
 	var taskID, endpointID, targetKind, targetRef, decisionRef, decisionKind, decisionAction sql.NullString
 	var payloadRaw string
 	var appliedRevision sql.NullInt64
-	err := p.db.QueryRowContext(ctx, `SELECT b.invocation_id, b.input_ref, i.conversation_id, i.observed_graph_revision,
+	err := p.db.QueryRowContext(ctx, `SELECT b.invocation_id, b.input_ref, i.conversation_id, COALESCE(d.expected_revision, i.observed_graph_revision),
 i.selected_task_id, i.selected_endpoint_id, i.target_kind, i.target_ref,
 i.input_kind, i.payload::text,
 COALESCE((SELECT e.body FROM production_conversation_entries e
@@ -800,6 +1361,7 @@ COALESCE((SELECT e.body FROM production_conversation_entries e
 b.decision_ref, b.decision_kind, b.decision_action, b.mutation_applied, b.applied_graph_revision
 FROM production_taskmanager_bindings b
 JOIN production_manager_inputs i ON i.project_id=b.project_id AND i.input_ref=b.input_ref
+LEFT JOIN taskmanager_decisions d ON d.project_id=b.project_id AND d.decision_ref=b.decision_ref AND d.input_ref=b.input_ref
 WHERE b.project_id=$1 AND b.invocation_id=$2`, p.projectID, caller.InvocationID).
 		Scan(&binding.InvocationID, &binding.InputRef, &binding.ConversationID, &binding.SeenRevision, &taskID, &endpointID, &targetKind, &targetRef, &binding.InputKind, &payloadRaw, &binding.InputBody, &decisionRef, &decisionKind, &decisionAction, &binding.MutationApplied, &appliedRevision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -858,31 +1420,10 @@ func (p *productionTaskManagerRuntime) recoverAppliedRevision(ctx context.Contex
 	if binding.DecisionRef == "" || (binding.DecisionKind != taskmanager.DecisionKindReplacePending && binding.DecisionKind != taskmanager.DecisionKindTransition) {
 		return 0, false, nil
 	}
-	graphDecisionRef := binding.DecisionRef
-	if binding.DecisionKind == taskmanager.DecisionKindTransition {
-		var transitionRaw string
-		err := p.db.QueryRowContext(ctx, `SELECT transition_payload::text FROM taskmanager_decisions
-WHERE project_id=$1 AND decision_ref=$2 AND input_ref=$3`, p.projectID, binding.DecisionRef, binding.InputRef).Scan(&transitionRaw)
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, false, kernel.Error{Code: kernel.CodeInternalError, Message: "persisted Task Manager transition is missing", Recoverable: true}
-		}
-		if err != nil {
-			return 0, false, err
-		}
-		var transition coordination.GraphTransition
-		if err := json.Unmarshal([]byte(transitionRaw), &transition); err != nil {
-			return 0, false, kernel.Error{Code: kernel.CodeInternalError, Message: "persisted Task Manager transition is invalid", Recoverable: true}
-		}
-		canonical, err := json.Marshal(transition)
-		if err != nil {
-			return 0, false, err
-		}
-		graphDecisionRef = "transition:" + hashProductionBytes(canonical)
-	}
 	want := binding.SeenRevision.Next()
 	var revision kernel.Revision
 	err := p.db.QueryRowContext(ctx, `SELECT revision FROM coordination_graph_revisions
-WHERE project_id=$1 AND revision=$2 AND decision_ref=$3`, p.projectID, want, graphDecisionRef).Scan(&revision)
+WHERE project_id=$1 AND revision=$2 AND decision_ref=$3`, p.projectID, want, binding.DecisionRef).Scan(&revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -890,6 +1431,218 @@ WHERE project_id=$1 AND revision=$2 AND decision_ref=$3`, p.projectID, want, gra
 		return 0, false, err
 	}
 	return revision, true, nil
+}
+
+func (p *productionTaskManagerRuntime) trustedDecisionMutation(ctx context.Context, binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, decision taskmanager.TaskManagerDecision) (taskmanager.DecisionKind, coordination.GraphTransition, error) {
+	if decision.Action == string(coordination.TaskDone) {
+		taskID, evidenceRefs, err := p.trustedTaskCompletionBoundary(ctx, binding, snapshot, decision)
+		if err != nil {
+			return "", coordination.GraphTransition{}, err
+		}
+		return taskmanager.DecisionKindTransition, coordination.GraphTransition{
+			TargetKind: coordination.TargetTask, TaskID: taskID, Action: string(coordination.TaskDone), EvidenceRefs: evidenceRefs,
+		}, nil
+	}
+	if decision.Action == "reopen_round" {
+		return p.trustedTargetedVerifyReopenRound(ctx, binding, snapshot, decision)
+	}
+	return trustedDecisionMutation(binding, snapshot, decision)
+}
+
+func (p *productionTaskManagerRuntime) trustedTargetedVerifyReopenRound(ctx context.Context, binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, decision taskmanager.TaskManagerDecision) (taskmanager.DecisionKind, coordination.GraphTransition, error) {
+	if p == nil || p.db == nil {
+		return "", coordination.GraphTransition{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "targeted verify authority store is not configured", Recoverable: true}
+	}
+	taskID := kernel.TaskID(decision.TargetRef)
+	boundary, err := p.targetedVerifyReopenBoundary(ctx, binding, taskID)
+	if err != nil {
+		return "", coordination.GraphTransition{}, err
+	}
+	proposal := boundary.OrchestrationProposal
+	if boundary.SourceKind != productionTargetedVerifyProposalSource || boundary.CandidateID == "" || proposal.ProposalID == "" ||
+		proposal.FromEndpoint.TaskID == "" || proposal.FromEndpoint.EndpointID != coordination.EndpointVerify || proposal.FromInvocationID == "" {
+		return "", coordination.GraphTransition{}, kernel.Forbidden("reopen_round proposal identity is not a trusted targeted verify boundary")
+	}
+	if taskID == "" || taskID != proposal.FromEndpoint.TaskID {
+		return "", coordination.GraphTransition{}, kernel.InvalidArgument("reopen_round target_ref must be the Runtime-selected task ID")
+	}
+	var candidateProject kernel.ProjectID
+	var candidateTask kernel.TaskID
+	var candidateStatus string
+	var invocationProject kernel.ProjectID
+	var invocationTask kernel.TaskID
+	var invocationEndpoint coordination.EndpointID
+	var invocationRole auth.Role
+	var invocationBinding kernel.BindingRef
+	var invocationWorkspace string
+	var failureEvidenceRef string
+	var latestCandidate bool
+	err = p.db.QueryRowContext(ctx, `
+SELECT c.project_id, c.task_id, c.status, COALESCE(c.failure_evidence_ref,''),
+       c.id = (SELECT latest.id FROM merge_candidates latest
+               WHERE latest.project_id=c.project_id AND latest.task_id=c.task_id
+               ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1),
+       r.project_id, COALESCE(r.task_id,''), COALESCE(r.endpoint_id,''), r.role,
+       COALESCE(r.binding_ref,''), COALESCE(r.workspace_ref,'')
+FROM merge_candidates c
+JOIN runtime_invocations r ON r.invocation_id=$2
+WHERE c.id=$1`, boundary.CandidateID, proposal.FromInvocationID).Scan(
+		&candidateProject, &candidateTask, &candidateStatus, &failureEvidenceRef, &latestCandidate,
+		&invocationProject, &invocationTask, &invocationEndpoint, &invocationRole,
+		&invocationBinding, &invocationWorkspace,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", coordination.GraphTransition{}, kernel.Forbidden("targeted verify proposal has no persisted candidate invocation authority")
+	}
+	if err != nil {
+		return "", coordination.GraphTransition{}, err
+	}
+	if candidateProject != p.projectID || candidateTask != proposal.FromEndpoint.TaskID || !latestCandidate ||
+		(candidateStatus != string(mergequeue.StatusTargetedVerify) && candidateStatus != string(mergequeue.StatusFailed)) ||
+		invocationProject != p.projectID || invocationTask != candidateTask || invocationEndpoint != coordination.EndpointVerify || invocationRole != auth.RoleVerifier ||
+		invocationBinding != productionTargetedVerifyBindingRef(mergequeue.TargetedVerifyRequest{Candidate: mergequeue.Candidate{ID: boundary.CandidateID, TaskID: candidateTask}, LatestMainRevision: proposal.BasedOnWorkspaceRevision}) ||
+		strings.TrimSpace(invocationWorkspace) == "" {
+		return "", coordination.GraphTransition{}, kernel.Forbidden("targeted verify proposal does not match persisted merge authority")
+	}
+	var deliveryTask kernel.TaskID
+	var deliveryStatus string
+	if err := p.db.QueryRowContext(ctx, `
+SELECT task_id, status
+FROM production_merge_deliveries
+WHERE project_id=$1 AND candidate_id=$2`, p.projectID, boundary.CandidateID).Scan(&deliveryTask, &deliveryStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", coordination.GraphTransition{}, kernel.Forbidden("targeted verify proposal is not attached to a production merge delivery")
+		}
+		return "", coordination.GraphTransition{}, err
+	}
+	if deliveryTask != candidateTask || (deliveryStatus != "queued" && deliveryStatus != "failed") {
+		return "", coordination.GraphTransition{}, kernel.Forbidden("targeted verify proposal requires an active or failed production merge delivery")
+	}
+	var execute, verify coordination.PhaseEndpoint
+	for _, endpoint := range snapshot.Endpoints {
+		if endpoint.Ref.TaskID != candidateTask {
+			continue
+		}
+		switch endpoint.Ref.EndpointID {
+		case coordination.EndpointExecute:
+			execute = endpoint
+		case coordination.EndpointVerify:
+			verify = endpoint
+		}
+	}
+	if execute.Ref.TaskID == "" || verify.Ref.TaskID == "" {
+		return "", coordination.GraphTransition{}, kernel.InvalidGraph("reopen_round task is missing execute or verify endpoint")
+	}
+	if execute.State != coordination.EndpointSatisfied && execute.State != coordination.EndpointRejected {
+		return "", coordination.GraphTransition{}, kernel.TransitionRejected("targeted verify reopen_round requires a completed execute round")
+	}
+	if verify.State != coordination.EndpointPending && verify.State != coordination.EndpointSatisfied && verify.State != coordination.EndpointRejected {
+		return "", coordination.GraphTransition{}, kernel.TransitionRejected("targeted verify reopen_round requires pending, satisfied, or rejected verify")
+	}
+	refs := uniqueProductionStrings(append(append([]string(nil), proposal.EvidenceRefs...),
+		failureEvidenceRef, "merge-candidate:"+string(boundary.CandidateID), "targeted-verify-proposal:"+proposal.ProposalID))
+	return taskmanager.DecisionKindTransition, coordination.GraphTransition{
+		TargetKind:        coordination.TargetTask,
+		TaskID:            candidateTask,
+		Action:            "reopen_round",
+		ExecuteBindingRef: canonicalProductionBindingRef(execute.Ref, execute.Generation+1),
+		VerifyBindingRef:  canonicalProductionBindingRef(verify.Ref, verify.Generation+1),
+		EvidenceRefs:      refs,
+	}, nil
+}
+
+// targetedVerifyReopenBoundary accepts either the live internal targeted
+// verifier proposal or a later operator Manager message. The latter carries
+// no candidate authority of its own: Runtime resolves the latest failed
+// candidate and a completed, persisted internal replan proposal for that
+// exact task before the decision may be registered.
+func (p *productionTaskManagerRuntime) targetedVerifyReopenBoundary(ctx context.Context, binding productionTaskManagerBinding, taskID kernel.TaskID) (productionTargetedVerifyProposalBoundary, error) {
+	if taskID == "" {
+		return productionTargetedVerifyProposalBoundary{}, kernel.InvalidArgument("reopen_round target_ref is required")
+	}
+	switch binding.InputKind {
+	case "phase_orchestration":
+		if binding.TargetKind != "phase_orchestration" {
+			return productionTargetedVerifyProposalBoundary{}, kernel.Forbidden("reopen_round requires a targeted verifier orchestration proposal")
+		}
+		boundary, err := decodeProductionTargetedVerifyProposalBoundary(binding.InputPayload)
+		if err != nil {
+			return productionTargetedVerifyProposalBoundary{}, err
+		}
+		proposal := boundary.OrchestrationProposal
+		if proposal.ProposalID != binding.TargetRef || proposal.FromEndpoint.TaskID != binding.SelectedTaskID ||
+			binding.SelectedEndpoint != coordination.EndpointVerify || proposal.FromEndpoint.TaskID != taskID {
+			return productionTargetedVerifyProposalBoundary{}, kernel.Forbidden("reopen_round proposal identity is not bound to the current targeted verifier input")
+		}
+		return boundary, nil
+	case "manager":
+		if err := trustedManagerControlIntent(binding, httpapi.ManagerIntentOrchestrate); err != nil {
+			return productionTargetedVerifyProposalBoundary{}, err
+		}
+		return p.latestPersistedTargetedVerifyReopenBoundary(ctx, taskID)
+	default:
+		return productionTargetedVerifyProposalBoundary{}, kernel.Forbidden("reopen_round requires a targeted verifier proposal or an orchestrate Manager input backed by one")
+	}
+}
+
+func decodeProductionTargetedVerifyProposalBoundary(payload []byte) (productionTargetedVerifyProposalBoundary, error) {
+	var boundary productionTargetedVerifyProposalBoundary
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&boundary); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return productionTargetedVerifyProposalBoundary{}, trustedBoundaryError("targeted verify orchestration payload is invalid")
+	}
+	return boundary, nil
+}
+
+func (p *productionTaskManagerRuntime) latestPersistedTargetedVerifyReopenBoundary(ctx context.Context, taskID kernel.TaskID) (productionTargetedVerifyProposalBoundary, error) {
+	var candidateID mergequeue.CandidateID
+	err := p.db.QueryRowContext(ctx, `
+SELECT c.id
+FROM merge_candidates c
+JOIN production_merge_deliveries d
+  ON d.project_id=c.project_id AND d.candidate_id=c.id AND d.task_id=c.task_id
+WHERE c.project_id=$1 AND c.task_id=$2
+  AND c.status IN ('targeted_verify','failed')
+  AND d.status IN ('queued','failed')
+ORDER BY c.created_at DESC, c.id DESC
+LIMIT 1`, p.projectID, taskID).Scan(&candidateID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return productionTargetedVerifyProposalBoundary{}, kernel.Forbidden("reopen_round has no current failed merge candidate authority")
+	}
+	if err != nil {
+		return productionTargetedVerifyProposalBoundary{}, err
+	}
+	var payload string
+	err = p.db.QueryRowContext(ctx, `
+SELECT i.payload::text
+FROM production_manager_inputs i
+WHERE i.project_id=$1
+  AND i.input_kind='phase_orchestration'
+  AND i.target_kind='phase_orchestration'
+  AND i.selected_task_id=$2
+  AND i.selected_endpoint_id=$3
+  AND i.status='completed'
+  AND i.payload->>'source_kind'=$4
+  AND i.payload->>'candidate_id'=$5
+  AND i.payload->>'orchestration_advice'=$6
+  AND i.target_ref=i.payload->>'proposal_id'
+ORDER BY i.created_at DESC, i.input_ref DESC
+LIMIT 1`, p.projectID, taskID, coordination.EndpointVerify, productionTargetedVerifyProposalSource, candidateID, phasepkg.OrchestrationReplan).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return productionTargetedVerifyProposalBoundary{}, kernel.Forbidden("reopen_round has no completed trusted targeted verifier replan proposal")
+	}
+	if err != nil {
+		return productionTargetedVerifyProposalBoundary{}, err
+	}
+	boundary, err := decodeProductionTargetedVerifyProposalBoundary([]byte(payload))
+	if err != nil {
+		return productionTargetedVerifyProposalBoundary{}, err
+	}
+	if boundary.CandidateID != candidateID || boundary.FromEndpoint.TaskID != taskID {
+		return productionTargetedVerifyProposalBoundary{}, kernel.Forbidden("persisted targeted verifier proposal does not match the latest failed candidate")
+	}
+	return boundary, nil
 }
 
 func trustedDecisionMutation(binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, decision taskmanager.TaskManagerDecision) (taskmanager.DecisionKind, coordination.GraphTransition, error) {
@@ -911,8 +1664,13 @@ func trustedDecisionMutation(binding productionTaskManagerBinding, snapshot coor
 		}
 		return taskmanager.DecisionKindTerminal, coordination.GraphTransition{}, nil
 	case "held":
-		if binding.InputKind != "manager" && binding.InputKind != "human" {
-			return "", coordination.GraphTransition{}, kernel.Forbidden("held requires a trusted manager or human boundary")
+		if binding.InputKind != "manager" && binding.InputKind != "human" && !(binding.InputKind == "phase_orchestration" && binding.TargetKind == "phase_orchestration") {
+			return "", coordination.GraphTransition{}, kernel.Forbidden("held requires a trusted manager, human, or orchestration proposal boundary")
+		}
+		if binding.InputKind == "manager" {
+			if err := trustedManagerControlIntent(binding, httpapi.ManagerIntentHold); err != nil {
+				return "", coordination.GraphTransition{}, err
+			}
 		}
 		ref, err := trustedEndpoint(binding)
 		if err != nil {
@@ -963,13 +1721,207 @@ func trustedDecisionMutation(binding productionTaskManagerBinding, snapshot coor
 			EvidenceRefs: []string{"phase-stop:" + stableProductionSuffix(stopped.CommandID, stopped.LeaseRef, stopped.CheckpointRef, stopped.NonResumable)},
 		}, nil
 	case "released":
+		if binding.InputKind == "manager" || binding.InputKind == "human" {
+			if binding.InputKind == "manager" {
+				if err := trustedManagerControlIntent(binding, httpapi.ManagerIntentResume); err != nil {
+					return "", coordination.GraphTransition{}, err
+				}
+			}
+			ref, err := trustedEndpoint(binding)
+			if err != nil {
+				return "", coordination.GraphTransition{}, err
+			}
+			want := fmt.Sprintf("%s/%s", ref.TaskID, ref.EndpointID)
+			if decision.TargetRef != want {
+				return "", coordination.GraphTransition{}, kernel.InvalidArgument("decision target_ref does not match Runtime-selected endpoint")
+			}
+			endpoint, err := productionSnapshotEndpoint(snapshot, ref)
+			if err != nil {
+				return "", coordination.GraphTransition{}, err
+			}
+			if endpoint.RunPolicy != coordination.RunHeld {
+				return "", coordination.GraphTransition{}, kernel.TransitionRejected("released transition requires held endpoint")
+			}
+			// The Coordination Graph store still rejects release while this
+			// generation owns an active lease. This branch restores the public
+			// Manager/human resume intent without exposing GraphRuntime control.
+			return taskmanager.DecisionKindTransition, coordination.GraphTransition{
+				TargetKind: coordination.TargetPhaseEndpoint,
+				Endpoint:   endpoint.Ref,
+				Action:     decision.Action,
+				Generation: endpoint.Generation,
+			}, nil
+		}
 		endpoint, _, err := trustedStopReleaseBoundary(binding, snapshot, decision)
 		if err != nil {
 			return "", coordination.GraphTransition{}, err
 		}
 		return taskmanager.DecisionKindTransition, coordination.GraphTransition{TargetKind: coordination.TargetPhaseEndpoint, Endpoint: endpoint.Ref, Action: decision.Action, Generation: endpoint.Generation}, nil
+	case "reopened":
+		endpoint, failed, err := trustedPhaseFailedBoundary(binding, snapshot, decision, false)
+		if err != nil {
+			return "", coordination.GraphTransition{}, err
+		}
+		return taskmanager.DecisionKindTransition, coordination.GraphTransition{
+			TargetKind: coordination.TargetPhaseEndpoint, Endpoint: endpoint.Ref, Action: decision.Action, Generation: endpoint.Generation,
+			NewBindingRef: canonicalProductionBindingRef(endpoint.Ref, endpoint.Generation+1),
+			EvidenceRefs:  []string{"phase-failure:" + stableProductionSuffix(failed.CommandID, failed.LeaseRef, failed.BindingRef)},
+		}, nil
+	case "failed":
+		_, failed, err := trustedPhaseFailedBoundary(binding, snapshot, decision, true)
+		if err != nil {
+			return "", coordination.GraphTransition{}, err
+		}
+		return taskmanager.DecisionKindTransition, coordination.GraphTransition{
+			TargetKind: coordination.TargetTask, TaskID: failed.Endpoint.TaskID, Action: string(coordination.TaskFailed),
+			EvidenceRefs: []string{"phase-failure:" + stableProductionSuffix(failed.CommandID, failed.LeaseRef, failed.BindingRef)},
+		}, nil
 	default:
 		return "", coordination.GraphTransition{}, kernel.Forbidden("decision action requires a Runtime-authenticated phase or delivery boundary")
+	}
+}
+
+func trustedManagerControlIntent(binding productionTaskManagerBinding, expected httpapi.ManagerMessageIntent) error {
+	var request httpapi.ManagerMessageRequest
+	decoder := json.NewDecoder(bytes.NewReader(binding.InputPayload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return trustedBoundaryError("manager control payload is invalid")
+	}
+	intent := request.Intent
+	if intent == "" {
+		intent = httpapi.ManagerIntentOrchestrate
+	}
+	if intent != expected {
+		return kernel.Forbidden(fmt.Sprintf("%s decision requires explicit manager intent %s", expected, expected))
+	}
+	return nil
+}
+
+func trustedPhaseFailedBoundary(binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, decision taskmanager.TaskManagerDecision, taskTarget bool) (coordination.PhaseEndpoint, productionPhaseFailedBoundary, error) {
+	if binding.InputKind != "phase_failed" || binding.TargetKind != "phase_failed" || binding.TargetRef == "" {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, kernel.Forbidden("reopened or failed requires a Runtime-authenticated phase_failed boundary")
+	}
+	ref, err := trustedEndpoint(binding)
+	if err != nil {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, err
+	}
+	want := fmt.Sprintf("%s/%s", ref.TaskID, ref.EndpointID)
+	if taskTarget {
+		want = string(ref.TaskID)
+	}
+	if decision.TargetRef != want {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, kernel.InvalidArgument("decision target_ref does not match Runtime-selected failed Phase")
+	}
+	endpoint, err := productionSnapshotEndpoint(snapshot, ref)
+	if err != nil {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, err
+	}
+	var failed productionPhaseFailedBoundary
+	if err := json.Unmarshal(binding.InputPayload, &failed); err != nil {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, trustedBoundaryError("phase_failed payload is invalid")
+	}
+	if failed.CommandID == "" || failed.CommandID != binding.TargetRef || failed.Endpoint != ref || kernel.IsZeroID(failed.LeaseRef) ||
+		(failed.CommandAction != coordination.CommandStart && failed.CommandAction != coordination.CommandResume) {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, trustedBoundaryError("phase_failed command identity does not match its persisted binding")
+	}
+	if failed.Generation != endpoint.Generation || failed.BindingRef != endpoint.BindingRef {
+		return coordination.PhaseEndpoint{}, productionPhaseFailedBoundary{}, kernel.StaleBinding("phase_failed does not match the graph snapshot")
+	}
+	return endpoint, failed, nil
+}
+
+func (p *productionTaskManagerRuntime) trustedTaskCompletionBoundary(ctx context.Context, binding productionTaskManagerBinding, snapshot coordination.GraphSnapshot, decision taskmanager.TaskManagerDecision) (kernel.TaskID, []string, error) {
+	if binding.InputKind != "phase_orchestration" || binding.TargetKind != "task_completion" || binding.TargetRef == "" {
+		return "", nil, kernel.Forbidden("done requires a Runtime-authenticated task_completion boundary")
+	}
+	taskID := kernel.TaskID(binding.TargetRef)
+	if decision.TargetRef != string(taskID) || binding.SelectedTaskID != taskID || binding.SelectedEndpoint != coordination.EndpointVerify {
+		return "", nil, kernel.InvalidArgument("done target does not match the Runtime-selected Task")
+	}
+	var task coordination.Task
+	for _, candidate := range snapshot.Tasks {
+		if candidate.ID == taskID {
+			task = candidate
+			break
+		}
+	}
+	if task.ID == "" {
+		return "", nil, kernel.Error{Code: kernel.CodeNotFound, Message: "task completion target not found", Recoverable: true}
+	}
+	if task.Outcome != coordination.TaskActive {
+		return "", nil, kernel.TransitionRejected("task completion target is not active")
+	}
+	verifyRef := coordination.PhaseEndpointRef{TaskID: taskID, EndpointID: coordination.EndpointVerify}
+	verify, err := productionSnapshotEndpoint(snapshot, verifyRef)
+	if err != nil {
+		return "", nil, err
+	}
+	if verify.State != coordination.EndpointSatisfied {
+		return "", nil, kernel.TransitionRejected("task done requires a satisfied verify endpoint")
+	}
+	var completion productionTaskCompletionBoundary
+	if err := json.Unmarshal(binding.InputPayload, &completion); err != nil {
+		return "", nil, trustedBoundaryError("task_completion payload is invalid")
+	}
+	if completion.TaskID != taskID || completion.VerifyEndpoint != verifyRef || completion.VerifyOutput.OutputRef == "" || completion.VerifyOutput.Receipt.Endpoint != verifyRef {
+		return "", nil, trustedBoundaryError("task_completion identity does not match its persisted binding")
+	}
+	if completion.VerifyOutput.Receipt.Generation != verify.Generation || completion.VerifyOutput.Receipt.BindingRef != verify.BindingRef {
+		return "", nil, kernel.StaleBinding("task_completion output does not match the verify endpoint")
+	}
+	contract, err := p.decisions.TaskContract(ctx, taskID)
+	if err != nil {
+		return "", nil, err
+	}
+	switch contract.DeliveryPolicy {
+	case taskmanager.DeliveryPolicyNonCodeArtifact:
+		if len(completion.VerifyOutput.Receipt.Output.DeliveryRefs) == 0 {
+			return "", nil, kernel.TransitionRejected("non_code_artifact completion requires a verified delivery artifact")
+		}
+	case taskmanager.DeliveryPolicyCodeMerge:
+		if p.mergeEvidence == nil {
+			return "", nil, kernel.TransitionRejected("code_merge completion requires a trusted Merge Queue success boundary")
+		}
+		delivery, mergeEvidenceRefs, ok, err := p.mergeEvidence.CodeMergeEvidence(ctx, taskID, completion.VerifyOutput.Receipt.WorkspaceHead)
+		if err != nil {
+			return "", nil, err
+		}
+		if !ok || !taskmanagerDeliverySatisfied(contract.DeliveryPolicy, delivery) {
+			return "", nil, kernel.TransitionRejected("code_merge completion requires a trusted Merge Queue success boundary")
+		}
+		evidenceRefs := append([]string(nil), mergeEvidenceRefs...)
+		if delivery.MergeCommitRef != "" {
+			evidenceRefs = append(evidenceRefs, delivery.MergeCommitRef)
+		}
+		return taskID, uniqueProductionStrings(evidenceRefs), nil
+	case taskmanager.DeliveryPolicyHumanAcceptance:
+		return "", nil, kernel.TransitionRejected("human_acceptance completion requires a trusted human decision boundary")
+	case taskmanager.DeliveryPolicyExternalDelivery:
+		return "", nil, kernel.TransitionRejected("external_delivery completion requires a trusted external delivery boundary")
+	default:
+		return "", nil, kernel.InvalidArgument("task delivery policy is unsupported")
+	}
+	evidenceRefs := append([]string(nil), completion.VerifyOutput.Receipt.Output.EvidenceRefs...)
+	evidenceRefs = append(evidenceRefs, completion.VerifyOutput.Receipt.Output.DeliveryRefs...)
+	if completion.VerifyOutput.Receipt.Output.ReportRef != "" {
+		evidenceRefs = append(evidenceRefs, completion.VerifyOutput.Receipt.Output.ReportRef)
+	}
+	return taskID, uniqueProductionStrings(evidenceRefs), nil
+}
+
+func taskmanagerDeliverySatisfied(policy taskmanager.DeliveryPolicy, evidence taskmanager.DeliveryEvidence) bool {
+	switch policy {
+	case taskmanager.DeliveryPolicyNonCodeArtifact:
+		return len(evidence.ArtifactRefs) > 0
+	case taskmanager.DeliveryPolicyHumanAcceptance:
+		return evidence.HumanAccepted
+	case taskmanager.DeliveryPolicyCodeMerge:
+		return evidence.LatestMainVerified && evidence.MergeSucceeded && evidence.MergeCommitRef != ""
+	case taskmanager.DeliveryPolicyExternalDelivery:
+		return evidence.ExternalDelivered && len(evidence.EvidenceRefs) > 0
+	default:
+		return false
 	}
 }
 
@@ -1239,6 +2191,14 @@ func validateProductionEndpointRef(ref coordination.PhaseEndpointRef) error {
 
 func canonicalProductionBindingRef(ref coordination.PhaseEndpointRef, generation int) kernel.BindingRef {
 	return kernel.BindingRef(fmt.Sprintf("binding://%s/%s/%d", ref.TaskID, ref.EndpointID, generation))
+}
+
+func canonicalProductionContractRef(projectID kernel.ProjectID, inputRef string, taskID kernel.TaskID) string {
+	return "task-contract:" + stableProductionSuffix(projectID, inputRef, taskID)
+}
+
+func canonicalProductionSpecRef(projectID kernel.ProjectID, inputRef string, ref coordination.PhaseEndpointRef) string {
+	return "phase-spec:" + stableProductionSuffix(projectID, inputRef, ref.TaskID, ref.EndpointID)
 }
 
 func validateProductionEdges(edges []coordination.Edge, existing, replacement []coordination.PhaseEndpoint) error {

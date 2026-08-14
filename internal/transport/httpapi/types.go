@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextgraph"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
@@ -40,6 +41,7 @@ type ManagerPort interface {
 type QueryPort interface {
 	Task(context.Context, auth.Principal, kernel.TaskID) (TaskProjection, error)
 	ProjectSnapshot(context.Context, auth.Principal, kernel.ProjectID, kernel.Revision) (CoordinationSnapshot, error)
+	ContextSnapshot(context.Context, auth.Principal, kernel.ProjectID) (ContextGraphSnapshot, error)
 	InspectEndpoint(context.Context, auth.Principal, coordination.PhaseEndpointRef, int) (EndpointInspector, error)
 }
 
@@ -114,9 +116,18 @@ type ManagerMessageRequest struct {
 	ProjectID             kernel.ProjectID               `json:"project_id"`
 	ConversationID        string                         `json:"conversation_id"`
 	Body                  string                         `json:"body"`
+	Intent                ManagerMessageIntent           `json:"intent,omitempty"`
 	SelectedEndpoint      *coordination.PhaseEndpointRef `json:"selected_endpoint,omitempty"`
 	ObservedGraphRevision *kernel.Revision               `json:"observed_graph_revision,omitempty"`
 }
+
+type ManagerMessageIntent string
+
+const (
+	ManagerIntentOrchestrate ManagerMessageIntent = "orchestrate"
+	ManagerIntentHold        ManagerMessageIntent = "hold"
+	ManagerIntentResume      ManagerMessageIntent = "resume"
+)
 
 type ManagerMessageResponse struct {
 	ManagerInputRef string              `json:"manager_input_ref"`
@@ -217,6 +228,10 @@ type ContextSliceView = uiprojection.ContextSliceView
 type ContextNodeView = uiprojection.ContextNodeView
 type OmittedContext = uiprojection.OmittedContext
 type TaskMemoryBufferView = uiprojection.TaskMemoryBufferView
+type ContextGraphSnapshot = contextgraph.ContextGraphSnapshot
+type ContextSnapshotNode = contextgraph.ContextSnapshotNode
+type ContextSnapshotEdge = contextgraph.ContextSnapshotEdge
+type ContextSnapshotSubgraph = contextgraph.ContextSnapshotSubgraph
 
 type ManagerConversation struct {
 	ConversationID string                     `json:"conversation_id"`

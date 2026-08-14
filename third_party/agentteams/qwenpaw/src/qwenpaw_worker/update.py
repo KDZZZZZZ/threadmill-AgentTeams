@@ -39,7 +39,6 @@ TEAMS_INTERNAL_CONTROL_MARKER = (
 )
 TEAMS_CONTEXT_START = "<!-- BEGIN AGENTTEAMS RUNTIME TEAM CONTEXT -->"
 TEAMS_CONTEXT_END = "<!-- END AGENTTEAMS RUNTIME TEAM CONTEXT -->"
-THREADMILL_INVOCATION_MCP_KEY = re.compile(r"^threadmill-[0-9a-f]{24}$")
 AGENT_IDENTITY_DATA_ENDPOINT_FORMAT = "agentidentitydata.{region_id}.aliyuncs.com"
 REGION_ID_ENV_NAMES = ("AGENTTEAMS_REGION", "ALIBABA_CLOUD_REGION_ID", "REGION_ID")
 
@@ -128,10 +127,6 @@ def _named_keys(value: Any) -> str:
         return "-"
     names = sorted(str(name).strip() for name in value.keys() if str(name).strip())
     return ",".join(names) if names else "-"
-
-
-def _is_threadmill_invocation_mcp_key(value: str) -> bool:
-    return THREADMILL_INVOCATION_MCP_KEY.fullmatch(_string(value)) is not None
 
 
 def _duration_ms(started_at: float) -> int:
@@ -1558,15 +1553,12 @@ class RuntimeUpdater:
             if servers:
                 raise RuntimeError("QwenPaw API client is required for MCP configuration")
             return
-        existing = {str(item.get("key")): item for item in self.api_client.list_mcp()}
         ownership_path = self.config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
         try:
             managed = set(json.loads(ownership_path.read_text(encoding="utf-8")))
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
-        for key in sorted((managed & existing.keys()) - servers.keys()):
-            if _is_threadmill_invocation_mcp_key(key):
-                continue
+        for key in sorted(managed - servers.keys()):
             self.api_client.delete_mcp(key)
         for key, server in servers.items():
             transport = _string(server.get("transport") or "http")
@@ -1583,7 +1575,7 @@ class RuntimeUpdater:
                 "env": dict(server.get("env") or {}),
                 "cwd": _string(server.get("cwd")),
             }
-            if key in existing:
+            if self.api_client.get_mcp_if_present(key) is not None:
                 self.api_client.update_mcp(key, payload)
             else:
                 self.api_client.create_mcp(key, payload)
@@ -1602,7 +1594,6 @@ class RuntimeUpdater:
                     "QwenPaw API client is required for agent package MCP configuration",
                 )
             return
-        existing = {str(item.get("key")): item for item in self.api_client.list_mcp()}
         ownership_path = (
             self.config.qwenpaw_working_dir / ".agentteams-managed-package-mcp.json"
         )
@@ -1610,14 +1601,12 @@ class RuntimeUpdater:
             managed = set(json.loads(ownership_path.read_text(encoding="utf-8")))
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
-        for key in sorted((managed & existing.keys()) - servers.keys()):
-            if _is_threadmill_invocation_mcp_key(key):
-                continue
+        for key in sorted(managed - servers.keys()):
             self.api_client.delete_mcp(key)
         for key, server in servers.items():
             payload = dict(server)
             payload.setdefault("name", key)
-            if key in existing:
+            if self.api_client.get_mcp_if_present(key) is not None:
                 self.api_client.update_mcp(key, payload)
             else:
                 self.api_client.create_mcp(key, payload)
@@ -1674,8 +1663,8 @@ class RuntimeUpdater:
             "encryption": _env_bool("AGENTTEAMS_MATRIX_E2EE"),
             "group_disabled": False,
             "dm_disabled": False,
-            "show_tool_calls": True,
-            "show_tool_results": True,
+            "show_tool_calls": False,
+            "show_tool_results": False,
             "show_thinking": True,
             "groups": groups,
             },

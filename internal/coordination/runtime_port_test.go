@@ -56,6 +56,6 @@ func (readOnlyCoordinationStore) ReplacePending(context.Context, kernel.ProjectI
 	return GraphSnapshot{}, nil
 }
 
-func (readOnlyCoordinationStore) Transition(context.Context, kernel.ProjectID, kernel.Revision, GraphTransition) (GraphSnapshot, error) {
+func (readOnlyCoordinationStore) TransitionWithDecisionRef(context.Context, kernel.ProjectID, kernel.Revision, string, GraphTransition) (GraphSnapshot, error) {
 	return GraphSnapshot{}, nil
 }

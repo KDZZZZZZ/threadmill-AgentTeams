@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ func TestAgentTeamsPhaseHostDispatchPersistsPreparedBeforeDispatch(t *testing.T)
 		t.Fatalf("Dispatch() error = %v", err)
 	}
 
-	invocationRef, err := agentTeamsInvocationRef(req)
+	invocationRef, err := agentTeamsInvocationRef(req, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +56,45 @@ func TestAgentTeamsPhaseHostDispatchPersistsPreparedBeforeDispatch(t *testing.T)
 	}
 	if spec.Prompt != req.Prompt.Text || spec.WorkspaceRevision != req.Binding.WorkspaceRevision {
 		t.Fatalf("prepared spec = %#v", spec)
+	}
+}
+
+func TestAgentTeamsPhaseHostDispatchReplayKeepsOriginalExecutionAcrossRerender(t *testing.T) {
+	host, service, writer, state := newAgentTeamsPhaseHostHarness(t)
+	req := validAgentTeamsDispatchRequest("inv-dispatch-replay")
+	if err := host.Dispatch(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	original, ok, err := state.LoadAgentTeamsPhaseHostState(context.Background(), req.Invocation.ID)
+	if err != nil || !ok {
+		t.Fatalf("load original state = ok %v err %v", ok, err)
+	}
+
+	replayed := req
+	replayed.Prompt.Text = "a newly rendered prompt must not create another provider execution"
+	replayed.Prompt.SHA256 = "new-render-hash"
+	replayed.Binding.WorkspaceRevision = "new-binding-revision"
+	replayed.Start.Inputs.InputRevision = "new-input-revision"
+	if err := host.Dispatch(context.Background(), replayed); err != nil {
+		t.Fatalf("Dispatch() replay error = %v", err)
+	}
+	current, ok, err := state.LoadAgentTeamsPhaseHostState(context.Background(), req.Invocation.ID)
+	if err != nil || !ok || current != original {
+		t.Fatalf("replayed state = %#v, ok %v err %v; want %#v", current, ok, err, original)
+	}
+	if service.nextAttempt != 2 {
+		t.Fatalf("provider attempts = %d, want exactly one execution", service.nextAttempt-1)
+	}
+	prepared, err := writer.LoadPreparedInvocation(context.Background(), original.InvocationRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec agentTeamsPhaseSpecDocument
+	if err := json.Unmarshal([]byte(prepared.Spec), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.Prompt != req.Prompt.Text || spec.WorkspaceRevision != req.Binding.WorkspaceRevision {
+		t.Fatalf("immutable prepared invocation changed on replay: %#v", spec)
 	}
 }
 
@@ -132,9 +172,10 @@ func TestAgentTeamsPhaseHostStopThenRevokeUsesRecoverableStopMode(t *testing.T) 
 }
 
 func TestAgentTeamsPhaseHostStopWithoutCheckpointDerivesStableCheckpoint(t *testing.T) {
-	host, _, _, _ := newAgentTeamsPhaseHostHarness(t)
+	host, service, _, _ := newAgentTeamsPhaseHostHarness(t)
 	req := validAgentTeamsDispatchRequest("inv-stop-derived")
 	req.Binding.CheckpointRef = ""
+	service.syncWorkspaceRevision = "workspace-rev-synced"
 	if err := host.Dispatch(context.Background(), req); err != nil {
 		t.Fatalf("Dispatch() error = %v", err)
 	}
@@ -142,8 +183,12 @@ func TestAgentTeamsPhaseHostStopWithoutCheckpointDerivesStableCheckpoint(t *test
 	if err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}
-	if result.NonResumable || result.CheckpointRef == "" || result.ResumeStateRef == "" || result.WorkspaceRevision != req.Binding.WorkspaceRevision {
+	if result.NonResumable || result.CheckpointRef == "" || result.ResumeStateRef == "" || result.WorkspaceRevision != service.syncWorkspaceRevision {
 		t.Fatalf("derived resumable stop result = %#v", result)
+	}
+	wantCheckpoint := deterministicWorkspaceCheckpointRef(req.Invocation.ID, service.syncWorkspaceRevision)
+	if result.CheckpointRef != wantCheckpoint {
+		t.Fatalf("checkpoint ref = %q, want synced workspace checkpoint %q", result.CheckpointRef, wantCheckpoint)
 	}
 	again, err := host.Stop(context.Background(), StopRequest{Invocation: req.Invocation, Binding: req.Binding})
 	if err != nil {
@@ -367,6 +412,108 @@ func TestMemoryPreparedInvocationWriterReplacesUndispatchedEnvelope(t *testing.T
 	}
 }
 
+func TestPostgresPreparedInvocationWriterPrunesFailedRetryEnvelopes(t *testing.T) {
+	db := openAgentTeamsPhasePostgres(t)
+	ctx := context.Background()
+	store := NewPostgresAgentTeamsPhaseHostStoreFromSQL(db)
+	invocationID := kernel.InvocationID("inv-pg-prune-retries")
+	base := adapter.PreparedInvocation{
+		InvocationID: invocationID,
+		ProjectID:    "project-pg-prune-retries",
+		Role:         auth.RolePlanner,
+		RoomID:       "!threadmill:example.test",
+	}
+	active := base
+	active.Spec = "active"
+	active.EnvelopeRef = "envelope-active"
+	active.RuntimeConfigRef = "runtime-active"
+	if err := store.SavePreparedInvocation(ctx, "ref-active", active); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAgentTeamsPhaseHostState(ctx, AgentTeamsPhaseHostState{
+		InvocationID:  invocationID,
+		InvocationRef: "ref-active",
+		Execution: adapter.AgentTeamsExecutionRef{
+			InvocationID:     invocationID,
+			AgentTeamsTaskID: "task-active",
+			HostRef:          "phase-a",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range []string{"retry-1", "retry-2", "retry-3"} {
+		prepared := base
+		prepared.Spec = candidate
+		prepared.EnvelopeRef = "envelope-" + candidate
+		prepared.RuntimeConfigRef = "runtime-" + candidate
+		if err := store.SavePreparedInvocation(ctx, "ref-"+candidate, prepared); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var refs []string
+	rows, err := db.QueryContext(ctx, `SELECT invocation_ref FROM phase_agentteams_prepared_invocations WHERE invocation_id=$1 ORDER BY invocation_ref`, invocationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ref-active", "ref-retry-3"}
+	if !reflect.DeepEqual(refs, want) {
+		t.Fatalf("prepared refs = %v, want %v", refs, want)
+	}
+}
+
+func openAgentTeamsPhasePostgres(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = os.Getenv("DATABASE_URL")
+	}
+	if dsn == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL or DATABASE_URL is required for real PostgreSQL integration")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		t.Fatalf("ping postgres: %v", err)
+	}
+	schema := fmt.Sprintf("threadmill_phase_host_prune_it_%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, `CREATE SCHEMA `+quoteIdent(schema)); err != nil {
+		db.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+quoteIdent(schema)+` CASCADE`)
+		_ = db.Close()
+	})
+	if _, err := db.ExecContext(ctx, `SET search_path TO `+quoteIdent(schema)); err != nil {
+		t.Fatalf("set search_path: %v", err)
+	}
+	loaded, err := platformpostgres.LoadMigrations(migrations.FS, ".")
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if err := platformpostgres.NewMigrator(db).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply full migrations: %v", err)
+	}
+	return db
+}
+
 func validAgentTeamsDispatchRequest(invocationID string) DispatchRequest {
 	now := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
 	invocation := baseruntime.Invocation{
@@ -429,14 +576,15 @@ func validAgentTeamsDispatchRequest(invocationID string) DispatchRequest {
 }
 
 type fakeAgentTeamsPhaseAdapter struct {
-	dispatchCalls    int
-	nextAttempt      int
-	current          map[string]adapter.AgentTeamsExecutionRef
-	states           map[string]string
-	terminationModes map[string]adapter.TerminateMode
-	terminateCalls   map[string]int
-	calls            []string
-	failTerminate    error
+	dispatchCalls         int
+	nextAttempt           int
+	current               map[string]adapter.AgentTeamsExecutionRef
+	states                map[string]string
+	terminationModes      map[string]adapter.TerminateMode
+	terminateCalls        map[string]int
+	calls                 []string
+	failTerminate         error
+	syncWorkspaceRevision string
 }
 
 func newFakeAgentTeamsPhaseAdapter() *fakeAgentTeamsPhaseAdapter {
@@ -488,6 +636,16 @@ func (a *fakeAgentTeamsPhaseAdapter) Terminate(_ context.Context, execution adap
 	a.states[execution.AgentTeamsTaskID] = "terminated"
 	a.terminationModes[execution.AgentTeamsTaskID] = mode
 	return nil
+}
+
+func (a *fakeAgentTeamsPhaseAdapter) FenceExecution(_ context.Context, execution adapter.AgentTeamsExecutionRef) error {
+	a.calls = append(a.calls, "fence:"+string(execution.InvocationID))
+	return nil
+}
+
+func (a *fakeAgentTeamsPhaseAdapter) SyncExecutionWorkspace(_ context.Context, execution adapter.AgentTeamsExecutionRef) (adapter.ExecutionWorkspaceCheckpoint, error) {
+	a.calls = append(a.calls, "sync:"+execution.AgentTeamsTaskID)
+	return adapter.ExecutionWorkspaceCheckpoint{WorkspaceRevision: a.syncWorkspaceRevision}, nil
 }
 
 func (a *fakeAgentTeamsPhaseAdapter) Collect(context.Context, adapter.AgentTeamsExecutionRef) (adapter.UntrustedExecutionResult, error) {

@@ -53,8 +53,8 @@ func TestContextBindingResolverCreatesInitialOnceAndReplaysMaterializedContext(t
 	if len(activeSubscriptions(subs)) != 1 {
 		t.Fatalf("active subscriptions after replay = %#v", subs)
 	}
-	if runtime.ensureCalls != 1 {
-		t.Fatalf("ensure initial calls = %d, want 1", runtime.ensureCalls)
+	if runtime.ensureCalls != 2 {
+		t.Fatalf("ensure initial calls = %d, want 2 idempotent resolutions", runtime.ensureCalls)
 	}
 }
 
@@ -89,11 +89,51 @@ func TestContextBindingResolverMaterializesExplicitSubscriptionUnion(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(activeSubscriptions(subs)) != 2 {
-		t.Fatalf("initial subscription should not be created when explicit exists: %#v", subs)
+	if len(activeSubscriptions(subs)) != 3 {
+		t.Fatalf("initial subscription must be created in addition to explicit subscriptions: %#v", subs)
 	}
-	if runtime.ensureCalls != 0 {
-		t.Fatalf("ensure initial calls = %d, want 0", runtime.ensureCalls)
+	if runtime.ensureCalls != 1 {
+		t.Fatalf("ensure initial calls = %d, want 1", runtime.ensureCalls)
+	}
+}
+
+func TestContextBindingResolverKeepsInitialSliceRefWhenDynamicSubscriptionsChange(t *testing.T) {
+	ctx := context.Background()
+	store := contextgraph.NewMemoryStore(fixedNow)
+	sgA := createContextSubgraph(t, store, "project-a", "alpha")
+	sgB := createContextSubgraph(t, store, "project-a", "beta")
+	createContextNode(t, store, "project-a", sgA.ID, "alpha node")
+	createContextNode(t, store, "project-a", sgB.ID, "beta node")
+	cmd := contextBindingCommand("run-a", "task-a", "execute")
+	invocationID := invocationIDForCommand(cmd)
+	principal := phasePrincipal("project-a", "task-a", "execute", invocationID)
+	runtime := newTestContextRuntime(store)
+	resolver := NewContextBindingResolver(&fakeBaseBindingSource{initial: []string{sgA.ID}}, runtime)
+
+	initial, err := resolver.ResolveForInvocation(ctx, BindingResolveRequest{Command: cmd, InvocationID: invocationID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Subscribe(ctx, principal, contextgraph.SubscribeRequest{SubgraphIDs: []string{sgB.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	dynamic, err := store.MaterializeRuntimeContext(ctx, principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamicJSON, err := json.Marshal(dynamic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := materializedSubgraphs(t, string(dynamicJSON)); !reflect.DeepEqual(got, []string{sgA.ID, sgB.ID}) {
+		t.Fatalf("dynamic context subgraphs = %#v", got)
+	}
+	replayed, err := resolver.ResolveForInvocation(ctx, BindingResolveRequest{Command: cmd, InvocationID: invocationID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.ContextSliceRef != initial.ContextSliceRef || replayed.ContextSlice != initial.ContextSlice {
+		t.Fatalf("initial slice changed after dynamic subscription: first=%q/%s replay=%q/%s", initial.ContextSliceRef, initial.ContextSlice, replayed.ContextSliceRef, replayed.ContextSlice)
 	}
 }
 
@@ -321,14 +361,14 @@ func TestContextBindingResolverAbortsResolvedBindingAfterContextFailure(t *testi
 	createContextNode(t, store, "project-a", sgA.ID, "alpha node")
 	source := &fakeBaseBindingSource{initial: []string{sgA.ID}}
 	runtime := newTestContextRuntime(store)
-	runtime.materializeErr = errors.New("materialize failed")
+	runtime.ensureErr = errors.New("initial slice failed")
 	resolver := NewContextBindingResolver(source, runtime)
 	cmd := contextBindingCommand("run-a", "task-a", "execute")
 	invocationID := invocationIDForCommand(cmd)
 
 	_, err := resolver.ResolveForInvocation(ctx, BindingResolveRequest{Command: cmd, InvocationID: invocationID})
-	if err == nil || err.Error() != "materialize failed" {
-		t.Fatalf("err = %v, want materialize failed", err)
+	if err == nil || err.Error() != "initial slice failed" {
+		t.Fatalf("err = %v, want initial slice failed", err)
 	}
 	if source.abortCalls != 1 {
 		t.Fatalf("abort calls = %d, want 1", source.abortCalls)
@@ -364,7 +404,8 @@ func TestContextBindingResolverSingleflightsConcurrentInitialSlice(t *testing.T)
 	createContextNode(t, store, "project-a", sgA.ID, "alpha node")
 	runtime := newTestContextRuntime(store)
 	runtime.blockEnsure = make(chan struct{})
-	resolver := NewContextBindingResolver(&fakeBaseBindingSource{initial: []string{sgA.ID}}, runtime)
+	resolved := make(chan struct{}, 2)
+	resolver := NewContextBindingResolver(&fakeBaseBindingSource{initial: []string{sgA.ID}, resolved: resolved}, runtime)
 	cmd := contextBindingCommand("run-a", "task-a", "execute")
 	invocationID := invocationIDForCommand(cmd)
 	errs := make(chan error, 2)
@@ -378,7 +419,13 @@ func TestContextBindingResolverSingleflightsConcurrentInitialSlice(t *testing.T)
 	}
 	close(start)
 	runtime.waitEnsureStarted(t)
-	runtime.waitInspectCalls(t, 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-resolved:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for both binding resolutions")
+		}
+	}
 	close(runtime.blockEnsure)
 	for i := 0; i < 2; i++ {
 		if err := <-errs; err != nil {
@@ -391,6 +438,7 @@ func TestContextBindingResolverSingleflightsConcurrentInitialSlice(t *testing.T)
 }
 
 type fakeBaseBindingSource struct {
+	mu            sync.Mutex
 	initial       []string
 	initialByTask map[kernel.TaskID][]string
 	binding       BindingSnapshot
@@ -398,6 +446,7 @@ type fakeBaseBindingSource struct {
 	resolveCalls  int
 	refreshCalls  int
 	abortCalls    int
+	resolved      chan struct{}
 }
 
 type testContextRuntime struct {
@@ -439,14 +488,7 @@ func (r *testContextRuntime) EnsureInitialSlice(ctx context.Context, principal a
 	if r.ensureErr != nil {
 		return contextgraph.ContextSlice{}, r.ensureErr
 	}
-	subscriptions, err := r.store.InspectSubscriptions(ctx, principal, principal.InvocationID)
-	if err != nil {
-		return contextgraph.ContextSlice{}, err
-	}
-	if hasActiveSubscription(subscriptions) {
-		return r.store.MaterializeRuntimeContext(ctx, principal)
-	}
-	return r.store.CreateInitialSlice(ctx, principal, subgraphIDs)
+	return r.store.EnsureInitialSlice(ctx, principal, subgraphIDs)
 }
 
 func (r *testContextRuntime) InspectSubscriptions(ctx context.Context, principal auth.Principal, invocationID kernel.InvocationID) ([]contextgraph.SubscriptionInspection, error) {
@@ -502,27 +544,14 @@ func (r *testContextRuntime) waitEnsureStarted(t *testing.T) {
 	}
 }
 
-func (r *testContextRuntime) waitInspectCalls(t *testing.T, want int) {
-	t.Helper()
-	deadline := time.After(time.Second)
-	for {
-		r.mu.Lock()
-		got := r.inspectCalls
-		r.mu.Unlock()
-		if got >= want {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for inspect calls: got %d want %d", got, want)
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
-}
-
 func (s *fakeBaseBindingSource) ResolvePhaseBinding(_ context.Context, req BindingResolveRequest) (BindingSnapshot, []string, error) {
+	s.mu.Lock()
 	s.resolveCalls++
+	resolved := s.resolved
+	s.mu.Unlock()
+	if resolved != nil {
+		resolved <- struct{}{}
+	}
 	initial := append([]string(nil), s.initial...)
 	if s.initialByTask != nil {
 		initial = append([]string(nil), s.initialByTask[req.Command.Endpoint.TaskID]...)

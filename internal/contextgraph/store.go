@@ -31,6 +31,7 @@ type MemoryStore struct {
 	subgraphs      map[string]SubgraphRecord
 	edges          map[string]ContextEdge
 	subscriptions  map[string]ContextSubscriptionRecord
+	initialSlices  map[invocationScopeKey]ContextSlice
 	deltas         map[string]ContextDelta
 	deltaAck       map[string]bool
 	taskBindings   map[taskScopeKey]TaskContextSubgraphBinding
@@ -76,6 +77,7 @@ func NewMemoryStore(now func() time.Time) *MemoryStore {
 		subgraphs:      make(map[string]SubgraphRecord),
 		edges:          make(map[string]ContextEdge),
 		subscriptions:  make(map[string]ContextSubscriptionRecord),
+		initialSlices:  make(map[invocationScopeKey]ContextSlice),
 		deltas:         make(map[string]ContextDelta),
 		deltaAck:       make(map[string]bool),
 		taskBindings:   make(map[taskScopeKey]TaskContextSubgraphBinding),
@@ -317,10 +319,11 @@ func (s *MemoryStore) Search(ctx context.Context, principal auth.Principal, req 
 	var nodes []ContextNode
 	hitSubgraphs := map[string]struct{}{}
 	for _, record := range s.sortedNodesLocked() {
-		if !canSeeNode(principal, s.subgraphs, record) {
+		node, ok := generalVisibleNode(principal.ProjectID, s.subgraphs, record.Node)
+		if !ok {
 			continue
 		}
-		if len(scope) > 0 && !intersects(record.Node.SubgraphIDs, scope) {
+		if len(scope) > 0 && !intersects(node.SubgraphIDs, scope) {
 			continue
 		}
 		if len(anchored) > 0 {
@@ -328,12 +331,10 @@ func (s *MemoryStore) Search(ctx context.Context, principal auth.Principal, req 
 				continue
 			}
 		}
-		if keywordMatch(record.Node.Statement, keywords) {
-			nodes = append(nodes, visibleNode(principal, s.subgraphs, record.Node))
-			for _, subgraphID := range record.Node.SubgraphIDs {
-				if subgraph, ok := s.subgraphs[subgraphID]; ok && canSeeSubgraph(principal, subgraph) {
-					hitSubgraphs[subgraphID] = struct{}{}
-				}
+		if keywordMatch(node.Statement, keywords) {
+			nodes = append(nodes, node)
+			for _, subgraphID := range node.SubgraphIDs {
+				hitSubgraphs[subgraphID] = struct{}{}
 			}
 		}
 	}
@@ -400,7 +401,7 @@ func (s *MemoryStore) visibleScopeLocked(principal auth.Principal, scopeRefs []s
 	for _, ref := range uniqueStrings(scopeRefs) {
 		subgraphID := strings.TrimPrefix(ref, "subgraph:")
 		record, ok := s.subgraphs[subgraphID]
-		if !ok || !canSeeSubgraph(principal, record) {
+		if !ok || record.ProjectID != principal.ProjectID || record.Subgraph.Kind != string(SubgraphKindGeneral) {
 			return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "scope not found"}
 		}
 		scope = append(scope, subgraphID)
@@ -421,17 +422,20 @@ func (s *MemoryStore) visibleAnchorNodesLocked(principal auth.Principal, anchorR
 		switch kind {
 		case "node":
 			record, ok := s.nodes[id]
-			if !ok || !canSeeNode(principal, s.subgraphs, record) {
+			if !ok {
+				return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
+			}
+			if _, ok := generalVisibleNode(principal.ProjectID, s.subgraphs, record.Node); !ok {
 				return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
 			}
 			nodes[id] = struct{}{}
 		case "subgraph":
 			record, ok := s.subgraphs[id]
-			if !ok || !canSeeSubgraph(principal, record) {
+			if !ok || record.ProjectID != principal.ProjectID || record.Subgraph.Kind != string(SubgraphKindGeneral) {
 				return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
 			}
 			for _, node := range s.sortedNodesLocked() {
-				if contains(node.Node.SubgraphIDs, id) && canSeeNode(principal, s.subgraphs, node) {
+				if contains(node.Node.SubgraphIDs, id) {
 					nodes[node.Node.ID] = struct{}{}
 				}
 			}
@@ -484,6 +488,24 @@ func visibleNode(principal auth.Principal, subgraphs map[string]SubgraphRecord, 
 		visible.SubgraphIDs = nil
 	}
 	return visible
+}
+
+func generalVisibleNode(projectID kernel.ProjectID, subgraphs map[string]SubgraphRecord, node ContextNode) (ContextNode, bool) {
+	visible := cloneNode(node)
+	visible.SubgraphIDs = visible.SubgraphIDs[:0]
+	for _, subgraphID := range node.SubgraphIDs {
+		subgraph, ok := subgraphs[subgraphID]
+		if ok && subgraph.ProjectID == projectID && subgraph.Subgraph.Kind == string(SubgraphKindGeneral) {
+			visible.SubgraphIDs = append(visible.SubgraphIDs, subgraphID)
+		}
+	}
+	if len(node.SubgraphIDs) > 0 && len(visible.SubgraphIDs) == 0 {
+		return ContextNode{}, false
+	}
+	if len(visible.SubgraphIDs) == 0 {
+		visible.SubgraphIDs = nil
+	}
+	return visible, true
 }
 
 func (s *MemoryStore) GetSubgraph(ctx context.Context, principal auth.Principal, req GetSubgraphRequest) (ContextSubgraph, error) {

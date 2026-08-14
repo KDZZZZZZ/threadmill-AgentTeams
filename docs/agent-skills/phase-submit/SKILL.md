@@ -28,10 +28,13 @@ description: 提交符合当前 DeliverySpec 与 ReportSpec 的正式 PhaseOutpu
   "phase": "plan | execute | verify，与当前 endpoint 严格一致",
   "delivery_refs": ["满足 DeliverySpec 的真实引用"],
   "report_ref": "满足 ReportSpec 的真实引用",
-  "evidence_refs": ["支撑交付和判断的真实引用"]
+  "evidence_refs": ["支撑交付和判断的真实引用；复用 Context 时证据正文包含准确 NodeRef/SourceRef"]
 }
 ```
 
 不要填写 TaskID、Endpoint、Generation、BindingRef、InputRevision、WorkspaceHead、lease 或 InvocationID；Runtime 会绑定。
 
 Accepted 只表示提交被接收。后续 submitted、satisfied、rejected、invalidated、verify passed 和 Task done 由授权方裁决。
+Targeted verifier report_ref rule:
+- When the PhaseSpec is `threadmill.targeted_verify.v1`, `report_ref` must be the artifact id returned by `evidence.register(type=generated_report, content_type=application/json, body=<strict v1 JSON>)`.
+- Do not put a local path, markdown report, `type=json`, `type=tool_output`, or command-output artifact in `report_ref` for targeted verify.

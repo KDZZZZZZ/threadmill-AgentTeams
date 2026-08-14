@@ -33,6 +33,7 @@ description: 原子审查 frozen-unreviewed Task Memory 候选批次并提交决
    - reject：不落图，只保留审计结论。
 5. revise、supersede、dispute 必须填写当前可见 TargetNodeID。SubgraphIDs 只能是可写 general 子图。
 6. Statement 是可独立理解的单一陈述；Kind 与语义一致；Reason 说明 evidence、复用价值、重复/冲突判断和 action 理由。
+7. 保持候选的原子粒度。多个有独立证据和复用价值的论断分别落为多个节点，不为了减少节点数把批次合并成总结；Context Graph 预期拥有大量细粒度节点。
 
 每份 CandidateReviewDecision 只含：CandidateID、Action、Statement、Kind、SubgraphIDs、TargetNodeID、Reason。不要添加评分、置信度或图命令字段。
 
@@ -40,7 +41,7 @@ description: 原子审查 frozen-unreviewed Task Memory 候选批次并提交决
 
 优先保留：会改变后续计划/实现/验证的知识、难以恢复的决定理由、已验证接口与约束、可复现失败模式、稳定项目偏好、图连接或旧节点修正。
 
-默认拒绝：临时进度、单次命令输出、可廉价恢复的细节、无新增价值近重复、事实/假设混淆、敏感信息和权威对象全文复制。
+默认拒绝：临时进度、单次命令输出、TaskID/InvocationID/SubscriptionID 等运行标识、当前排队或健康状态、Task Contract/Phase Spec/Context Slice 的复述、可从 Workspace 或权威输入廉价恢复的细节、已有节点的同义改写、无新增价值近重复、事实/假设混淆、敏感信息和权威对象全文复制。带 SourceRef 只证明可追溯，不免除这些拒绝条件。
 
 ## 提交
 

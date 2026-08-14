@@ -735,6 +735,7 @@ func workerToResponse(w *v1beta1.Worker) WorkerResponse {
 		ContainerState:   w.Status.ContainerState,
 		MatrixUserID:     w.Status.MatrixUserID,
 		RoomID:           w.Status.RoomID,
+		LastHeartbeat:    w.Status.LastHeartbeat,
 		Message:          w.Status.Message,
 	}
 	if resp.Phase == "" {

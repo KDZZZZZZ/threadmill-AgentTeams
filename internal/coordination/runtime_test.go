@@ -4,9 +4,38 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
+
+func TestGraphRuntimeExpiredLeaseStopsThroughPhaseController(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	createTask(t, graph, decisions, "task-expired")
+	now := time.Date(2026, 8, 11, 8, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return now }
+	controller := &recordingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := controller.lastAction(); got != CommandStart {
+		t.Fatalf("initial action = %s, want start", got)
+	}
+
+	now = now.Add(defaultPhaseLeaseTTL + time.Second)
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := controller.lastAction(); got != CommandStop {
+		t.Fatalf("expired lease action = %s, want stop", got)
+	}
+	stop := controller.lastCommand()
+	if stop.LeaseRef == "" || stop.Endpoint != ref("task-expired", EndpointPlan) {
+		t.Fatalf("stop command = %#v, want expired plan lease", stop)
+	}
+}
 
 func TestGraphRuntimeConcurrentReconcileClaimsOneRunAndLease(t *testing.T) {
 	graph, decisions, store := newGraphHarness()
@@ -340,6 +369,44 @@ func TestGraphRuntimeQuarantinesRejectedRunCommandsWithoutRedispatch(t *testing.
 	}
 }
 
+func TestGraphRuntimeRetriesExecutorUnavailableWithSameCommandAndLease(t *testing.T) {
+	graph, decisions, store := newGraphHarness()
+	_ = createTask(t, graph, decisions, "task-a")
+	controller := &capacityRejectingController{}
+	runtime := newGraphRuntime(projectID, store, controller)
+
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if err := runtime.reconcile(context.Background()); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if len(controller.commands) != 2 || controller.commands[0] != controller.commands[1] {
+		t.Fatalf("capacity retry commands = %#v, want same command delivered twice", controller.commands)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	project := store.ensureProject(projectID)
+	if len(project.runtime.commands) != 1 {
+		t.Fatalf("persisted commands = %d, want 1", len(project.runtime.commands))
+	}
+	for _, record := range project.runtime.commands {
+		if record.Accepted || !record.RetryScheduled || record.NotExecutable || record.Quarantined {
+			t.Fatalf("retry command state = %#v", record)
+		}
+	}
+	activeLeases := 0
+	for _, lease := range project.runtime.leases {
+		if lease.State == "active" {
+			activeLeases++
+		}
+	}
+	if activeLeases != 1 {
+		t.Fatalf("active leases = %d, want 1", activeLeases)
+	}
+}
+
 func TestGraphRuntimeDoesNotRedispatchRejectedStopCommand(t *testing.T) {
 	for _, code := range []kernel.ErrorCode{kernel.CodeStaleCommand, kernel.CodeLeaseConflict, kernel.CodeStaleCheckpoint} {
 		t.Run(string(code), func(t *testing.T) {
@@ -478,6 +545,15 @@ type rejectingController struct {
 type stopRejectingController struct {
 	err       error
 	stopCalls int
+}
+
+type capacityRejectingController struct {
+	commands []PhaseCommand
+}
+
+func (c *capacityRejectingController) Apply(_ context.Context, command PhaseCommand) error {
+	c.commands = append(c.commands, command)
+	return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "capacity saturated", Recoverable: true}
 }
 
 func (c *stopRejectingController) Apply(_ context.Context, command PhaseCommand) error {

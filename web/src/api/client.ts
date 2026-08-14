@@ -1,6 +1,7 @@
 import type {
   ApiErrorBody,
   CapacityState,
+  ContextGraphSnapshot,
   CoordinationSnapshot,
   EndpointInspector,
   EndpointRef,
@@ -55,6 +56,13 @@ export function getCoordinationSnapshot(
 ): Promise<CoordinationSnapshot> {
   const params = new URLSearchParams({ project_id: projectID });
   return request(`/v1/coordination/snapshot?${params}`);
+}
+
+export function getContextGraphSnapshot(
+  projectID: string,
+): Promise<ContextGraphSnapshot> {
+  const params = new URLSearchParams({ project_id: projectID });
+  return request(`/v1/context/snapshot?${params}`);
 }
 
 export function submitRequirement(input: {
@@ -130,6 +138,7 @@ export function submitManagerMessage(input: {
   projectID: string;
   conversationID: string;
   body: string;
+  intent?: "orchestrate" | "hold" | "resume";
   selectedEndpoint?: EndpointRef;
   observedGraphRevision: number;
 }): Promise<{
@@ -146,6 +155,7 @@ export function submitManagerMessage(input: {
       project_id: input.projectID,
       conversation_id: input.conversationID,
       body: input.body,
+      intent: input.intent ?? "orchestrate",
       selected_endpoint: input.selectedEndpoint,
       observed_graph_revision: input.observedGraphRevision,
     }),

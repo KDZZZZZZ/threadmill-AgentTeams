@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
@@ -51,6 +52,13 @@ func (c *AutoSleepController) reconcile(ctx context.Context) {
 		return
 	}
 	for _, worker := range workers.Items {
+		// Threadmill owns the lifecycle of its bounded execution carriers. It
+		// releases idle hosts explicitly after revoking invocation authority;
+		// independently auto-sleeping one can terminate an active model turn
+		// while its durable AgentTeams slot is still dispatched.
+		if strings.HasPrefix(worker.Name, "threadmill-") {
+			continue
+		}
 		if !shouldSleep(c.Now(), worker.Spec.DesiredState(), worker.Spec.IdleTimeout, worker.Status.LastActiveAt) {
 			continue
 		}

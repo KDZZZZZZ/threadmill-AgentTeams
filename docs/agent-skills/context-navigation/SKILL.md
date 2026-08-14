@@ -21,6 +21,7 @@ description: 在 Threadmill Invocation 中列出可见 Context 子图并按锚�
 3. 需要展开时调用 explore，使用当前 Slice、frontier、node: 或 subgraph: AnchorRef；默认一跳，Depth 只取完成当前判断所需的最小值。
 4. 对齐响应的 GraphRevision。过期结果不与新 revision 静默拼接。
 5. Context Agent 只能消费 general 可见对象；若 Adapter 意外暴露 task 对象，停止读取并报告边界错误。
+6. 导航的目标是减少后续 Workspace 读取：命中节点已回答问题时立即停止探索，保留 NodeRef/SourceRef 并直接用于判断；不得再到仓库寻找同一事实的另一份表述。
 
 ## 不变量
 

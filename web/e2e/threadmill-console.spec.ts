@@ -145,36 +145,28 @@ test.describe.serial("Threadmill operator console", () => {
     expect(graphWrites).toEqual([]);
   });
 
-  test("reconnects the projection after a finite SSE response", async ({
+  test("refreshes the snapshot and reconnects after an expired SSE cursor", async ({
     page,
   }) => {
     let streams = 0;
+    let snapshots = 0;
+    await page.route("**/v1/coordination/snapshot?**", async (route) => {
+      snapshots++;
+      await route.continue();
+    });
     await page.route("**/v1/events/stream?**", async (route) => {
       streams++;
       if (streams === 1) {
-        const occurredAt = new Date().toISOString();
-        const event = {
-          event_id: "evt-e2e-reconnect",
-          cursor: "999",
-          type: "manager.interaction",
-          occurred_at: occurredAt,
-          project_id: "demo-project",
-          payload: {
-            kind: "decision",
-            created_at: occurredAt,
-            manager_input_ref: "manager-input://e2e-reconnect",
-            decision_ref: "decision://e2e-reconnect",
-            graph_revision: 1,
-            disposition: "accepted",
-          },
-        };
         await route.fulfill({
-          status: 200,
+          status: 410,
           headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
+            "Content-Type": "application/json",
           },
-          body: `id: 999\nevent: manager.interaction\ndata: ${JSON.stringify(event)}\n\n`,
+          body: JSON.stringify({
+            code: "cursor_expired",
+            message: "event cursor expired",
+            recoverable: true,
+          }),
         });
         return;
       }
@@ -192,6 +184,7 @@ test.describe.serial("Threadmill operator console", () => {
       timeout: 15_000,
     });
     expect(streams).toBeGreaterThanOrEqual(2);
+    expect(snapshots).toBeGreaterThanOrEqual(2);
     await page.unrouteAll({ behavior: "ignoreErrors" });
     await page.close();
   });

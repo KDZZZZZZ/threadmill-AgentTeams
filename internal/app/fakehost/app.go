@@ -682,6 +682,49 @@ func (s *state) InspectInvocation(_ context.Context, _ auth.Principal, invocatio
 	return s.contexts[invocation.ID], nil
 }
 
+func (s *state) ProjectContextSnapshot(_ context.Context, projectID kernel.ProjectID) (contextgraph.ContextGraphSnapshot, error) {
+	if projectID != s.projectID {
+		return contextgraph.ContextGraphSnapshot{}, kernel.Forbidden("project not found")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nodes := map[string]contextgraph.ContextSnapshotNode{}
+	for _, inspection := range s.contexts {
+		seen := map[string]struct{}{}
+		for _, node := range inspection.Slice.Nodes {
+			if node.ID == "" {
+				continue
+			}
+			item := nodes[node.ID]
+			if item.NodeID == "" {
+				item = contextgraph.ContextSnapshotNode{
+					NodeID:      node.ID,
+					Kind:        node.Kind,
+					Statement:   node.Statement,
+					Status:      node.Status,
+					SourceRefs:  append([]string(nil), node.SourceRefs...),
+					SubgraphIDs: append([]string(nil), node.SubgraphIDs...),
+				}
+			}
+			seen[node.ID] = struct{}{}
+			nodes[node.ID] = item
+		}
+		for nodeID := range seen {
+			item := nodes[nodeID]
+			item.UsageCount++
+			last := s.now().UTC()
+			item.LastUsedAt = &last
+			nodes[nodeID] = item
+		}
+	}
+	out := make([]contextgraph.ContextSnapshotNode, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, node)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return contextgraph.ContextGraphSnapshot{ProjectID: projectID, Revision: 1, Nodes: out, Edges: []contextgraph.ContextSnapshotEdge{}, Subgraphs: []contextgraph.ContextSnapshotSubgraph{}}, nil
+}
+
 type queryPort struct {
 	projectID   kernel.ProjectID
 	graph       *coordination.MemoryStore
@@ -691,6 +734,10 @@ type queryPort struct {
 
 func (q queryPort) ProjectSnapshot(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID, revision kernel.Revision) (httpapi.CoordinationSnapshot, error) {
 	return q.ui.Snapshot(ctx, principal, projectID, revision)
+}
+
+func (q queryPort) ContextSnapshot(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID) (httpapi.ContextGraphSnapshot, error) {
+	return q.ui.ContextSnapshot(ctx, principal, projectID)
 }
 
 func (q queryPort) InspectEndpoint(ctx context.Context, principal auth.Principal, ref coordination.PhaseEndpointRef, generation int) (httpapi.EndpointInspector, error) {

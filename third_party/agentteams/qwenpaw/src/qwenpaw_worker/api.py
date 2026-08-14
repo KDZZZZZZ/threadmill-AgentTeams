@@ -13,6 +13,10 @@ import urllib.request
 class QwenPawApiError(RuntimeError):
     """Raised when QwenPaw rejects or fails to persist desired state."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class QwenPawApiClient:
     def __init__(self, base_url: str, timeout: float = 10) -> None:
@@ -38,6 +42,7 @@ class QwenPawApiClient:
         except urllib.error.HTTPError as exc:
             raise QwenPawApiError(
                 f"QwenPaw API {method} {path} failed with HTTP {exc.code}",
+                status_code=exc.code,
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise QwenPawApiError(
@@ -73,7 +78,7 @@ class QwenPawApiClient:
                 f"/api/config/channels/{urllib.parse.quote(channel, safe='')}",
             )
         except QwenPawApiError as exc:
-            if "HTTP 404" in str(exc):
+            if exc.status_code == 404:
                 return {}
             raise
 
@@ -176,6 +181,14 @@ class QwenPawApiClient:
             f"/api/mcp/{urllib.parse.quote(client_key, safe='')}",
         )
 
+    def get_mcp_if_present(self, client_key: str) -> dict[str, Any] | None:
+        try:
+            return self.get_mcp(client_key)
+        except QwenPawApiError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
     def create_mcp(
         self,
         client_key: str,
@@ -229,11 +242,15 @@ class QwenPawApiClient:
         return actual
 
     def delete_mcp(self, client_key: str) -> None:
-        self._request(
-            "DELETE",
-            f"/api/mcp/{urllib.parse.quote(client_key, safe='')}",
-        )
-        if any(item.get("key") == client_key for item in self.list_mcp()):
+        try:
+            self._request(
+                "DELETE",
+                f"/api/mcp/{urllib.parse.quote(client_key, safe='')}",
+            )
+        except QwenPawApiError as exc:
+            if exc.status_code != 404:
+                raise
+        if self.get_mcp_if_present(client_key) is not None:
             raise QwenPawApiError(
                 f"QwenPaw MCP {client_key} delete readback mismatch",
             )

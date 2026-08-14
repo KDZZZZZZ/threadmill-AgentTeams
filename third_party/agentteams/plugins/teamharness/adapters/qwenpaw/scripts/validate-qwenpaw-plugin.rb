@@ -24,11 +24,24 @@ def assert_dir(path)
   fail!("missing directory: #{path}") unless path.directory?
 end
 
+def python_command
+  candidates = [ENV["PYTHON"], "python3", "python"].compact.uniq
+  candidates.each do |candidate|
+    _, _, status = Open3.capture3(candidate, "--version")
+    return candidate if status.success?
+  rescue Errno::ENOENT
+    next
+  end
+  fail!("no usable Python interpreter found")
+end
+
+PYTHON_COMMAND = python_command
+
 def py_compile(path)
   Dir.mktmpdir("teamharness-pycache-") do |cache_dir|
     Open3.capture3(
       { "PYTHONPYCACHEPREFIX" => cache_dir },
-      "python3",
+      PYTHON_COMMAND,
       "-m",
       "py_compile",
       path.to_s

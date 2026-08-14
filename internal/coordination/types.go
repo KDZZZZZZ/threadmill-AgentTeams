@@ -169,18 +169,20 @@ type PendingSubgraph struct {
 }
 
 type GraphTransition struct {
-	TargetKind    TransitionTarget  `json:"target_kind"`
-	Endpoint      PhaseEndpointRef  `json:"endpoint,omitempty"`
-	BlockerID     string            `json:"blocker_id,omitempty"`
-	TaskID        kernel.TaskID     `json:"task_id,omitempty"`
-	Action        string            `json:"action"`
-	Generation    int               `json:"generation,omitempty"`
-	Result        PhaseResult       `json:"result,omitempty"`
-	NewBindingRef kernel.BindingRef `json:"new_binding_ref,omitempty"`
-	NewSpecRef    string            `json:"new_spec_ref,omitempty"`
-	CheckpointRef string            `json:"checkpoint_ref,omitempty"`
-	NonResumable  bool              `json:"non_resumable,omitempty"`
-	EvidenceRefs  []string          `json:"evidence_refs,omitempty"`
+	TargetKind        TransitionTarget  `json:"target_kind"`
+	Endpoint          PhaseEndpointRef  `json:"endpoint,omitempty"`
+	BlockerID         string            `json:"blocker_id,omitempty"`
+	TaskID            kernel.TaskID     `json:"task_id,omitempty"`
+	Action            string            `json:"action"`
+	Generation        int               `json:"generation,omitempty"`
+	Result            PhaseResult       `json:"result,omitempty"`
+	NewBindingRef     kernel.BindingRef `json:"new_binding_ref,omitempty"`
+	ExecuteBindingRef kernel.BindingRef `json:"execute_binding_ref,omitempty"`
+	VerifyBindingRef  kernel.BindingRef `json:"verify_binding_ref,omitempty"`
+	NewSpecRef        string            `json:"new_spec_ref,omitempty"`
+	CheckpointRef     string            `json:"checkpoint_ref,omitempty"`
+	NonResumable      bool              `json:"non_resumable,omitempty"`
+	EvidenceRefs      []string          `json:"evidence_refs,omitempty"`
 }
 
 type TaskManagerGraph interface {
@@ -197,7 +199,7 @@ type Store interface {
 	Latest(ctx context.Context, projectID kernel.ProjectID) (GraphSnapshot, error)
 	Snapshot(ctx context.Context, projectID kernel.ProjectID, revision kernel.Revision) (GraphSnapshot, error)
 	ReplacePending(ctx context.Context, projectID kernel.ProjectID, next PendingSubgraph) (GraphSnapshot, error)
-	Transition(ctx context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, transition GraphTransition) (GraphSnapshot, error)
+	TransitionWithDecisionRef(ctx context.Context, projectID kernel.ProjectID, expectedRevision kernel.Revision, decisionRef string, transition GraphTransition) (GraphSnapshot, error)
 }
 
 type DecisionKind string

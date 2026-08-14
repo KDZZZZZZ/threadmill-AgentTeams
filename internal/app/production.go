@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextagent"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/contextgraph"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
@@ -52,6 +51,9 @@ type productionRuntimeDependencies struct {
 	orchestration     mcpapi.OrchestrationProposalRuntime
 	taskManager       mcpapi.TaskManagerAgentRuntime
 	workspace         workspace.AgentToolPort
+	contextRetrieve   mcpapi.ContextAgentRetrieveDispatcher
+	contextSearcher   contextgraph.ContextGraphSearcher
+	memoryFinalizer   contextgraph.TaskMemoryFinalizer
 	phaseController   coordination.PhaseController
 	objectStoreDriver objectstore.Store
 	objectStore       productionReadinessProbe
@@ -148,9 +150,13 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 			return nil, err
 		}
 	}
+	objectStore, err := productionEvidenceObjectStore(cfg, objectStore)
+	if err != nil {
+		return nil, err
+	}
 	artifactRegistry := evidence.NewPostgresArtifactRegistry(sqlDB, objectStore, cfg.ObjectStoreBucket)
 	eventStore := evidence.NewPostgresEventStore(sqlDB, 1<<20)
-	permissions := allowProjectPermission{projectID: projectID}
+	permissions := productionUIPermissions{db: sqlDB, projectID: projectID}
 	events := uiprojection.NewEventLogQuery(eventStore, permissions)
 	coordStore := coordination.NewPostgresStore(sqlDB)
 	contextStore := contextgraph.NewPostgresStore(sqlDB, time.Now)
@@ -176,14 +182,14 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 	})
 	registry, err := mcpapi.NewRegistry(mcpapi.AllRuntimeToolSpecs(mcpapi.RuntimeToolDependencies{
 		ContextReader:      contextStore,
-		ContextRetrieve:    productionContextRetrieve{agent: contextagent.Agent{Searcher: contextStore}},
+		ContextRetrieve:    deps.contextRetrieve,
 		ContextCurator:     contextStore,
-		ContextSearcher:    contextStore,
+		ContextSearcher:    deps.contextSearcher,
 		ContextReviewer:    contextStore,
 		TaskMemoryReader:   contextStore,
 		CandidateSubmitter: contextStore,
 		TaskContextWriter:  contextStore,
-		MemoryFinalizer:    contextStore,
+		MemoryFinalizer:    deps.memoryFinalizer,
 		Phase:              deps.phase,
 		Requirement:        deps.requirement,
 		Orchestration:      deps.orchestration,
@@ -194,7 +200,10 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 	if err != nil {
 		return nil, err
 	}
-	mcp, err := mcpapi.NewHTTPHandler(authenticator, registry, mcpapi.HTTPOptions{ServerVersion: "production"})
+	mcp, err := mcpapi.NewHTTPHandler(authenticator, registry, mcpapi.HTTPOptions{
+		ServerVersion: "production",
+		ToolCallGuard: productionInvocationToolCallGuard{invocations: invocations},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -204,6 +213,41 @@ func buildProductionHostWithDependencies(ctx context.Context, cfg config.Config,
 	}
 	_ = invocations
 	return &productionHost{db: db, background: deps.background, api: api, mcp: mcp, web: web.Handler()}, nil
+}
+
+// productionEvidenceObjectStore keeps every artifact producer and consumer on
+// the same logical namespace. AgentTeams shared-storage credentials can be
+// restricted to the shared prefix of the same bucket; in that deployment the
+// registry still exposes stable logical keys such as plan/<hash> while the
+// physical objects live below shared/threadmill/evidence/.
+func productionEvidenceObjectStore(cfg config.Config, store objectstore.Store) (objectstore.Store, error) {
+	if store == nil || cfg.AgentTeamsSharedBucket != cfg.ObjectStoreBucket {
+		return store, nil
+	}
+	return objectstore.WithKeyPrefix(store, "shared/threadmill/evidence")
+}
+
+type productionInvocationToolCallGuard struct {
+	invocations runtime.InvocationStore
+}
+
+func (g productionInvocationToolCallGuard) AuthorizeToolCall(ctx context.Context, principal auth.Principal) error {
+	if principal.Kind != auth.PrincipalAgent || g.invocations == nil {
+		return kernel.Forbidden("Threadmill tool call requires an active Runtime invocation")
+	}
+	invocation, ok, err := g.invocations.Get(ctx, principal.InvocationID)
+	if err != nil {
+		return err
+	}
+	if !ok || invocation.ActorPrincipalID != principal.ActorPrincipalID || invocation.ProjectID != principal.ProjectID || invocation.Role != principal.Role {
+		return kernel.Forbidden("Threadmill tool call invocation binding is invalid")
+	}
+	switch invocation.Status {
+	case runtime.InvocationPrepared, runtime.InvocationRunning, runtime.InvocationWaiting:
+		return nil
+	default:
+		return kernel.Error{Code: kernel.CodeForbidden, Message: "Runtime invocation is terminal; Threadmill tools are fenced", Recoverable: false}
+	}
 }
 
 func (h *productionHost) Handler() http.Handler {
@@ -243,17 +287,38 @@ func newProductionAPIHandler(cfg config.Config, options httpapi.Options) http.Ha
 	return httpapi.New(options).Handler()
 }
 
-type allowProjectPermission struct{ projectID kernel.ProjectID }
+const allProjectTasks = "*"
 
-func (p allowProjectPermission) CanReadProject(_ context.Context, principal auth.Principal, projectID kernel.ProjectID) (bool, error) {
+type productionUIPermissions struct {
+	db        *sql.DB
+	projectID kernel.ProjectID
+}
+
+func (p productionUIPermissions) CanReadProject(_ context.Context, principal auth.Principal, projectID kernel.ProjectID) (bool, error) {
 	return principal.ProjectID == p.projectID && projectID == p.projectID, nil
 }
 
-func (p allowProjectPermission) TaskGrant(_ context.Context, principal auth.Principal, projectID kernel.ProjectID, taskID kernel.TaskID) (uiprojection.TaskReadGrant, error) {
+func (p productionUIPermissions) TaskGrant(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID, taskID kernel.TaskID) (uiprojection.TaskReadGrant, error) {
 	if principal.ProjectID != p.projectID || projectID != p.projectID || taskID == "" {
 		return uiprojection.TaskReadGrant{}, nil
 	}
-	return uiprojection.TaskReadGrant{Visible: true, ContextBodies: true, CandidateBodies: true}, nil
+	if p.db == nil {
+		return uiprojection.TaskReadGrant{}, kernel.Forbidden("UI task permission store is not configured")
+	}
+	var grant uiprojection.TaskReadGrant
+	err := p.db.QueryRowContext(ctx, `
+SELECT visible, context_bodies, candidate_bodies
+FROM operator_ui_task_grants
+WHERE actor_principal_id = $1 AND project_id = $2 AND task_id IN ($3, $4)
+ORDER BY CASE WHEN task_id = $3 THEN 0 ELSE 1 END
+LIMIT 1`, principal.ActorPrincipalID, projectID, taskID, allProjectTasks).Scan(&grant.Visible, &grant.ContextBodies, &grant.CandidateBodies)
+	if errors.Is(err, sql.ErrNoRows) {
+		return uiprojection.TaskReadGrant{}, nil
+	}
+	if err != nil {
+		return uiprojection.TaskReadGrant{}, err
+	}
+	return grant, nil
 }
 
 type productionCapacity struct {
@@ -338,36 +403,31 @@ type productionContextInspector struct {
 }
 
 func (p productionContextInspector) InspectInvocation(ctx context.Context, principal auth.Principal, invocation runtime.Invocation) (uiprojection.ContextInspection, error) {
-	agent := auth.Principal{
-		ActorPrincipalID: invocation.ActorPrincipalID,
-		Kind:             auth.PrincipalAgent,
-		ProjectID:        invocation.ProjectID,
-		Role:             invocation.Role,
-		Operation:        invocation.Operation,
-		TaskID:           invocation.TaskID,
-		InvocationID:     invocation.ID,
-		Tools: auth.ToolSet(
-			auth.ToolContextListSubgraphs,
-			auth.ToolContextExplore,
-			auth.ToolContextSubscribe,
-			auth.ToolContextUnsubscribe,
-			auth.ToolAgentListTaskMemoryCandidates,
-		),
-		AuthenticatedAt: time.Now(),
-	}
 	subs, err := p.contexts.InspectSubscriptions(ctx, principal, invocation.ID)
 	if err != nil {
 		return uiprojection.ContextInspection{}, err
 	}
-	slice, err := p.contexts.MaterializeRuntimeContext(ctx, agent)
-	if err != nil {
+	slice, err := p.contexts.InspectInitialSlice(ctx, principal, invocation.ID)
+	var omitted []uiprojection.OmittedContext
+	if kernel.IsCode(err, kernel.CodeNotFound) && invocation.ContextSliceRef != "" {
+		// Invocations created before immutable slice persistence cannot have
+		// their startup baseline reconstructed from today's active union. Keep
+		// the historical ref and metadata visible, but mark its body stale
+		// instead of fabricating an empty snapshot or failing the whole panel.
+		slice = contextgraph.ContextSlice{Nodes: []contextgraph.ContextNode{}, SubscriptionIDs: []string{}}
+		omitted = []uiprojection.OmittedContext{{Reason: "stale", Count: 0}}
+	} else if err != nil {
 		return uiprojection.ContextInspection{}, err
 	}
 	candidates, err := p.candidates(ctx, invocation)
 	if err != nil {
 		return uiprojection.ContextInspection{}, err
 	}
-	return uiprojection.ContextInspection{Subscriptions: subs, Slice: slice, Frontier: slice.SubscriptionIDs, Candidates: candidates}, nil
+	return uiprojection.ContextInspection{Subscriptions: subs, Slice: slice, Frontier: slice.SubscriptionIDs, Omitted: omitted, Candidates: candidates}, nil
+}
+
+func (p productionContextInspector) ProjectContextSnapshot(ctx context.Context, projectID kernel.ProjectID) (contextgraph.ContextGraphSnapshot, error) {
+	return p.contexts.ProjectContextSnapshot(ctx, projectID)
 }
 
 func (p productionContextInspector) candidates(ctx context.Context, invocation runtime.Invocation) ([]uiprojection.CandidateInspectionRecord, error) {
@@ -406,6 +466,10 @@ type productionQuery struct {
 
 func (q productionQuery) ProjectSnapshot(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID, revision kernel.Revision) (httpapi.CoordinationSnapshot, error) {
 	return q.ui.Snapshot(ctx, principal, projectID, revision)
+}
+
+func (q productionQuery) ContextSnapshot(ctx context.Context, principal auth.Principal, projectID kernel.ProjectID) (httpapi.ContextGraphSnapshot, error) {
+	return q.ui.ContextSnapshot(ctx, principal, projectID)
 }
 
 func (q productionQuery) InspectEndpoint(ctx context.Context, principal auth.Principal, ref coordination.PhaseEndpointRef, generation int) (httpapi.EndpointInspector, error) {
@@ -453,7 +517,19 @@ func (q productionQuery) Task(ctx context.Context, principal auth.Principal, tas
 	if contract, err := q.contracts.TaskContract(ctx, taskID); err == nil && contract.DeliveryPolicy != "" {
 		policy = string(contract.DeliveryPolicy)
 	}
-	return httpapi.TaskProjection{TaskID: taskID, ProjectID: q.projectID, Status: status, GraphRevision: graph.Revision, ContractRef: task.ContractRef, DeliveryPolicy: policy, Endpoints: endpoints}, nil
+	return httpapi.TaskProjection{TaskID: taskID, ProjectID: q.projectID, Status: status, GraphRevision: graph.Revision, ContractRef: task.ContractRef, DeliveryPolicy: policy, Endpoints: endpoints, Blockers: productionTaskBlockers(graph, taskID)}, nil
+}
+
+func productionTaskBlockers(graph coordination.GraphSnapshot, taskID kernel.TaskID) []httpapi.BlockerProjection {
+	blockers := make([]httpapi.BlockerProjection, 0)
+	for _, blocker := range graph.Blockers {
+		if blocker.Target.TaskID != taskID {
+			continue
+		}
+		blockers = append(blockers, httpapi.BlockerProjection{BlockerID: blocker.ID, Target: blocker.Target, State: string(blocker.State)})
+	}
+	sort.Slice(blockers, func(i, j int) bool { return blockers[i].BlockerID < blockers[j].BlockerID })
+	return blockers
 }
 
 type productionDatabasePinger interface {
@@ -527,6 +603,9 @@ func validateProductionRuntimeDependencies(deps productionRuntimeDependencies) e
 		{name: "orchestration_runtime", value: deps.orchestration},
 		{name: "task_manager_runtime", value: deps.taskManager},
 		{name: "workspace", value: deps.workspace},
+		{name: "context_retrieve_runtime", value: deps.contextRetrieve},
+		{name: "context_search_runtime", value: deps.contextSearcher},
+		{name: "context_memory_finalizer", value: deps.memoryFinalizer},
 		{name: "phase_controller", value: deps.phaseController},
 		{name: "object_store_readiness", value: deps.objectStore},
 		{name: "agentteams_readiness", value: deps.agentTeams},
@@ -585,24 +664,4 @@ func scanProductionInvocation(row interface{ Scan(...any) error }) (runtime.Invo
 		_ = json.Unmarshal(effectiveTools, &invocation.EffectiveTools)
 	}
 	return invocation, nil
-}
-
-type productionContextRetrieve struct{ agent contextagent.Agent }
-
-func (d productionContextRetrieve) RetrieveForConsumer(ctx context.Context, caller auth.Principal, req contextagent.ContextRetrieveRequest) (contextagent.ContextRetrieveResult, error) {
-	contextPrincipal := auth.Principal{
-		ActorPrincipalID:     "context-agent://production-retrieve",
-		Kind:                 auth.PrincipalAgent,
-		ProjectID:            caller.ProjectID,
-		Role:                 auth.RoleContext,
-		Operation:            "retrieve",
-		TaskID:               caller.TaskID,
-		InvocationID:         kernel.InvocationID("context-retrieve://" + string(caller.InvocationID)),
-		ConsumerInvocationID: caller.InvocationID,
-		ConsumerTaskID:       caller.TaskID,
-		ConsumerRole:         caller.Role,
-		Tools:                auth.ToolSet(auth.ToolContextSearch),
-		AuthenticatedAt:      time.Now(),
-	}
-	return d.agent.Retrieve(ctx, contextPrincipal, req)
 }

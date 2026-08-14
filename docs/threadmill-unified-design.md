@@ -101,7 +101,9 @@ plan -> execute -> verify
 
 ```text
 Task Contract
-  -> Round 1: plan -> execute -> verify
+  -> Round 1: plan -> execute
+       -> code_merge: Merge Queue -> verify merged revision
+       -> other policy: verify current delivery
        -> passed + delivery conditions -> done
        -> failed, contract still valid -> verifier 提交 Proposal，Task Manager 重开轮次
        -> independent prerequisite found -> new Task + endpoint edge
@@ -116,7 +118,7 @@ Task Contract
 DeliveryPolicy: non_code_artifact | code_merge | human_acceptance | external_delivery
 ```
 
-- `code_merge` 型 Task（默认代码任务）：`done = verify passed && latest-main targeted verify passed && merge succeeded && dependency/decision conditions satisfied`（按 8.2 全链）；
+- `code_merge` 型 Task（默认代码任务）：`done = merge succeeded && post-merge verify passed && dependency/decision conditions satisfied`（按 8.2 全链）；
 - `non_code_artifact` / `human_acceptance` / `external_delivery` 型按交付条件定义，不经过 Merge Queue。
 
 ### 3.3 阶段状态与 revision
@@ -145,7 +147,7 @@ Task Contract、依赖结果、代码基线、Workspace Head 或高影响上下�
 
 ### 4.1 核心规则
 
-**同一个 Task 轮次的 plan、execute、verify 默认共享同一个 Workspace Binding。** 三个阶段可以由不同 Agent、不同 provider 或不同 Thread 执行，但它们看到的是同一份受控执行现场。
+**同一个 Task 轮次的 plan、execute 默认共享同一个 Workspace Binding。** 非代码交付的 verify 默认继续使用该 Binding；`code_merge` 的 verify 使用从精确 merged revision 创建的下一代只读 Binding，并继承 plan/execute 完成谱系。三个阶段仍可由不同 Agent、provider 或 Thread 执行。
 
 这解决四个问题：
 
@@ -200,8 +202,9 @@ Scheduler 激活 T.execute
 
 Scheduler 激活 T.verify
   -> Runtime 继续复用同一 Workspace Binding
-  -> verifier 默认只读实现，可运行检查并写 evidence artifact
-  -> Verify Result 绑定 Workspace CurrentRevision
+  -> verifier 默认只读实现，可运行检查并注册 evidence artifact
+  -> Verify 的临时 evidence/ 不改变候选代码 revision
+  -> Verify Result 绑定 execute 候选的 Workspace CurrentRevision
 ```
 
 共享 Workspace 不等于共享权限。权限随 phase lease 切换：plan 默认只读源码，execute 可写批准范围，verify 默认不可修改候选实现。任何阶段只能有一个有效写 lease；同 Task 内需要并行工作时，只能并行进行只读准备或由 Task Manager 拆为具有独立 Workspace 的 Task。Runtime 创建的是 Invocation 而不是任何业务对象；Workspace Binding 由 Workspace Service 创建/复用。
@@ -360,7 +363,7 @@ Task Manager 收到建议后校验来源 endpoint、当前 graph revision、理�
 | Context Agent | 响应 `contextAgent.retrieve`；受控探索；经 Context Service CRUD general 节点和 general 子图；审查 done 后冻结候选 | 可见 Context Graph、Event Log、Artifact Store、权限策略 | 主动无界巡图、操作 task 子图或其节点、直连图存储、改 Coordination Graph、批准阶段交付 |
 | Agent Runtime | 启动/取消/恢复 Invocation，施加 phase 权限，记录事件并校验输入与输出形状 | Scheduler 的 run request、Context Slice、Workspace Binding、PhaseInputSet | 判断业务完成、暴露未提交过程上下文、写任一图的业务状态 |
 | Workspace Service | 为 Task 轮次创建/复用/封存执行现场，观察 write set | Runtime policy、轮次 revision | 调度 Agent、判断验收、写 main |
-| Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上机械检查并合入 | Task Contract、Approved Plan、Workspace、evidence | Verifier 修改实现；Merge Queue 修冲突或直接改 Coordination/Context Graph |
+| Verifier / Merge Queue | Verifier 判断候选是否满足契约；Merge Queue 在 latest main 上检查并合入 | Task Contract、Approved Plan、Workspace、evidence、受限冲突现场 | 普通 Verifier 修改实现；Targeted Verifier 越过 allowed/conflict paths、commit/push 或写 Coordination/Context Graph；Merge Queue 直接改图 |
 | Phase Agent | 完成当前 phase；在已知 completion 输入上自主等待或汇总；提交 PhaseOutput 或编排建议；使用可见 Context Graph | Task Contract、endpoint 契约、自己的 Context Slice/Delta、子图列表与描述、PhaseInputSet | 直接改图、直接通信、改 main、宣布 done |
 
 依赖约束：Task Manager 与 phase agent 使用相同 Context 读/订阅生命周期接口（`ContextGraphReader`：ListSubgraphs / Explore / Subscribe / Unsubscribe；机械检索 `ContextGraphSearcher.Search` 只注入 Context Agent）。phase agent 不能直接写 Context Graph；Task Manager 只能经 Context Service 向 `task` 子图投影上下文节点——`directive`（Task Contract 与 endpoint DeliverySpec/ReportSpec、用户 Requirement 的上下文投影，权威来源是 Coordination Graph 与 Requirement provenance）、`fact`（已接受/验证的 PhaseOutput、交付物、报告和证据的上下文投影，权威载荷在 Artifact Store/PhaseOutput）——`hypothesis` 不得承载任务或用户要求。节点引用权威来源、不复制易变 runnable/blocked 状态，不能访问图存储；Task Manager 的定向投影只写 `task` 子图，Phase Agent 候选只建议 `general` 子图，两条路径目标不相交，不存在逐目标混合鉴权。Context Agent 不依赖 Scheduler；Runtime 不依赖图的具体存储；Workspace 不依赖 Context Graph。
@@ -426,29 +429,36 @@ Verifier 必须同时读取：Task Contract、Approved Plan、真实 diff/产物
 
 ### 8.2 Merge Queue
 
-代码型 Task（`DeliveryPolicy=code_merge`）的 `verify passed` 只获得进入 Merge Queue 的资格，不等于 `done`：
+代码型 Task（`DeliveryPolicy=code_merge`）先合入，再由普通 Verify 对已合入 revision 做最终验收：
 
 ```text
-Verify passed on round Workspace
+Execute satisfied on round Workspace
   -> MergeCandidate
   -> latest main 上机械应用检查
   -> 临时 merge-check workspace
-  -> targeted verify on latest main + candidate
+  -> 有真实冲突时 targeted verifier 仅解冲突
   -> serial merge
   -> merge event + commit/diff/test evidence
-  -> Task Manager 计算 done
+  -> merged-revision Verify workspace
+  -> normal Verify on merged revision
+  -> 通过后 Task Manager 计算 done
+  -> 失败时 Verify 提交 proposal，由 Manager 决定 retry/replan/split/dependency
 ```
 
-Merge Queue 是 main 的唯一写入口。它不修冲突、不重写 Task Graph、不直接写 Context Graph。冲突或复验失败会产生 evidence，并由 Task Manager 将受影响阶段编排回 plan/execute/verify 或 waiting_human。
+Merge Queue 是 main 的唯一写入口，只做权限、写集、机械应用、冲突处理和串行写入，不提前执行 Task 的普通验收 Verify。main 发生无冲突漂移时直接机械合入；只有机械 apply 出现真实冲突时才启动 Targeted Verifier。它可在 Runtime 注入的精确 `allowed_write_paths` / `conflict_paths` 内使用原生搜索、读写文件和 shell 解冲突，但不得 commit/push，不得写 Coordination Graph 或 Context Graph。若解冲突会破坏 Task Contract、验收条件或使任务不可完成，Verifier 必须通过 `agent.proposeOrchestration` 向 Manager 申请重新编排；该候选随后失败，Manager 只能在可信 targeted boundary 上用一次 `reopen_round` 原子重开 execute+verify。普通 proposal 不能重开已终态节点。
+
+合入成功后，Runtime 从 `merged_revision` 创建只读 Verify Binding 并继承本轮 plan/execute 完成谱系；Scheduler 在此之前不得启动 verify。普通 Verify 若发现已合入结果不满足 Contract，必须提交失败 evidence 与 `OrchestrationProposal`，由 Manager 裁决如何重开或拆分，Verifier 不自行回滚 main。
+
+`reopen_round` 复用原 Task、plan、Contract 和 declared write authority，从 Targeted Verifier 观察到的 latest-main 创建新 Workspace Binding；execute 与 verify generation 同步轮换，旧结果和冲突 evidence 保留审计，不参与新轮次的通过判断。
 
 ### 8.3 多 Workspace 合并语义
 
 不同 Task 各有独立 Workspace（按轮次切换）。合并顺序不由 Agent 私聊决定：
 
-- 已通过 verify 并进入队列的 candidate 优先尝试；
-- candidate 必须在 latest main 上仍可应用并通过 targeted verify；
-- 后合入 Task 的旧验证因相关 main revision 改变而失效；
-- write set 重叠是风险信号，真正 gate 由机械冲突和 targeted verify 决定；
+- 已满足 execute 且进入队列的 candidate 优先尝试；
+- candidate 必须能在 latest main 上机械应用；只有真实冲突交给 targeted verifier；
+- 普通 Verify 始终绑定各自实际 merged revision，不复用合入前判断；
+- write set 重叠是风险信号，真正的合入 gate 是权限与机械冲突，业务验收由合入后的普通 Verify 完成；
 - 合并后的新事实通过 Event Log 进入 Context Graph，并可推送给订阅相关子图的 active Agent。
 
 ---

@@ -118,7 +118,7 @@ func (s *Service) Transition(ctx context.Context, expectedRevision kernel.Revisi
 		kernel.IdempotencyKey(transitionRef),
 		payload,
 		func(ctx context.Context) (kernel.IdempotencyResponse, error) {
-			updated, err := s.store.Transition(ctx, scope.ProjectID, expectedRevision, transition)
+			updated, err := s.store.TransitionWithDecisionRef(ctx, scope.ProjectID, expectedRevision, transitionRef, transition)
 			if err != nil {
 				return kernel.IdempotencyResponse{}, err
 			}

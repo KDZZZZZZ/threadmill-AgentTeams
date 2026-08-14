@@ -134,11 +134,16 @@ inputRef
   -> snapshot + report/delivery/evidence
   -> submitDecision + transition
   -> 接受的结果投影为 task fact
-  -> DeliveryPolicy 与 merge evidence 均满足后才 transition(done)
+  -> code_merge: execute satisfied 后入 Merge Queue
+  -> merged revision ready 后 Runtime 解锁普通 verify
+  -> post-merge verify satisfied 且 merge evidence 匹配后才 transition(done)
+  -> post-merge verify failed 时接收 Verifier proposal 并决定重开/拆分/依赖
   -> done 成功后 finalizeTaskMemory
 ```
 
 `submitted`、`satisfied` 与 `done` 必须是三个独立裁决。Task Manager 不能因收到 PhaseOutput 就跳过 verifier/DeliveryPolicy，也不能因 Runtime started/failed/stopped 观察直接宣布业务完成。
+
+`code_merge` 的 Merge Queue 边界按最新规则处理：execute satisfied 后先机械合入；无冲突 main drift 不启动 Verifier，只有真实冲突才有 Targeted Verifier。合入成功后普通 Verify 对 merged revision 验收；它发现缺陷时必须带 evidence 提交 `agent.proposeOrchestration`，Task Manager 决定 retry/replan/split/dependency。若 Targeted Verifier 认为解冲突会破坏 Contract、验收条件或任务可完成性，也必须提案；Task Manager 可在可信 targeted boundary 上使用单次 `reopen_round`。普通 proposal 不能重开已终态节点。
 
 ### 3.2 失败与恢复
 

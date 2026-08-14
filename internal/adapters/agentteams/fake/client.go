@@ -36,6 +36,7 @@ type Client struct {
 	DelegateResponseError error
 	FailRevoke            error
 	FailForceStop         error
+	FailRelease           error
 	FailCancel            error
 	FailCheck             error
 	FailObserve           error
@@ -152,6 +153,9 @@ func (c *Client) ReleaseHostSlot(ctx context.Context, taskID, hostRef string) er
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls = append(c.calls, "release:"+taskID)
+	if c.FailRelease != nil {
+		return c.FailRelease
+	}
 	record, ok := c.tasks[taskID]
 	if !ok {
 		return kernel.Error{Code: kernel.CodeNotFound, Message: "fake task not found"}
@@ -182,6 +186,16 @@ func (c *Client) RevokeInvocation(ctx context.Context, hostRef string, invocatio
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls = append(c.calls, "revoke:"+string(invocationID))
+	return c.FailRevoke
+}
+
+func (c *Client) FenceInvocation(ctx context.Context, _ string, invocationID kernel.InvocationID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, "fence:"+string(invocationID))
 	return c.FailRevoke
 }
 
@@ -267,13 +281,23 @@ func (c *Client) ReadObservations(ctx context.Context, cursor string) ([]adapter
 	return result, nil
 }
 
-func (c *Client) PullExecution(ctx context.Context, taskID string) error {
+func (c *Client) PullExecution(ctx context.Context, execution adapter.AgentTeamsExecutionRef) (adapter.ExecutionWorkspaceCheckpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return adapter.ExecutionWorkspaceCheckpoint{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, "pull:"+execution.AgentTeamsTaskID)
+	return adapter.ExecutionWorkspaceCheckpoint{}, c.FailPull
+}
+
+func (c *Client) PrepareExecution(ctx context.Context, execution adapter.AgentTeamsExecutionRef, _ adapter.PreparedInvocation) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.calls = append(c.calls, "pull:"+taskID)
+	c.calls = append(c.calls, "prepare-files:"+execution.AgentTeamsTaskID)
 	return c.FailPull
 }
 

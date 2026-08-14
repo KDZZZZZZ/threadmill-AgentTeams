@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -34,7 +35,32 @@ func BootstrapOperator(ctx context.Context, cfg config.Config, actor kernel.Acto
 		return OperatorBootstrap{}, err
 	}
 	defer db.Close(context.Background())
-	return bootstrapOperatorWithStore(ctx, auth.NewPostgresStore(db.SQL()), time.Now, kernel.ProjectID(cfg.ProjectID), actor, ttl)
+	store := auth.NewPostgresStore(db.SQL())
+	result, err := bootstrapOperatorWithStore(ctx, store, time.Now, kernel.ProjectID(cfg.ProjectID), actor, ttl)
+	if err != nil {
+		return OperatorBootstrap{}, err
+	}
+	if err := grantProductionOperatorUI(ctx, db.SQL(), actor, kernel.ProjectID(cfg.ProjectID)); err != nil {
+		_ = auth.NewAuthenticator(store, time.Now).RevokeOperatorSession(context.Background(), result.SessionToken)
+		return OperatorBootstrap{}, err
+	}
+	return result, nil
+}
+
+func grantProductionOperatorUI(ctx context.Context, db *sql.DB, actor kernel.ActorPrincipalID, projectID kernel.ProjectID) error {
+	if db == nil || kernel.IsZeroID(actor) || kernel.IsZeroID(projectID) {
+		return kernel.InvalidArgument("operator UI grant requires database, actor, and project")
+	}
+	_, err := db.ExecContext(ctx, `
+INSERT INTO operator_ui_task_grants (
+  actor_principal_id, project_id, task_id, visible, context_bodies, candidate_bodies
+) VALUES ($1, $2, $3, TRUE, TRUE, TRUE)
+ON CONFLICT (actor_principal_id, project_id, task_id) DO UPDATE SET
+  visible = EXCLUDED.visible,
+  context_bodies = EXCLUDED.context_bodies,
+  candidate_bodies = EXCLUDED.candidate_bodies,
+  updated_at = now()`, actor, projectID, allProjectTasks)
+	return err
 }
 
 func bootstrapOperatorWithStore(ctx context.Context, store auth.Store, now func() time.Time, projectID kernel.ProjectID, actor kernel.ActorPrincipalID, ttl time.Duration) (OperatorBootstrap, error) {

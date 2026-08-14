@@ -247,6 +247,61 @@ func (s *Service) BindPhase(ctx context.Context, id kernel.BindingRef, phase Pha
 	})
 }
 
+// AuthorizeExecuteWrites promotes the Planner's persisted declared write set
+// into the next execute lease. Runtime is the only caller: the Planner writes
+// plan/declared-writes.json but cannot mutate Binding authority directly.
+func (s *Service) AuthorizeExecuteWrites(ctx context.Context, id kernel.BindingRef, declared WriteSet, expectedRevision ...kernel.Revision) (Binding, error) {
+	allowed, err := allowedDirsForDeclaredWrites(declared.Files)
+	if err != nil {
+		return Binding{}, err
+	}
+	normalized, err := normalizeWriteSet(declared, allowed)
+	if err != nil {
+		return Binding{}, err
+	}
+	return s.mutate(ctx, id, firstRevision(expectedRevision), func(binding *Binding) (bool, error) {
+		if binding.Status == StatusSealed {
+			return false, kernel.Forbidden("workspace binding is sealed")
+		}
+		if binding.ActiveInvocation != "" {
+			return false, kernel.LeaseConflict("cannot change execute write authority while a phase lease is active")
+		}
+		if binding.PhaseLeases[PhasePlan] == "" {
+			return false, kernel.TransitionRejected("planner phase must complete before execute write authority is promoted")
+		}
+		if binding.PhaseLeases[PhaseExecute] != "" {
+			if stringSlicesEqual(binding.AllowedDirs, allowed) && writeSetsEqual(binding.DeclaredWrites, normalized) {
+				return false, nil
+			}
+			return false, kernel.LeaseConflict("execute write authority cannot change after execute completion")
+		}
+		if stringSlicesEqual(binding.AllowedDirs, allowed) && writeSetsEqual(binding.DeclaredWrites, normalized) {
+			return false, nil
+		}
+		binding.AllowedDirs = allowed
+		binding.DeclaredWrites = normalized
+		return true, nil
+	})
+}
+
+func allowedDirsForDeclaredWrites(files []string) ([]string, error) {
+	if len(files) == 0 {
+		return nil, kernel.InvalidArgument("declared write set requires at least one file")
+	}
+	dirs := make([]string, 0, len(files))
+	for _, file := range files {
+		clean, err := cleanRelativePath(file)
+		if err != nil {
+			return nil, fmt.Errorf("invalid declared write %q: %w", file, err)
+		}
+		if protectedWorkspacePath(clean) || hasPathPrefix(clean, "plan") || hasPathPrefix(clean, "evidence") {
+			return nil, kernel.Forbidden("declared execute write targets a protected phase path")
+		}
+		dirs = append(dirs, clean)
+	}
+	return normalizedStrings(dirs), nil
+}
+
 func (s *Service) ReleasePhase(ctx context.Context, id kernel.BindingRef, phase Phase, invocationID kernel.InvocationID, expectedRevision ...kernel.Revision) (Binding, error) {
 	return s.finishPhaseLease(ctx, id, phase, invocationID, firstRevision(expectedRevision), false)
 }
@@ -285,6 +340,195 @@ func (s *Service) Get(ctx context.Context, id kernel.BindingRef) (Binding, error
 	return s.store.Get(ctx, id)
 }
 
+func (s *Service) GetByRound(ctx context.Context, taskID kernel.TaskID, generation int) (Binding, bool, error) {
+	if err := s.ready(); err != nil {
+		return Binding{}, false, err
+	}
+	if err := kernel.RequireID("task_id", taskID); err != nil {
+		return Binding{}, false, err
+	}
+	if generation <= 0 {
+		return Binding{}, false, kernel.InvalidArgument("generation must be positive")
+	}
+	binding, ok, err := s.store.GetByRound(ctx, taskID, generation)
+	return cloneBinding(binding), ok, err
+}
+
+func (s *Service) GetLatestByTask(ctx context.Context, taskID kernel.TaskID) (Binding, bool, error) {
+	if err := s.ready(); err != nil {
+		return Binding{}, false, err
+	}
+	if err := kernel.RequireID("task_id", taskID); err != nil {
+		return Binding{}, false, err
+	}
+	binding, ok, err := s.store.GetLatestByTask(ctx, taskID)
+	return cloneBinding(binding), ok, err
+}
+
+// InheritPhasePrerequisites projects already-completed earlier phases into a
+// fresh generation workspace. It never carries an active lease or marks the
+// target phase complete. The source and target must be adjacent generations of
+// the same Task and the target must start at the source's current Git revision.
+func (s *Service) InheritPhasePrerequisites(ctx context.Context, targetID, sourceID kernel.BindingRef, phase Phase, activeInvocation ...kernel.InvocationID) (Binding, error) {
+	if !validPhase(phase) {
+		return Binding{}, kernel.InvalidArgument("invalid phase")
+	}
+	if len(activeInvocation) > 1 {
+		return Binding{}, kernel.InvalidArgument("at most one active invocation may be supplied")
+	}
+	var replayInvocation kernel.InvocationID
+	if len(activeInvocation) == 1 {
+		replayInvocation = activeInvocation[0]
+		if replayInvocation == "" {
+			return Binding{}, kernel.InvalidArgument("active invocation cannot be empty")
+		}
+	}
+	if targetID == "" || sourceID == "" || targetID == sourceID {
+		return Binding{}, kernel.InvalidArgument("distinct source and target workspace bindings are required")
+	}
+	source, err := s.store.Get(ctx, sourceID)
+	if err != nil {
+		return Binding{}, err
+	}
+	if source.ActiveInvocation != "" {
+		return Binding{}, kernel.LeaseConflict("previous workspace generation still has an active phase")
+	}
+	return s.mutate(ctx, targetID, kernel.LatestRevision, func(target *Binding) (bool, error) {
+		if target.TaskID != source.TaskID || target.Generation != source.Generation+1 {
+			return false, kernel.StaleBinding("workspace prerequisite source is not the previous Task generation")
+		}
+		if target.BaseRevision != source.CurrentRevision {
+			return false, kernel.StaleBinding("new workspace is not based on the previous generation revision")
+		}
+		if target.Status == StatusSealed {
+			return false, kernel.LeaseConflict("new workspace is not available for prerequisite inheritance")
+		}
+		replayingActive := target.ActiveInvocation != ""
+		if replayingActive && (target.ActiveInvocation != replayInvocation || target.ActivePhase != phase) {
+			return false, kernel.LeaseConflict("new workspace is not available for prerequisite inheritance")
+		}
+		changed := false
+		for _, prerequisite := range phasePrerequisites(phase) {
+			completed := source.PhaseLeases[prerequisite]
+			if completed == "" {
+				return false, kernel.TransitionRejected("previous workspace phase prerequisites are not complete")
+			}
+			if existing := target.PhaseLeases[prerequisite]; existing != "" {
+				if existing != completed {
+					return false, kernel.LeaseConflict("workspace prerequisite was inherited from a different invocation")
+				}
+				continue
+			}
+			if replayingActive {
+				return false, kernel.LeaseConflict("active workspace is missing an inherited phase prerequisite")
+			}
+			target.PhaseLeases[prerequisite] = completed
+			changed = true
+		}
+		return changed, nil
+	})
+}
+
+// InheritPlanPrerequisite is the narrow fresh-round seam used when Merge
+// Queue targeted verification has selected a newer main revision as the next
+// execution baseline. Unlike InheritPhasePrerequisites, the target is not
+// required to share the source's Git revision: it inherits only the audited
+// fact that plan completed. Execute and verify completion never cross rounds.
+func (s *Service) InheritPlanPrerequisite(ctx context.Context, targetID, sourceID kernel.BindingRef) (Binding, error) {
+	if targetID == "" || sourceID == "" || targetID == sourceID {
+		return Binding{}, kernel.InvalidArgument("distinct source and target workspace bindings are required")
+	}
+	source, err := s.store.Get(ctx, sourceID)
+	if err != nil {
+		return Binding{}, err
+	}
+	if source.ActiveInvocation != "" {
+		return Binding{}, kernel.LeaseConflict("previous workspace generation still has an active phase")
+	}
+	planInvocation := source.PhaseLeases[PhasePlan]
+	if planInvocation == "" {
+		return Binding{}, kernel.TransitionRejected("previous workspace plan prerequisite is not complete")
+	}
+	return s.mutate(ctx, targetID, kernel.LatestRevision, func(target *Binding) (bool, error) {
+		if target.TaskID != source.TaskID || target.Generation != source.Generation+1 {
+			return false, kernel.StaleBinding("workspace prerequisite source is not the previous Task generation")
+		}
+		if target.Status == StatusSealed || target.ActiveInvocation != "" {
+			return false, kernel.LeaseConflict("new workspace is not available for prerequisite inheritance")
+		}
+		if target.PhaseLeases[PhaseExecute] != "" || target.PhaseLeases[PhaseVerify] != "" {
+			return false, kernel.LeaseConflict("new workspace already contains later phase completion")
+		}
+		changed := false
+		if existing := target.PhaseLeases[PhasePlan]; existing != "" {
+			if existing != planInvocation {
+				return false, kernel.LeaseConflict("workspace plan prerequisite was inherited from a different invocation")
+			}
+		} else {
+			target.PhaseLeases[PhasePlan] = planInvocation
+			changed = true
+		}
+		// Planner output is immutable authority for the execute write boundary.
+		// Carry that validated scope into the fresh latest-main round without
+		// carrying any observed writes or later-phase completion.
+		if !writeSetsEqual(target.DeclaredWrites, source.DeclaredWrites) || !stringSlicesEqual(target.AllowedDirs, source.AllowedDirs) {
+			target.DeclaredWrites = cloneWriteSet(source.DeclaredWrites)
+			target.AllowedDirs = append([]string(nil), source.AllowedDirs...)
+			changed = true
+		}
+		return changed, nil
+	})
+}
+
+// InheritMergedVerifyPrerequisites prepares a read-only verification round on
+// the exact revision already written to the managed target branch. Unlike a
+// retry round, the target intentionally does not share the execute candidate's
+// commit: Merge Queue supplies the merged revision as its base. Only the
+// audited plan/execute completion facts cross the boundary; observed writes,
+// active leases, and verify completion never do.
+func (s *Service) InheritMergedVerifyPrerequisites(ctx context.Context, targetID, sourceID kernel.BindingRef) (Binding, error) {
+	if targetID == "" || sourceID == "" || targetID == sourceID {
+		return Binding{}, kernel.InvalidArgument("distinct source and target workspace bindings are required")
+	}
+	source, err := s.store.Get(ctx, sourceID)
+	if err != nil {
+		return Binding{}, err
+	}
+	if source.ActiveInvocation != "" {
+		return Binding{}, kernel.LeaseConflict("execute workspace still has an active phase")
+	}
+	planInvocation := source.PhaseLeases[PhasePlan]
+	executeInvocation := source.PhaseLeases[PhaseExecute]
+	if planInvocation == "" || executeInvocation == "" {
+		return Binding{}, kernel.TransitionRejected("merged verification requires completed plan and execute prerequisites")
+	}
+	return s.mutate(ctx, targetID, kernel.LatestRevision, func(target *Binding) (bool, error) {
+		if target.TaskID != source.TaskID || target.Generation != source.Generation+1 {
+			return false, kernel.StaleBinding("merged verification workspace is not the next Task generation")
+		}
+		if target.Status == StatusSealed || target.ActiveInvocation != "" {
+			return false, kernel.LeaseConflict("merged verification workspace is not available")
+		}
+		if target.PhaseLeases[PhaseVerify] != "" {
+			return false, kernel.LeaseConflict("merged verification workspace is already complete")
+		}
+		changed := false
+		for phase, invocationID := range map[Phase]kernel.InvocationID{
+			PhasePlan: planInvocation, PhaseExecute: executeInvocation,
+		} {
+			if existing := target.PhaseLeases[phase]; existing != "" {
+				if existing != invocationID {
+					return false, kernel.LeaseConflict("merged verification prerequisite came from another execution lineage")
+				}
+				continue
+			}
+			target.PhaseLeases[phase] = invocationID
+			changed = true
+		}
+		return changed, nil
+	})
+}
+
 func (s *Service) Seal(ctx context.Context, id kernel.BindingRef, expectedRevision ...kernel.Revision) (Binding, error) {
 	return s.mutate(ctx, id, firstRevision(expectedRevision), func(binding *Binding) (bool, error) {
 		if binding.Status == StatusSealed {
@@ -308,7 +552,7 @@ func (s *Service) RefreshObservedWrites(ctx context.Context, id kernel.BindingRe
 		if err != nil {
 			return false, err
 		}
-		nextWrites := WriteSet{Files: files}
+		nextWrites := WriteSet{Files: candidateObservedFiles(files)}
 		if writeSetsEqual(binding.ObservedWrites, nextWrites) && binding.CurrentRevision == current {
 			return false, nil
 		}
@@ -515,6 +759,19 @@ func phasePrerequisitesMet(binding Binding, phase Phase) bool {
 		return binding.PhaseLeases[PhaseExecute] != ""
 	default:
 		return false
+	}
+}
+
+func phasePrerequisites(phase Phase) []Phase {
+	switch phase {
+	case PhasePlan:
+		return nil
+	case PhaseExecute:
+		return []Phase{PhasePlan}
+	case PhaseVerify:
+		return []Phase{PhasePlan, PhaseExecute}
+	default:
+		return nil
 	}
 }
 

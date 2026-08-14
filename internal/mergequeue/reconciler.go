@@ -3,9 +3,12 @@ package mergequeue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/evidence"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
@@ -17,8 +20,8 @@ type Reconciler struct {
 	workspaces WorkspaceReader
 	verifier   TargetedVerifier
 	backend    GitBackend
-	artifacts  *evidence.ArtifactRegistry
-	events     *evidence.EventLog
+	artifacts  evidence.ArtifactStore
+	events     evidence.EventStore
 }
 
 type Store interface {
@@ -59,7 +62,7 @@ type mergeOperationRequest struct {
 	Audit                  auditRecord
 }
 
-func NewReconciler(store Store, workspaces WorkspaceReader, verifier TargetedVerifier, backend GitBackend, artifacts *evidence.ArtifactRegistry, events *evidence.EventLog) *Reconciler {
+func NewReconciler(store Store, workspaces WorkspaceReader, verifier TargetedVerifier, backend GitBackend, artifacts evidence.ArtifactStore, events evidence.EventStore) *Reconciler {
 	return &Reconciler{store: store, workspaces: workspaces, verifier: verifier, backend: backend, artifacts: artifacts, events: events}
 }
 
@@ -139,11 +142,29 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		}
 		claim.Candidate = candidate
 	}
-	verifyResult, verifyErr := r.verifier.Verify(ctx, TargetedVerifyRequest{
-		Candidate:          candidate,
-		WorkspaceRoot:      prepared.Root,
-		LatestMainRevision: prepared.LatestMainRevision,
-	})
+	verifyCtx, renewal := startClaimRenewal(ctx, r.store, claim)
+	defer func() { _, _ = renewal.Stop() }()
+	// Merge Queue is deliberately mechanical. A clean apply (including clean
+	// main drift) is merged without running the Task's acceptance Verify early.
+	// The targeted verifier exists only to resolve concrete conflict paths; the
+	// normal Coordination Verify runs afterwards on the merged revision.
+	verifyResult := TargetedVerifyResult{
+		Passed: true,
+		EvidenceRefs: dedupeEvidence(append(
+			[]evidence.ArtifactID{candidate.VerifyResultRef},
+			candidate.EvidenceRefs...,
+		)),
+	}
+	var verifyErr error
+	if len(prepared.ConflictPaths) > 0 {
+		verifyResult, verifyErr = r.verifier.Verify(verifyCtx, TargetedVerifyRequest{
+			Candidate:          candidate,
+			WorkspaceRoot:      prepared.Root,
+			LatestMainRevision: prepared.LatestMainRevision,
+			AllowedWritePaths:  append([]string(nil), prepared.AllowedWritePaths...),
+			ConflictPaths:      append([]string(nil), prepared.ConflictPaths...),
+		})
+	}
 	principal := evidence.Principal{Role: evidence.RoleTaskManager, ProjectID: candidate.ProjectID, TaskID: candidate.TaskID}
 	trustedVerifyRefs := append([]evidence.ArtifactID(nil), verifyResult.EvidenceRefs...)
 	for _, ref := range trustedVerifyRefs {
@@ -157,14 +178,30 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		if verifyErr == nil {
 			verifyErr = fmt.Errorf("targeted verify did not pass with evidence")
 		}
+		claim, err = renewal.Stop()
+		candidate = claim.Candidate
+		if err != nil {
+			return candidate, true, errors.Join(verifyErr, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return candidate, true, errors.Join(verifyErr, err)
+		}
 		failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, failureReason(verifyErr, FailureVerifyFailed), verifyErr, trustedVerifyRefs...)
 		return failed, true, failErr
 	}
 
-	mergedRevision, err := r.backend.CreateMergeCommit(ctx, prepared, candidate)
+	mergedRevision, mergeErr := r.backend.CreateMergeCommit(verifyCtx, prepared, candidate)
+	claim, err = renewal.Stop()
+	candidate = claim.Candidate
 	if err != nil {
-		reason := failureReason(err, FailureConflict)
-		failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, reason, err)
+		return candidate, true, errors.Join(mergeErr, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return candidate, true, errors.Join(mergeErr, err)
+	}
+	if mergeErr != nil {
+		reason := failureReason(mergeErr, FailureConflict)
+		failed, failErr := r.fail(ctx, claim, candidate, StatusTargetedVerify, reason, mergeErr)
 		return failed, true, failErr
 	}
 	op, err := r.store.beginMergeOperation(ctx, claim, mergeOperationRequest{
@@ -207,6 +244,83 @@ func (r *Reconciler) ReconcileOne(ctx context.Context, targetRepository string) 
 		return Candidate{}, true, err
 	}
 	return merged, true, r.flushAudits(ctx, candidate.ProjectID)
+}
+
+// claimRenewal keeps the repository claim alive while targeted verification
+// and the reversible merge-commit preparation are running. Once Stop returns,
+// no renewal call remains in flight and claim is the last successfully renewed
+// value. The durable merge operation becomes the repository fence afterwards.
+type claimRenewal struct {
+	store    Store
+	cancel   context.CancelFunc
+	done     chan struct{}
+	stopOnce sync.Once
+	claim    Claim
+	err      error
+}
+
+func startClaimRenewal(parent context.Context, store Store, claim Claim) (context.Context, *claimRenewal) {
+	ctx, cancel := context.WithCancel(parent)
+	renewal := &claimRenewal{
+		store:  store,
+		cancel: cancel,
+		done:   make(chan struct{}),
+		claim:  claim,
+	}
+	go renewal.run(ctx)
+	return ctx, renewal
+}
+
+func (r *claimRenewal) run(ctx context.Context) {
+	defer close(r.done)
+	for {
+		timer := time.NewTimer(claimRenewalDelay(r.claim.ExpiresAt))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
+		}
+
+		renewed, err := r.store.RenewClaim(ctx, r.claim)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			r.err = err
+			r.cancel()
+			return
+		}
+		r.claim = renewed
+	}
+}
+
+func (r *claimRenewal) Stop() (Claim, error) {
+	r.stopOnce.Do(r.cancel)
+	<-r.done
+	return r.claim, r.err
+}
+
+func claimRenewalDelay(expiresAt time.Time) time.Duration {
+	remaining := time.Until(expiresAt)
+	if remaining <= 0 {
+		return 0
+	}
+	delay := remaining / 3
+	if delay <= 0 {
+		return time.Nanosecond
+	}
+	// ExpiresAt is issued by the database clock. Capping the interval keeps a
+	// slow application clock from sleeping past a remotely enforced lease.
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
 }
 
 func (r *Reconciler) recoverPendingMergeOperation(ctx context.Context, targetRepository string) (Candidate, bool, error) {
@@ -317,16 +431,19 @@ func validateWorkspace(candidate Candidate, binding workspace.Binding) error {
 	if binding.ActivePhase != "" || binding.ActiveInvocation != "" {
 		return kernel.Forbidden("candidate workspace still has an active phase lease")
 	}
-	if binding.PhaseLeases[workspace.PhaseVerify] == "" {
-		return kernel.Forbidden("candidate workspace has no completed verify phase")
+	if binding.PhaseLeases[workspace.PhaseExecute] == "" {
+		return kernel.Forbidden("candidate workspace has no completed execute phase")
 	}
 	if binding.BaseRevision != candidate.BaseRevision || binding.CurrentRevision != candidate.CandidateRevision {
 		return kernel.Forbidden("candidate revisions do not match sealed workspace")
 	}
-	for _, file := range binding.ObservedWrites.Files {
+	if len(binding.DeclaredWrites.Files) == 0 {
+		return kernel.Forbidden("candidate workspace has no declared code writes")
+	}
+	for _, file := range binding.DeclaredWrites.Files {
 		clean := path.Clean(strings.ReplaceAll(file, "\\", "/"))
 		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || path.IsAbs(clean) || !withinAllowed(clean, binding.AllowedDirs) {
-			return kernel.Forbidden("observed write is outside allowed dirs")
+			return kernel.Forbidden("declared write is outside allowed dirs")
 		}
 	}
 	return nil

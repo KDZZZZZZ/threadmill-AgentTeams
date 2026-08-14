@@ -3,11 +3,13 @@ package mergequeue
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -199,7 +201,7 @@ func TestPostgresMergeFenceCoversIrreversibleActionPastLeaseExpiry(t *testing.T)
 	}
 }
 
-func TestPostgresReconcilerFencePreventsExpiredOwnerFromWritingMain(t *testing.T) {
+func TestPostgresReconcilerRenewsClaimDuringLongTargetedVerify(t *testing.T) {
 	ctx := context.Background()
 	db := openMergeQueuePostgresSchema(t, ctx)
 	repo := seedRepo(t)
@@ -216,12 +218,15 @@ func TestPostgresReconcilerFencePreventsExpiredOwnerFromWritingMain(t *testing.T
 
 	storeA := NewPostgresStore(db)
 	storeB := NewPostgresStore(db)
-	storeA.SetClaimTTL(2 * time.Second)
-	storeB.SetClaimTTL(2 * time.Second)
+	storeA.SetClaimTTL(5 * time.Second)
+	storeB.SetClaimTTL(5 * time.Second)
 	verifier := &fakeVerifier{
 		result:  TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{passRef}},
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
+		resolve: func(req TargetedVerifyRequest) error {
+			return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "fenced.txt"), []byte("fenced\n"), 0o644)
+		},
 	}
 	reconciler := NewReconciler(storeA, staticWorkspaceReader{binding: binding}, verifier, GitBackend{TempParent: t.TempDir()}, artifacts, evidence.NewEventLog(64*1024))
 	if _, err := reconciler.Enqueue(ctx, EnqueueRequest{
@@ -240,6 +245,7 @@ func TestPostgresReconcilerFencePreventsExpiredOwnerFromWritingMain(t *testing.T
 	}); err != nil {
 		t.Fatalf("enqueue fence candidate: %v", err)
 	}
+	pushChange(t, repo, "workspace/fenced.txt", "main advanced before targeted verify\n")
 
 	type outcome struct {
 		candidate Candidate
@@ -254,29 +260,37 @@ func TestPostgresReconcilerFencePreventsExpiredOwnerFromWritingMain(t *testing.T
 	select {
 	case <-verifier.entered:
 	case got := <-done:
-		t.Fatalf("reconcile finished before verify: candidate:%#v claimed:%v err:%v", got.candidate, got.claimed, got.err)
+		stored, storedErr := storeB.Get(ctx, "candidate-fence")
+		t.Fatalf("reconcile finished before verify: candidate:%#v claimed:%v err:%v stored:%#v storedErr:%v", got.candidate, got.claimed, got.err, stored, storedErr)
 	case <-time.After(15 * time.Second):
 		t.Fatal("reconcile did not reach targeted verify")
 	}
-	time.Sleep(2100 * time.Millisecond)
-	stolen, claimed, err := storeB.ClaimNext(ctx, repo)
-	if err != nil || !claimed || stolen.Candidate.ID != "candidate-fence" || stolen.Token == "" {
-		t.Fatalf("storeB takeover = %#v claimed=%v err=%v", stolen, claimed, err)
+	if !reflect.DeepEqual(verifier.request.ConflictPaths, []string{"workspace/fenced.txt"}) || !reflect.DeepEqual(verifier.request.AllowedWritePaths, verifier.request.ConflictPaths) {
+		t.Fatalf("PostgreSQL conflict verifier authority = conflicts:%v allowed:%v", verifier.request.ConflictPaths, verifier.request.AllowedWritePaths)
+	}
+	time.Sleep(5100 * time.Millisecond)
+	if stolen, claimed, err := storeB.ClaimNext(ctx, repo); err != nil || claimed {
+		t.Fatalf("storeB claimed during long targeted verify = %#v claimed=%v err=%v", stolen, claimed, err)
 	}
 	close(verifier.release)
-	got := <-done
-	if !got.claimed || !kernel.IsCode(got.err, kernel.CodeLeaseConflict) {
-		t.Fatalf("expired owner reconcile = candidate:%#v claimed:%v err:%v, want lease_conflict", got.candidate, got.claimed, got.err)
+	var got outcome
+	select {
+	case got = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("reconcile did not finish after targeted verify release")
 	}
-	if contents := fileAtBranchIfExists(t, repo, "main", "workspace/fenced.txt"); contents != "" {
-		t.Fatalf("expired owner wrote main: %q", contents)
+	if !got.claimed || got.err != nil || got.candidate.Status != StatusMerged {
+		t.Fatalf("long targeted verify reconcile = candidate:%#v claimed:%v err:%v, want merged", got.candidate, got.claimed, got.err)
+	}
+	if contents := fileAtBranchIfExists(t, repo, "main", "workspace/fenced.txt"); contents != "fenced" {
+		t.Fatalf("merged main contents = %q", contents)
 	}
 	stored, err := storeB.Get(ctx, "candidate-fence")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status == StatusMerged {
-		t.Fatalf("expired owner merged candidate: %#v", stored)
+	if stored.Status != StatusMerged || stored.MergedRevision == "" {
+		t.Fatalf("long targeted verify candidate = %#v", stored)
 	}
 }
 
@@ -380,10 +394,11 @@ func TestPostgresReconcilerFinalizesWhenPushReportsErrorAfterSideEffect(t *testi
 	}
 
 	store := NewPostgresStore(db)
+	verifier := &fakeVerifier{result: TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{passRef}}}
 	reconciler := NewReconciler(
 		store,
 		staticWorkspaceReader{binding: binding},
-		&fakeVerifier{result: TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{passRef}}},
+		verifier,
 		GitBackend{TempParent: t.TempDir(), pushErrorAfterSuccess: errors.New("simulated transport error after push side effect")},
 		artifacts,
 		evidence.NewEventLog(64*1024),
@@ -411,6 +426,12 @@ func TestPostgresReconcilerFinalizesWhenPushReportsErrorAfterSideEffect(t *testi
 	}
 	if merged.Status != StatusMerged || merged.MergedRevision == "" || merged.FailureReason != "" {
 		t.Fatalf("merged candidate after side-effect push error = %#v", merged)
+	}
+	if calls := verifier.calls.Load(); calls != 0 {
+		t.Fatalf("unchanged PostgreSQL main invoked targeted verifier %d times, want 0", calls)
+	}
+	if !containsArtifact(merged.EvidenceRefs, verifyRef) || containsArtifact(merged.EvidenceRefs, passRef) {
+		t.Fatalf("PostgreSQL fast path evidence = %#v, want original verify without targeted evidence", merged.EvidenceRefs)
 	}
 	if got := fileAtBranch(t, repo, "main", "workspace/pushed.txt"); got != "pushed\n" {
 		t.Fatalf("pushed file = %q", got)
@@ -467,14 +488,26 @@ VALUES ($1, $2, 1, 'git_worktree', $3, $4, $5, 'sealed')`,
 
 func insertMergeQueueWorkspaceBinding(t *testing.T, ctx context.Context, db *sql.DB, binding workspace.Binding) {
 	t.Helper()
-	_, err := db.ExecContext(ctx, `
+	declaredWrites, err := json.Marshal(binding.DeclaredWrites)
+	if err != nil {
+		t.Fatalf("marshal declared writes for %s: %v", binding.ID, err)
+	}
+	observedWrites, err := json.Marshal(binding.ObservedWrites)
+	if err != nil {
+		t.Fatalf("marshal observed writes for %s: %v", binding.ID, err)
+	}
+	phaseLeases, err := json.Marshal(binding.PhaseLeases)
+	if err != nil {
+		t.Fatalf("marshal phase leases for %s: %v", binding.ID, err)
+	}
+	_, err = db.ExecContext(ctx, `
 INSERT INTO workspace_bindings(
 	id, task_id, generation, kind, root, branch_name, base_revision, current_revision,
-	allowed_dirs, observed_writes, phase_leases, status
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text[], $10::jsonb, $11::jsonb, $12)`,
+	allowed_dirs, declared_writes, observed_writes, phase_leases, status
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text[], $10::jsonb, $11::jsonb, $12::jsonb, $13)`,
 		binding.ID, binding.TaskID, binding.Generation, binding.Kind, binding.Root, binding.BranchName,
 		binding.BaseRevision, binding.CurrentRevision, textArrayLiteral(binding.AllowedDirs),
-		`{"files":["workspace/fenced.txt"]}`, `{"verify":"inv-verify"}`, binding.Status)
+		string(declaredWrites), string(observedWrites), string(phaseLeases), binding.Status)
 	if err != nil {
 		t.Fatalf("insert workspace binding %s: %v", binding.ID, err)
 	}
@@ -500,9 +533,13 @@ func createMergeQueueGitBinding(t *testing.T, repo string, taskID kernel.TaskID,
 		BaseRevision:    mainRevision,
 		CurrentRevision: gitOut(t, root, "rev-parse", "HEAD"),
 		AllowedDirs:     []string{"workspace"},
+		DeclaredWrites:  workspace.WriteSet{Files: []string{file}},
 		ObservedWrites:  workspace.WriteSet{Files: []string{file}},
-		PhaseLeases:     map[workspace.Phase]kernel.InvocationID{workspace.PhaseVerify: "inv-verify"},
-		Status:          workspace.StatusSealed,
+		PhaseLeases: map[workspace.Phase]kernel.InvocationID{
+			workspace.PhaseExecute: "inv-execute",
+			workspace.PhaseVerify:  "inv-verify",
+		},
+		Status: workspace.StatusSealed,
 	}
 }
 

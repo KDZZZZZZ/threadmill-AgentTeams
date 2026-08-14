@@ -21,8 +21,8 @@ func TestLoadReportsMissingRequiredConfiguration(t *testing.T) {
 	if !ok || diag.Code != "configuration_missing" {
 		t.Fatalf("Load() diagnostic = %#v, %t, want configuration_missing", diag, ok)
 	}
-	if len(diag.Missing) != 16 {
-		t.Fatalf("missing keys = %v, want all 16 production secrets/endpoints", diag.Missing)
+	if len(diag.Missing) != 19 {
+		t.Fatalf("missing keys = %v, want all 19 production secrets/endpoints", diag.Missing)
 	}
 }
 
@@ -71,6 +71,7 @@ func TestLoadRejectsUnsafeProductionConfiguration(t *testing.T) {
 		{name: "room whitespace", key: envAgentTeamsRoomID, value: "!threadmill room:example.test"},
 		{name: "runtime key", key: envRuntimeTokenKey, value: base64.StdEncoding.EncodeToString([]byte("too-short"))},
 		{name: "shared prefix traversal", key: envAgentTeamsSharedPrefix, value: "runtime/../escape"},
+		{name: "relative runtime assets", key: envRuntimeAssetsRoot, value: "./runtime-assets"},
 		{name: "relative repo", key: envRepositoryPath, value: "./repo"},
 	}
 	for _, test := range tests {
@@ -98,7 +99,7 @@ func TestCheckDoesNotExposeSecrets(t *testing.T) {
 	if diag.Message == "" {
 		t.Fatal("diagnostic message is empty")
 	}
-	if containsAny(diag.Message, []string{cfg.ObjectStoreAccessKey, cfg.ObjectStoreSecretKey, cfg.AgentTeamsControllerBearer, base64.StdEncoding.EncodeToString(cfg.RuntimeTokenKey), "password"}) {
+	if containsAny(diag.Message, []string{cfg.ObjectStoreAccessKey, cfg.ObjectStoreSecretKey, cfg.AgentTeamsSharedAccessKey, cfg.AgentTeamsSharedSecretKey, cfg.AgentTeamsControllerBearer, base64.StdEncoding.EncodeToString(cfg.RuntimeTokenKey), "password"}) {
 		t.Fatalf("diagnostic leaked secret material: %q", diag.Message)
 	}
 }
@@ -118,6 +119,9 @@ func productionConfigEnv() Environment {
 		envAgentTeamsContainers:       "manager-a=qwen-manager-a,worker-a=qwen-worker-a",
 		envAgentTeamsSharedBucket:     "artifacts",
 		envAgentTeamsSharedPrefix:     "agentteams/runtime",
+		envAgentTeamsSharedAccessKey:  "threadmill-dispatcher",
+		envAgentTeamsSharedSecretKey:  "dispatcher-secret",
+		envRuntimeAssetsRoot:          filepath.Join(os.TempDir(), "threadmill-runtime-assets"),
 		envRepositoryPath:             filepath.Join(os.TempDir(), "threadmill-repository"),
 		envWorktreeParent:             filepath.Join(os.TempDir(), "threadmill-worktrees"),
 		envRuntimeTokenKey:            base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),

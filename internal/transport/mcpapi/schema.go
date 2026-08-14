@@ -21,6 +21,12 @@ type toolDefinition struct {
 
 func definitionForTool(tool auth.Tool) toolDefinition {
 	inputSchema := schemaForType(reflect.TypeOf(toolInputPrototype(tool)), map[reflect.Type]bool{})
+	if tool == auth.ToolTaskManagerSubmitDecision {
+		inputSchema = taskManagerDecisionSchema()
+	}
+	if tool == auth.ToolCoordinationReplacePending {
+		inputSchema = pendingSubgraphIntentSchema()
+	}
 	if required := requiredFieldsForTool(tool); len(required) > 0 {
 		inputSchema["required"] = required
 	}
@@ -29,6 +35,62 @@ func definitionForTool(tool auth.Tool) toolDefinition {
 		Description: toolDescription(tool),
 		InputSchema: inputSchema,
 	}
+}
+
+func taskManagerDecisionSchema() map[string]any {
+	schema := schemaForType(reflect.TypeOf(taskmanager.TaskManagerDecision{}), map[reflect.Type]bool{})
+	properties := schema["properties"].(map[string]any)
+	properties["action"].(map[string]any)["enum"] = []string{
+		"replace_pending", "reject", "defer", "no_change",
+		"submitted", "satisfied", "rejected", "reopened", "reopen_round", "held", "released", "stopped",
+		"resolved", "denied", "obsolete", "done", "canceled", "failed",
+	}
+	properties["action"].(map[string]any)["description"] = "Use the authoritative lifecycle mapping: phase_output=submitted; phase_evaluation=satisfied or rejected; phase_stopped=stopped; stop_release=released; phase_failed=reopened or failed; task_completion=done. Use reopen_round only for a Runtime-marked merge targeted-verify proposal that says conflict resolution cannot preserve the Task Contract."
+	properties["target_ref"].(map[string]any)["description"] = "For phase_output, phase_evaluation, phase_stopped, stop_release, and phase_failed=reopened, use exactly selected_endpoint.task_id + \"/\" + selected_endpoint.endpoint_id (for example task-a/execute). For phase_failed=failed, task_completion=done, and a trusted targeted-verify reopen_round use exactly the selected task ID. Omit for replace_pending, reject, defer, and no_change. Never use an artifact ref, output ref, command ID, binding ref, lease ref, or a target_ref copied from the boundary payload."
+	properties["evidence_refs"].(map[string]any)["description"] = "Optional supporting evidence references visible in the current trusted boundary input. Evidence never determines the transition target."
+	properties["reason"].(map[string]any)["description"] = "Concise reason grounded in the current trusted boundary input."
+	return schema
+}
+
+func pendingSubgraphIntentSchema() map[string]any {
+	schema := schemaForType(reflect.TypeOf(PendingSubgraphIntent{}), map[reflect.Type]bool{})
+	properties := schema["properties"].(map[string]any)
+	taskPolicy := properties["task_policies"].(map[string]any)["items"].(map[string]any)
+	taskPolicy["required"] = []string{"task_id", "delivery_policy"}
+	taskPolicy["properties"].(map[string]any)["delivery_policy"].(map[string]any)["enum"] = []string{
+		string(taskmanager.DeliveryPolicyNonCodeArtifact), string(taskmanager.DeliveryPolicyCodeMerge),
+		string(taskmanager.DeliveryPolicyHumanAcceptance), string(taskmanager.DeliveryPolicyExternalDelivery),
+	}
+	endpoint := properties["endpoints"].(map[string]any)["items"].(map[string]any)
+	endpoint["required"] = []string{"ref", "run_policy"}
+	endpointProperties := endpoint["properties"].(map[string]any)
+	endpointRef := endpointProperties["ref"].(map[string]any)
+	endpointRef["required"] = []string{"task_id", "endpoint_id"}
+	endpointRefProperties := endpointRef["properties"].(map[string]any)
+	endpointRefProperties["endpoint_id"].(map[string]any)["enum"] = []string{"plan", "execute", "verify"}
+	endpointProperties["run_policy"].(map[string]any)["enum"] = []string{"enabled", "held"}
+
+	edge := properties["edges"].(map[string]any)["items"].(map[string]any)
+	edge["required"] = []string{"from", "to", "signal", "required_by", "on_false"}
+	edgeProperties := edge["properties"].(map[string]any)
+	for _, field := range []string{"from", "to"} {
+		ref := edgeProperties[field].(map[string]any)
+		ref["required"] = []string{"task_id", "endpoint_id"}
+		ref["properties"].(map[string]any)["endpoint_id"].(map[string]any)["enum"] = []string{"plan", "execute", "verify"}
+	}
+	edgeProperties["signal"].(map[string]any)["enum"] = []string{"phase_satisfied", "task_done"}
+	edgeProperties["required_by"].(map[string]any)["enum"] = []string{"start", "completion"}
+	edgeProperties["on_false"].(map[string]any)["enum"] = []string{"block", "replan", "cancel"}
+
+	blocker := properties["blockers"].(map[string]any)["items"].(map[string]any)
+	blocker["required"] = []string{"id", "target", "required_by", "on_false"}
+	blockerProperties := blocker["properties"].(map[string]any)
+	blockerTarget := blockerProperties["target"].(map[string]any)
+	blockerTarget["required"] = []string{"task_id", "endpoint_id"}
+	blockerTarget["properties"].(map[string]any)["endpoint_id"].(map[string]any)["enum"] = []string{"plan", "execute", "verify"}
+	blockerProperties["required_by"].(map[string]any)["enum"] = []string{"start", "completion"}
+	blockerProperties["on_false"].(map[string]any)["enum"] = []string{"block", "replan", "cancel"}
+	return schema
 }
 
 func toolInputPrototype(tool auth.Tool) any {
@@ -219,7 +281,7 @@ func toolDescription(tool auth.Tool) string {
 		auth.ToolAgentSubmitMemoryCandidate:    "Submit a sourced task memory candidate.",
 		auth.ToolAgentSubmitPhaseOutput:        "Submit structured output and artifact references for this phase.",
 		auth.ToolCoordinationSnapshot:          "Read the Task Manager's visible coordination graph snapshot.",
-		auth.ToolTaskManagerSubmitDecision:     "Persist a structured Task Manager decision.",
+		auth.ToolTaskManagerSubmitDecision:     "Persist one structured Task Manager decision. Runtime injects revision and authority. Follow the lifecycle action mapping and use the Runtime-selected task or task/endpoint target exactly.",
 		auth.ToolCoordinationReplacePending:    "Replace only the not-yet-executed coordination subgraph.",
 		auth.ToolCoordinationTransition:        "Apply a persisted decision as one graph state transition.",
 		auth.ToolContextRegisterTaskSubgraph:   "Register the authoritative context subgraph for a task.",
@@ -241,7 +303,7 @@ func toolDescription(tool auth.Tool) string {
 		auth.ToolWorkspaceWrite:                "Write a file allowed by the current workspace lease.",
 		auth.ToolWorkspaceRun:                  "Run an argv command in the current workspace.",
 		auth.ToolWorkspaceDiff:                 "Read the controlled diff for the current workspace.",
-		auth.ToolEvidenceRegister:              "Register evidence produced by the current invocation.",
+		auth.ToolEvidenceRegister:              "Register evidence produced by the current invocation. For targeted verify final reports, use type=generated_report, content_type=application/json, and body as the strict threadmill.targeted_verify.v1 JSON object; use the returned artifact id as report_ref.",
 	}
 	if description := descriptions[tool]; description != "" {
 		return description

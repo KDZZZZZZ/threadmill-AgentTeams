@@ -49,7 +49,19 @@ func TestAssembleInvocationRecordsPromptSkillAndEffectiveToolHashes(t *testing.T
 		t.Fatal("rendered prompt hash is empty")
 	}
 	capability := assembly.Invocation.Capability()
-	if capability.TaskID != "task-a" || capability.InvocationID != "inv-a" || !contains(capability.Tools, auth.ToolWorkspaceWrite) {
+	for _, tool := range []auth.Tool{
+		auth.ToolAgentSubmitPhaseOutput,
+		auth.ToolRuntimeAwaitInputs,
+		auth.ToolContextUnsubscribe,
+		auth.ToolContextAgentRetrieve,
+		auth.ToolAgentListTaskMemoryCandidates,
+		auth.ToolAgentSubmitMemoryCandidate,
+	} {
+		if !contains(capability.Tools, tool) {
+			t.Fatalf("capability missing assembled tool %q: %#v", tool, capability)
+		}
+	}
+	if capability.TaskID != "task-a" || capability.InvocationID != "inv-a" {
 		t.Fatalf("capability did not preserve assembled authority: %#v", capability)
 	}
 }

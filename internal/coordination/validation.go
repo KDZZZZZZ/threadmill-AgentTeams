@@ -8,7 +8,7 @@ import (
 
 var fixedEndpoints = []EndpointID{EndpointPlan, EndpointExecute, EndpointVerify}
 
-func validatePendingSubgraph(current graphState, next PendingSubgraph) error {
+func validatePendingSubgraph(current graphState, runtime memoryRuntimeState, next PendingSubgraph) error {
 	if next.BaseRevision.IsLatestRead() {
 		return kernel.InvalidArgument("base_revision must be a concrete revision")
 	}
@@ -29,17 +29,19 @@ func validatePendingSubgraph(current graphState, next PendingSubgraph) error {
 			if existing.State != EndpointPending {
 				return kernel.ScopeNotPending("only pending endpoints can be replaced")
 			}
-			if existing.Generation != endpoint.Generation {
-				return kernel.StaleBinding("pending endpoint generation cannot be changed by ReplacePending")
-			}
-			if existing.BindingRef != endpoint.BindingRef {
-				return kernel.StaleBinding("BindingRef is immutable for an endpoint generation")
-			}
 			if existing.SpecRef != endpoint.SpecRef {
 				return kernel.StaleBinding("SpecRef is immutable for an endpoint generation")
 			}
 			if existing.RunPolicy != endpoint.RunPolicy {
 				return kernel.InvalidArgument("ReplacePending cannot rewrite endpoint run policy")
+			}
+			if existing.Generation == endpoint.Generation {
+				if existing.BindingRef != endpoint.BindingRef {
+					return kernel.StaleBinding("BindingRef is immutable for an endpoint generation")
+				}
+			} else if endpoint.Generation != existing.Generation+1 || endpoint.BindingRef == existing.BindingRef ||
+				!runtime.hasDefinitiveDispatchRejection(existing) {
+				return kernel.StaleBinding("pending endpoint generation can advance only after a definitive pre-start dispatch rejection")
 			}
 		}
 	}
@@ -90,6 +92,27 @@ func validatePendingSubgraph(current graphState, next PendingSubgraph) error {
 	return nil
 }
 
+func (runtime memoryRuntimeState) hasDefinitiveDispatchRejection(endpoint PhaseEndpoint) bool {
+	for _, record := range runtime.commands {
+		command := record.Command
+		if command.Endpoint != endpoint.Ref || command.Generation != endpoint.Generation || command.BindingRef != endpoint.BindingRef ||
+			!isRunCommand(command) || !record.NotExecutable || record.ObservedEventRef != "" || record.CompletedEventRef == "" {
+			continue
+		}
+		lease, ok := runtime.leases[command.LeaseRef]
+		if !ok || lease.State != "released" || lease.Endpoint != endpoint.Ref || lease.Generation != endpoint.Generation || lease.BindingRef != endpoint.BindingRef {
+			continue
+		}
+		for _, observation := range runtime.observations {
+			if observation.ID == record.CompletedEventRef && observation.Kind == "DispatchRejected" && observation.Folded &&
+				observation.CommandID == command.ID && observation.LeaseRef == command.LeaseRef {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func applyPendingSubgraph(state *graphState, next PendingSubgraph) {
 	scope := make(map[PhaseEndpointRef]struct{}, len(next.Endpoints))
 	for _, endpoint := range next.Endpoints {
@@ -132,6 +155,16 @@ func validatePendingSubgraphRuntime(runtime memoryRuntimeState, next PendingSubg
 		if _, ok := scope[lease.Endpoint]; ok {
 			return kernel.EndpointInFlight("ReplacePending scope contains an endpoint with an active phase lease; hold and stop the phase before replacing it")
 		}
+	}
+	return nil
+}
+
+func validateReopenRoundRuntime(runtime memoryRuntimeState, taskID kernel.TaskID) error {
+	for _, lease := range runtime.leases {
+		if lease.State != "active" || lease.Endpoint.TaskID != taskID {
+			continue
+		}
+		return kernel.EndpointInFlight("reopen_round requires all task phase leases to be terminally released")
 	}
 	return nil
 }
@@ -430,6 +463,22 @@ func validateTransitionShape(transition GraphTransition) error {
 		}
 		switch transition.Action {
 		case string(TaskDone), string(TaskCanceled), string(TaskFailed):
+			return nil
+		case "reopen_round":
+			if transition.Endpoint != (PhaseEndpointRef{}) || transition.BlockerID != "" || transition.Generation != 0 ||
+				transition.Result != (PhaseResult{}) || transition.NewBindingRef != "" || transition.NewSpecRef != "" ||
+				transition.CheckpointRef != "" || transition.NonResumable {
+				return kernel.InvalidArgument("reopen_round only accepts task_id, execute_binding_ref, verify_binding_ref, action, and evidence_refs")
+			}
+			if err := kernel.RequireID("execute_binding_ref", transition.ExecuteBindingRef); err != nil {
+				return err
+			}
+			if err := kernel.RequireID("verify_binding_ref", transition.VerifyBindingRef); err != nil {
+				return err
+			}
+			if transition.ExecuteBindingRef == transition.VerifyBindingRef {
+				return kernel.StaleBinding("reopen_round requires distinct execute and verify binding_ref values")
+			}
 			return nil
 		default:
 			return kernel.InvalidArgument("task transition action is not allowed")

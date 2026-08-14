@@ -22,6 +22,16 @@ type fakeAgentTokenAuthenticator struct {
 	calls     int
 }
 
+type fakeToolCallGuard struct {
+	err   error
+	calls int
+}
+
+func (g *fakeToolCallGuard) AuthorizeToolCall(context.Context, auth.Principal) error {
+	g.calls++
+	return g.err
+}
+
 func (f *fakeAgentTokenAuthenticator) AuthenticateAgentToken(_ context.Context, token string) (auth.Principal, error) {
 	f.calls++
 	if f.err != nil {
@@ -200,6 +210,37 @@ func TestHTTPHandlerMapsToolErrorsAndProtocolErrors(t *testing.T) {
 	decodeRecorderJSON(t, trailing, &trailingResponse)
 	if trailingResponse.Error == nil || trailingResponse.Error.Code != -32600 || string(trailingResponse.ID) != "null" {
 		t.Fatalf("trailing response = %#v", trailingResponse)
+	}
+}
+
+func TestHTTPHandlerKeepsTransportAliveButRejectsFencedInvocationToolCalls(t *testing.T) {
+	principal := principalWithTools(auth.RoleTaskManager, auth.ToolCoordinationSnapshot)
+	authenticator := &fakeAgentTokenAuthenticator{token: "secret", principal: principal}
+	handlerCalls := 0
+	registry, err := NewRegistry(ToolSpec{ID: auth.ToolCoordinationSnapshot, Handler: HandlerFunc(func(context.Context, auth.Principal, auth.BoundScope, json.RawMessage) (any, error) {
+		handlerCalls++
+		return map[string]any{"revision": 2}, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := &fakeToolCallGuard{err: kernel.Forbidden("Runtime invocation is terminal; Threadmill tools are fenced")}
+	handler, err := NewHTTPHandler(authenticator, registry, HTTPOptions{ToolCallGuard: guard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialized := serveMCP(t, handler, "secret", "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`, nil)
+	listed := serveMCP(t, handler, "secret", "", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, nil)
+	called := serveMCP(t, handler, "secret", "", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"coordination.snapshot","arguments":{}}}`, nil)
+	if initialized.Code != http.StatusOK || listed.Code != http.StatusOK || called.Code != http.StatusOK {
+		t.Fatalf("transport codes initialize=%d list=%d call=%d", initialized.Code, listed.Code, called.Code)
+	}
+	var response struct {
+		Result toolCallResult `json:"result"`
+	}
+	decodeRecorderJSON(t, called, &response)
+	if !response.Result.IsError || response.Result.StructuredContent["code"] != string(kernel.CodeForbidden) || handlerCalls != 0 || guard.calls != 1 {
+		t.Fatalf("fenced result=%#v handler=%d guard=%d", response.Result, handlerCalls, guard.calls)
 	}
 }
 

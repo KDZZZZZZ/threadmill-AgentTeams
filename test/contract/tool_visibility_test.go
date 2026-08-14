@@ -36,8 +36,7 @@ func TestSkillToolsMatchRegistryAndRoleBoundaries(t *testing.T) {
 			auth.ToolContextSubscribe, auth.ToolContextUnsubscribe,
 			auth.ToolContextAgentRetrieve, auth.ToolCoordinationSnapshot,
 			auth.ToolTaskManagerSubmitDecision, auth.ToolCoordinationReplacePending,
-			auth.ToolCoordinationTransition, auth.ToolContextRegisterTaskSubgraph,
-			auth.ToolContextProjectTaskContext, auth.ToolContextFinalizeTaskMemory,
+			auth.ToolCoordinationTransition,
 		)},
 		{auth.RoleContext, "retrieve", toolList(
 			auth.ToolContextListSubgraphs, auth.ToolContextExplore,
@@ -54,18 +53,9 @@ func TestSkillToolsMatchRegistryAndRoleBoundaries(t *testing.T) {
 			auth.ToolContextGetSubgraph, auth.ToolContextGetNode,
 			auth.ToolContextSearch, auth.ToolContextSubmitReview,
 		)},
-		{auth.RolePlanner, "", phaseTools(
-			auth.ToolWorkspaceList, auth.ToolWorkspaceRead,
-			auth.ToolWorkspaceWritePlan, auth.ToolWorkspaceDiff, auth.ToolEvidenceRegister,
-		)},
-		{auth.RoleExecutor, "", phaseTools(
-			auth.ToolWorkspaceList, auth.ToolWorkspaceRead, auth.ToolWorkspaceWrite,
-			auth.ToolWorkspaceRun, auth.ToolWorkspaceDiff, auth.ToolEvidenceRegister,
-		)},
-		{auth.RoleVerifier, "", phaseTools(
-			auth.ToolWorkspaceList, auth.ToolWorkspaceRead,
-			auth.ToolWorkspaceRun, auth.ToolWorkspaceDiff, auth.ToolEvidenceRegister,
-		)},
+		{auth.RolePlanner, "", phaseTools(auth.ToolEvidenceRegister)},
+		{auth.RoleExecutor, "", phaseTools(auth.ToolEvidenceRegister)},
+		{auth.RoleVerifier, "", phaseTools(auth.ToolEvidenceRegister)},
 	}
 	for _, profile := range profiles {
 		bundle, err := catalog.Bundle(profile.role, profile.operation)
@@ -89,10 +79,21 @@ func TestSkillToolsMatchRegistryAndRoleBoundaries(t *testing.T) {
 	assertVisible(t, catalog, auth.RoleExecutor, "", auth.ToolCoordinationReplacePending, false)
 	assertVisible(t, catalog, auth.RoleContext, "retrieve", auth.ToolContextSearch, true)
 	assertVisible(t, catalog, auth.RoleTaskManager, "", auth.ToolContextSearch, false)
+	assertVisible(t, catalog, auth.RoleTaskManager, "", auth.ToolContextRegisterTaskSubgraph, false)
+	assertVisible(t, catalog, auth.RoleTaskManager, "", auth.ToolContextProjectTaskContext, false)
+	assertVisible(t, catalog, auth.RoleTaskManager, "", auth.ToolContextFinalizeTaskMemory, false)
 	assertVisible(t, catalog, auth.RoleExecutor, "", auth.ToolContextSearch, false)
-	assertVisible(t, catalog, auth.RolePlanner, "", auth.ToolWorkspaceWritePlan, true)
+	assertVisible(t, catalog, auth.RolePlanner, "", auth.ToolWorkspaceWritePlan, false)
 	assertVisible(t, catalog, auth.RolePlanner, "", auth.ToolWorkspaceWrite, false)
 	assertVisible(t, catalog, auth.RoleVerifier, "", auth.ToolWorkspaceWrite, false)
+	for _, role := range []auth.Role{auth.RolePlanner, auth.RoleExecutor, auth.RoleVerifier} {
+		for _, tool := range []auth.Tool{
+			auth.ToolWorkspaceList, auth.ToolWorkspaceRead, auth.ToolWorkspaceWritePlan,
+			auth.ToolWorkspaceWrite, auth.ToolWorkspaceRun, auth.ToolWorkspaceDiff,
+		} {
+			assertVisible(t, catalog, role, "", tool, false)
+		}
+	}
 
 	for _, forbidden := range []auth.Tool{
 		"runtime.startPhase",

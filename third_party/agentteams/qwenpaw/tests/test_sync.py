@@ -22,7 +22,9 @@ def _sync(tmp_path: Path) -> FileSync:
     )
 
 
-def test_mirror_all_restores_worker_and_shared_storage(tmp_path: Path, monkeypatch) -> None:
+def test_mirror_all_restores_worker_and_shared_storage(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     commands = []
 
@@ -56,7 +58,9 @@ def test_mirror_all_restores_worker_and_shared_storage(tmp_path: Path, monkeypat
     ]
 
 
-def test_pull_runtime_config_downloads_controller_projection(tmp_path: Path, monkeypatch) -> None:
+def test_pull_runtime_config_downloads_controller_projection(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     commands = []
     target = sync.local_dir / "runtime" / "runtime.yaml"
@@ -86,7 +90,9 @@ def test_pull_runtime_config_downloads_controller_projection(tmp_path: Path, mon
     ]
 
 
-def test_ensure_alias_skips_static_alias_in_k8s_mode(tmp_path: Path, monkeypatch) -> None:
+def test_ensure_alias_skips_static_alias_in_k8s_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = FileSync(
         endpoint="https://oss.example.test",
         access_key="access-key",
@@ -111,16 +117,23 @@ def test_ensure_alias_skips_static_alias_in_k8s_mode(tmp_path: Path, monkeypatch
     assert commands == []
 
 
-def test_storage_alias_derives_from_agentteams_storage_prefix(tmp_path: Path, monkeypatch) -> None:
+def test_storage_alias_derives_from_agentteams_storage_prefix(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setenv("AGENTTEAMS_STORAGE_PREFIX", "agentteams/agentteams-storage")
 
     sync = _sync(tmp_path)
 
     assert sync.mc_alias == "agentteams"
-    assert sync._object_path("agents/worker-a/file.txt") == "agentteams/agentteams-storage/agents/worker-a/file.txt"
+    assert (
+        sync._object_path("agents/worker-a/file.txt")
+        == "agentteams/agentteams-storage/agents/worker-a/file.txt"
+    )
 
 
-def test_push_local_uploads_worker_files_but_skips_controller_owned_state(tmp_path: Path, monkeypatch) -> None:
+def test_push_local_uploads_worker_files_but_skips_controller_owned_state(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     uploads = []
 
@@ -136,6 +149,14 @@ def test_push_local_uploads_worker_files_but_skips_controller_owned_state(tmp_pa
         ".qwenpaw/qwenpaw.log": "log",
         ".qwenpaw/logs/qwenpaw-worker.log": "worker log",
         ".qwenpaw/workspaces/default/tool_result/result.json": "{}",
+        ".qwenpaw/workspaces/default/tool_results/result.json": "{}",
+        ".qwenpaw/workspaces/default/sessions/matrix/room.json": "{}",
+        ".qwenpaw/workspaces/default/chats.json": "{}",
+        ".qwenpaw/workspaces/default/history.db": "history",
+        ".qwenpaw/workspaces/default/history.db-wal": "wal",
+        ".qwenpaw/workspaces/default/notes/old-task.md": "old note",
+        ".qwenpaw/workspaces/default/memory/2026-08-13.md": "old memory",
+        ".qwenpaw/workspaces/default/mem_metadata/index.json": "{}",
         ".qwenpaw/workspaces/default/file_store/a.bin": "file",
         "runtime/runtime.yaml": "controller owned runtime config",
         "credentials/token": "secret",
@@ -173,6 +194,15 @@ def test_push_local_uploads_worker_files_but_skips_controller_owned_state(tmp_pa
     assert not any("credentials" in item for item in pushed)
     assert not any("logs/" in item for item in pushed)
     assert not any("shared/" in item for item in pushed)
+    assert not any(
+        "history.db" in item
+        or "chats.json" in item
+        or "/sessions/" in item
+        or "/notes/" in item
+        or "/memory/" in item
+        or "/mem_metadata/" in item
+        for item in pushed
+    )
     assert set(uploads) == {
         "agentteams/agentteams-storage/agents/worker-a/SOUL.md",
         "agentteams/agentteams-storage/agents/worker-a/.qwenpaw/workspaces/default/AGENTS.md",
@@ -185,7 +215,9 @@ def test_push_local_uploads_worker_files_but_skips_controller_owned_state(tmp_pa
     }
 
 
-def test_push_paths_persists_selected_migration_files_in_order(tmp_path: Path, monkeypatch) -> None:
+def test_push_paths_persists_selected_migration_files_in_order(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     session = sync.local_dir / ".qwenpaw" / "workspaces" / "default" / "chats.json"
     marker = sync.local_dir / ".qwenpaw" / ".copaw-migrated"
@@ -229,7 +261,10 @@ def test_push_directories_mirrors_migration_roots(tmp_path: Path, monkeypatch) -
 
     monkeypatch.setattr(sync, "_mc", fake_mc)
 
-    assert sync.push_directories([working_dir, secret_dir]) == [".qwenpaw", ".qwenpaw.secret"]
+    assert sync.push_directories([working_dir, secret_dir]) == [
+        ".qwenpaw",
+        ".qwenpaw.secret",
+    ]
     assert commands == [
         (
             "mirror",
@@ -246,7 +281,9 @@ def test_push_directories_mirrors_migration_roots(tmp_path: Path, monkeypatch) -
     ]
 
 
-def test_push_local_does_not_remove_remote_files_missing_from_local_state(tmp_path: Path, monkeypatch) -> None:
+def test_push_local_does_not_remove_remote_files_missing_from_local_state(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     commands = []
 
@@ -255,7 +292,11 @@ def test_push_local_does_not_remove_remote_files_missing_from_local_state(tmp_pa
     current.write_text("runtime prompt", encoding="utf-8")
 
     monkeypatch.setattr(sync, "ensure_alias", lambda: None)
-    monkeypatch.setattr(sync, "_cat_bytes", lambda key: b"runtime prompt" if key.endswith("/AGENTS.md") else None)
+    monkeypatch.setattr(
+        sync,
+        "_cat_bytes",
+        lambda key: b"runtime prompt" if key.endswith("/AGENTS.md") else None,
+    )
 
     def fake_mc(*args, **_kwargs):
         commands.append(args)
@@ -268,7 +309,9 @@ def test_push_local_does_not_remove_remote_files_missing_from_local_state(tmp_pa
     assert not any(args[0] == "find" for args in commands)
 
 
-def test_push_local_skips_older_and_unchanged_files(tmp_path: Path, monkeypatch) -> None:
+def test_push_local_skips_older_and_unchanged_files(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     uploads = []
 
@@ -284,7 +327,9 @@ def test_push_local_skips_older_and_unchanged_files(tmp_path: Path, monkeypatch)
     changed_file.write_text("changed", encoding="utf-8")
 
     monkeypatch.setattr(sync, "ensure_alias", lambda: None)
-    monkeypatch.setattr(sync, "_cat_bytes", lambda key: b"same" if key.endswith("/same.txt") else None)
+    monkeypatch.setattr(
+        sync, "_cat_bytes", lambda key: b"same" if key.endswith("/same.txt") else None
+    )
 
     def fake_mc(*args, **_kwargs):
         if args[0] == "cp":
@@ -297,7 +342,9 @@ def test_push_local_skips_older_and_unchanged_files(tmp_path: Path, monkeypatch)
     assert uploads == ["agentteams/agentteams-storage/agents/worker-a/changed.txt"]
 
 
-def test_push_local_compares_small_binary_files_as_bytes(tmp_path: Path, monkeypatch) -> None:
+def test_push_local_compares_small_binary_files_as_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     uploads = []
 
@@ -330,7 +377,9 @@ def test_push_local_compares_small_binary_files_as_bytes(tmp_path: Path, monkeyp
     assert uploads == ["agentteams/agentteams-storage/agents/worker-a/changed.bin"]
 
 
-def test_push_local_uploads_large_files_without_remote_content_compare(tmp_path: Path, monkeypatch) -> None:
+def test_push_local_uploads_large_files_without_remote_content_compare(
+    tmp_path: Path, monkeypatch
+) -> None:
     sync = _sync(tmp_path)
     uploads = []
 
@@ -341,7 +390,9 @@ def test_push_local_uploads_large_files_without_remote_content_compare(tmp_path:
     monkeypatch.setattr(sync, "ensure_alias", lambda: None)
 
     def fail_cat_bytes(_key):
-        raise AssertionError("large files should not download remote content for comparison")
+        raise AssertionError(
+            "large files should not download remote content for comparison"
+        )
 
     monkeypatch.setattr(sync, "_cat_bytes", fail_cat_bytes)
 

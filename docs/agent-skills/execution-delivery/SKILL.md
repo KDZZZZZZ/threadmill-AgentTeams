@@ -16,16 +16,11 @@ description: 在批准范围内实施计划、运行必要检查并生成可审�
 
 ## 工具
 
-- `workspace.list`
-- `workspace.read`
-- `workspace.write`
-- `workspace.run`
-- `workspace.diff`
 - `evidence.register`
 
 ## Workspace 权限
 
-只能在 Workspace Binding、AllowedDirs、Declared Write Set 和有效 lease 内写入。路径或命令被拒绝时不得绕过。
+使用宿主原生文件搜索、读取、编辑/写入与命令工具，只在 Runtime 投影的任务工作区、AllowedDirs、Declared Write Set 和有效 lease 内工作。Threadmill 在 PhaseOutput 提交前统一同步、校验 ACL 并落 Git checkpoint；不得混用 `workspace.*` MCP 文件工具形成第二条版本线。路径或同步被拒绝时不得绕过。
 
 ## 流程
 

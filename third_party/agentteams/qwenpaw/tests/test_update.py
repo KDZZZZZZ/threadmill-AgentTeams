@@ -74,7 +74,10 @@ class _FakeQwenPawApi:
         return payload
 
     def list_mcp(self):
-        return list(self.mcp.values())
+        raise AssertionError("runtime MCP reconciliation must not call global list_mcp")
+
+    def get_mcp_if_present(self, key):
+        return self.mcp.get(key)
 
     def create_mcp(self, key, payload):
         self.mcp[key] = {"key": key, **payload}
@@ -149,6 +152,8 @@ def test_runtime_updater_reconciles_model_mcp_matrix_channel_and_acl_via_api(
     assert api.mcp["docs"]["transport"] == "streamable_http"
     assert api.channels["agentteams_matrix"]["access_token"] == "matrix-token"
     assert api.channels["agentteams_matrix"]["groups"]["!team:matrix.local"]["requireMention"] is True
+    assert api.channels["agentteams_matrix"]["show_tool_calls"] is False
+    assert api.channels["agentteams_matrix"]["show_tool_results"] is False
     assert "@human:matrix.local" in api.acls["agentteams_matrix"]["whitelist"]
     assert not (updater.config.default_workspace_dir / "agent.json").exists()
     assert not (updater.config.default_workspace_dir / "config" / "mcporter.json").exists()
@@ -208,6 +213,36 @@ def test_runtime_updater_preserves_unmanaged_mcp_clients(tmp_path: Path) -> None
     )
 
     assert "third-party" in updater.api_client.mcp
+
+
+def test_runtime_updater_reconciles_managed_mcp_with_targeted_reads(tmp_path: Path) -> None:
+    updater = _runtime_updater(config=_config(tmp_path), package_manager=_NoopPackageManager())
+    ownership_path = updater.config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
+    ownership_path.parent.mkdir(parents=True)
+    ownership_path.write_text('["old-docs", "docs"]\n', encoding="utf-8")
+    updater.api_client.mcp["old-docs"] = {"key": "old-docs", "name": "old-docs"}
+    updater.api_client.mcp["docs"] = {"key": "docs", "name": "docs", "url": "https://old.example/mcp"}
+    updater.api_client.mcp["third-party"] = {"key": "third-party", "name": "third-party"}
+
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=updater.config.runtime_config_path,
+            raw={
+                "metadata": {"generation": "1"},
+                "member": {"runtime": "qwenpaw"},
+                "desired": {
+                    "mcpServers": [
+                        {"name": "docs", "url": "https://gateway.example.com/mcp"},
+                    ],
+                },
+            },
+        ),
+    )
+
+    assert "old-docs" not in updater.api_client.mcp
+    assert updater.api_client.mcp["docs"]["url"] == "https://gateway.example.com/mcp"
+    assert "third-party" in updater.api_client.mcp
+    assert json.loads(ownership_path.read_text(encoding="utf-8")) == ["docs"]
 
 
 def _agent_package(tmp_path: Path, version: str, *, include_teams: bool = False) -> Path:
@@ -422,47 +457,6 @@ def test_runtime_config_identity_distinguishes_empty_list_and_empty_object(tmp_p
     )
 
     assert first.desired_identity != second.desired_identity
-
-
-def test_runtime_updater_preserves_threadmill_invocation_mcp_clients(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    api = _FakeQwenPawApi()
-    updater = _runtime_updater(
-        config=config,
-        api_client=api,
-        package_manager=_NoopPackageManager(),
-    )
-    ownership_path = config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
-    ownership_path.parent.mkdir(parents=True, exist_ok=True)
-    ownership_path.write_text(
-        json.dumps(["docs", "threadmill-abcdef1234567890abcdef12"]) + "\n",
-        encoding="utf-8",
-    )
-    api.create_mcp("docs", {"name": "docs", "url": "https://docs.example.test/mcp"})
-    api.create_mcp(
-        "threadmill-abcdef1234567890abcdef12",
-        {
-            "name": "threadmill-abcdef1234567890abcdef12",
-            "url": "https://threadmill.example.test/mcp",
-            "transport": "streamable_http",
-            "tools": ["phase.submit"],
-        },
-    )
-
-    updater.apply_once(
-        runtime_config=MemberRuntimeConfig(
-            path=config.runtime_config_path,
-            raw={
-                "metadata": {"generation": "1"},
-                "member": {"runtime": "qwenpaw"},
-                "desired": {},
-            },
-        )
-    )
-
-    assert "docs" not in api.mcp
-    assert "threadmill-abcdef1234567890abcdef12" in api.mcp
-    assert json.loads(ownership_path.read_text(encoding="utf-8")) == []
 
 
 def _legacy_test_runtime_updater_does_not_reapply_adapter_for_mcp_only_change(

@@ -151,6 +151,97 @@ func TestApplyStartObservationFailureRetriesWithoutRedispatch(t *testing.T) {
 	}
 }
 
+func TestFailInvocationClosesProviderFailureAndRetriesObservationWithoutRedispatch(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	command := validCommand("cmd-provider-failed", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, command); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := deterministicInvocationID(command)
+	harness.observations.failFailedOnce = kernel.Error{Code: kernel.CodeRevisionConflict, Message: "failure boundary unavailable", Recoverable: true}
+
+	if err := controller.FailInvocation(ctx, command); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
+		t.Fatalf("first failure close = %v, want revision_conflict", err)
+	}
+	invocation, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || invocation.Status != baseruntime.InvocationFailed {
+		t.Fatalf("failed invocation = %#v, %v, %v; want failed", invocation, ok, err)
+	}
+	if _, ok := harness.recovery.active[invocationID]; !ok {
+		t.Fatal("failure observation error cleared recovery obligation")
+	}
+	if err := controller.FailInvocation(ctx, command); err != nil {
+		t.Fatalf("retry failure close: %v", err)
+	}
+	if got := len(harness.host.dispatches); got != 1 {
+		t.Fatalf("failure retry redispatched invocation = %d, want 1", got)
+	}
+	if got := len(harness.observations.failed); got != 1 || harness.observations.failed[0] != command {
+		t.Fatalf("failed observations = %#v, want one exact command", harness.observations.failed)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("successful failure close retained recovery obligation")
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("output after failed invocation = %v, want stale_command", err)
+	}
+}
+
+func TestAbandonInvocationCleansRejectedRecoveryWithoutGraphObservation(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	command := validCommand("cmd-rejected-recovery", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, command); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := deterministicInvocationID(command)
+
+	if err := controller.AbandonInvocation(ctx, command); err != nil {
+		t.Fatalf("abandon rejected recovery: %v", err)
+	}
+	invocation, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || invocation.Status != baseruntime.InvocationFailed {
+		t.Fatalf("abandoned invocation = %#v ok=%v err=%v, want failed", invocation, ok, err)
+	}
+	if !harness.host.revoked[invocationID] || !harness.lifecycle.ended[invocationID] {
+		t.Fatal("abandonment did not revoke provider authority and end invocation resources")
+	}
+	if got := len(harness.observations.failed); got != 0 {
+		t.Fatalf("abandonment emitted %d graph failure observations, want 0", got)
+	}
+	if _, ok := harness.recovery.active[invocationID]; ok {
+		t.Fatal("abandonment retained active recovery obligation")
+	}
+}
+
+func TestFailInvocationRejectsUntrustedOrDifferentCommandIdentity(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	controller := harness.controller()
+	command := validCommand("cmd-provider-failed-mismatch", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, command); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+
+	stop := command
+	stop.Action = coordination.CommandStop
+	if err := controller.FailInvocation(ctx, stop); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("stop failure report = %v, want stale_command", err)
+	}
+	mismatched := command
+	mismatched.BindingRef = "binding-other"
+	if err := controller.FailInvocation(ctx, mismatched); !kernel.IsCode(err, kernel.CodeStaleCommand) {
+		t.Fatalf("mismatched failure report = %v, want stale_command", err)
+	}
+	invocation, ok, err := harness.store.Get(ctx, deterministicInvocationID(command))
+	if err != nil || !ok || invocation.Status != baseruntime.InvocationRunning {
+		t.Fatalf("invocation after rejected failure = %#v, %v, %v; want running", invocation, ok, err)
+	}
+}
+
 func TestStopAfterDispatchCrashBeforeRunningTransitionRecoversActiveInvocation(t *testing.T) {
 	ctx := context.Background()
 	harness := newHarness(t)
@@ -385,8 +476,8 @@ func TestSubmitPhaseOutputCompletedTransitionFailureUsesPendingReceiptOnRetry(t 
 	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); !kernel.IsCode(err, kernel.CodeRevisionConflict) {
 		t.Fatalf("submit with terminal transition failure = %v, want revision_conflict", err)
 	}
-	if !harness.host.revoked[invocationID] {
-		t.Fatal("terminal transition failure should happen after revoke/fence")
+	if !harness.host.fenced[invocationID] || harness.host.revoked[invocationID] {
+		t.Fatal("terminal transition failure should happen after fence without destructive revoke")
 	}
 	if _, ok, err := controller.Output(ctx, invocationID); err != nil || ok {
 		t.Fatalf("final receipt after terminal failure = ok %v err %v, want no final receipt", ok, err)
@@ -470,6 +561,50 @@ func TestSubmitPhaseOutputCompletedObservationFailureRestartsFromRecoveryReceipt
 
 	if _, err := rebuilt.SubmitPhaseOutput(ctx, invocationID, PhaseOutput{Phase: "execute", ReportRef: "different"}); !kernel.IsCode(err, kernel.CodeIdempotencyConflict) {
 		t.Fatalf("completed retry with different payload = %v, want idempotency_conflict", err)
+	}
+}
+
+func TestSubmitPhaseOutputRebuildFinishesReceiptPersistedBeforeRevocation(t *testing.T) {
+	ctx := context.Background()
+	harness := newHarness(t)
+	harness.host.fenceErrOnce = errors.New("token revocation unavailable")
+	controller := harness.controller()
+	cmd := validCommand("cmd-output-revoke-restart", coordination.CommandStart, "binding-1", "lease-1", 1)
+	if err := controller.Apply(ctx, cmd); err != nil {
+		t.Fatalf("apply start: %v", err)
+	}
+	invocationID := harness.host.dispatches[0].Invocation.ID
+	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
+		t.Fatalf("await inputs: %v", err)
+	}
+	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err == nil || err.Error() != "phase output capability fencing: token revocation unavailable" {
+		t.Fatalf("submit before restart = %v, want revocation failure", err)
+	}
+	running, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || running.Status != baseruntime.InvocationRunning {
+		t.Fatalf("invocation before recovery = %#v %v %v, want running", running, ok, err)
+	}
+
+	rebuilt := harness.controller()
+	receipt, err := rebuilt.SubmitPhaseOutput(ctx, invocationID, validOutput())
+	if err != nil {
+		t.Fatalf("retry persisted receipt after restart: %v", err)
+	}
+	completed, ok, err := harness.store.Get(ctx, invocationID)
+	if err != nil || !ok || completed.Status != baseruntime.InvocationCompleted {
+		t.Fatalf("invocation after recovery = %#v %v %v, want completed", completed, ok, err)
+	}
+	if receipt.CommandID != cmd.ID || receipt.InvocationID != invocationID {
+		t.Fatalf("recovered receipt = %#v", receipt)
+	}
+	if got := harness.host.fenceCalls[invocationID]; got != 2 {
+		t.Fatalf("fence calls = %d, want initial failure plus recovery", got)
+	}
+	if got := harness.lifecycle.completeCalls[invocationID]; got != 1 {
+		t.Fatalf("lifecycle complete calls = %d, want 1", got)
+	}
+	if got := len(harness.observations.outputs); got != 1 || harness.observations.outputs[0] != cmd {
+		t.Fatalf("output observations = %#v, want recovered command", harness.observations.outputs)
 	}
 }
 
@@ -668,7 +803,7 @@ func TestSubmitPhaseOutputRejectsIncompleteCompletionDeliveryMetadata(t *testing
 	}
 }
 
-func TestSubmitPhaseOutputRevokeFailureKeepsInvocationRetryable(t *testing.T) {
+func TestSubmitPhaseOutputFenceFailureKeepsInvocationRetryable(t *testing.T) {
 	ctx := context.Background()
 	harness := newHarness(t)
 	controller := harness.controller()
@@ -680,14 +815,14 @@ func TestSubmitPhaseOutputRevokeFailureKeepsInvocationRetryable(t *testing.T) {
 	if _, err := controller.AwaitInputs(ctx, invocationID, AwaitInputsRequest{}); err != nil {
 		t.Fatalf("await inputs: %v", err)
 	}
-	harness.host.revokeErr = errors.New("fence unavailable")
+	harness.host.fenceErr = errors.New("fence unavailable")
 	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err == nil {
-		t.Fatal("submit unexpectedly succeeded with revoke failure")
+		t.Fatal("submit unexpectedly succeeded with fence failure")
 	}
 	if _, ok, err := controller.Output(ctx, invocationID); err != nil || ok {
-		t.Fatalf("receipt after failed revoke = ok %v err %v, want no receipt", ok, err)
+		t.Fatalf("receipt after failed fence = ok %v err %v, want no receipt", ok, err)
 	}
-	harness.host.revokeErr = nil
+	harness.host.fenceErr = nil
 	if _, err := controller.SubmitPhaseOutput(ctx, invocationID, validOutput()); err != nil {
 		t.Fatalf("retry submit after revoke failure: %v", err)
 	}
@@ -1294,6 +1429,8 @@ type fakeHost struct {
 	dispatchErr         error
 	revokeErr           error
 	revokeErrOnce       error
+	fenceErr            error
+	fenceErrOnce        error
 	dispatchBlock       chan struct{}
 	dispatchReturnBlock chan struct{}
 	dispatches          []DispatchRequest
@@ -1305,6 +1442,8 @@ type fakeHost struct {
 	suspendCalls        map[kernel.InvocationID]int
 	revoked             map[kernel.InvocationID]bool
 	revokeCalls         map[kernel.InvocationID]int
+	fenced              map[kernel.InvocationID]bool
+	fenceCalls          map[kernel.InvocationID]int
 }
 
 func newFakeHost() *fakeHost {
@@ -1315,6 +1454,8 @@ func newFakeHost() *fakeHost {
 		suspendCalls:   map[kernel.InvocationID]int{},
 		revoked:        map[kernel.InvocationID]bool{},
 		revokeCalls:    map[kernel.InvocationID]int{},
+		fenced:         map[kernel.InvocationID]bool{},
+		fenceCalls:     map[kernel.InvocationID]int{},
 	}
 }
 
@@ -1363,6 +1504,20 @@ func (h *fakeHost) Revoke(_ context.Context, invocationID kernel.InvocationID) e
 	}
 	h.revoked[invocationID] = true
 	delete(h.activeSessions, invocationID)
+	return nil
+}
+
+func (h *fakeHost) Fence(_ context.Context, invocationID kernel.InvocationID) error {
+	h.fenceCalls[invocationID]++
+	if h.fenceErrOnce != nil {
+		err := h.fenceErrOnce
+		h.fenceErrOnce = nil
+		return err
+	}
+	if h.fenceErr != nil {
+		return h.fenceErr
+	}
+	h.fenced[invocationID] = true
 	return nil
 }
 

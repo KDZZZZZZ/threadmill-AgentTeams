@@ -114,6 +114,7 @@ type BindingSnapshot struct {
 	LeaseRef            kernel.LeaseID
 	WorkspaceRef        string
 	WorkspaceRevision   string
+	WorkspaceBinding    string
 	ContextSliceRef     string
 	ContextSlice        string
 	TaskMemoryBufferRef string
@@ -177,8 +178,12 @@ type Host interface {
 	Rehydrate(context.Context, DispatchRequest) error
 	Suspend(context.Context, kernel.InvocationID) error
 	Stop(context.Context, StopRequest) (StopResult, error)
+	// Fence removes Threadmill authority without interrupting the provider's
+	// current MCP response or its native-tool and TeamHarness finalization.
+	Fence(context.Context, kernel.InvocationID) error
 	// Revoke is keyed by invocation ID and must be idempotent across recovery
-	// retries after stop evidence has already been persisted.
+	// retries after stop evidence has already been persisted. Unlike Fence it
+	// may cancel the provider execution and release its host slot.
 	Revoke(context.Context, kernel.InvocationID) error
 }
 
@@ -373,39 +378,39 @@ func (c *Controller) SubmitPhaseOutput(ctx context.Context, invocationID kernel.
 	}
 	refreshed, err := c.bindings.Refresh(ctx, active)
 	if err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output binding refresh: %w", err)
 	}
 	if err := validateBindingForActive(refreshed, active); err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output binding validation: %w", err)
 	}
 	active.Binding = cloneBindingSnapshot(refreshed)
 	if err := validatePhaseOutput(active, output); err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output contract validation: %w", err)
 	}
 	receipt, err := c.pendingOrRouteReceipt(ctx, active, output)
 	if err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output artifact routing: %w", err)
 	}
 	if c.recovery != nil {
 		if err := c.recovery.RecordOutputReceipt(ctx, active, receipt); err != nil {
-			return OutputReceipt{}, err
+			return OutputReceipt{}, fmt.Errorf("phase output receipt persistence: %w", err)
 		}
 	}
-	if err := c.host.Revoke(ctx, invocationID); err != nil {
-		return OutputReceipt{}, err
+	if err := c.host.Fence(ctx, invocationID); err != nil {
+		return OutputReceipt{}, fmt.Errorf("phase output capability fencing: %w", err)
 	}
 	if err := c.lifecycle.Complete(ctx, active.Invocation); err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output lifecycle completion: %w", err)
 	}
 	if err := c.transitionToCompleted(ctx, invocationID); err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output invocation completion: %w", err)
 	}
 	if err := c.recordOutputSubmitted(ctx, active); err != nil {
-		return OutputReceipt{}, err
+		return OutputReceipt{}, fmt.Errorf("phase output observation persistence: %w", err)
 	}
 	if c.recovery != nil {
 		if err := c.recovery.ClearActiveInvocation(ctx, invocationID); err != nil {
-			return OutputReceipt{}, err
+			return OutputReceipt{}, fmt.Errorf("phase output recovery cleanup: %w", err)
 		}
 	}
 	c.mu.Lock()
@@ -416,6 +421,124 @@ func (c *Controller) SubmitPhaseOutput(ctx context.Context, invocationID kernel.
 	delete(c.byLease, active.Command.LeaseRef)
 	c.mu.Unlock()
 	return receipt, nil
+}
+
+// FailInvocation closes an already-dispatched start/resume command after the
+// bounded execution provider reports a terminal failure. The command identity
+// comes from Runtime persistence, never from the model. Every side effect is
+// idempotent so a crash after revocation, lifecycle cleanup, status transition,
+// or observation persistence can be retried without redispatching the phase.
+func (c *Controller) FailInvocation(ctx context.Context, command PhaseCommand) error {
+	if err := validateCommand(command); err != nil {
+		return err
+	}
+	if command.Action != coordination.CommandStart && command.Action != coordination.CommandResume {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "failed invocation requires start or resume command", Recoverable: true}
+	}
+	invocationID := deterministicInvocationID(command)
+	unlock := c.lockTerminal(invocationID)
+	defer unlock()
+
+	invocation, ok, err := c.store.Get(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "phase invocation not found"}
+	}
+	if invocation.TaskID != command.Endpoint.TaskID || invocation.EndpointID != command.Endpoint.EndpointID ||
+		invocation.Generation != uint64(command.Generation) || invocation.BindingRef != command.BindingRef || invocation.LeaseID != command.LeaseRef {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "failed invocation command does not match persisted invocation", Recoverable: true}
+	}
+	switch invocation.Status {
+	case baseruntime.InvocationCompleted, baseruntime.InvocationStopped:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase invocation already reached a different terminal state", Recoverable: true}
+	case baseruntime.InvocationPrepared, baseruntime.InvocationRunning, baseruntime.InvocationWaiting, baseruntime.InvocationFailed:
+	default:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase invocation is not failure-eligible", Recoverable: true}
+	}
+
+	if err := c.host.Revoke(ctx, invocationID); err != nil {
+		return err
+	}
+	if err := c.lifecycle.End(ctx, invocation); err != nil {
+		return err
+	}
+	if err := c.transitionToFailed(ctx, invocationID); err != nil {
+		return err
+	}
+	if err := c.recordInvocationFailed(ctx, invocation.ProjectID, command); err != nil {
+		return err
+	}
+	if c.recovery != nil {
+		if err := c.recovery.ClearActiveInvocation(ctx, invocationID); err != nil {
+			return err
+		}
+	}
+	c.mu.Lock()
+	delete(c.active, invocationID)
+	delete(c.byLease, command.LeaseRef)
+	c.mu.Unlock()
+	return nil
+}
+
+// AbandonInvocation closes a persisted provider execution after the trusted
+// Runtime has established that its start/resume command is no longer
+// authoritative (for example, the command was rejected or its lease expired
+// while Threadmill was down). Unlike FailInvocation it deliberately emits no
+// graph observation: the Coordination Graph already contains the authoritative
+// rejection/release and must not be mutated a second time during recovery.
+// This is an internal Runtime recovery seam and is never exposed as an Agent
+// tool.
+func (c *Controller) AbandonInvocation(ctx context.Context, command PhaseCommand) error {
+	if err := validateCommand(command); err != nil {
+		return err
+	}
+	if command.Action != coordination.CommandStart && command.Action != coordination.CommandResume {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "abandoned invocation requires start or resume command", Recoverable: true}
+	}
+	invocationID := deterministicInvocationID(command)
+	unlocks := c.lockTerminal(invocationID)
+	defer unlocks()
+
+	invocation, ok, err := c.store.Get(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "phase invocation not found"}
+	}
+	if invocation.TaskID != command.Endpoint.TaskID || invocation.EndpointID != command.Endpoint.EndpointID ||
+		invocation.Generation != uint64(command.Generation) || invocation.BindingRef != command.BindingRef || invocation.LeaseID != command.LeaseRef {
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "abandoned invocation command does not match persisted invocation", Recoverable: true}
+	}
+	switch invocation.Status {
+	case baseruntime.InvocationCompleted, baseruntime.InvocationStopped:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase invocation already reached a different terminal state", Recoverable: true}
+	case baseruntime.InvocationPrepared, baseruntime.InvocationRunning, baseruntime.InvocationWaiting, baseruntime.InvocationFailed:
+	default:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "phase invocation is not abandonment-eligible", Recoverable: true}
+	}
+
+	if err := c.host.Revoke(ctx, invocationID); err != nil {
+		return err
+	}
+	if err := c.lifecycle.End(ctx, invocation); err != nil {
+		return err
+	}
+	if err := c.transitionToFailed(ctx, invocationID); err != nil {
+		return err
+	}
+	if c.recovery != nil {
+		if err := c.recovery.ClearActiveInvocation(ctx, invocationID); err != nil {
+			return err
+		}
+	}
+	c.mu.Lock()
+	delete(c.active, invocationID)
+	delete(c.byLease, command.LeaseRef)
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *Controller) Output(ctx context.Context, invocationID kernel.InvocationID) (OutputReceipt, bool, error) {
@@ -450,7 +573,7 @@ func (c *Controller) completedOutputReceipt(ctx context.Context, invocationID ke
 	if err != nil {
 		return OutputReceipt{}, err
 	}
-	if !ok || invocation.Status != baseruntime.InvocationCompleted {
+	if !ok || invocation.Status != baseruntime.InvocationRunning && invocation.Status != baseruntime.InvocationCompleted {
 		return OutputReceipt{}, kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation is no longer active", Recoverable: true}
 	}
 	receipt, ok, err := c.recovery.GetOutputReceipt(ctx, invocationID, "")
@@ -485,6 +608,23 @@ func (c *Controller) completedOutputReceipt(ctx context.Context, invocationID ke
 			WorkspaceRef:      receipt.WorkspaceRef,
 			WorkspaceRevision: receipt.WorkspaceHead,
 		},
+	}
+	if invocation.Status == baseruntime.InvocationRunning {
+		// The output receipt is the terminal-race winner. A process restart may
+		// happen after that receipt is persisted but before revocation, lifecycle
+		// completion, and the Invocation status transition. Finish those mechanical
+		// steps from the durable receipt instead of allowing a later stop command
+		// to turn the valid output into a stale-command dead end.
+		if err := c.host.Fence(ctx, invocationID); err != nil {
+			return OutputReceipt{}, err
+		}
+		if err := c.lifecycle.Complete(ctx, invocation); err != nil {
+			return OutputReceipt{}, err
+		}
+		if err := c.transitionToCompleted(ctx, invocationID); err != nil {
+			return OutputReceipt{}, err
+		}
+		active.Invocation.Status = baseruntime.InvocationCompleted
 	}
 	if err := c.recordOutputSubmitted(ctx, active); err != nil {
 		return OutputReceipt{}, err
@@ -930,6 +1070,13 @@ func (c *Controller) recordOutputSubmitted(ctx context.Context, active ActiveInv
 	return c.obs.RecordPhaseOutputSubmitted(ctx, active.Invocation.ProjectID, active.Command)
 }
 
+func (c *Controller) recordInvocationFailed(ctx context.Context, projectID kernel.ProjectID, command PhaseCommand) error {
+	if c.obs == nil {
+		return nil
+	}
+	return c.obs.RecordPhaseInvocationFailed(ctx, projectID, command)
+}
+
 func (c *Controller) recordInvocationStopped(ctx context.Context, active ActiveInvocation, command PhaseCommand, result StopResult) error {
 	if c.obs == nil {
 		return nil
@@ -1023,6 +1170,28 @@ func (c *Controller) transitionToStopped(ctx context.Context, invocationID kerne
 	}
 }
 
+func (c *Controller) transitionToFailed(ctx context.Context, invocationID kernel.InvocationID) error {
+	invocation, ok, err := c.store.Get(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return kernel.Error{Code: kernel.CodeNotFound, Message: "invocation not found"}
+	}
+	switch invocation.Status {
+	case baseruntime.InvocationPrepared:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationPrepared, baseruntime.InvocationFailed)
+	case baseruntime.InvocationRunning:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationRunning, baseruntime.InvocationFailed)
+	case baseruntime.InvocationWaiting:
+		return c.store.Transition(ctx, invocationID, baseruntime.InvocationWaiting, baseruntime.InvocationFailed)
+	case baseruntime.InvocationFailed:
+		return nil
+	default:
+		return kernel.Error{Code: kernel.CodeStaleCommand, Message: "invocation is not active or failed", Recoverable: true}
+	}
+}
+
 func (c *Controller) rehydrate(ctx context.Context, active ActiveInvocation) error {
 	binding, err := c.bindings.Refresh(ctx, active)
 	if err != nil {
@@ -1078,7 +1247,7 @@ func (c *Controller) renderData(invocation baseruntime.Invocation, start StartPh
 		StartOrResumeInput: string(startPayload),
 		TaskContract:       binding.TaskContract,
 		PhaseSpec:          binding.PhaseSpec,
-		WorkspaceBinding:   binding.WorkspaceRef,
+		WorkspaceBinding:   binding.WorkspaceBinding,
 		ContextSlice:       binding.ContextSlice,
 		TaskMemoryBuffer:   binding.TaskMemoryBuffer,
 	}, nil

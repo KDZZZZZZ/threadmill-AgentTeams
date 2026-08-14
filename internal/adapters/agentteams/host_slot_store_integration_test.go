@@ -159,6 +159,13 @@ WHERE agentteams_task_id = $1`, winnerTask).Scan(&storedKey, &storedHash, &store
 	if err != nil || len(activeClaims) != 1 || activeClaims[0].InvocationID != loserInvocation {
 		t.Fatalf("ActiveByHost() = %#v, %v", activeClaims, err)
 	}
+	staleKeys, err := slots.StaleMCPClientKeysByHost(ctx, "worker-a")
+	if err != nil {
+		t.Fatalf("StaleMCPClientKeysByHost() error = %v", err)
+	}
+	if len(staleKeys) != 1 || staleKeys[0] != winnerKey {
+		t.Fatalf("stale MCP keys = %#v, want only released %q and not active %q", staleKeys, winnerKey, loserKey)
+	}
 	if err := slots.MarkHostFenced(ctx, "worker-a"); err != nil {
 		t.Fatalf("MarkHostFenced() error = %v", err)
 	}

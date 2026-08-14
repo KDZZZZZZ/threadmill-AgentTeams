@@ -11,9 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/coordination"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/config"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/objectstore"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/transport/httpapi"
 )
 
@@ -126,6 +129,76 @@ func TestProductionReadinessPropagatesDependencyFailure(t *testing.T) {
 		if dependency.Name == "agentteams" && dependency.Message != "controller unavailable" {
 			t.Fatalf("agentteams readiness = %#v, want failure message", dependency)
 		}
+	}
+}
+
+func TestProductionEvidenceObjectStoreUsesOneNamespaceAcrossRuntimeAndMCP(t *testing.T) {
+	base := objectstore.NewMemoryStore()
+	cfg := config.Config{ObjectStoreBucket: "artifacts", AgentTeamsSharedBucket: "artifacts"}
+	phaseStore, err := productionEvidenceObjectStore(cfg, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpStore, err := productionEvidenceObjectStore(cfg, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mcpStore.Put(context.Background(), objectstore.PutObject{
+		Bucket: "artifacts", Key: "plan/hash", Body: strings.NewReader("registered by MCP"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := phaseStore.Get(context.Background(), objectstore.ObjectRef{Bucket: "artifacts", Key: "plan/hash"})
+	if err != nil {
+		t.Fatalf("phase runtime could not open MCP artifact: %v", err)
+	}
+	_ = opened.Body.Close()
+	physical, err := base.Get(context.Background(), objectstore.ObjectRef{Bucket: "artifacts", Key: "shared/threadmill/evidence/plan/hash"})
+	if err != nil {
+		t.Fatalf("physical evidence object is not in the restricted shared namespace: %v", err)
+	}
+	_ = physical.Body.Close()
+}
+
+func TestProductionInvocationToolCallGuardRejectsTerminalInvocation(t *testing.T) {
+	store := runtime.NewMemoryInvocationStore()
+	created := time.Date(2026, 8, 12, 6, 0, 0, 0, time.UTC)
+	invocation := runtime.Invocation{
+		ID: "inv-guard", ActorPrincipalID: "agent-guard", ProjectID: "project-guard",
+		TaskID: "task-guard", EndpointID: "execute", Generation: 1, Role: auth.RoleExecutor,
+		Status: runtime.InvocationRunning, BindingRef: "binding-guard", LeaseID: "lease-guard",
+		EffectiveTools: []auth.Tool{auth.ToolWorkspaceRead}, PromptHashes: map[string]string{"p": "h"},
+		SkillHashes: map[string]string{"s": "h"}, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}
+	if err := store.Create(context.Background(), invocation); err != nil {
+		t.Fatal(err)
+	}
+	principal := auth.Principal{ActorPrincipalID: invocation.ActorPrincipalID, Kind: auth.PrincipalAgent, ProjectID: invocation.ProjectID, TaskID: invocation.TaskID, Role: invocation.Role, InvocationID: invocation.ID}
+	guard := productionInvocationToolCallGuard{invocations: store}
+	if err := guard.AuthorizeToolCall(context.Background(), principal); err != nil {
+		t.Fatalf("active guard: %v", err)
+	}
+	if err := store.Transition(context.Background(), invocation.ID, runtime.InvocationRunning, runtime.InvocationCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.AuthorizeToolCall(context.Background(), principal); !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("terminal guard error=%v, want forbidden", err)
+	}
+}
+
+func TestProductionTaskBlockersProjectsOnlyAuthoritativeTaskTargets(t *testing.T) {
+	graph := coordination.GraphSnapshot{Blockers: []coordination.Blocker{
+		{ID: "blocker-z", Target: coordination.PhaseEndpointRef{TaskID: "task-a", EndpointID: coordination.EndpointVerify}, State: coordination.BlockerResolved},
+		{ID: "blocker-other", Target: coordination.PhaseEndpointRef{TaskID: "task-b", EndpointID: coordination.EndpointPlan}, State: coordination.BlockerActive},
+		{ID: "blocker-a", Target: coordination.PhaseEndpointRef{TaskID: "task-a", EndpointID: coordination.EndpointExecute}, State: coordination.BlockerActive},
+	}}
+
+	got := productionTaskBlockers(graph, "task-a")
+	if len(got) != 2 || got[0].BlockerID != "blocker-a" || got[1].BlockerID != "blocker-z" {
+		t.Fatalf("task blocker projection = %#v", got)
+	}
+	if got[0].Target.TaskID != "task-a" || got[0].State != string(coordination.BlockerActive) || got[1].State != string(coordination.BlockerResolved) {
+		t.Fatalf("task blocker authority lost: %#v", got)
 	}
 }
 

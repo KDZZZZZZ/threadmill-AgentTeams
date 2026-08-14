@@ -407,7 +407,7 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 | --- | --- | --- |
 | 角色门控 | taskflow 权限与 Runtime 适配器 | 无 `plan_dag`、`accept_task_result` 等写图动作 |
 | 工具门控 | MCP allow policy | 各 phase 只看到允许工具 |
-| 路径门控 | AccessEntries + AllowedDirs | execute 只能改批准目录；plan/verify 不改实现 |
+| 路径门控 | AccessEntries + AllowedDirs | execute 只能改批准目录；普通 plan/verify 不改实现；Merge Queue 的 Targeted Verifier 仅可在 injected allowed/conflict paths 内解冲突 |
 | lease 门控 | Runtime + Workspace Service | 同一轮次任一时刻只有一个有效写 lease |
 | 输入门控 | `PhaseInputSet` + Runtime 校验 | 上游只以正式交付引用进入；未满足输入不可完成 |
 | 通信门控 | worker 默认禁用 message 工具 | 无 Agent mailbox；Matrix 只用于人工可见性和最终报告 |
@@ -420,9 +420,9 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 | --- | --- | --- | --- |
 | plan | 结构化计划产物 | 修改实现、改写 Task Contract、写 Coordination Graph | Submitted Plan、Declared Write Set、验证计划、Requirement |
 | execute | Approved Plan 与 AllowedDirs 范围内实现 | 静默扩 scope、写 main、宣布完成 | diff/候选产物、证据、MemoryCandidate |
-| verify | evidence 产物；可运行检查 | 修改实现以让自己通过、自我批准旧 revision | Verify Result、测试/检查证据、风险与缺口 |
+| verify | evidence 产物；可运行检查；Targeted Verifier 可在受限冲突路径内写文件 | 修改实现以让自己通过、自我批准旧 revision、commit/push、写 Coordination/Context Graph、越过 allowed/conflict paths | merged revision 的 Verify Result、测试/检查证据、风险与缺口；失败时必须有 OrchestrationProposal |
 
-同一轮次的三个阶段共享 Workspace Binding。`verify passed` 仅代表获得后续 Merge Queue 资格；`done` 仍由 Task Manager 和 DeliveryPolicy 决定。
+plan/execute 共享轮次 Workspace；`code_merge` 的普通 verify 使用基于 merged revision 的下一代只读 Workspace。execute satisfied 只获得 Merge Queue 资格，post-merge verify passed 后仍由 Task Manager 和 DeliveryPolicy 决定 `done`。
 
 这些实现选择不改变 interface 的核心不变量：输入由图声明、正式交付经 Runtime 注入、Agent 可以自主 join 已知输入、未知依赖只能提案、Task 完成不由 Agent 宣布。
 

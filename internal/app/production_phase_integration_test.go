@@ -32,6 +32,49 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/migrations"
 )
 
+func TestProductionTaskContextProjectionIDsFollowSemanticUnits(t *testing.T) {
+	projectID := kernel.ProjectID("project-context-projection")
+	taskID := kernel.TaskID("task-context-projection")
+	contract := taskmanager.TaskContract{
+		TaskID: taskID, ContractRef: "contract-ref-opaque", DeliveryPolicy: taskmanager.DeliveryPolicyCodeMerge,
+		PhaseSpecs: map[coordination.EndpointID]string{
+			coordination.EndpointPlan: "spec-plan-opaque", coordination.EndpointExecute: "spec-execute-opaque", coordination.EndpointVerify: "spec-verify-opaque",
+		},
+	}
+	request := productionTaskContextRequest{
+		InputRef: "input-context-projection", TaskID: taskID, GraphRevision: 2,
+		Requirement: taskmanager.Requirement{Text: "Alpha。Beta。", Goal: "Goal", Constraints: []string{"Constraint A", "Constraint B"}},
+		Contract:    contract,
+	}
+	endpoints := []contextgraph.PhaseEndpointRef{{TaskID: taskID, EndpointID: coordination.EndpointPlan}}
+	first := productionTaskContextProjections(projectID, request, "task-subgraph-context-projection", endpoints)
+	request.GraphRevision = 3
+	request.Requirement.Constraints = append([]string{"Constraint X"}, request.Requirement.Constraints...)
+	second := productionTaskContextProjections(projectID, request, "task-subgraph-context-projection", endpoints)
+
+	firstByStatement := make(map[string]string, len(first))
+	for _, projection := range first {
+		firstByStatement[projection.Statement] = projection.ProjectionID
+	}
+	secondByStatement := make(map[string]string, len(second))
+	for _, projection := range second {
+		secondByStatement[projection.Statement] = projection.ProjectionID
+		for _, forbidden := range []string{string(taskID), contract.ContractRef, "spec-plan-opaque", "spec-execute-opaque", "spec-verify-opaque"} {
+			if strings.Contains(projection.Statement, forbidden) {
+				t.Fatalf("projection statement leaks recoverable binding pointer %q: %q", forbidden, projection.Statement)
+			}
+		}
+	}
+	for statement, projectionID := range firstByStatement {
+		if secondByStatement[statement] != projectionID {
+			t.Fatalf("projection ID for %q drifted from %q to %q", statement, projectionID, secondByStatement[statement])
+		}
+	}
+	if secondByStatement["Constraint X"] == "" {
+		t.Fatal("new semantic constraint did not receive its own projection")
+	}
+}
+
 func TestProductionPhaseBindingContextWorkspaceAndArtifactsAgainstPostgres(t *testing.T) {
 	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -189,6 +232,241 @@ func TestProductionPhaseBindingAbortReleasesWorkspaceLeaseAgainstPostgres(t *tes
 	}
 	if activeSubscriptions != 0 {
 		t.Fatalf("abort leaked active subscriptions = %d, want 0", activeSubscriptions)
+	}
+}
+
+func TestProductionPhaseRetryWorkspaceStartsFromPreviousCheckpointAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-retry-workspace")
+	repo := seedProductionPhaseBareRepo(t)
+	workspaces := workspace.NewPostgresService(db)
+	source := &productionPhaseBindingSource{
+		db: db, projectID: projectID, workspaces: workspaces,
+		repositoryPath: repo, worktreeParent: t.TempDir(), now: time.Now,
+	}
+
+	firstRef, err := source.EnsureTaskWorkspace(ctx, productionTaskWorkspaceRequest{TaskID: "task-retry", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := workspaces.Get(ctx, firstRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.BindPhase(ctx, first.ID, workspace.PhasePlan, "inv-plan", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Root, "plan", "PLAN.md"), []byte("# Retry plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Root, "plan", "declared-writes.json"), []byte(`{"files":["retry/policy.go","retry/policy_test.go"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitPhaseTest(t, first.Root, "add", "plan/PLAN.md", "plan/declared-writes.json")
+	gitPhaseTest(t, first.Root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "planner checkpoint")
+	first, err = workspaces.RefreshObservedWrites(ctx, first.ID, first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.CompletePhase(ctx, first.ID, workspace.PhasePlan, "inv-plan", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	command := coordination.PhaseCommand{
+		ID: "cmd:run:task-retry:execute:2", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-retry", EndpointID: coordination.EndpointExecute},
+		Generation: 2, BindingRef: "binding://task-retry/execute/2", LeaseRef: "lease-task-retry-execute-2", Action: coordination.CommandStart,
+	}
+	second, err := source.materializeWorkspace(ctx, command, "inv-execute-2", true)
+	if err != nil {
+		t.Fatalf("materializeWorkspace() error = %v", err)
+	}
+	if second.ID != first.ID || second.CurrentRevision != first.CurrentRevision {
+		t.Fatalf("retry invocation workspace = %q at %q, want unfinished Task round %q at %q", second.ID, second.CurrentRevision, first.ID, first.CurrentRevision)
+	}
+	if second.PhaseLeases[workspace.PhasePlan] != "inv-plan" || second.ActivePhase != workspace.PhaseExecute || second.ActiveInvocation != "inv-execute-2" {
+		t.Fatalf("retry workspace did not inherit plan and bind execute: %#v", second)
+	}
+	if _, err := os.Stat(filepath.Join(second.Root, "plan", "declared-writes.json")); err != nil {
+		t.Fatalf("retry workspace is missing planner declared writes: %v", err)
+	}
+	if got := second.DeclaredWrites.Files; len(got) != 2 || got[0] != "retry/policy.go" || got[1] != "retry/policy_test.go" {
+		t.Fatalf("retry workspace declared writes = %#v", got)
+	}
+}
+
+func TestProductionPhaseReopenRoundUsesLatestMainWorkspaceAndPlanAuthorityAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-reopen-round-workspace")
+	repo := seedProductionPhaseBareRepo(t)
+	workspaces := workspace.NewPostgresService(db)
+	source := &productionPhaseBindingSource{
+		db: db, projectID: projectID, workspaces: workspaces,
+		repositoryPath: repo, worktreeParent: t.TempDir(), now: time.Now,
+	}
+	firstRef, err := source.EnsureTaskWorkspace(ctx, productionTaskWorkspaceRequest{TaskID: "task-reopen-round", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := workspaces.Get(ctx, firstRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.BindPhase(ctx, first.ID, workspace.PhasePlan, "inv-plan-1", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Root, "plan", "declared-writes.json"), []byte(`{"files":["workspace/reopen.go"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitPhaseTest(t, first.Root, "add", "plan/declared-writes.json")
+	gitPhaseTest(t, first.Root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "plan")
+	first, err = workspaces.RefreshObservedWrites(ctx, first.ID, first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.CompletePhase(ctx, first.ID, workspace.PhasePlan, "inv-plan-1", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.AuthorizeExecuteWrites(ctx, first.ID, workspace.WriteSet{Files: []string{"workspace/reopen.go"}}, first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.BindPhase(ctx, first.ID, workspace.PhaseExecute, "inv-execute-1", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.CompletePhase(ctx, first.ID, workspace.PhaseExecute, "inv-execute-1", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latestMain := advanceProductionPhaseBareRepo(t, repo)
+	secondRef, err := source.EnsureTaskWorkspace(ctx, productionTaskWorkspaceRequest{
+		TaskID: "task-reopen-round", Generation: 2, BaseRevision: latestMain,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := workspaces.Get(ctx, secondRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BaseRevision != latestMain || second.PhaseLeases[workspace.PhasePlan] != "inv-plan-1" || second.PhaseLeases[workspace.PhaseExecute] != "" ||
+		len(second.DeclaredWrites.Files) != 1 || second.DeclaredWrites.Files[0] != "workspace/reopen.go" {
+		t.Fatalf("reopen round workspace = %#v", second)
+	}
+	command := coordination.PhaseCommand{
+		ID: "cmd:run:task-reopen-round:execute:2", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-reopen-round", EndpointID: coordination.EndpointExecute},
+		Generation: 2, BindingRef: "binding://task-reopen-round/execute/2", LeaseRef: "lease-task-reopen-round-execute-2", Action: coordination.CommandStart,
+	}
+	active, err := source.materializeWorkspace(ctx, command, "inv-execute-2", true)
+	if err != nil {
+		t.Fatalf("materialize reopened execute: %v", err)
+	}
+	if active.ID != second.ID || active.BaseRevision != latestMain || active.ActiveInvocation != "inv-execute-2" || active.ActivePhase != workspace.PhaseExecute {
+		t.Fatalf("reopened execute selected workspace = %#v", active)
+	}
+}
+
+func TestProductionPhaseEndpointGenerationsShareTaskWorkspaceRoundAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-shared-round")
+	repo := seedProductionPhaseBareRepo(t)
+	workspaces := workspace.NewPostgresService(db)
+	source := &productionPhaseBindingSource{
+		db: db, projectID: projectID, workspaces: workspaces,
+		repositoryPath: repo, worktreeParent: t.TempDir(), now: time.Now,
+	}
+
+	firstRef, err := source.EnsureTaskWorkspace(ctx, productionTaskWorkspaceRequest{TaskID: "task-shared", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := workspaces.Get(ctx, firstRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.BindPhase(ctx, first.ID, workspace.PhasePlan, "inv-plan", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(first.Root, "plan", "declared-writes.json"), []byte(`{"files":["retry/policy.go"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitPhaseTest(t, first.Root, "add", "plan/declared-writes.json")
+	gitPhaseTest(t, first.Root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "plan")
+	first, err = workspaces.RefreshObservedWrites(ctx, first.ID, first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err = workspaces.CompletePhase(ctx, first.ID, workspace.PhasePlan, "inv-plan", first.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	execute := coordination.PhaseCommand{
+		ID: "cmd:run:task-shared:execute:2", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-shared", EndpointID: coordination.EndpointExecute},
+		Generation: 2, BindingRef: "binding://task-shared/execute/2", LeaseRef: "lease-execute-2", Action: coordination.CommandStart,
+	}
+	executeBinding, err := source.materializeWorkspace(ctx, execute, "inv-execute-2", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executeBinding.ID != first.ID || executeBinding.Generation != 1 {
+		t.Fatalf("execute generation 2 got workspace %#v, want Task round 1 %q", executeBinding, first.ID)
+	}
+	refreshedExecuteBinding, err := source.workspaceForStart(ctx, execute, "inv-execute-2")
+	if err != nil {
+		t.Fatalf("workspaceForStart() rejected the active invocation's binding refresh: %v", err)
+	}
+	if refreshedExecuteBinding.ID != executeBinding.ID || refreshedExecuteBinding.ActivePhase != workspace.PhaseExecute || refreshedExecuteBinding.ActiveInvocation != "inv-execute-2" {
+		t.Fatalf("binding refresh changed active execute ownership: %#v", refreshedExecuteBinding)
+	}
+	replayedExecuteBinding, err := source.materializeWorkspace(ctx, execute, "inv-execute-2", true)
+	if err != nil {
+		t.Fatalf("materializeWorkspace() rejected idempotent active execute replay: %v", err)
+	}
+	if replayedExecuteBinding.ID != executeBinding.ID || replayedExecuteBinding.ActiveInvocation != "inv-execute-2" || replayedExecuteBinding.DeclaredWrites.Files[0] != "retry/policy.go" {
+		t.Fatalf("active execute replay changed binding authority: %#v", replayedExecuteBinding)
+	}
+	executeBinding, err = workspaces.CompletePhase(ctx, executeBinding.ID, workspace.PhaseExecute, "inv-execute-2", executeBinding.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verify := coordination.PhaseCommand{
+		ID: "cmd:run:task-shared:verify:1", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-shared", EndpointID: coordination.EndpointVerify},
+		Generation: 1, BindingRef: "binding://task-shared/verify/1", LeaseRef: "lease-verify-1", Action: coordination.CommandStart,
+	}
+	verifyBinding, err := source.materializeWorkspace(ctx, verify, "inv-verify-1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifyBinding.ID != first.ID || verifyBinding.Generation != 1 || verifyBinding.ActivePhase != workspace.PhaseVerify {
+		t.Fatalf("verify generation 1 did not reuse the active Task round: %#v", verifyBinding)
 	}
 }
 
@@ -396,24 +674,71 @@ func TestProductionPhaseTerminalOutboxReplaysOutputAndStopAgainstPostgres(t *tes
 	if err != nil {
 		t.Fatalf("persistOutputIntent: %v", err)
 	}
-	if err := runtime.deliverOutputReceipt(ctx, receipt, requestID, receipt.Output); !errors.Is(err, errProductionDispatch) {
-		t.Fatalf("deliverOutputReceipt error = %v, want injected dispatch failure", err)
+	if err := runtime.deliverOutputReceipt(ctx, receipt, requestID, receipt.Output); err != nil {
+		t.Fatalf("deliverOutputReceipt should persist final obligation without surfacing downstream dispatch failure: %v", err)
+	}
+	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_output", "pending")
+	if dispatcher.calls != 0 {
+		t.Fatalf("phase output dispatches = %d, want replay loop to own delivery", dispatcher.calls)
+	}
+	if err := runtime.ReplayTerminalDeliveries(ctx); !errors.Is(err, errProductionDispatch) {
+		t.Fatalf("first ReplayTerminalDeliveries output error = %v, want injected dispatch failure", err)
 	}
 	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_output", "pending")
 	if err := runtime.ReplayTerminalDeliveries(ctx); err != nil {
-		t.Fatalf("ReplayTerminalDeliveries output: %v", err)
+		t.Fatalf("second ReplayTerminalDeliveries output: %v", err)
 	}
 	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_output", "delivered")
 
-	dispatcher.failNextDispatch()
 	writer := productionPhaseObservationWriter{projectID: projectID, graph: graph, ingress: ingress, now: time.Now}
-	stop := coordination.PhaseCommand{
-		ID: "cmd-terminal-stop", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointPlan},
-		Generation: 1, BindingRef: "binding://task-real/plan/1", LeaseRef: "lease-terminal-stop", Action: coordination.CommandStop,
+	automaticStop := coordination.PhaseCommand{
+		ID: "cmd-terminal-automatic-stop", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointPlan},
+		Generation: 1, BindingRef: "binding://task-real/plan/1", LeaseRef: "lease-terminal-automatic-stop", Action: coordination.CommandStop,
 	}
 	if _, err := db.ExecContext(ctx, `
-INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state)
-VALUES ($1,$2,$3,$4,$5,$6,'active')`, projectID, stop.LeaseRef, stop.Endpoint.TaskID, stop.Endpoint.EndpointID, stop.Generation, stop.BindingRef); err != nil {
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'active',now()+interval '1 hour')`, projectID, automaticStop.LeaseRef, automaticStop.Endpoint.TaskID, automaticStop.Endpoint.EndpointID, automaticStop.Generation, automaticStop.BindingRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_commands(project_id, command_id, task_id, endpoint_id, generation, binding_ref, lease_ref, action, cause_ref)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'test-automatic-stop')`, projectID, automaticStop.ID, automaticStop.Endpoint.TaskID, automaticStop.Endpoint.EndpointID, automaticStop.Generation, automaticStop.BindingRef, automaticStop.LeaseRef, automaticStop.Action); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.RecordPhaseInvocationStopped(ctx, projectID, automaticStop, "checkpoint-automatic", false); err != nil {
+		t.Fatalf("RecordPhaseInvocationStopped automatic stop: %v", err)
+	}
+	var stopObligations int
+	if err := db.QueryRowContext(ctx, `
+SELECT count(*) FROM production_phase_terminal_obligations
+WHERE project_id=$1 AND input_kind='phase_stopped'`, projectID).Scan(&stopObligations); err != nil {
+		t.Fatal(err)
+	}
+	if stopObligations != 0 {
+		t.Fatalf("automatic stop obligations = %d, want 0", stopObligations)
+	}
+
+	snapshot, err := graph.Latest(ctx, projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.Transition(ctx, projectID, snapshot.Revision, coordination.GraphTransition{
+		TargetKind: coordination.TargetPhaseEndpoint,
+		Endpoint:   coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointExecute},
+		Action:     "held",
+		Generation: automaticStop.Generation,
+	}); err != nil {
+		t.Fatalf("hold endpoint before controlled stop: %v", err)
+	}
+
+	dispatcher.failNextDispatch()
+	stop := coordination.PhaseCommand{
+		ID: "cmd-terminal-stop", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointExecute},
+		Generation: 1, BindingRef: "binding://task-real/execute/1", LeaseRef: "lease-terminal-stop", Action: coordination.CommandStop,
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'active',now()+interval '1 hour')`, projectID, stop.LeaseRef, stop.Endpoint.TaskID, stop.Endpoint.EndpointID, stop.Generation, stop.BindingRef); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `
@@ -429,6 +754,68 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'test-stop')`, projectID, stop.ID, stop.Endpoint
 		t.Fatalf("ReplayTerminalDeliveries stop: %v", err)
 	}
 	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_stopped", "delivered")
+}
+
+func TestProductionPhaseFailureObservationPersistsManagerBoundaryAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+	projectID := kernel.ProjectID("project-phase-failure-boundary")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	ingress, err := newProductionIngress(db, projectID, "room-phase-failure", productionPhaseTestAssembler(t), graph, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := &recordingProductionDispatcher{}
+	if err := ingress.setDispatcher(dispatcher); err != nil {
+		t.Fatal(err)
+	}
+	command := coordination.PhaseCommand{
+		ID: "cmd-phase-failure-boundary", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointPlan},
+		Generation: 1, BindingRef: "binding://task-real/plan/1", LeaseRef: "lease-phase-failure-boundary",
+		Action: coordination.CommandStart, CauseRef: "revision://2",
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'active',now()+interval '1 hour')`, projectID, command.LeaseRef, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_commands(project_id, command_id, task_id, endpoint_id, generation, binding_ref, lease_ref, action, cause_ref, accepted_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())`, projectID, command.ID, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef, command.LeaseRef, command.Action, command.CauseRef); err != nil {
+		t.Fatal(err)
+	}
+	writer := productionPhaseObservationWriter{projectID: projectID, graph: graph, ingress: ingress, now: time.Now}
+	if err := writer.RecordPhaseInvocationFailed(ctx, projectID, command); err != nil {
+		t.Fatalf("RecordPhaseInvocationFailed: %v", err)
+	}
+	var observationKind, inputKind, selectedTaskID, selectedEndpointID, targetKind, targetRef, status, payloadRaw string
+	if err := db.QueryRowContext(ctx, `
+SELECT o.kind, i.input_kind, i.selected_task_id, i.selected_endpoint_id, i.target_kind, i.target_ref, i.status, i.payload::text
+FROM coordination_runtime_observations o
+JOIN production_manager_inputs i
+  ON i.project_id=o.project_id AND i.input_kind='phase_failed' AND i.target_ref=o.command_id
+WHERE o.project_id=$1 AND o.command_id=$2`, projectID, command.ID).Scan(
+		&observationKind, &inputKind, &selectedTaskID, &selectedEndpointID, &targetKind, &targetRef, &status, &payloadRaw,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if observationKind != "PhaseInvocationFailed" || inputKind != "phase_failed" || selectedTaskID != string(command.Endpoint.TaskID) || selectedEndpointID != string(command.Endpoint.EndpointID) || targetKind != "phase_failed" || targetRef != command.ID || status != "dispatched" {
+		t.Fatalf("failure boundary observation=%q input=%q selected=%s/%s target=%s/%s status=%q", observationKind, inputKind, selectedTaskID, selectedEndpointID, targetKind, targetRef, status)
+	}
+	var failed productionPhaseFailedBoundary
+	if err := json.Unmarshal([]byte(payloadRaw), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.CommandID != command.ID || failed.CommandAction != command.Action || failed.Endpoint != command.Endpoint || failed.Generation != command.Generation || failed.BindingRef != command.BindingRef || failed.LeaseRef != command.LeaseRef {
+		t.Fatalf("persisted failure payload = %#v, want exact command", failed)
+	}
+	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_failed", "delivered")
 }
 
 func TestProductionPhaseOutputIntentReplaysRecoveredReceiptAgainstPostgres(t *testing.T) {
@@ -608,6 +995,234 @@ func TestProductionPhaseOutputIntentReplaysRecoveredReceiptAgainstPostgres(t *te
 	}
 	if dispatchedRows != 1 {
 		t.Fatalf("manager inputs after conflicting output=%d, want 1", dispatchedRows)
+	}
+}
+
+func TestProductionPhaseOutputIntentRestoresRunningControllerAfterRestartAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-output-restart-active")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	assembler := productionPhaseTestAssembler(t)
+	ingress, err := newProductionIngress(db, projectID, "room-phase-output-restart", assembler, graph, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := &recordingProductionDispatcher{}
+	if err := ingress.setDispatcher(dispatcher); err != nil {
+		t.Fatal(err)
+	}
+	command := coordination.PhaseCommand{
+		ID: "cmd:run:task-real:plan:1", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointPlan},
+		Generation: 1, BindingRef: "binding://task-real/plan/1", LeaseRef: "lease:task-real:plan:1",
+		Action: coordination.CommandStart, CauseRef: "revision://2",
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'active',now()+interval '1 hour')`, projectID, command.LeaseRef, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_commands(project_id, command_id, task_id, endpoint_id, generation, binding_ref, lease_ref, action, cause_ref, accepted_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())`, projectID, command.ID, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef, command.LeaseRef, command.Action, command.CauseRef); err != nil {
+		t.Fatal(err)
+	}
+
+	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db)
+	recovery := phasepkg.NewPostgresRecoveryStoreFromSQL(db, invocations)
+	invocationID := productionPhaseInvocationID(command.ID)
+	created := time.Now().UTC()
+	invocation := runtimepkg.Invocation{
+		ID: invocationID, ActorPrincipalID: "actor-output-restart", ProjectID: projectID,
+		TaskID: command.Endpoint.TaskID, EndpointID: command.Endpoint.EndpointID, Generation: uint64(command.Generation),
+		Role: auth.RolePlanner, Status: runtimepkg.InvocationRunning, BindingRef: command.BindingRef, LeaseID: command.LeaseRef,
+		WorkspaceRef: "workspace-output-restart", PromptHashes: map[string]string{"prompt": "hash"},
+		SkillHashes: map[string]string{"skill": "hash"}, EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput},
+		CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}
+	if err := invocations.Create(ctx, invocation); err != nil {
+		t.Fatal(err)
+	}
+	inputs := phasepkg.PhaseInputSet{InputRevision: "inputs-output-restart"}
+	binding := phasepkg.BindingSnapshot{
+		ProjectID: projectID, ActorPrincipalID: invocation.ActorPrincipalID, TaskID: command.Endpoint.TaskID,
+		EndpointID: command.Endpoint.EndpointID, Generation: command.Generation, BindingRef: command.BindingRef,
+		LeaseRef: command.LeaseRef, WorkspaceRef: invocation.WorkspaceRef, WorkspaceRevision: "head-output-restart", Inputs: inputs,
+	}
+	if err := recovery.RecordActiveInvocation(ctx, phasepkg.ActiveInvocation{Invocation: invocation, Command: command, Binding: binding, Inputs: inputs}); err != nil {
+		t.Fatal(err)
+	}
+	host := &productionPhaseRestartHost{}
+	controller := phasepkg.NewController(phasepkg.Config{
+		InvocationStore: invocations, Assembler: assembler,
+		BindingResolver: productionPhaseRestartBindingResolver{binding: binding},
+		InputRuntime:    productionPhaseRestartInputs{}, ArtifactRouter: productionPhaseRestartArtifacts{},
+		Host: host, RecoveryStore: phasepkg.NewPostgresRecoveryStoreFromSQL(db, invocations),
+		Lifecycle: runtimepkg.NoopInvocationLifecycle{}, Now: time.Now,
+	})
+	runtime := &productionPhaseRuntime{
+		controller: controller, db: db, projectID: projectID, graph: graph, ingress: ingress,
+		invocations: invocations, artifacts: evidence.NewPostgresArtifactRegistry(db, objectstore.NewMemoryStore(), "artifacts"),
+		recovery: phasepkg.NewPostgresRecoveryStoreFromSQL(db, invocations), now: time.Now,
+	}
+	output := phasepkg.PhaseOutput{Phase: string(coordination.EndpointPlan), ReportRef: "art_report_output_restart"}
+	if _, err := runtime.persistOutputIntent(ctx, invocationID, output); err != nil {
+		t.Fatalf("persistOutputIntent: %v", err)
+	}
+	if err := runtime.ReplayTerminalDeliveries(ctx); err != nil {
+		t.Fatalf("ReplayTerminalDeliveries: %v", err)
+	}
+	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_output", "delivered")
+	completed, ok, err := invocations.Get(ctx, invocationID)
+	if err != nil || !ok || completed.Status != runtimepkg.InvocationCompleted {
+		t.Fatalf("completed invocation = %#v ok=%v err=%v", completed, ok, err)
+	}
+	if host.dispatches != 0 || host.fences != 1 || host.revokes != 0 {
+		t.Fatalf("restart host dispatches=%d fences=%d revokes=%d, want no redispatch, one logical fence, and no early revoke", host.dispatches, host.fences, host.revokes)
+	}
+	if _, ok, err := runtime.recovery.GetOutputReceipt(ctx, invocationID, command.ID); err != nil || !ok {
+		t.Fatalf("recovered output receipt ok=%v err=%v", ok, err)
+	}
+}
+
+func TestProductionPhaseRestartAbandonsRejectedCommandInsteadOfRedispatchingAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-rejected-restart")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	command := coordination.PhaseCommand{
+		ID: "cmd:run:task-real:execute:1", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointExecute},
+		Generation: 1, BindingRef: "binding://task-real/execute/1", LeaseRef: "lease:task-real:execute:1",
+		Action: coordination.CommandStart, CauseRef: "revision://2",
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'released',now()+interval '1 hour')`, projectID, command.LeaseRef, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_commands(project_id, command_id, task_id, endpoint_id, generation, binding_ref, lease_ref, action, cause_ref, not_executable, completed_event_ref)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,'dispatch-rejection:test:lease_conflict')`, projectID, command.ID, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef, command.LeaseRef, command.Action, command.CauseRef); err != nil {
+		t.Fatal(err)
+	}
+
+	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db)
+	invocationID := productionPhaseInvocationID(command.ID)
+	created := time.Now().UTC()
+	invocation := runtimepkg.Invocation{
+		ID: invocationID, ActorPrincipalID: "actor-rejected-restart", ProjectID: projectID,
+		TaskID: command.Endpoint.TaskID, EndpointID: command.Endpoint.EndpointID, Generation: uint64(command.Generation),
+		Role: auth.RoleExecutor, Status: runtimepkg.InvocationRunning, BindingRef: command.BindingRef, LeaseID: command.LeaseRef,
+		WorkspaceRef: "workspace-rejected-restart", PromptHashes: map[string]string{"prompt": "hash"},
+		SkillHashes: map[string]string{"skill": "hash"}, EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput},
+		CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}
+	if err := invocations.Create(ctx, invocation); err != nil {
+		t.Fatal(err)
+	}
+	inputs := phasepkg.PhaseInputSet{InputRevision: "inputs-rejected-restart"}
+	binding := phasepkg.BindingSnapshot{
+		ProjectID: projectID, ActorPrincipalID: invocation.ActorPrincipalID, TaskID: command.Endpoint.TaskID,
+		EndpointID: command.Endpoint.EndpointID, Generation: command.Generation, BindingRef: command.BindingRef,
+		LeaseRef: command.LeaseRef, WorkspaceRef: invocation.WorkspaceRef, WorkspaceRevision: "head-rejected-restart", Inputs: inputs,
+	}
+	recovery := phasepkg.NewPostgresRecoveryStoreFromSQL(db, invocations)
+	if err := recovery.RecordActiveInvocation(ctx, phasepkg.ActiveInvocation{Invocation: invocation, Command: command, Binding: binding, Inputs: inputs}); err != nil {
+		t.Fatal(err)
+	}
+	host := &productionPhaseRestartHost{}
+	controller := phasepkg.NewController(phasepkg.Config{
+		InvocationStore: invocations, Assembler: productionPhaseTestAssembler(t),
+		BindingResolver: productionPhaseRestartBindingResolver{binding: binding},
+		InputRuntime:    productionPhaseRestartInputs{}, ArtifactRouter: productionPhaseRestartArtifacts{},
+		Host: host, RecoveryStore: recovery, Lifecycle: runtimepkg.NoopInvocationLifecycle{}, Now: time.Now,
+	})
+	runtime := &productionPhaseRuntime{controller: controller, db: db, projectID: projectID, invocations: invocations, recovery: recovery, now: time.Now}
+
+	if err := runtime.recoverActivePhaseInvocations(ctx); err != nil {
+		t.Fatalf("recover rejected invocation: %v", err)
+	}
+	got, ok, err := invocations.Get(ctx, invocationID)
+	if err != nil || !ok || got.Status != runtimepkg.InvocationFailed {
+		t.Fatalf("rejected invocation = %#v ok=%v err=%v, want failed", got, ok, err)
+	}
+	if host.dispatches != 0 || host.revokes != 1 {
+		t.Fatalf("restart host dispatches=%d revokes=%d, want 0/1", host.dispatches, host.revokes)
+	}
+	var active bool
+	if err := db.QueryRowContext(ctx, `SELECT active FROM phase_recovery_obligations WHERE run_command_id=$1`, command.ID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active {
+		t.Fatal("rejected invocation retained active recovery obligation")
+	}
+}
+
+func TestProductionPhaseOutputIntentAbandonsAfterInvocationFailedAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+
+	projectID := kernel.ProjectID("project-phase-output-late-after-failure")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	ingress, err := newProductionIngress(db, projectID, "room-phase-output-late", productionPhaseTestAssembler(t), graph, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ingress.setDispatcher(&recordingProductionDispatcher{}); err != nil {
+		t.Fatal(err)
+	}
+	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db)
+	created := time.Now().UTC()
+	invocation := runtimepkg.Invocation{
+		ID: "inv-output-late", ActorPrincipalID: "actor-output-late", ProjectID: projectID,
+		TaskID: "task-real", EndpointID: coordination.EndpointPlan, Generation: 1, Role: auth.RolePlanner,
+		Status: runtimepkg.InvocationRunning, BindingRef: "binding://task-real/plan/1", LeaseID: "lease-output-late",
+		PromptHashes: map[string]string{"prompt": "hash"}, SkillHashes: map[string]string{"skill": "hash"},
+		EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput}, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}
+	if err := invocations.Create(ctx, invocation); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &productionPhaseRuntime{
+		db: db, projectID: projectID, graph: graph, ingress: ingress, invocations: invocations,
+		artifacts: evidence.NewPostgresArtifactRegistry(db, objectstore.NewMemoryStore(), "artifacts"), now: time.Now,
+	}
+	if _, err := runtime.persistOutputIntent(ctx, invocation.ID, phasepkg.PhaseOutput{Phase: string(coordination.EndpointPlan), ReportRef: "art_output_late"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := invocations.Transition(ctx, invocation.ID, runtimepkg.InvocationRunning, runtimepkg.InvocationFailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ReplayTerminalDeliveries(ctx); err != nil {
+		t.Fatalf("ReplayTerminalDeliveries: %v", err)
+	}
+	assertPhaseTerminalObligation(t, ctx, db, projectID, "phase_output", "abandoned")
+	var managerRows int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM production_manager_inputs WHERE project_id=$1 AND input_kind='phase_output'`, projectID).Scan(&managerRows); err != nil {
+		t.Fatal(err)
+	}
+	if managerRows != 0 {
+		t.Fatalf("late failed output dispatched %d manager inputs, want 0", managerRows)
 	}
 }
 
@@ -988,9 +1603,207 @@ func TestBuildProductionPhaseSeamsUsesRealComponents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildProductionPhaseSeams() error = %v", err)
 	}
-	if seams.Controller == nil || seams.Runtime == nil || seams.Orchestration == nil || seams.Readiness == nil || seams.TaskWorkspaces == nil || seams.TaskContexts == nil {
+	if seams.Controller == nil || seams.Failures == nil || seams.Runtime == nil || seams.Orchestration == nil || seams.Readiness == nil || seams.TaskWorkspaces == nil || seams.TaskContexts == nil {
 		t.Fatalf("seams not fully configured: %#v", seams)
 	}
+}
+
+func TestProductionPhaseExecutionMonitorUsesPersistedCommandIdentityAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+	projectID := kernel.ProjectID("project-phase-provider-monitor")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	command := coordination.PhaseCommand{
+		ID: "cmd-provider-terminal", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointPlan},
+		Generation: 1, BindingRef: "binding://task-real/plan/1", LeaseRef: "lease-provider-terminal",
+		Action: coordination.CommandStart, CauseRef: "revision://2",
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'active',now()+interval '1 hour')`, projectID, command.LeaseRef, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_commands(project_id, command_id, task_id, endpoint_id, generation, binding_ref, lease_ref, action, cause_ref, accepted_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())`, projectID, command.ID, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef, command.LeaseRef, command.Action, command.CauseRef); err != nil {
+		t.Fatal(err)
+	}
+	created := time.Now().UTC().Add(-time.Minute)
+	invocationID := productionPhaseInvocationID(command.ID)
+	if err := runtimepkg.NewPostgresInvocationStoreFromSQL(db).Create(ctx, runtimepkg.Invocation{
+		ID: invocationID, ActorPrincipalID: "actor-provider-terminal", ProjectID: projectID,
+		TaskID: command.Endpoint.TaskID, EndpointID: command.Endpoint.EndpointID, Generation: 1,
+		Role: auth.RolePlanner, Status: runtimepkg.InvocationRunning, BindingRef: command.BindingRef, LeaseID: command.LeaseRef,
+		PromptHashes: map[string]string{"prompt": "hash"}, SkillHashes: map[string]string{"skill": "hash"},
+		EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput}, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invocationRef := "threadmill://phase-invocation/" + string(invocationID) + "/test"
+	providerTaskID := "threadmill-provider-terminal"
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO phase_agentteams_host_states(invocation_id, invocation_ref, agentteams_task_id, host_ref)
+VALUES ($1,$2,$3,'phase-a')`, invocationID, invocationRef, providerTaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO agentteams_execution_refs(invocation_ref, invocation_id, agentteams_task_id, host_ref, dispatch_fingerprint, state, attempt, created_at, updated_at)
+VALUES ($1,$2,$3,'phase-a','fingerprint','dispatched',1,$4,$4)`, invocationRef, invocationID, providerTaskID, created); err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingPhaseExecutionProvider{terminal: false, activity: agentteams.HostActivity{Status: "running", RunningTaskCount: 1}}
+	failures := &recordingPhaseFailureReporter{}
+	monitor, err := newProductionPhaseExecutionMonitor(db, projectID, provider, failures, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(failures.commands) != 0 {
+		t.Fatalf("provider in_progress while QwenPaw active failed commands = %#v", failures.commands)
+	}
+	provider.terminal = true
+	if err := monitor.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(failures.commands) != 1 || failures.commands[0] != command {
+		t.Fatalf("failure commands = %#v, want exact persisted command %#v", failures.commands, command)
+	}
+	if len(provider.executions) != 2 || provider.executions[0].InvocationID != invocationID || provider.executions[0].AgentTeamsTaskID != providerTaskID || provider.executions[1].InvocationID != invocationID {
+		t.Fatalf("provider probes = %#v, want persisted execution", provider.executions)
+	}
+	if got, want := strings.Join(provider.probes, ","), "activity,terminal,activity,terminal"; got != want {
+		t.Fatalf("provider probe order = %q, want %q so active carriers are refreshed before terminal checks", got, want)
+	}
+}
+
+func TestProductionPhaseExecutionMonitorReclaimsExpiredReservedExecutionAgainstPostgres(t *testing.T) {
+	databaseURL := os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("THREADMILL_TEST_DATABASE_URL is required for the real PostgreSQL integration test")
+	}
+	ctx := context.Background()
+	db := openProductionPhasePostgres(t, ctx, databaseURL)
+	defer db.Close()
+	projectID := kernel.ProjectID("project-phase-reserved-expired")
+	graph := coordination.NewPostgresStore(db)
+	seedProductionPhaseTask(t, ctx, db, projectID, graph)
+	command := coordination.PhaseCommand{
+		ID: "cmd-expired-reserved", Endpoint: coordination.PhaseEndpointRef{TaskID: "task-real", EndpointID: coordination.EndpointVerify},
+		Generation: 1, BindingRef: "binding://task-real/verify/1", LeaseRef: "lease-expired-reserved",
+		Action: coordination.CommandStart, CauseRef: "revision://2",
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_leases(project_id, lease_ref, task_id, endpoint_id, generation, binding_ref, state, expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,'active',now()-interval '1 minute')`, projectID, command.LeaseRef, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO coordination_phase_commands(project_id, command_id, task_id, endpoint_id, generation, binding_ref, lease_ref, action, cause_ref, accepted_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now()-interval '2 minutes')`, projectID, command.ID, command.Endpoint.TaskID, command.Endpoint.EndpointID, command.Generation, command.BindingRef, command.LeaseRef, command.Action, command.CauseRef); err != nil {
+		t.Fatal(err)
+	}
+	invocations := runtimepkg.NewPostgresInvocationStoreFromSQL(db)
+	invocationID := productionPhaseInvocationID(command.ID)
+	created := time.Now().UTC().Add(-2 * time.Hour)
+	if err := invocations.Create(ctx, runtimepkg.Invocation{
+		ID: invocationID, ActorPrincipalID: "actor-expired-reserved", ProjectID: projectID,
+		TaskID: command.Endpoint.TaskID, EndpointID: command.Endpoint.EndpointID, Generation: 1,
+		Role: auth.RoleVerifier, Status: runtimepkg.InvocationPrepared, BindingRef: command.BindingRef, LeaseID: command.LeaseRef,
+		PromptHashes: map[string]string{"prompt": "hash"}, SkillHashes: map[string]string{"skill": "hash"},
+		EffectiveTools: []auth.Tool{auth.ToolAgentSubmitPhaseOutput}, CreatedAt: created, ExpiresAt: created.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invocationRef := "threadmill://phase-invocation/" + string(invocationID) + "/reserved"
+	providerTaskID := "threadmill-expired-reserved"
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO phase_agentteams_host_states(invocation_id, invocation_ref, agentteams_task_id, host_ref)
+VALUES ($1,$2,$3,'phase-a')`, invocationID, invocationRef, providerTaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO agentteams_execution_refs(invocation_ref, invocation_id, agentteams_task_id, host_ref, dispatch_fingerprint, state, attempt, created_at, updated_at)
+VALUES ($1,$2,$3,'phase-a','fingerprint','reserved',1,$4,$4)`, invocationRef, invocationID, providerTaskID, created); err != nil {
+		t.Fatal(err)
+	}
+	provider := &recordingPhaseExecutionProvider{terminal: false, activity: agentteams.HostActivity{Status: "running", RunningTaskCount: 1}}
+	host := &productionPhaseRestartHost{}
+	controller := phasepkg.NewController(phasepkg.Config{
+		InvocationStore: invocations, Host: host, RecoveryStore: phasepkg.NewPostgresRecoveryStoreFromSQL(db, invocations),
+		Lifecycle: runtimepkg.NoopInvocationLifecycle{}, Observations: graph, Now: time.Now,
+	})
+	monitor, err := newProductionPhaseExecutionMonitor(db, projectID, provider, controller, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	failed, ok, err := invocations.Get(ctx, invocationID)
+	if err != nil || !ok || failed.Status != runtimepkg.InvocationFailed {
+		t.Fatalf("expired reserved invocation = %#v ok=%v err=%v, want failed", failed, ok, err)
+	}
+	if host.revokes != 1 {
+		t.Fatalf("host revokes=%d, want controller revoke", host.revokes)
+	}
+	if len(provider.terminated) != 1 || provider.terminated[0].InvocationID != invocationID || provider.terminated[0].AgentTeamsTaskID != providerTaskID {
+		t.Fatalf("terminated executions = %#v, want expired reserved execution", provider.terminated)
+	}
+	if len(provider.executions) != 0 {
+		t.Fatalf("reserved cleanup probed provider terminal/activity: %#v", provider.executions)
+	}
+	var observations int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM coordination_runtime_observations WHERE project_id=$1 AND command_id=$2 AND kind='PhaseInvocationFailed'`, projectID, command.ID).Scan(&observations); err != nil {
+		t.Fatal(err)
+	}
+	if observations != 1 {
+		t.Fatalf("expired reserved cleanup persisted %d failure observations, want 1", observations)
+	}
+}
+
+type recordingPhaseExecutionProvider struct {
+	terminal   bool
+	activity   agentteams.HostActivity
+	probes     []string
+	executions []agentteams.AgentTeamsExecutionRef
+	finalized  []agentteams.AgentTeamsExecutionRef
+	terminated []agentteams.AgentTeamsExecutionRef
+}
+
+func (p *recordingPhaseExecutionProvider) FinalizeExecution(_ context.Context, execution agentteams.AgentTeamsExecutionRef, _ string) error {
+	p.finalized = append(p.finalized, execution)
+	return nil
+}
+
+func (p *recordingPhaseExecutionProvider) ExecutionTerminal(_ context.Context, execution agentteams.AgentTeamsExecutionRef) (bool, error) {
+	p.probes = append(p.probes, "terminal")
+	p.executions = append(p.executions, execution)
+	return p.terminal, nil
+}
+
+func (p *recordingPhaseExecutionProvider) ExecutionActivity(_ context.Context, _ agentteams.AgentTeamsExecutionRef) (agentteams.HostActivity, error) {
+	p.probes = append(p.probes, "activity")
+	return p.activity, nil
+}
+
+func (p *recordingPhaseExecutionProvider) Terminate(_ context.Context, execution agentteams.AgentTeamsExecutionRef, _ string) error {
+	p.terminated = append(p.terminated, execution)
+	return nil
+}
+
+type recordingPhaseFailureReporter struct{ commands []coordination.PhaseCommand }
+
+func (r *recordingPhaseFailureReporter) FailInvocation(_ context.Context, command coordination.PhaseCommand) error {
+	r.commands = append(r.commands, command)
+	return nil
 }
 
 func seedProductionPhaseTask(t *testing.T, ctx context.Context, db *sql.DB, projectID kernel.ProjectID, graph *coordination.PostgresStore) {
@@ -1248,6 +2061,25 @@ func seedProductionPhaseBareRepo(t *testing.T) string {
 	return bare
 }
 
+func advanceProductionPhaseBareRepo(t *testing.T, bare string) string {
+	t.Helper()
+	work := filepath.Join(t.TempDir(), "advance")
+	gitPhaseTest(t, filepath.Dir(work), "clone", bare, work)
+	if err := os.WriteFile(filepath.Join(work, "latest-main.txt"), []byte("latest main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitPhaseTest(t, work, "add", "latest-main.txt")
+	gitPhaseTest(t, work, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "advance main")
+	gitPhaseTest(t, work, "push", "origin", "HEAD")
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = work
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read advanced main revision: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func gitPhaseTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -1261,6 +2093,63 @@ func gitPhaseTest(t *testing.T, dir string, args ...string) {
 func productionPhaseInvocationID(commandID string) kernel.InvocationID {
 	sum := sha256.Sum256([]byte(commandID))
 	return kernel.InvocationID(fmt.Sprintf("inv_%x", sum[:8]))
+}
+
+type productionPhaseRestartBindingResolver struct {
+	binding phasepkg.BindingSnapshot
+}
+
+func (r productionPhaseRestartBindingResolver) Resolve(context.Context, coordination.PhaseCommand) (phasepkg.BindingSnapshot, error) {
+	return r.binding, nil
+}
+
+func (r productionPhaseRestartBindingResolver) Refresh(context.Context, phasepkg.ActiveInvocation) (phasepkg.BindingSnapshot, error) {
+	return r.binding, nil
+}
+
+type productionPhaseRestartInputs struct{}
+
+func (productionPhaseRestartInputs) AwaitInputs(context.Context, phasepkg.ActiveInvocation, phasepkg.AwaitInputsRequest) (phasepkg.InputWaitResult, error) {
+	return phasepkg.InputWaitResult{}, nil
+}
+
+type productionPhaseRestartArtifacts struct{}
+
+func (productionPhaseRestartArtifacts) Route(_ context.Context, _ phasepkg.ActiveInvocation, ref string) (string, error) {
+	return ref, nil
+}
+
+type productionPhaseRestartHost struct {
+	dispatches int
+	revokes    int
+	fences     int
+}
+
+func (h *productionPhaseRestartHost) Dispatch(context.Context, phasepkg.DispatchRequest) error {
+	h.dispatches++
+	return nil
+}
+
+func (*productionPhaseRestartHost) Rehydrate(context.Context, phasepkg.DispatchRequest) error {
+	return nil
+}
+
+func (*productionPhaseRestartHost) Suspend(context.Context, kernel.InvocationID) error {
+	return nil
+}
+
+func (*productionPhaseRestartHost) Stop(context.Context, phasepkg.StopRequest) (phasepkg.StopResult, error) {
+	return phasepkg.StopResult{NonResumable: true}, nil
+}
+
+func (h *productionPhaseRestartHost) Revoke(context.Context, kernel.InvocationID) error {
+	h.revokes++
+	return nil
+}
+
+func (h *productionPhaseRestartHost) Fence(context.Context, kernel.InvocationID) error {
+	h.fences++
+	return nil
 }
 
 type productionPhaseFakeAdapter struct{}
@@ -1278,6 +2167,14 @@ func (a *productionPhaseFakeAdapter) Dispatch(_ context.Context, ref string) (ag
 
 func (a *productionPhaseFakeAdapter) Terminate(context.Context, agentteams.AgentTeamsExecutionRef, string) error {
 	return nil
+}
+
+func (a *productionPhaseFakeAdapter) FenceExecution(context.Context, agentteams.AgentTeamsExecutionRef) error {
+	return nil
+}
+
+func (a *productionPhaseFakeAdapter) SyncExecutionWorkspace(context.Context, agentteams.AgentTeamsExecutionRef) (agentteams.ExecutionWorkspaceCheckpoint, error) {
+	return agentteams.ExecutionWorkspaceCheckpoint{WorkspaceRevision: "workspace-synced"}, nil
 }
 
 func (a *productionPhaseFakeAdapter) Collect(context.Context, agentteams.AgentTeamsExecutionRef) (agentteams.UntrustedExecutionResult, error) {

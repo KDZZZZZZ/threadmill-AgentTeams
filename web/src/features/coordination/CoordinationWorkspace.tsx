@@ -1,14 +1,15 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Background,
   Controls,
   MarkerType,
   ReactFlow,
+  useReactFlow,
   type Edge,
   type Node,
   type NodeMouseHandler,
 } from "@xyflow/react";
-import { ListTree, Network, Workflow } from "lucide-react";
+import { Gauge, ListTree, Network, Workflow } from "lucide-react";
 import type {
   CoordinationSnapshot,
   EndpointRef,
@@ -24,6 +25,11 @@ interface Props {
 }
 
 const phaseOrder = { plan: 0, execute: 1, verify: 2 } as const;
+const phaseLabels: Record<keyof typeof phaseOrder, string> = {
+  plan: "Plan",
+  execute: "Execute",
+  verify: "Verify",
+};
 
 function refKey(ref: EndpointRef): string {
   return `${ref.task_id}:${ref.endpoint_id}`;
@@ -68,8 +74,8 @@ export function CoordinationWorkspace({
         connectable: false,
         selectable: true,
         position: {
-          x: (taskIndex.get(node.task_id) ?? 0) * 330 + 40,
-          y: phaseOrder[node.endpoint_id] * 170 + 48,
+          x: phaseOrder[node.endpoint_id] * 300 + 36,
+          y: (taskIndex.get(node.task_id) ?? 0) * 122 + 78,
         },
         data: {
           label: node.label,
@@ -93,9 +99,13 @@ export function CoordinationWorkspace({
             id: edge.id,
             source,
             target,
-            label: edge.required_by,
+            type: "smoothstep",
             className: `graph-edge state-${edge.state}`,
-            markerEnd: { type: MarkerType.ArrowClosed },
+            markerEnd: {
+              type: MarkerType.ArrowClosed,
+              width: 14,
+              height: 14,
+            },
           },
         ];
       }),
@@ -114,6 +124,21 @@ export function CoordinationWorkspace({
 
   return (
     <div className="coordination-workspace">
+      <div className="coordination-map-summary" aria-label="协调图概览">
+        <span>
+          <Workflow size={14} aria-hidden="true" />
+          {snapshot.tasks.length} tasks
+        </span>
+        <span>
+          <Network size={14} aria-hidden="true" />
+          {endpointNodes.length} phases
+        </span>
+        <span>
+          <Gauge size={14} aria-hidden="true" />
+          {snapshot.edges.length} deps
+        </span>
+      </div>
+
       <div className="view-switch" role="group" aria-label="协调图显示方式">
         <button
           type="button"
@@ -145,13 +170,16 @@ export function CoordinationWorkspace({
             nodesConnectable={false}
             elementsSelectable
             fitView
+            fitViewOptions={{ padding: 0.16, minZoom: 0.35, maxZoom: 1.08 }}
             minZoom={0.35}
             maxZoom={1.6}
+            defaultEdgeOptions={{ interactionWidth: 18 }}
             proOptions={{ hideAttribution: true }}
             aria-label="Coordination Graph 节点和依赖"
           >
             <Background gap={24} size={1} color="var(--graph-dot)" />
             <Controls showInteractive={false} position="bottom-left" />
+            <GraphFit revision={snapshot.revision} nodeCount={nodes.length} />
           </ReactFlow>
         ) : (
           <div className="graph-empty">
@@ -214,7 +242,7 @@ export function CoordinationWorkspace({
                       <span className="phase-name">{node.endpoint_id}</span>
                       <span>{node.label}</span>
                       <span className="phase-list-meta">
-                        gen {node.generation} ·{" "}
+                        gen {node.generation} /{" "}
                         {node.run_policy === "held" ? "held" : node.state}
                       </span>
                     </button>
@@ -224,6 +252,48 @@ export function CoordinationWorkspace({
           </section>
         ))}
       </div>
+
+      <div className="graph-legend" aria-label="协调图图例">
+        <span>
+          <i className="legend-swatch state-running" aria-hidden="true" />
+          running
+        </span>
+        <span>
+          <i className="legend-swatch state-satisfied" aria-hidden="true" />
+          satisfied
+        </span>
+        <span>
+          <i className="legend-swatch state-failed" aria-hidden="true" />
+          failed
+        </span>
+        <span>
+          <i className="legend-swatch state-waiting" aria-hidden="true" />
+          held/waiting
+        </span>
+        {Object.entries(phaseLabels).map(([phase, label]) => (
+          <span key={phase}>
+            <i className="legend-column" aria-hidden="true" />
+            {label} column
+          </span>
+        ))}
+      </div>
     </div>
   );
+}
+
+function GraphFit({
+  revision,
+  nodeCount,
+}: {
+  revision: number;
+  nodeCount: number;
+}) {
+  const { fitView } = useReactFlow();
+  useEffect(() => {
+    if (!nodeCount) return;
+    window.requestAnimationFrame(() =>
+      fitView({ padding: 0.16, minZoom: 0.35, maxZoom: 1.08 }),
+    );
+  }, [fitView, nodeCount, revision]);
+  return null;
 }

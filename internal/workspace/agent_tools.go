@@ -298,7 +298,7 @@ func (t *AgentTools) Run(ctx context.Context, invocationID kernel.InvocationID, 
 			if snapshotErr != nil {
 				return snapshotErr
 			}
-			if applyErr := applySandboxChanges(binding, copyRoot, before, after); applyErr != nil {
+			if applyErr := applySandboxChanges(binding, binding.ActivePhase, copyRoot, before, after); applyErr != nil {
 				return applyErr
 			}
 			var refreshErr error
@@ -365,11 +365,23 @@ func (s *Service) refreshLocked(ctx context.Context, binding Binding) (Binding, 
 	}
 	next := cloneBinding(binding)
 	next.CurrentRevision = head
-	next.ObservedWrites = WriteSet{Files: files}
+	next.ObservedWrites = WriteSet{Files: candidateObservedFiles(files)}
 	if head == binding.CurrentRevision && writeSetsEqual(next.ObservedWrites, binding.ObservedWrites) {
 		return binding, nil
 	}
 	return s.store.UpdateCAS(ctx, next, binding.Revision)
+}
+
+func candidateObservedFiles(files []string) []string {
+	result := make([]string, 0, len(files))
+	for _, file := range files {
+		clean := filepath.ToSlash(filepath.Clean(file))
+		if hasPathPrefix(clean, "plan") || hasPathPrefix(clean, "evidence") {
+			continue
+		}
+		result = append(result, clean)
+	}
+	return normalizedStrings(result)
 }
 
 func resolveReadPath(binding Binding, requested string, allowRoot bool) (string, string, error) {
@@ -704,7 +716,10 @@ type sandboxChange struct {
 	originalMode    os.FileMode
 }
 
-func applySandboxChanges(binding Binding, copyRoot string, before, after map[string]workspaceFileState) error {
+func applySandboxChanges(binding Binding, phase Phase, copyRoot string, before, after map[string]workspaceFileState) error {
+	if !validPhase(phase) {
+		return kernel.InvalidArgument("invalid phase")
+	}
 	paths := make(map[string]struct{}, len(before)+len(after))
 	for filePath := range before {
 		paths[filePath] = struct{}{}
@@ -726,10 +741,10 @@ func applySandboxChanges(binding Binding, copyRoot string, before, after map[str
 	changes := make([]sandboxChange, 0, len(ordered))
 	var applyBytes int64
 	for _, filePath := range ordered {
-		if protectedWorkspacePath(filePath) || !phaseAllows(binding, PhaseExecute, filePath) {
-			return kernel.Forbidden("workspace command wrote outside the execute phase boundary")
+		if protectedWorkspacePath(filePath) || !phaseAllows(binding, phase, filePath) {
+			return kernel.Forbidden("workspace command wrote outside the active phase boundary")
 		}
-		target, err := ResolveWritePath(binding, PhaseExecute, filePath)
+		target, err := ResolveWritePath(binding, phase, filePath)
 		if err != nil {
 			return err
 		}

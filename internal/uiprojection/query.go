@@ -16,6 +16,7 @@ import (
 // adapters may depend on it; graph/runtime/context writers must never be added.
 type Query interface {
 	Snapshot(context.Context, auth.Principal, kernel.ProjectID, kernel.Revision) (CoordinationSnapshot, error)
+	ContextSnapshot(context.Context, auth.Principal, kernel.ProjectID) (contextgraph.ContextGraphSnapshot, error)
 	InspectEndpoint(context.Context, auth.Principal, kernel.ProjectID, coordination.PhaseEndpointRef, int) (EndpointInspector, error)
 }
 
@@ -90,12 +91,13 @@ type PermissionReader interface {
 }
 
 type Service struct {
-	capacity    CapacityReader
-	graphs      GraphReader
-	invocations InvocationReader
-	contexts    ContextInspectionReader
-	cursors     CursorReader
-	permissions PermissionReader
+	capacity     CapacityReader
+	graphs       GraphReader
+	invocations  InvocationReader
+	contexts     ContextInspectionReader
+	contextGraph contextgraph.ContextGraphSnapshotReader
+	cursors      CursorReader
+	permissions  PermissionReader
 }
 
 func NewService(
@@ -107,11 +109,19 @@ func NewService(
 	permissions PermissionReader,
 ) *Service {
 	return &Service{
-		capacity:    capacity,
-		graphs:      graphs,
-		invocations: invocations,
-		contexts:    contexts,
-		cursors:     cursors,
-		permissions: permissions,
+		capacity:     capacity,
+		graphs:       graphs,
+		invocations:  invocations,
+		contexts:     contexts,
+		contextGraph: contextSnapshotReader(contexts),
+		cursors:      cursors,
+		permissions:  permissions,
 	}
+}
+
+func contextSnapshotReader(reader ContextInspectionReader) contextgraph.ContextGraphSnapshotReader {
+	if snapshotReader, ok := reader.(contextgraph.ContextGraphSnapshotReader); ok {
+		return snapshotReader
+	}
+	return nil
 }

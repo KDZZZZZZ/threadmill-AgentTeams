@@ -3,9 +3,11 @@ package mergequeue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,30 +49,42 @@ func TestMergeQueueHappyPathWritesMainAndPreservesCandidateWorkspace(t *testing.
 	if len(events) != 2 || events[0].Type != "MergeCandidateQueued" || events[1].Type != "MergeCandidateMerged" {
 		t.Fatalf("merge events = %#v", events)
 	}
+	if calls := h.verifier.calls.Load(); calls != 0 {
+		t.Fatalf("unchanged main invoked targeted verifier %d times, want 0", calls)
+	}
+	if !containsArtifact(events[1].ArtifactRefs, candidate.VerifyResultRef) || !containsArtifact(merged.EvidenceRefs, candidate.VerifyResultRef) {
+		t.Fatalf("fast path dropped trusted verify evidence: merged=%#v event=%#v", merged.EvidenceRefs, events[1].ArtifactRefs)
+	}
 }
 
 func TestMergeQueueFailsWithEvidenceForPermissionConflictVerifyAndMainDrift(t *testing.T) {
 	t.Run("permission", func(t *testing.T) {
 		h := newHarness(t)
-		binding := h.workspace(t, "task-a", 1, "outside.txt", "not allowed\n")
+		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
 		h.enqueue(t, "candidate-permission", binding)
+		binding.Status = workspace.StatusPrepared
+		if _, err := h.wsStore.UpdateCAS(context.Background(), binding, binding.Revision); err != nil {
+			t.Fatal(err)
+		}
 		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
 		assertFailure(t, failed, claimed, err, FailurePermission)
 	})
 
-	t.Run("conflict", func(t *testing.T) {
+	t.Run("conflict_rejected_by_verifier", func(t *testing.T) {
 		h := newHarness(t)
 		binding := h.workspaceAllowed(t, "task-a", 1, "README.md", "candidate\n", []string{"README.md"})
 		h.enqueue(t, "candidate-conflict", binding)
 		pushChange(t, h.repo, "README.md", "main drift\n")
+		h.verifier.result = TargetedVerifyResult{Passed: false, EvidenceRefs: h.verifier.result.EvidenceRefs}
 		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
-		assertFailure(t, failed, claimed, err, FailureConflict)
+		assertFailure(t, failed, claimed, err, FailureVerifyFailed)
 	})
 
 	t.Run("verify_failed", func(t *testing.T) {
 		h := newHarness(t)
 		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
 		h.enqueue(t, "candidate-verify", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
 		failureEvidence := registerArtifact(t, h.artifacts, "project-a", "task-a", "targeted verification failure")
 		h.verifier.result = TargetedVerifyResult{Passed: false, EvidenceRefs: []evidence.ArtifactID{failureEvidence}}
 		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
@@ -84,15 +98,51 @@ func TestMergeQueueFailsWithEvidenceForPermissionConflictVerifyAndMainDrift(t *t
 		h := newHarness(t)
 		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
 		h.enqueue(t, "candidate-targeted-drift", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
 		h.verifier.err = MainDrift("main-old", "main-new")
 		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
 		assertFailure(t, failed, claimed, err, FailureMainDrift)
+	})
+
+	t.Run("verifier_terminal_proposal", func(t *testing.T) {
+		h := newHarness(t)
+		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+		h.enqueue(t, "candidate-verifier-proposal", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
+		proposalEvidence := registerArtifact(t, h.artifacts, "project-a", "task-a", "verifier proposal persisted")
+		h.verifier.result = TargetedVerifyResult{EvidenceRefs: []evidence.ArtifactID{proposalEvidence}}
+		h.verifier.err = kernel.TransitionRejected("targeted verifier submitted orchestration proposal")
+
+		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+		assertFailure(t, failed, claimed, err, FailureVerifyFailed)
+		if !containsArtifact(failed.EvidenceRefs, proposalEvidence) {
+			t.Fatalf("verifier proposal evidence dropped: %#v", failed.EvidenceRefs)
+		}
+	})
+
+	t.Run("targeted_evidence_acl", func(t *testing.T) {
+		h := newHarness(t)
+		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+		h.enqueue(t, "candidate-targeted-acl", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
+		foreignEvidence := registerArtifact(t, h.artifacts, "project-a", "task-other", "foreign targeted evidence")
+		h.verifier.result = TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{foreignEvidence}}
+
+		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+		assertFailure(t, failed, claimed, err, FailureVerifyFailed)
+		if containsArtifact(failed.EvidenceRefs, foreignEvidence) {
+			t.Fatalf("cross-task verifier evidence persisted: %#v", failed.EvidenceRefs)
+		}
 	})
 
 	t.Run("main_drift", func(t *testing.T) {
 		h := newHarness(t)
 		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
 		h.enqueue(t, "candidate-drift", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
+		h.verifier.resolve = func(req TargetedVerifyRequest) error {
+			return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "a.txt"), []byte("resolved\n"), 0o644)
+		}
 		h.verifier.entered = make(chan struct{})
 		h.verifier.release = make(chan struct{})
 		type outcome struct {
@@ -119,6 +169,10 @@ func TestMergeQueueSerializesSameRepository(t *testing.T) {
 	second := h.workspace(t, "task-b", 1, "workspace/b.txt", "b\n")
 	h.enqueue(t, "candidate-a", first)
 	h.enqueue(t, "candidate-b", second)
+	pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
+	h.verifier.resolve = func(req TargetedVerifyRequest) error {
+		return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "a.txt"), []byte("resolved\n"), 0o644)
+	}
 	h.verifier.entered = make(chan struct{})
 	h.verifier.release = make(chan struct{})
 
@@ -148,6 +202,193 @@ func TestMergeQueueSerializesSameRepository(t *testing.T) {
 	}
 }
 
+func TestMergeQueueTargetedVerifierResolvesAuthorizedConflict(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	h.enqueue(t, "candidate-resolved-conflict", binding)
+	pushChange(t, h.repo, "workspace/a.txt", "main\n")
+	h.verifier.resolve = func(req TargetedVerifyRequest) error {
+		if req.Candidate.ID != "candidate-resolved-conflict" {
+			return fmt.Errorf("unexpected candidate %s", req.Candidate.ID)
+		}
+		if !reflect.DeepEqual(req.ConflictPaths, []string{"workspace/a.txt"}) || !reflect.DeepEqual(req.AllowedWritePaths, req.ConflictPaths) {
+			return fmt.Errorf("unexpected conflict authority: conflicts=%v allowed=%v", req.ConflictPaths, req.AllowedWritePaths)
+		}
+		pushURL, err := gitOutput(context.Background(), req.WorkspaceRoot, "remote", "get-url", "--push", "origin")
+		if err != nil || pushURL != "threadmill-readonly://mergequeue" {
+			return fmt.Errorf("verifier workspace push URL = %q err=%v", pushURL, err)
+		}
+		return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "a.txt"), []byte("resolved\n"), 0o644)
+	}
+
+	merged, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	if err != nil || !claimed || merged.Status != StatusMerged {
+		t.Fatalf("resolved conflict = %#v claimed=%v err=%v", merged, claimed, err)
+	}
+	if got := fileAtBranch(t, h.repo, "main", "workspace/a.txt"); got != "resolved\n" {
+		t.Fatalf("resolved file = %q", got)
+	}
+	if calls := h.verifier.calls.Load(); calls != 1 {
+		t.Fatalf("targeted verifier calls = %d, want 1", calls)
+	}
+}
+
+func TestMergeQueueConflictExcludesPlanMetadataFromMergeCommit(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	write(t, filepath.Join(binding.Root, "plan", "declared-writes.json"), `{"files":["workspace/a.txt"]}`+"\n")
+	git(t, binding.Root, "add", "plan/declared-writes.json")
+	git(t, binding.Root, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "plan metadata")
+	var err error
+	binding, err = h.workspaces.RefreshObservedWrites(context.Background(), binding.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(binding.ObservedWrites.Files, []string{"workspace/a.txt"}) {
+		t.Fatalf("candidate observed writes = %v, want business write only", binding.ObservedWrites.Files)
+	}
+	h.enqueue(t, "candidate-conflict-with-plan-metadata", binding)
+	pushChange(t, h.repo, "workspace/a.txt", "main\n")
+	h.verifier.resolve = func(req TargetedVerifyRequest) error {
+		return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "a.txt"), []byte("resolved\n"), 0o644)
+	}
+
+	merged, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	if err != nil || !claimed || merged.Status != StatusMerged {
+		t.Fatalf("resolved conflict with plan metadata = %#v claimed=%v err=%v", merged, claimed, err)
+	}
+	if got := fileAtBranch(t, h.repo, "main", "workspace/a.txt"); got != "resolved\n" {
+		t.Fatalf("resolved file = %q", got)
+	}
+	if got := fileAtBranchIfExists(t, h.repo, "main", "plan/declared-writes.json"); got != "" {
+		t.Fatalf("plan metadata leaked into merged branch: %q", got)
+	}
+}
+
+func TestMergeQueueCleanMainDriftMergesWithoutPreAcceptanceVerify(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	h.enqueue(t, "candidate-clean-drift", binding)
+	pushChange(t, h.repo, "unrelated.txt", "main advanced\n")
+
+	merged, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	if err != nil || !claimed || merged.Status != StatusMerged {
+		t.Fatalf("clean drift = %#v claimed=%v err=%v", merged, claimed, err)
+	}
+	if calls := h.verifier.calls.Load(); calls != 0 {
+		t.Fatalf("clean drift targeted verifier calls = %d, want 0", calls)
+	}
+}
+
+func TestMergeQueueAcceptsCompletedExecuteWithoutCompletedVerify(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	binding.PhaseLeases[workspace.PhaseVerify] = ""
+	if _, err := h.wsStore.UpdateCAS(context.Background(), binding, binding.Revision); err != nil {
+		t.Fatal(err)
+	}
+	h.enqueue(t, "candidate-execute-first", binding)
+
+	merged, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	if err != nil || !claimed || merged.Status != StatusMerged {
+		t.Fatalf("execute-first merge = %#v claimed=%v err=%v", merged, claimed, err)
+	}
+	if calls := h.verifier.calls.Load(); calls != 0 {
+		t.Fatalf("clean execute-first merge invoked verifier %d times", calls)
+	}
+}
+
+func TestMergeQueueRejectsUnresolvedAndOutOfScopeConflict(t *testing.T) {
+	t.Run("unresolved", func(t *testing.T) {
+		h := newHarness(t)
+		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+		h.enqueue(t, "candidate-unresolved-conflict", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main\n")
+
+		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+		assertFailure(t, failed, claimed, err, FailureVerifyFailed)
+		if got := fileAtBranch(t, h.repo, "main", "workspace/a.txt"); got != "main\n" {
+			t.Fatalf("unresolved conflict changed main: %q", got)
+		}
+	})
+
+	t.Run("out_of_scope", func(t *testing.T) {
+		h := newHarness(t)
+		binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+		binding.DeclaredWrites.Files = []string{"workspace/other.txt"}
+		if _, err := h.wsStore.UpdateCAS(context.Background(), binding, binding.Revision); err != nil {
+			t.Fatal(err)
+		}
+		h.enqueue(t, "candidate-out-of-scope-conflict", binding)
+		pushChange(t, h.repo, "workspace/a.txt", "main\n")
+
+		failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+		assertFailure(t, failed, claimed, err, FailurePermission)
+		if calls := h.verifier.calls.Load(); calls != 0 {
+			t.Fatalf("out-of-scope conflict invoked verifier %d times", calls)
+		}
+	})
+}
+
+func TestMergeQueueRejectsVerifierWriteOutsideAuthorizedCandidatePaths(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	h.enqueue(t, "candidate-verifier-scope-escape", binding)
+	pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
+	h.verifier.resolve = func(req TargetedVerifyRequest) error {
+		return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "escape.txt"), []byte("escape\n"), 0o644)
+	}
+
+	failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	assertFailure(t, failed, claimed, err, FailurePermission)
+	if got := fileAtBranchIfExists(t, h.repo, "main", "workspace/escape.txt"); got != "" {
+		t.Fatalf("scope-escaping verifier wrote main: %q", got)
+	}
+}
+
+func TestMergeQueueCleanDriftDoesNotInvokeVerifierRewrite(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	h.enqueue(t, "candidate-clean-drift-rewrite", binding)
+	pushChange(t, h.repo, "unrelated.txt", "main advanced\n")
+	h.verifier.resolve = func(req TargetedVerifyRequest) error {
+		if len(req.AllowedWritePaths) != 0 {
+			return fmt.Errorf("clean drift unexpectedly granted writes: %v", req.AllowedWritePaths)
+		}
+		return os.WriteFile(filepath.Join(req.WorkspaceRoot, "workspace", "a.txt"), []byte("rewritten\n"), 0o644)
+	}
+
+	merged, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	if err != nil || !claimed || merged.Status != StatusMerged {
+		t.Fatalf("clean drift = %#v claimed=%v err=%v", merged, claimed, err)
+	}
+	if calls := h.verifier.calls.Load(); calls != 0 {
+		t.Fatalf("clean drift invoked verifier %d times", calls)
+	}
+	if got := fileAtBranchIfExists(t, h.repo, "main", "workspace/a.txt"); got != "candidate" {
+		t.Fatalf("mechanical merge content = %q, want candidate", got)
+	}
+}
+
+func TestMergeQueueRejectsVerifierCreatedCommit(t *testing.T) {
+	h := newHarness(t)
+	binding := h.workspace(t, "task-a", 1, "workspace/a.txt", "candidate\n")
+	h.enqueue(t, "candidate-verifier-commit", binding)
+	pushChange(t, h.repo, "workspace/a.txt", "main advanced\n")
+	h.verifier.resolve = func(req TargetedVerifyRequest) error {
+		if err := gitRun(context.Background(), req.WorkspaceRoot, "add", "--", "workspace/a.txt"); err != nil {
+			return err
+		}
+		return gitRun(context.Background(), req.WorkspaceRoot, "-c", "user.email=verifier@example.com", "-c", "user.name=Verifier", "commit", "-m", "verifier must not commit")
+	}
+
+	failed, claimed, err := h.reconciler.ReconcileOne(context.Background(), h.repo)
+	assertFailure(t, failed, claimed, err, FailurePermission)
+	if got := fileAtBranchIfExists(t, h.repo, "main", "workspace/a.txt"); got != "main advanced" {
+		t.Fatalf("verifier commit changed main: %q", got)
+	}
+}
+
 func assertFailure(t *testing.T, candidate Candidate, claimed bool, err error, reason FailureReason) {
 	t.Helper()
 	if err != nil || !claimed {
@@ -170,6 +411,7 @@ func containsArtifact(refs []evidence.ArtifactID, target evidence.ArtifactID) bo
 type harness struct {
 	repo       string
 	workspaces *workspace.Service
+	wsStore    *workspace.MemoryStore
 	store      *MemoryStore
 	artifacts  *evidence.ArtifactRegistry
 	events     *evidence.EventLog
@@ -184,11 +426,13 @@ func newHarness(t *testing.T) *harness {
 	verifyEvidence := registerArtifact(t, artifacts, "project-a", "task-a", "targeted verify passed")
 	verifier := &fakeVerifier{result: TargetedVerifyResult{Passed: true, EvidenceRefs: []evidence.ArtifactID{verifyEvidence}}}
 	store := NewMemoryStore()
-	workspaces := workspace.NewService()
+	wsStore := workspace.NewMemoryStore()
+	workspaces := workspace.NewServiceWithStore(wsStore, workspace.NewLocalGitBackend())
 	events := evidence.NewEventLog(64 * 1024)
 	return &harness{
 		repo:       repo,
 		workspaces: workspaces,
+		wsStore:    wsStore,
 		store:      store,
 		artifacts:  artifacts,
 		events:     events,
@@ -209,6 +453,7 @@ func (h *harness) workspaceAllowed(t *testing.T, taskID kernel.TaskID, generatio
 		RepoPath:       h.repo,
 		WorktreeParent: t.TempDir(),
 		AllowedDirs:    allowedDirs,
+		DeclaredWrites: workspace.WriteSet{Files: []string{file}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -269,10 +514,20 @@ type fakeVerifier struct {
 	release   chan struct{}
 	active    atomic.Int32
 	maxActive atomic.Int32
+	calls     atomic.Int32
 	once      sync.Once
+	request   TargetedVerifyRequest
+	resolve   func(TargetedVerifyRequest) error
 }
 
-func (v *fakeVerifier) Verify(context.Context, TargetedVerifyRequest) (TargetedVerifyResult, error) {
+func (v *fakeVerifier) Verify(ctx context.Context, req TargetedVerifyRequest) (TargetedVerifyResult, error) {
+	v.calls.Add(1)
+	v.request = req
+	if v.resolve != nil {
+		if err := v.resolve(req); err != nil {
+			return TargetedVerifyResult{}, err
+		}
+	}
 	active := v.active.Add(1)
 	defer v.active.Add(-1)
 	for {
@@ -285,7 +540,11 @@ func (v *fakeVerifier) Verify(context.Context, TargetedVerifyRequest) (TargetedV
 		v.once.Do(func() { close(v.entered) })
 	}
 	if v.release != nil {
-		<-v.release
+		select {
+		case <-v.release:
+		case <-ctx.Done():
+			return TargetedVerifyResult{}, ctx.Err()
+		}
 	}
 	return v.result, v.err
 }

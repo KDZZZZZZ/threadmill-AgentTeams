@@ -9,7 +9,7 @@ import (
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 )
 
-func TestTaskflowArgumentsExposeOnlyLeaderLifecycleActions(t *testing.T) {
+func TestTaskflowArgumentsExposeOnlyRuntimeOwnedLifecycleActions(t *testing.T) {
 	arguments, err := taskflowArguments(TaskflowCall{
 		Action:     "delegate_task",
 		ProjectID:  "project-a",
@@ -28,7 +28,7 @@ func TestTaskflowArgumentsExposeOnlyLeaderLifecycleActions(t *testing.T) {
 		t.Fatalf("delegate arguments contain unexpected fields: %#v", arguments)
 	}
 
-	for _, action := range []string{"ack_task", "submit_task", "projectflow"} {
+	for _, action := range []string{"ack_task", "projectflow"} {
 		_, err := taskflowArguments(TaskflowCall{Action: action, TaskID: "task-a"})
 		if err == nil {
 			t.Fatalf("unsupported direct action %q accepted", action)
@@ -39,6 +39,22 @@ func TestTaskflowArgumentsExposeOnlyLeaderLifecycleActions(t *testing.T) {
 	}
 	if _, err := taskflowArguments(TaskflowCall{Action: "check_task", TaskID: "../task-a"}); err == nil {
 		t.Fatal("unsafe provider task id accepted")
+	}
+	submit, err := taskflowArguments(TaskflowCall{
+		Action: "submit_task", Role: "worker", TaskID: "task-a",
+		Status: "SUCCESS", Summary: "Threadmill accepted the authoritative result", Deliverables: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submit["role"] != "worker" || submit["status"] != "SUCCESS" || submit["summary"] == "" {
+		t.Fatalf("submit arguments = %#v", submit)
+	}
+	if deliverables, ok := submit["deliverables"].([]string); !ok || len(deliverables) != 0 {
+		t.Fatalf("submit deliverables = %#v, want empty []string", submit["deliverables"])
+	}
+	if _, err := taskflowArguments(TaskflowCall{Action: "submit_task", Role: "leader", TaskID: "task-a", Status: "SUCCESS", Summary: "done"}); err == nil {
+		t.Fatal("leader submit_task accepted")
 	}
 }
 
@@ -170,6 +186,42 @@ func TestParseTaskflowCallResultRejectsProviderErrorWithoutEcho(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("provider error leaked provider text: %v", err)
+	}
+}
+
+func TestParseTaskflowCallResultMapsOnlySafeTerminalFacts(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		action string
+		error  string
+		code   kernel.ErrorCode
+	}{
+		{name: "missing", action: "check_task", error: "task not found", code: kernel.CodeNotFound},
+		{name: "terminal", action: "cancel_task", error: "cannot cancel terminal task: submitted", code: kernel.CodeStaleCommand},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider, err := json.Marshal(map[string]any{
+				"ok": false, "action": test.action, "error": test.error,
+				"task": map[string]string{"task_id": "task-a"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outer, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0", "id": 1,
+				"result": map[string]any{"content": []map[string]string{{"type": "text", "text": string(provider)}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = parseTaskflowCallResult(outer)
+			if !kernel.IsCode(err, test.code) {
+				t.Fatalf("error = %v, want %s", err, test.code)
+			}
+			if strings.Contains(err.Error(), test.error) {
+				t.Fatalf("provider text leaked: %v", err)
+			}
+		})
 	}
 }
 

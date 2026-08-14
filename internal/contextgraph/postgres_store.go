@@ -421,20 +421,51 @@ func (s *PostgresStore) EnsureInitialSlice(ctx context.Context, principal auth.P
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`, principal.ProjectID, consumerInvocationID(principal)); err != nil {
 		return ContextSlice{}, mapContextPostgresError(err)
 	}
-	active, err := activeSubscriptionIDsSQL(ctx, tx, principal.ProjectID, consumerInvocationID(principal))
+	if initial, found, err := initialSliceSQL(ctx, tx, principal.ProjectID, consumerInvocationID(principal)); err != nil {
+		return ContextSlice{}, err
+	} else if found {
+		return initial, mapContextPostgresError(tx.Commit())
+	}
+	initialSubscription, err := ensureInitialSubscriptionSQL(ctx, tx, principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, s.now().UTC())
 	if err != nil {
 		return ContextSlice{}, err
-	}
-	if len(active) == 0 {
-		if _, err := ensureInitialSubscriptionSQL(ctx, tx, principal, SubscribeRequest{SubgraphIDs: subgraphIDs}, s.now().UTC()); err != nil {
-			return ContextSlice{}, err
-		}
 	}
 	slice, err := materializeInvocationSliceSQL(ctx, tx, principal)
 	if err != nil {
 		return ContextSlice{}, err
 	}
+	slice.SubscriptionIDs = []string{initialSubscription.ID}
+	slice = canonicalContextSlice(slice)
+	raw, err := json.Marshal(slice)
+	if err != nil {
+		return ContextSlice{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO context_invocation_initial_slices(project_id, consumer_invocation_id, context_slice, graph_revision, created_at)
+VALUES ($1, $2, $3::jsonb, $4, $5)`, principal.ProjectID, consumerInvocationID(principal), string(raw), slice.GraphRevision, s.now().UTC()); err != nil {
+		return ContextSlice{}, mapContextPostgresError(err)
+	}
 	return slice, mapContextPostgresError(tx.Commit())
+}
+
+func (s *PostgresStore) InspectInitialSlice(ctx context.Context, principal auth.Principal, invocationID kernel.InvocationID) (ContextSlice, error) {
+	invocationID, err := authorizeInitialSliceInspection(principal, invocationID)
+	if err != nil {
+		return ContextSlice{}, err
+	}
+	tx, err := s.begin(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ContextSlice{}, err
+	}
+	defer tx.Rollback()
+	initial, found, err := initialSliceSQL(ctx, tx, principal.ProjectID, invocationID)
+	if err != nil {
+		return ContextSlice{}, err
+	}
+	if !found {
+		return ContextSlice{}, kernel.Error{Code: kernel.CodeNotFound, Message: "initial context slice not found"}
+	}
+	return initial, mapContextPostgresError(tx.Commit())
 }
 
 func (s *PostgresStore) EffectiveSubgraphs(ctx context.Context, principal auth.Principal) ([]string, error) {
@@ -1027,6 +1058,9 @@ func (s *PostgresStore) SubmitCandidate(ctx context.Context, principal auth.Prin
 	if state == TaskMemoryFrozenUnreviewed || state == TaskMemoryReviewed {
 		return TaskMemoryCandidateView{}, kernel.TransitionRejected("task memory is frozen")
 	}
+	if err := validateCandidateNodeRefsSQL(ctx, tx, principal, candidate.SourceRefs); err != nil {
+		return TaskMemoryCandidateView{}, err
+	}
 	if err := validateWritableGeneralSubgraphs(ctx, tx, principal, candidate.SubgraphIDs); err != nil {
 		return TaskMemoryCandidateView{}, err
 	}
@@ -1041,6 +1075,33 @@ func (s *PostgresStore) SubmitCandidate(ctx context.Context, principal auth.Prin
 		return TaskMemoryCandidateView{}, mapContextPostgresError(err)
 	}
 	return TaskMemoryCandidateView{CandidateID: id, Candidate: cloneMemoryCandidate(candidate)}, mapContextPostgresError(tx.Commit())
+}
+
+func validateCandidateNodeRefsSQL(ctx context.Context, q postgresDBTX, principal auth.Principal, sourceRefs []string) error {
+	nodeRefs := candidateNodeRefs(sourceRefs)
+	if len(nodeRefs) == 0 {
+		return nil
+	}
+	slice, err := materializeInvocationSliceSQL(ctx, q, principal)
+	if err != nil {
+		return err
+	}
+	visible := make(map[string]struct{}, len(slice.Nodes))
+	for _, node := range slice.Nodes {
+		visible[node.ID] = struct{}{}
+	}
+	for _, nodeID := range uniqueStrings(nodeRefs) {
+		if _, err := generalVisibleNodeSQL(ctx, q, principal.ProjectID, nodeID); err != nil {
+			if kernel.IsCode(err, kernel.CodeNotFound) {
+				return kernel.Error{Code: kernel.CodeNotFound, Message: "candidate node_ref is not available in the current context"}
+			}
+			return err
+		}
+		if _, ok := visible[nodeID]; !ok {
+			return kernel.Error{Code: kernel.CodeNotFound, Message: "candidate node_ref is not available in the current context"}
+		}
+	}
+	return nil
 }
 
 func (s *PostgresStore) FinalizeTaskMemory(ctx context.Context, principal auth.Principal, taskID kernel.TaskID) (FrozenCandidateBatch, error) {
@@ -1749,6 +1810,39 @@ func materializeInvocationSliceSQL(ctx context.Context, q postgresDBTX, principa
 	return ContextSlice{Nodes: nodes, SubscriptionIDs: subs, GraphRevision: int64(revision)}, nil
 }
 
+func initialSliceSQL(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, invocationID kernel.InvocationID) (ContextSlice, bool, error) {
+	var raw string
+	var graphRevision int64
+	err := q.QueryRowContext(ctx, `
+SELECT context_slice::text, graph_revision
+FROM context_invocation_initial_slices
+WHERE project_id = $1 AND consumer_invocation_id = $2`, projectID, invocationID).Scan(&raw, &graphRevision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ContextSlice{}, false, nil
+	}
+	if err != nil {
+		return ContextSlice{}, false, mapContextPostgresError(err)
+	}
+	var slice ContextSlice
+	if err := json.Unmarshal([]byte(raw), &slice); err != nil {
+		return ContextSlice{}, false, err
+	}
+	if slice.GraphRevision != graphRevision || slice.GraphRevision <= 0 {
+		return ContextSlice{}, false, fmt.Errorf("persisted initial context slice revision mismatch")
+	}
+	return slice, true, nil
+}
+
+func canonicalContextSlice(slice ContextSlice) ContextSlice {
+	if slice.Nodes == nil {
+		slice.Nodes = []ContextNode{}
+	}
+	if slice.SubscriptionIDs == nil {
+		slice.SubscriptionIDs = []string{}
+	}
+	return slice
+}
+
 func visibleNodeSQL(ctx context.Context, q postgresDBTX, principal auth.Principal, nodeID string) (ContextNode, error) {
 	record, err := nodeRecordSQL(ctx, q, principal.ProjectID, nodeID, false)
 	if err != nil {
@@ -1854,12 +1948,13 @@ func visibleScopeSQL(ctx context.Context, q postgresDBTX, principal auth.Princip
 	var out []string
 	for _, ref := range uniqueStrings(refs) {
 		id := strings.TrimPrefix(ref, "subgraph:")
-		ok, err := canSeeSubgraphSQL(ctx, q, principal, id)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
+		var kind string
+		err := q.QueryRowContext(ctx, `SELECT kind FROM context_subgraphs WHERE project_id = $1 AND id = $2`, principal.ProjectID, id).Scan(&kind)
+		if errors.Is(err, sql.ErrNoRows) || kind != string(SubgraphKindGeneral) {
 			return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "scope not found"}
+		}
+		if err != nil {
+			return nil, mapContextPostgresError(err)
 		}
 		out = append(out, id)
 	}
@@ -1878,7 +1973,7 @@ func visibleAnchorNodesSQL(ctx context.Context, q postgresDBTX, principal auth.P
 		}
 		switch kind {
 		case "node":
-			if _, err := visibleNodeSQL(ctx, q, principal, id); err != nil {
+			if _, err := generalVisibleNodeSQL(ctx, q, principal.ProjectID, id); err != nil {
 				if kernel.IsCode(err, kernel.CodeNotFound) {
 					return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
 				}
@@ -1886,12 +1981,13 @@ func visibleAnchorNodesSQL(ctx context.Context, q postgresDBTX, principal auth.P
 			}
 			nodes[id] = struct{}{}
 		case "subgraph":
-			ok, err := canSeeSubgraphSQL(ctx, q, principal, id)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
+			var subgraphKind string
+			err := q.QueryRowContext(ctx, `SELECT kind FROM context_subgraphs WHERE project_id = $1 AND id = $2`, principal.ProjectID, id).Scan(&subgraphKind)
+			if errors.Is(err, sql.ErrNoRows) || subgraphKind != string(SubgraphKindGeneral) {
 				return nil, kernel.Error{Code: kernel.CodeNotFound, Message: "anchor not found"}
+			}
+			if err != nil {
+				return nil, mapContextPostgresError(err)
 			}
 			anchored, err := nodesInSubgraphsSQL(ctx, q, principal, []string{id})
 			if err != nil {
@@ -1934,7 +2030,7 @@ func searchNodesSQL(ctx context.Context, q postgresDBTX, principal auth.Principa
 	}
 	var out []ContextNode
 	for _, id := range ids {
-		node, err := visibleNodeSQL(ctx, q, principal, id)
+		node, err := generalVisibleNodeSQL(ctx, q, principal.ProjectID, id)
 		if kernel.IsCode(err, kernel.CodeNotFound) {
 			continue
 		}
@@ -1946,6 +2042,33 @@ func searchNodesSQL(ctx context.Context, q postgresDBTX, principal auth.Principa
 		}
 	}
 	return out, nil
+}
+
+func generalVisibleNodeSQL(ctx context.Context, q postgresDBTX, projectID kernel.ProjectID, nodeID string) (ContextNode, error) {
+	record, err := nodeRecordSQL(ctx, q, projectID, nodeID, false)
+	if err != nil {
+		return ContextNode{}, err
+	}
+	var visible []string
+	for _, subgraphID := range record.Node.SubgraphIDs {
+		var kind string
+		err := q.QueryRowContext(ctx, `SELECT kind FROM context_subgraphs WHERE project_id = $1 AND id = $2`, projectID, subgraphID).Scan(&kind)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return ContextNode{}, mapContextPostgresError(err)
+		}
+		if kind == string(SubgraphKindGeneral) {
+			visible = append(visible, subgraphID)
+		}
+	}
+	if len(record.Node.SubgraphIDs) > 0 && len(visible) == 0 {
+		return ContextNode{}, kernel.Error{Code: kernel.CodeNotFound, Message: "node not found"}
+	}
+	node := cloneNode(record.Node)
+	node.SubgraphIDs = visible
+	return node, nil
 }
 
 func filterKeywordNodes(nodes []ContextNode, keywords []string) []ContextNode {

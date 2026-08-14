@@ -1,376 +1,445 @@
-# Threadmill 两张图与三阶段 Agent：PPT 介绍底稿
+# Threadmill：面向软件研发全流程的多智能体协作基础设施
 
-状态：Draft
+> 初赛路演 PPT 逐页文案
+> 受众：初赛评委、产业方与投资人
+> 结构：14 页主线 + 2 页答辩附录
+> 核心叙事：并发边际递减 → 两张图与三阶段 → 多智能体协作、经验沉淀、可控安全、自进化
 
-用途：内部技术介绍、架构评审或产品技术沟通
+---
 
-建议时长：20 分钟
+## 使用说明（不进入 PPT）
 
-建议页数：14 页
+- 每页的“上屏文字”可直接用于 PPT；“图示建议”仅供设计排版。
+- 主线仍围绕 Coordination Graph、Context Graph 与 3-Phase Agent，不改变原方案方向。
+- 新增内容主要用于扣合“复杂任务多 Agent 自主协同—软件研发全流程协同”的初赛要求。
+- 所有性能曲线与公式均为概念模型；在完成基准测试前，不填写未经验证的提升比例。
+- 路演时先讲商业问题与系统价值，再讲技术机制，最后用现有证据、开放计划和边界建立可信度。
 
-## 1. 文档目标
+## 初赛评分扣题映射（不进入 PPT）
 
-这份文档用于解释 Threadmill 的三个核心机制：
+| 初赛关注项 | 主讲页面 | Threadmill 回答 |
+| --- | --- | --- |
+| 场景价值与行业复用 | 2、3、12、14 | 解决多 Agent 并发后的协作损耗，先落在软件研发全流程 |
+| 多 Agent 协作与自主闭环 | 4、5、6、9、12 | AgentTeams + Coordination Graph + PLAN/EXECUTE/VERIFY |
+| Skill 工程与生态复用 | 11、附录 2 | 15 个 Skill 文档、统一契约、版本与复用规划 |
+| 工程验证、安全与审计 | 6、10、13 | 状态机、最小权限、证据链、异常分支、演示与测试路径 |
+| 开放与开源贡献 | 13、附录 2 | 核心接口、Skill、适配器、评测脚本的开放计划与合规边界 |
 
-- Coordination Graph（协调图）记录任务编排与运行约束；
-- Context Graph（共享上下文图）保存可复用、可追溯的项目知识；
-- 3-Phase Agent 将每个 Task 固定为 `plan -> execute -> verify` 三个受控阶段。
+---
 
-目标听众是研发、架构师、产品技术负责人，以及需要理解多 Agent 协作边界的项目成员。听众不需要提前掌握 Threadmill 的接口细节，但应理解 Task、Agent、依赖和验收等基本概念。
+# 主线：14 页逐页文案
 
-整场介绍需要传达一个核心判断：
+## 第 1 页｜封面
 
-> 多 Agent 系统的关键不是让更多 Agent 同时工作，而是把编排事实、共享知识和阶段执行放进不同的权威边界。
+### 上屏文字
 
-## 2. 一句话模型
+**Threadmill**
 
-Threadmill 可以概括为“两张持久图、三个执行阶段、一个闭环”：
+**让每一个新增智能体增加系统能力，而不是增加协作成本**
 
-```text
-Coordination Graph 决定：做什么、何时做、被什么阻塞
-Context Graph 决定：知道什么、知识如何关联、何时收到更新
-3-Phase Agent 负责：计划、执行、独立验证
-```
+面向软件研发全流程的多 Agent 协同与知识基础设施
 
-两张图保存持久状态。Agent Invocation 是临时计算资源，可以替换、停止和恢复；Task 不属于某个 Agent Session。
+**AgentTeams × Coordination Graph × Context Graph × 3-Phase Agent**
 
-## 3. 三个机制解决三类问题
+### 图示建议
 
-传统 Agent Team 往往把三类信息混在聊天或单个 Agent 的会话里：
+以“两张图”为底座，多个 Agent 在其上协作；中央突出 Threadmill，底部保留项目名与团队信息。
 
-1. 谁依赖谁、谁可以开始、谁被阻塞；
-2. 项目已经确认了哪些事实，哪些结论已经过时；
-3. 当前 Agent 做到了哪一步，产生了哪些中间结果。
+---
 
-混在一起后，会出现三个直接问题：
+## 第 2 页｜核心痛点
 
-- 协调义务散落在消息里，无法稳定查询、恢复或审计；
-- Agent 各自保存私有记忆，项目出现多份互不一致的“事实”；
-- 产生结果的 Agent 同时负责验收，缺少独立验证边界。
+### 上屏文字
 
-Threadmill 按生命周期拆分这些信息：
+**智能体数量增加，研发产出不会线性增加**
 
-| 机制 | 保存什么 | 主要消费者 | 不保存什么 |
-| --- | --- | --- | --- |
-| Coordination Graph | Task、Phase Endpoint、依赖、Blocker、结果引用 | Task Manager、Scheduler、Runtime | Agent 的中间推理和工具轨迹 |
-| Context Graph | 有来源的 directive、fact、hypothesis，以及它们的子图关系 | 所有 Agent | 当前运行状态和未审查候选 |
-| Agent Runtime / Workspace | 当前 Invocation 的执行现场 | 当前 Phase Agent | 长期编排事实和共享知识 |
+在复杂软件研发中，Issue、日志、用户反馈、代码与测试证据分散在不同系统：
 
-## 4. 总体架构：两条链在 Phase Agent 交汇
+- Agent 各自理解任务，缺少统一分工与依赖关系
+- 上下文反复搬运，多个 Agent 重复检索、重复试错
+- 冲突、等待与返工随并发上升，局部正确不等于全局可交付
+- 结果缺少独立验证，过程经验也难以进入下一轮任务
 
-系统包含两条主链路。
+**当多智能体协作与知识共享能力不足，Agent 并发数越高，协调损耗越大；有效吞吐逐渐触顶，边际产出持续递减。**
 
-### 4.1 协调链：决定“做什么”
+### 图示建议
 
-```text
-Requirement
-  -> Task Manager 形成 Task Contract
-  -> 写入 Coordination Graph
-  -> Scheduler 选择 runnable endpoint
-  -> Runtime 创建受控 Invocation
-  -> Phase Agent 提交 PhaseOutput 或 OrchestrationProposal
-  -> Task Manager 裁决并更新图
-```
+左侧画“Agent 数量持续上升”，右侧画“有效产出先增长后趋缓”的概念曲线；中间标出重复劳动、冲突、等待和返工。
 
-这条链表达任务、依赖、阻塞、阶段契约和完成条件。Task Manager 是 Coordination Graph 的唯一写入口。Phase Agent 只能提交编排建议，不能直接拆 Task、修改依赖或宣布 Task 完成。
+---
 
-### 4.2 上下文闭环：决定“知道什么”
+## 第 3 页｜问题模型
 
-```text
-Context Slice + 当前 Task 候选缓冲
-  -> Phase Agent 读取、探索或订阅上下文
-  -> 提交 MemoryCandidate
-  -> 候选进入当前 Task 的共享缓冲
-  -> Task 权威 done 后冻结候选
-  -> Context Agent 批量审查
-  -> Context Service 原子落图
-  -> 已订阅 Invocation 收到 ContextDelta
-```
+### 上屏文字
 
-这条链负责知识复用。它不承担任务依赖：知识更新通过 `ContextDelta` 传播，因果等待通过 Coordination Edge 表达，两者不能混用。
+**规模化 Agent 系统的瓶颈，不只在模型能力**
 
-### 4.3 交汇点
+> **有效产出 ≈ Agent 并发能力 × 协作效率 × 知识复用率 × 可控系数**
 
-一次 Phase Invocation 同时受两类信息约束：
+行业正在快速提升“能同时启动多少 Agent”，但另外三个乘数仍然不足：
 
-- 协调图告诉它当前做什么、正式输入来自哪里、何时可以提交；
-- 上下文图告诉它已有事实、历史决策和可继续探索的知识边界。
+- **协作效率**：是否有统一任务图、依赖关系与动态调度
+- **知识复用率**：一次任务中的发现，能否被后续任务可靠调用
+- **可控系数**：执行是否可验证、可审计、可暂停、可回滚
 
-Phase Agent 在执行中把结果反馈给协调链，把可复用发现反馈给上下文闭环。
+Threadmill 的目标，是把并发规模转化为可持续的有效吞吐。
 
-## 5. Coordination Graph：编排的事实来源
+**拟验证指标：**任务完成率、有效吞吐、重复探索率、上下文复用率、返工与回滚率、端到端时延、Token 与工具调用成本。
 
-Coordination Graph 保存尚未完成的编排义务。它不是 Agent 的执行步骤清单，也不是聊天记录。
+### 图示建议
 
-### 5.1 核心对象
+使用一个四乘数公式和一张指标卡。页脚标注：**概念模型，最终数据以统一基准测试为准。**
 
-- `Task`：持久工作身份，由 Task Contract 约束；
-- `PhaseEndpoint`：固定为 `plan`、`execute`、`verify`；
-- `Edge`：描述上游 endpoint 对下游 endpoint 的正式交付义务；
-- `Blocker`：表示人工审批或外部条件等无法自然建模为 PhaseOutput 的门控；
-- `PhaseResult`：保存阶段正式输出的引用与判定；
-- `Generation + BindingRef`：把契约、输入、Workspace、上下文和结果绑定到同一版本。
+---
 
-### 5.2 控制由支撑层落地
+## 第 4 页｜解决方案总览
 
-Coordination Graph 本身不主动执行。控制过程由支撑层完成：
+### 上屏文字
 
-```text
-Coordination Graph
-  -> GraphRuntime 计算 runnable endpoint
-  -> Scheduler 按容量和优先级选择
-  -> Runtime 装配 BindingRef、输入、Workspace 与 Context
-  -> 启动 Phase Agent Invocation
-```
+**两张持久化图、三个受控阶段、一个持续进化闭环**
 
-图中的 `requiredBy: start` 决定启动前必须到达的输入；`requiredBy: completion` 允许上下游并行，但下游在正式提交前必须等到交付。
+**Coordination Graph｜协调图**
 
-### 5.3 受控热修改处理执行期变化
+把目标拆成可追踪的任务、角色、依赖、状态与交付关系，回答“谁在何时做什么、被什么阻塞”。
 
-真实执行会暴露规划阶段看不到的信息：缺少前置、任务需要拆分、并行应改为串行、验证失败需要重开轮次。Phase Agent 此时提交 `OrchestrationProposal`，包含建议、理由、版本与证据引用。
+**Context Graph｜共享上下文图**
 
-Task Manager 根据当前图和证据决定接受、改写或拒绝。接受后更新 Coordination Graph，Scheduler 再计算 runnable endpoint。热修改改变的是“当前编排”，变更过程仍然可审计。
+沉淀已验证的事实、决策、证据与经验，回答“哪些知识可以被哪些 Agent 可靠复用”。
 
-## 6. Shared Context Graph：共享知识的事实来源
+**3-Phase Agent｜三阶段智能体**
 
-本文中的“共享上下文图”正式名称是 Context Graph。它保存从执行证据中提炼出的知识，不保存完整 transcript，也不保存 Agent 的失败尝试和临时工具输出。
+通过 **PLAN → EXECUTE → VERIFY** 将计划、执行与验证分离，让每次交付都有边界、有证据、有复核。
 
-### 6.1 节点与子图
+**AgentTeams 提供 Agent 身份与执行生命周期基线；Threadmill 将角色编排、任务分解、上下文传递、协同执行和状态追踪映射为可审计的图与运行时。**
 
-`ContextNode` 的知识类型只有三种：
+### 图示建议
 
-- `directive`：必须、应当或期望怎样做；
-- `fact`：已经成立或经过相应验收的事实；
-- `hypothesis`：仍需证据验证的推测。
+上层为 AgentTeams 与五类 Agent，中层为三阶段流水线，下层并列 Coordination Graph 与 Context Graph；最外层用闭环箭头连接“执行—验证—沉淀—复用”。
 
-每个节点带有来源引用、创建者和状态。一个节点可以属于多个子图。子图分为：
+---
 
-- `general`：跨 Task 复用的知识，由 Context Agent 经 Context Service 管理；
-- `task`：面向稳定 Task/Endpoint 的定向投影，只能由 Task Manager 通过受控接口写入。
+## 第 5 页｜Coordination Graph：把并发变成协作
 
-### 6.2 Task Manager 与 Phase Agent 使用同一读面
+### 上屏文字
 
-Task Manager、planner、executor 和 verifier 使用同一套 Context 读接口：列表、探索、订阅和取消订阅。这样可以避免 Manager 与执行者依据不同的记忆做判断。Context Agent 可以列表和探索，并独占面向机械 Search 的受控调用路径；它不消费 Phase Invocation 的订阅生命周期。
+**从“同时运行很多 Agent”，升级为“围绕同一目标协同推进”**
 
-普通 Agent 不直接调用机械 Search。列表和探索仍无法定位信息时，它通过 `contextAgent.retrieve` 提交自然语言请求；Context Agent 将请求转成明确的关键词、范围和锚点，再由 Context Service 检索。
+Coordination Graph 统一表达：
 
-### 6.3 订阅与增量
+- **任务分解**：目标、子任务、负责人和交付标准
+- **依赖编排**：前置条件、并行关系、阻塞与等待
+- **状态追踪**：当前阶段、租约、版本和完成证据
+- **动态修正**：新证据出现后，允许提出改计划、增依赖、重开任务或暂停流程
 
-Agent 可以订阅可见子图。节点或边事务成功提交并递增 revision 后，Context Graph 的订阅执行器生成 `ContextDelta`，Runtime 将它送达仍然有效的 Invocation。
+Agent 可以发现局部变化并提出建议；Task Manager 基于全局依赖、风险与资源状态作出统一决策。
 
-Delta 只来自有效订阅，不存在订阅之外的旁路推送。Agent 收到新知识后可以调整当前判断；如果新知识证明编排已经失效，它仍需提交 `OrchestrationProposal`，不能直接修改协调图。
+**价值：减少重复劳动与隐性等待，让新增 Agent 获得明确的协作位置。**
 
-## 7. 两块记忆：Context Slice 与 Task Memory Buffer
+### 图示建议
 
-“共享上下文”需要区分两块生命周期不同的记忆。
+用一张任务 DAG：根任务拆成缺陷定位、影响分析、修复、测试和发布确认；在节点旁标注角色、状态与证据。
 
-| 记忆区 | 内容 | 可见范围 | 何时更新 | 是否触发 Delta |
-| --- | --- | --- | --- | --- |
-| Context Slice | 已落图、经过准入的上下文切片 | 当前 Invocation 按权限和订阅可见 | 图事务提交后更新 | 是 |
-| Task Memory Buffer | 当前 Task 尚未终审的候选 | 同一 Task 的 plan/execute/verify 可读 | Agent 提交候选后追加 | 否 |
+---
 
-Task Memory Buffer 是 append-only 工作记忆，不是 Context Graph 的一部分。它不能被 Search、Explore 或 Subscribe 访问，也不改变图 revision。
+## 第 6 页｜动态协同与异常分支
 
-只有 Task 达到权威 `done` 后，Task Manager 才冻结缓冲。Context Agent 随后批量判断候选应当创建、修订、替代、争议还是拒绝；Context Service 将通过审查的知识原子写入 Context Graph。
+### 上屏文字
 
-这个边界同时解决两个问题：后续阶段可以立即读到同一 Task 的发现，未经审查的内容又不会提前污染跨 Task 共享知识。
+**真实研发不会按静态计划运行，系统必须能在证据变化时重编排**
 
-## 8. 3-Phase Agent：固定阶段，不固定 Agent
+- 输入不足 → 请求补充上下文，或增加前置依赖
+- 执行失败 → 受控重试、重新分派或回到计划阶段
+- 验证失败 → 生成新一轮修复任务，而不是把失败结果写成完成
+- 高风险操作 → 进入人工审批、灰度确认或回滚路径
+- 任务已更新 → 拒绝过期结果，避免旧 Agent 覆盖新状态
+- Agent 异常退出 → 保留已提交状态与证据，进入恢复流程；完整跨进程恢复仍在补齐
 
-“3-Phase Agent”不表示一个常驻 Agent 同时拥有三种权限。准确含义是：每个 Task 固定经历 `plan -> execute -> verify` 三个阶段，每个阶段由一次受控 Agent Invocation 执行，也可以由不同模型、不同 Provider 或不同临时 Agent 承担。
+**局部 Agent 负责发现，控制平面负责全局判断；任何异常都有状态、有责任人、有下一步。**
 
-| 阶段 | 核心问题 | 主要输入 | 主要产物 | 关键限制 |
-| --- | --- | --- | --- | --- |
-| plan | 准备怎样完成 Task | Task Contract、Context、正式上游输入 | Submitted Plan、Declared Write Set、验证计划 | 默认不修改实现 |
-| execute | 按批准范围交付什么 | Approved Plan、AllowedDirs、Workspace、Context | 实现、交付物、证据、MemoryCandidate | 不静默扩 scope，不写 main |
-| verify | 交付是否满足契约 | 候选产物、Task Contract、验证计划、证据 | Verify Result、测试证据、风险与缺口 | 不修改实现让自己通过，不自我批准 |
+### 图示建议
 
-`prepared`、`done`、人工 decision 和外部 blocker 都是门控或派生状态，不是第四阶段。
+主流程使用 PLAN → EXECUTE → VERIFY；从每个阶段拉出等待、重试、重开、审批和回滚支线，再回到协调图。
 
-### 8.1 同一接口覆盖三个阶段
+---
 
-Runtime 为每次 Invocation 注入不可变执行绑定：
+## 第 7 页｜Context Graph：让团队共享同一份可信上下文
 
-- 当前 `Endpoint + Generation + BindingRef`；
-- 正式输入投影 `PhaseInputSet`；
-- 受控 Workspace；
-- `ContextSliceRef`；
-- `TaskMemoryBufferRef`；
-- 当前权限、预算、工具和路径范围。
+### 上屏文字
 
-Phase Agent 不需要读取整张 Coordination Graph，也看不到上游 Agent 的过程现场。它只消费正式输入和已注册 artifact 引用。
+**上下文不是聊天记录，而是可追踪、可授权、可复用的团队知识**
 
-### 8.2 三类结构化出站结果
+Context Graph 将分散信息组织为可引用的 Context Slice：
 
-Phase Agent 主要通过三类结果与系统交互：
+- 需求、日志、代码定位与影响范围
+- 已确认的事实、约束、接口与设计决策
+- 测试结果、验证证据、失败原因与回滚结论
+- 来源、版本、适用范围、权限和失效条件
 
-1. `PhaseOutput`：阶段交付、报告和证据；
-2. `OrchestrationProposal`：拆分、补依赖、重排、重试或重新规划建议；
-3. `MemoryCandidate`：可能跨阶段或跨 Task 复用的知识候选。
+相关 Agent 读取同一份已接受上下文，不再依赖人工复制粘贴，也不必从零重复探索。
 
-接受 `PhaseOutput` 只表示提交成功，不表示 endpoint 已满足，更不表示 Task 已完成。最终判定由授权方和 DeliveryPolicy 完成。
+**Threadmill 不把向量 RAG 设为前提：当前以 Agent Memory、共享状态和 Event/Artifact 轨迹证据构成核心；RAG 可通过 MCP 或适配器按场景接入。**
 
-## 9. 端到端示例：为 API 增加批量处理能力
+### 图示建议
 
-下面的例子用于 PPT 演示机制关系，不声明实际性能数据。
+中央是一张知识关系图，外围 Planner、Executor、Verifier 与 Context Agent 通过不同权限读取切片；每条知识带来源和证据标记。
 
-1. 用户提出“为现有 API 增加批量处理能力”。Task Manager 将它规整为 Task Contract，并创建固定的 plan、execute、verify endpoint。
-2. plan 阶段读取相关 API 规范、历史决策和当前 Task 候选缓冲，产出批准计划、修改范围和验证方案。
-3. planner 发现批量接口依赖尚未统一的幂等策略，提交 `OrchestrationProposal`。Task Manager 决定新增前置 Task，并热修改 Coordination Graph。
-4. 前置 Task 满足后，execute 阶段获得正式 PhaseOutput 引用，在批准目录内实现接口，同时把“批量请求必须复用单请求幂等键规则”提交为 MemoryCandidate。
-5. verify 阶段在独立权限边界内运行测试，检查交付、错误处理和证据。验证失败时提交重试或重排建议，不直接修改实现。
-6. DeliveryPolicy 得出 Task 权威 `done` 后，候选缓冲被冻结。Context Agent 审查候选，Context Service 将通过的知识写入 general 子图。
-7. 订阅该 API 子图的后续 Invocation 收到 ContextDelta。下一项相关工作可以复用该规则，无需读取历史聊天。
+---
 
-这个过程说明三者的分工：协调图保存责任，上下文图沉淀知识，三阶段 Agent 完成交付与独立验证。
+## 第 8 页｜经验沉淀：从任务记忆到组织资产
 
-## 10. PPT 逐页大纲
+### 上屏文字
 
-### 第 1 页：标题页
+**经验不能未经验证直接进入长期记忆**
 
-标题：**Threadmill：两张图与三阶段 Agent**
+Threadmill 设计两层记忆：
 
-副标题：让多 Agent 协作可编排、可共享、可验收
+**Task Memory｜任务工作记忆**
 
-画面：Coordination Graph、Context Graph、3-Phase Agent 三个元素汇入一个闭环。
+服务于当前任务的 PLAN、EXECUTE、VERIFY，保存临时发现、阶段输入与工作轨迹。
 
-### 第 2 页：多 Agent 并行不等于可控
+**Context Graph｜团队长期知识**
 
-核心信息：当协调义务、共享知识和执行现场混在消息里，系统更容易出现状态分叉。
+只接收经过验证、评审和定界的事实、决策与复用经验。
 
-画面：左侧为聊天、私有记忆和自我验收；右侧为两张图与三阶段边界。
+**沉淀路径：任务完成 → 候选经验冻结 → 独立评审 → 提交 Context Graph → 生成可追踪增量**
 
-### 第 3 页：Threadmill 的总体模型
+既让本轮发现立即服务当前协作，又避免错误经验污染后续任务。
 
-核心信息：五个核心节点承担编排与记忆语义，Runtime、Scheduler 和 Workspace 负责落地。
+### 图示建议
 
-画面：Task Manager、Coordination Graph、Phase Agent、Context Agent、Context Graph 五节点图。
+用上下两层漏斗：上层 Task Memory 中有大量临时信息，经过 VERIFY 与 Review 过滤后进入下层 Context Graph。
 
-### 第 4 页：两条链在 Phase Agent 交汇
+---
 
-核心信息：协调链决定“做什么”，上下文闭环决定“知道什么”。
+## 第 9 页｜Agent Identity 与 3-Phase Agent
 
-画面：蓝色协调链与绿色上下文链在 Phase Agent 汇合。
+### 上屏文字
 
-### 第 5 页：Coordination Graph 是编排事实来源
+**五类 Agent 身份，三段式交付责任**
 
-核心信息：Task、Phase Endpoint、Edge、Blocker 和 Result 共同决定 runnable 状态。
+| Agent Identity | 核心职责 |
+| --- | --- |
+| **Task Manager** | 目标拆解、角色编排、依赖决策、状态推进 |
+| **Planner** | 根因假设、影响分析、执行计划与验收标准 |
+| **Executor** | 受限工作区内修改代码、调用工具并提交交付物 |
+| **Verifier** | 独立检查测试、证据、风险与完成条件 |
+| **Context Agent** | 上下文检索、候选知识评审与长期沉淀 |
 
-画面：一组 Task 的 plan、execute、verify 节点及跨 Task 依赖。
+每个任务固定经过：
 
-### 第 6 页：协调图支持受控热修改
+**PLAN 定义怎么做 → EXECUTE 完成受控实现 → VERIFY 独立判断是否可交付**
 
-核心信息：Agent 提建议，Task Manager 做全局裁决，Scheduler 重新计算；热修改不等于无审计。
+三个阶段可由不同模型、供应商或 AgentTeams 调用承载，降低单一 Agent 自我确认和模型锁定风险。
 
-画面：发现新依赖 → Proposal → Manager 裁决 → 图 revision 更新。
+### 图示建议
 
-### 第 7 页：Context Graph 保存知识，不保存聊天
+上方列五类 Agent 身份，下方画三阶段交付门；用连线表明 Task Manager 负责调度，Context Agent 贯穿全程。
 
-核心信息：节点必须有类型、状态、来源和子图归属；Task Manager 与三类 Phase Agent 使用同一读面。
+---
 
-画面：general/task 子图、ContextNode 和来源引用。
+## 第 10 页｜可控安全：把 Agent 行为变成工程系统
 
-### 第 8 页：共享上下文包含两块记忆
+### 上屏文字
 
-核心信息：Context Slice 是已落图知识；Task Memory Buffer 是同一 Task 三阶段共享的未终审候选。
+**默认不信任过程，只信任受约束、可复核的交付**
 
-画面：两块记忆区并列，对比 revision、可见范围和 Delta 行为。
+- **阶段最小权限**：PLAN、EXECUTE、VERIFY 各自只获得必要工具和数据
+- **不可变绑定**：任务、输入、工作区、上下文与版本共同绑定，防止结果串线
+- **单一写入边界**：Agent 不直接修改协调图，由受控控制面校验后提交
+- **正式交付协议**：结果必须携带结构化输出、证据引用与完成声明
+- **审批与回滚**：高风险动作进入人工门禁，失败路径保留恢复点
+- **全程可审计**：Event、Artifact、图版本与界面投影组成证据链
 
-### 第 9 页：3-Phase 是三个受控阶段
+Skill 定义能力边界；MCP/API Adapter 以明确的输入输出、认证、错误、幂等、重试和审计契约连接外部工具。
 
-核心信息：plan、execute、verify 可以由不同 Invocation 执行，权限和产物各不相同。
+### 图示建议
 
-画面：三段横向流程，分别标注输入、权限和产物。
+画五层安全护栏：身份与权限、阶段绑定、工具契约、验证门、审计与回滚。
 
-### 第 10 页：Runtime 装配一次 Invocation
+---
 
-核心信息：Agent 只接收当前阶段的不可变绑定，不读取整张图，也不读取其他 Agent 的过程现场。
+## 第 11 页｜Skill 工程与受控自进化
 
-画面：Graph + Context + Workspace → BindingRef → Phase Agent。
+### 上屏文字
 
-### 第 11 页：Agent 只提交结构化结果
+**让能力可安装、可评测、可复用，让经验在验证后进入下一轮**
 
-核心信息：`PhaseOutput` 回报交付，`OrchestrationProposal` 回报编排意图，`MemoryCandidate` 回报知识候选。
+Threadmill 当前围绕协作闭环组织 15 个 Skill：
 
-画面：Phase Agent 向三个受控出口分流。
+- **交付类**：Planning Delivery、Execution Delivery、Verification Delivery
+- **运行与控制类**：Phase Runtime、Phase Submit、Coordination Control、Orchestration Escalation
+- **上下文类**：Context Navigation、Retrieval、Subscription、Task Memory
+- **治理类**：Candidate Review、Task Context Lifecycle、General Context Curation
 
-### 第 12 页：一个 Task 的完整闭环
+对外发布时，每个 Skill 统一明确：名称、用途、输入输出、调用条件、依赖工具、失败处理、安全边界、验证方式、版本与复用范围。
 
-核心信息：用“API 批量处理能力”案例串起建图、计划、依赖发现、执行、验证、候选审查和 Delta。
+**自进化闭环：执行任务 → 产生候选经验 → 独立验证与评审 → 写入 Context Graph / 更新 Skill → 后续 Agent 按新版本调用**
 
-画面：端到端时间线；避免再画一张完整架构图。
+这是受控进化，不是让 Agent 自行改写规则。
 
-### 第 13 页：五条关键边界
+### 图示建议
 
-核心信息：
+左侧为四组 Skill 卡片，右侧为“任务—候选—评审—发布—复用”版本闭环；在评审节点加安全闸门。
 
-1. Task Manager 是 Coordination Graph 唯一写入口；
-2. Phase Agent 不直接写任一图；
-3. 不存在 Agent mailbox；
-4. Agent 是临时计算资源，Task 身份独立；
-5. `verify passed` 与 `Task done` 是不同判定。
+---
 
-画面：用“允许 / 禁止”关系图突出边界。
+## 第 12 页｜软件研发全流程场景
 
-### 第 14 页：收束
+### 上屏文字
 
-标题：**可靠的 Multi-Agent 系统不是群聊，而是一个可恢复的控制闭环**
+**一次跨模块缺陷修复，如何让整个研发系统更聪明**
 
-核心信息：
+**输入汇聚**
 
-- Coordination Graph 管责任；
-- Context Graph 管知识；
-- 3-Phase Agent 管交付与独立验证。
+Issue、运行日志、用户反馈、相关代码、历史变更与已有测试。
 
-画面：回到第一页的三元素闭环，并增加“可替换、可恢复、可审计、可复用”四个结果词。
+**多 Agent 协同闭环**
 
-## 11. 视觉与讲解规范
+1. Context Agent 聚合、去重并形成可信输入
+2. Planner 完成根因分析、影响范围和依赖计划
+3. Task Manager 将工作拆成可并行、可验证的任务图
+4. Executor 在受控工作区完成修改并提交补丁与证据
+5. Verifier 执行测试、检查回归风险并给出通过或重开结论
+6. 合并与发布确认后，Context Agent 沉淀复盘、失败模式与可复用 Skill
 
-### 11.1 视觉语义
+**最终交付：代码补丁 + 测试证据 + 合并/发布结论 + 可复用知识与能力**
 
-- 蓝色：协调、依赖与控制；
-- 绿色：上下文、知识与订阅；
-- 橙色：Blocker、Proposal、失效和重试；
-- 实线箭头：正式控制或交付；
-- 虚线箭头：Context 读取、订阅或 Delta；
-- 圆角矩形：Agent 或服务；
-- 圆柱或图形容器：持久图；
-- 小标签：revision、BindingRef、artifact reference。
+初赛演示优先覆盖“输入—分析—修复—测试—合并后验证”；灰度发布与生产确认作为后续工程化扩展。
 
-### 11.2 讲解用词
+### 图示建议
 
-推荐使用：
+使用一条端到端研发流水线，在线路上标出五类 Agent、两张图、三阶段以及最终证据包。
 
-- “协调图记录编排事实”；
-- “上下文图保存经过准入的共享知识”；
-- “Agent 是一次受控 Invocation”；
-- “Phase Agent 提交建议，Task Manager 裁决”；
-- “候选缓冲是 Task 工作记忆，不是 Context Graph”。
+---
 
-避免使用：
+## 第 13 页｜当前进展、初赛证据与下一步
 
-- “协调图主动启动 Agent”——实际由 GraphRuntime、Scheduler 和 Runtime 落地；
-- “Context Agent 主动推送知识”——实际由订阅执行器生成 Delta；
-- “三个 Agent 依次交接”——阶段可以由不同 Agent 承担，但交接依靠正式输入和共享 Workspace/Context，不依赖 Agent 直接通信；
-- “verify 完成就是 Task done”——最终完成还受 DeliveryPolicy、合并和其他条件约束；
-- “MemoryCandidate 已经写入知识图”——候选先进入 Task 缓冲，Task done 后才审查落图。
+### 上屏文字
 
-## 12. 建议开场与收尾
+**不是停留在概念图：核心闭环已具备代码、界面和测试路径**
 
-开场：
+**当前仓库已包含**
 
-> 多 Agent 的难点不是让更多 Agent 同时工作，而是让它们共享同一套责任边界、事实来源和验收标准。
+- Coordination Graph、Context Graph 与固定三阶段运行模型
+- 5 类 Agent 身份提示与 15 个 Skill 文档
+- AgentTeams Phase Host / Adapter 集成路径
+- OpenAPI、SSE 与本地 GUI 演示链路
+- 单元、集成、端到端测试目录及设计—代码—测试追踪文档
 
-收尾：
+**初赛展示证据**
 
-> Coordination Graph 让系统知道谁应该做什么，Context Graph 让 Agent 知道哪些知识值得复用，3-Phase Agent 让每个 Task 从计划走到独立验证。
+- GUI 中的任务拆分、状态推进与上下文隔离
+- Hold / Stop / Resume 与新一代任务状态
+- PLAN / EXECUTE / VERIFY 的输入、交付和证据引用
+- 测试输出、Event / Artifact 记录与可复现演示脚本
 
-## 13. 参考文档
+**下一阶段**
 
-- [Threadmill 总体架构](./architecture.md)
-- [统一设计](./threadmill-unified-design.md)
-- [Coordination Graph Module](./coordination-graph.md)
-- [Context Graph 节点创建与关系模型](./context-graph.md)
-- [Phase Agent Interface](./phase-agent.md)
-- [Task Manager Agent](./task-manager-agent.md)
-- [设计理由](./design-rationale.md)
+真实软件缺陷样例、真实 AgentTeams 凭据冒烟、PostgreSQL / MinIO 生产适配、完整崩溃恢复、Trace / Metrics 与并发基准测试。
+
+### 图示建议
+
+左侧展示当前能力栈，中央放三张真实截图或日志证据，右侧放下一阶段路线图。不要用无法复现的概念截图替代证据。
+
+---
+
+## 第 14 页｜结尾
+
+### 上屏文字
+
+**模型能力可以买到，组织级智能必须在协作中积累**
+
+Threadmill 让复杂软件研发中的多 Agent 系统获得四种关键能力：
+
+- **多智能体协作**：用协调图承载分工、依赖与动态调度
+- **经验沉淀**：用共享上下文图把验证后的发现变成团队资产
+- **可控安全**：用三阶段、最小权限、证据链和回滚控制风险
+- **受控自进化**：让知识与 Skill 在评审和版本治理下持续升级
+
+**Threadmill 正在构建多 Agent 软件研发的协作与知识基础设施。**
+
+**让 Agent 越多，系统越强；让每次任务完成，都成为下一次任务的起点。**
+
+### 图示建议
+
+四个关键词环绕 Threadmill 核心标识，背景延续两张图汇聚成一条向上的能力曲线。
+
+---
+
+# 答辩附录
+
+## 附录 1｜AgentTeams 设计基线映射
+
+### 上屏文字
+
+**Threadmill 如何落实 AgentTeams 的多 Agent 协同要求**
+
+| 评审要求 | AgentTeams / Threadmill 映射 |
+| --- | --- |
+| Agent Identity 与生命周期 | AgentTeams 承载 Worker、Task Flow 与阶段调用；Threadmill 定义五类 Agent 身份 |
+| 角色编排与任务分解 | Task Manager + Coordination Graph 的任务、依赖、责任与状态 |
+| 上下文传递 | Binding、Phase Input、Context Slice 与 Task Memory 引用 |
+| 协同执行 | AgentTeams Phase Host / Adapter + Start、Stop、Resume 等阶段命令 |
+| 状态追踪与结果验证 | 图版本、PLAN/EXECUTE/VERIFY 状态、Verifier 结论与证据引用 |
+| 工具与能力复用 | Skill 契约 + MCP/API Adapter，明确权限、错误、审计与替换边界 |
+| 经验沉淀 | 候选冻结、独立评审、Context Graph 提交与版本增量 |
+
+**AgentTeams 负责“Agent 如何被组织和运行”，Threadmill 补足“协作状态、共享知识和验证证据如何长期治理”。**
+
+---
+
+## 附录 2｜开放复用与合规边界
+
+### 上屏文字
+
+**开放的不是一份演示代码，而是一套可复用的协作契约**
+
+**计划开放与复用**
+
+- 核心 Skill 定义、输入输出 Schema 与质量评测方法
+- Coordination / Context Graph 接口与事件模型
+- AgentTeams Adapter 示例、最小演示和评测脚本
+- 本地部署、故障恢复、迁移与二次开发文档
+
+**提交前必须明确**
+
+- 根项目许可证及第三方 AgentTeams 等依赖的许可证与授权边界
+- 商业 API、闭源模型、外部工具与可替换实现
+- 演示数据的来源、授权、脱敏与留存策略
+- Skill 的版本发布、质量门禁、回滚与维护责任
+- 可复现环境、部署步骤、已知限制和后续维护计划
+
+**当前不因代码仓库可访问就直接宣称“已完整开源”；以许可证、依赖披露和可复现交付为准。**
+
+---
+
+# 初赛报名简介（500 字内）
+
+**项目名称：Threadmill 多智能体协作与知识基础设施**
+
+复杂软件研发正在从单 Agent 自动化走向多 Agent 并发，但现有系统普遍缺少统一任务编排、可信上下文共享、独立结果验证与经验治理。随着 Agent 数量增加，重复检索、状态冲突、等待返工和知识失忆同步增长，导致有效吞吐出现边际递减。Threadmill 以 AgentTeams 为多 Agent 设计与执行基线，通过 Coordination Graph 管理任务、角色、依赖与状态，通过 Context Graph 沉淀已验证的事实、证据与经验，并以 PLAN、EXECUTE、VERIFY 三阶段分离计划、执行和验证责任。系统进一步通过 Skill 契约、最小权限、不可变绑定、事件与制品证据链、审批和回滚机制，实现多智能体协作、经验沉淀、可控安全与受控自进化。项目已形成核心图模型、五类 Agent 身份、十五个 Skill 文档、AgentTeams 适配路径、OpenAPI/SSE GUI 及多层测试与追踪材料；后续将补齐真实研发任务基准、生产存储、完整恢复、可观测性与开放许可，沉淀可复用的多 Agent 软件研发基础设施。
+
+---
+
+# 提交前检查清单（不进入 PPT）
+
+- [ ] 将上述报名简介压缩到赛事平台实际字符限制内，并逐字核对项目名称
+- [ ] PPT/PDF 展示角色、任务分解、协作流、上下文传递、结果验证与异常分支
+- [ ] 至少提供一条可复现的软件研发端到端演示，不只展示概念图
+- [ ] 准备 GUI 截图、日志、Trace/Event、Artifact、测试报告或演示视频等证据
+- [ ] 为至少一个核心 Skill 提供完整样例：输入、输出、触发条件、工具、失败处理、安全与复用
+- [ ] 明确 AgentTeams 的实际调用入口、配置、依赖、运行命令和结果证据
+- [ ] 将概念指标与实测指标分开，禁止填写未经验证的性能提升
+- [ ] 补齐根项目许可证、第三方依赖、模型/API、数据授权和开源边界说明
+
+# 内容依据
+
+- 赛事材料：《GOAI 新智基座 Agent Infra 赛道手册》（用户提供 PDF）
+- 项目总览：[README](../README.md)
+- 演示路径：[demo.md](demo.md)
+- 设计—代码—测试映射：[traceability.md](traceability.md)
+- 架构说明：[architecture.md](architecture.md)
+- 设计取舍：[design-rationale.md](design-rationale.md)
+- Agent Skill 清单：[agent-skills](agent-skills/)
+
+> 数据声明：本文中的“并发边际递减”曲线与有效产出公式用于表达待验证的问题模型，不代表已完成的性能结论。最终对外数据应来自统一任务集、固定模型与工具条件下的可复现实验。

@@ -11,11 +11,11 @@
 
 《统一设计》的核心规则：
 
-1. 同一 Task 轮次的 plan、execute、verify 默认共享同一个 Workspace Binding（§4.1）。
+1. 同一 Task 轮次的 plan、execute 默认共享一个 Workspace Binding；`code_merge` 的 verify 使用从 merged revision 创建的下一代只读 Binding（§4.1）。
 2. Workspace 实现形式可替换：Git 仓库（`git worktree + branch`，默认）、独立 clone/目录、容器加持久 volume、远程 sandbox；上层契约相同（稳定 Workspace ID、固定基线、允许写范围、可观测变更、阶段间持久、轮次间隔离）（§4.1）。
 3. 权限随 phase lease 切换：plan 默认只读源码，execute 可写批准范围，verify 默认不可修改候选实现；任何阶段只有一个有效写 lease（§4.3）。
-4. `verify passed` 只获得进入 Merge Queue 的资格；Merge Queue 是 main 的唯一写入口，在 latest main 上机械检查、targeted verify、串行合并（§8.2）。
-5. 冲突或复验失败产生 evidence，由 Task Manager 将受影响阶段编排回 plan/execute/verify 或 waiting_human（§8.2、§8.3）。
+4. `execute satisfied` 使代码候选进入 Merge Queue；Merge Queue 是 main 的唯一写入口，在 latest main 上机械检查、必要时解冲突并串行合入（§8.2）。
+5. 合入后普通 Verify 在 merged revision 上验收；冲突或验收失败产生 evidence 与 proposal，由 Task Manager 编排恢复（§8.2、§8.3）。
 
 **AgentTeams 基座现实（先讲清楚，避免虚构现成能力）：**
 
@@ -97,13 +97,13 @@ shared/tasks/{task_id}/{workspace_ref}/
 
 ### 3.3 phase lease
 
-语义：任一时刻一个轮次只有一个有效写 lease；plan 默认只读源码（可写 `plan/` 产物），execute 可写批准范围（`workspace/`），verify 默认只读实现（可写 `evidence/`）。**AgentTeams 没有 phase lease 概念**，Threadmill 用三层 enforcement：
+语义：任一时刻一个轮次只有一个有效写 lease；plan 默认只读源码（可写 `plan/` 产物），execute 可写批准范围（`workspace/`），verify 默认只读实现（可写 Invocation 临时 `evidence/`，但跨 Phase 必须注册 ArtifactRef，且不进入候选代码 revision）。**AgentTeams 没有 phase lease 概念**，Threadmill 用三层 enforcement：
 
 ```text
 a) 委派轮次隔离（强）：每 phase 一次 taskflow 委派给不同 worker / 每 phase 一个 WorkerFlow 临时 agent
    -> 容器或进程级隔离，天然满足"一个写 lease"；
 b) 工具级（中）：MCP allow policy（QwenPaw MCP Policy API）+ 目录 ACL（AccessEntries）+ AllowedDirs
-   -> plan 只授只读工具与 plan/ 写权；execute 授 workspace/ 写权；verify 只授检查工具与 evidence/ 写权；
+   -> plan 只授只读工具与 plan/ 写权；execute 授批准代码路径写权；verify 只授检查工具与临时 evidence/ 写权，Runtime 不把该目录 checkpoint 到候选代码；
 c) 提示词级（弱，兜底）：phase prompt 声明只读/只写边界。
 ```
 
@@ -124,7 +124,7 @@ lease 记录在 `WorkspaceBinding.PhaseLeases`；Task Manager 通过图激活或
 沿用统一设计的 Declared / Observed 二分（WriteSet 字段：files / modules / symbols / contracts / tests / owners）：
 
 - **Declared Write Set**：plan 阶段产出（`plan/declared-writes.json`），Task Manager 校验合理性后随 execute 委派下发。
-- **Observed Write Set**：Threadmill Runtime 观察器（新建）从三处交叉核对：`workspace/` 目录快照 diff、git diff（若为 git workspace）、`submit_task` deliverables 清单。agent 自报只能作参考。
+- **Observed Write Set**：Threadmill Runtime 观察器（新建）从三处交叉核对 execute 候选代码：批准路径目录快照 diff、受限路径 git diff（若为 git workspace）、`submit_task` deliverables 清单。`plan/` 与 `evidence/` 是阶段产物载体，不进入候选写集；agent 自报只能作参考。
 - **校验规则**（统一设计 §8.1）：
 
 ```text
@@ -140,21 +140,22 @@ lease 记录在 `WorkspaceBinding.PhaseLeases`；Task Manager 通过图激活或
 
 ### 4.1 语义与边界
 
-- `verify passed`（check_task `effective=true` + Threadmill verifier 语义判断 + evidence）→ MergeCandidate 资格（统一设计 §8.2）。
+- `execute satisfied` + 受控 diff/evidence → MergeCandidate 资格（统一设计 §8.2）。
 - Merge Queue 是 main 的唯一写入口（Threadmill 新建 Go 服务；"main"指 Threadmill 管理的目标仓库或目标目录，不是 AgentTeams 概念）。
-- Merge Queue 不修冲突、不重写 Coordination Graph、不直接写 Context Graph。
+- Merge Queue 不直接写 Coordination Graph / Context Graph；有冲突时只把受限冲突现场交给 Targeted Verifier 或产出失败 evidence。
 
 流程（统一设计 §8.2）：
 
 ```text
-Verify passed on round Workspace
+Execute satisfied on round Workspace
   -> MergeCandidate
   -> 临时 merge-check workspace（Threadmill git worktree / clone 新建）
-  -> latest main 上机械应用检查（文件冲突 / 权限边界 / 写集合重叠 / main drift）
-  -> targeted verify on latest main + candidate（复用 AgentTeams 执行基础设施：委派或临时 agent）
+  -> latest main 上机械应用检查（权限边界 / 写集合重叠 / main drift / 文件冲突）
+  -> 仅真实冲突时 targeted verifier 在受限路径解冲突
   -> 串行合入 main
   -> merge event + commit/diff/test evidence（Event Log 投影 + Artifact Store）
-  -> Task Manager 计算 done
+  -> 从 merged revision 创建 verify workspace
+  -> 普通 Verify 验收；失败则提案给 Manager，通过后计算 done
 ```
 
 ### 4.2 与 AgentTeams 的接口
@@ -174,19 +175,19 @@ Verify passed on round Workspace
 
 ```text
 MergeCandidate: queued
-  -> merge_check      （latest main 机械应用；失败 -> failed(conflict|permission|main_drift)）
-  -> targeted_verify  （latest main + candidate；失败 -> failed(verify_failed)）
+  -> merge_check      （latest main 机械应用；权限失败 -> failed(permission)）
+  -> targeted_verify  （仅冲突现场；失败 -> failed(verify_failed|conflict_unresolved|reorchestration_requested)）
   -> merged           （串行合入 main，产生 merge event）
   -> failed           （evidence 交 Task Manager 编排回 plan/execute/verify 或 waiting_human）
 ```
 
-任何失败都不在 Merge Queue 内修代码；重试必须重新经过 plan → execute → verify。
+冲突处理使用用户最新覆盖规则：Targeted Verifier 可以在 Runtime 注入的精确 `allowed_write_paths` / `conflict_paths` 内用原生文件搜索、读写和 shell 解冲突；不得 commit/push，不得写 Coordination Graph / Context Graph。若解冲突会破坏 Task Contract、验收条件或使任务不可完成，Verifier 必须通过 `agent.proposeOrchestration` 向 Manager 申请重新编排。该提案后当前候选失败；Manager 只能在可信 targeted boundary 上用单次 `reopen_round` 原子重开 execute+verify，并以 Verifier 观察到的 latest-main 为新 Workspace 基线。普通 proposal 不得重开已终态节点。
 
 ### 4.4 并发与冲突语义（统一设计 §8.3）
 
-- 已通过 verify 并进入队列的 candidate 优先尝试合入；candidate 必须在 latest main 上仍可应用并通过 targeted verify。
-- 后合入 Task 的旧验证因相关 main revision 改变而失效。
-- write set 重叠是风险信号，真正 gate 是机械冲突与 targeted verify。
+- 已满足 execute 并进入队列的 candidate 优先尝试合入；candidate 必须在 latest main 上仍可机械应用，只有真实冲突交给 targeted verifier。
+- 每个后合入 Task 都在自己的 merged revision 上启动普通 Verify，不复用合入前判断。
+- write set 重叠是风险信号；合入 gate 是权限与机械冲突，业务 gate 是 post-merge Verify。
 - 合并后的新事实经 Event Log 投影进入 Context Graph，并推送给订阅相关子图的 active Agent（订阅推送自动执行，见 agent-runtime.md §6.1）。
 
 ---
@@ -199,7 +200,7 @@ MergeCandidate: queued
 4. 隔离叠加：Pod 隔离（每 worker 一 Pod）+ 存储 ACL（AccessEntries scoped `agents/<name>/*`、`shared/*`）+ AllowedDirs + MCP allow policy + phase lease。
 5. worker 无状态：任何 Pod 重建后从 MinIO 恢复轮次现场；轮次身份与 Workspace 记录在 Threadmill 侧，不随容器丢失。
 6. 敏感路径（credentials/、sessions/、logs/、tool results/）在任何同步、观察与合并检查中排除（sync.py / worker-file-sync.sh 排除清单直接复用）。
-7. 冲突视为 verify gate 不通过，必须回到 plan → execute → verify 或等待人工决定；Merge Queue 不修冲突。
+7. 冲突先交给 Targeted Verifier 在受限路径内处理；无法在不破坏 Contract/验收的前提下处理时，Verifier 用 `agent.proposeOrchestration` 申请 Manager 重新编排，候选失败。
 8. 所有 merge、冲突、失败、权限违规都必须有事件记录与 evidence refs（Threadmill Event Log 投影 + Artifact Store）。
 9. AgentTeams 的 meta.json / result.md 不承载 Threadmill 的图状态；Merge Queue 状态只存 Threadmill 侧。
 

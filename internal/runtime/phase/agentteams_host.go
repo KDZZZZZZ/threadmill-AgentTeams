@@ -25,6 +25,16 @@ const (
 
 type PreparedInvocationWriter interface {
 	SavePreparedInvocation(context.Context, string, adapter.PreparedInvocation) error
+	LoadPreparedInvocation(context.Context, string) (adapter.PreparedInvocation, error)
+}
+
+// AgentTeamsPhaseAdapter is the Phase-only provider seam. FenceExecution is
+// intentionally absent from the generic AgentTeams dispatcher used by Task
+// Manager and Context Agent invocations.
+type AgentTeamsPhaseAdapter interface {
+	adapter.AgentTeamsHostAdapter
+	FenceExecution(context.Context, adapter.AgentTeamsExecutionRef) error
+	SyncExecutionWorkspace(context.Context, adapter.AgentTeamsExecutionRef) (adapter.ExecutionWorkspaceCheckpoint, error)
 }
 
 type AgentTeamsPhaseHostState struct {
@@ -40,14 +50,14 @@ type AgentTeamsPhaseHostStateStore interface {
 }
 
 type AgentTeamsPhaseHostConfig struct {
-	Adapter adapter.AgentTeamsHostAdapter
+	Adapter AgentTeamsPhaseAdapter
 	Writer  PreparedInvocationWriter
 	State   AgentTeamsPhaseHostStateStore
 	RoomID  string
 }
 
 type AgentTeamsPhaseHost struct {
-	adapter adapter.AgentTeamsHostAdapter
+	adapter AgentTeamsPhaseAdapter
 	writer  PreparedInvocationWriter
 	state   AgentTeamsPhaseHostStateStore
 	roomID  string
@@ -82,6 +92,9 @@ func (h *AgentTeamsPhaseHost) Suspend(ctx context.Context, invocationID kernel.I
 	if err != nil {
 		return err
 	}
+	if _, err := h.adapter.SyncExecutionWorkspace(ctx, state.Execution); err != nil {
+		return err
+	}
 	state.TerminationMode = adapter.TerminateReleaseWait
 	if err := h.state.SaveAgentTeamsPhaseHostState(ctx, state); err != nil {
 		return err
@@ -94,6 +107,10 @@ func (h *AgentTeamsPhaseHost) Stop(ctx context.Context, req StopRequest) (StopRe
 	if err != nil {
 		return StopResult{}, err
 	}
+	checkpoint, err := h.adapter.SyncExecutionWorkspace(ctx, state.Execution)
+	if err != nil {
+		return StopResult{}, err
+	}
 	state.TerminationMode = adapter.TerminateRecoverableStop
 	if err := h.state.SaveAgentTeamsPhaseHostState(ctx, state); err != nil {
 		return StopResult{}, err
@@ -101,7 +118,17 @@ func (h *AgentTeamsPhaseHost) Stop(ctx context.Context, req StopRequest) (StopRe
 	if err := h.adapter.Terminate(ctx, state.Execution, string(adapter.TerminateRecoverableStop)); err != nil {
 		return StopResult{}, err
 	}
-	return h.stopEvidence(req, state), nil
+	return h.stopEvidence(req, state, checkpoint), nil
+}
+
+// SyncWorkspace is used by the internal Phase Runtime immediately before it
+// asks Controller to refresh the authoritative binding and route output.
+func (h *AgentTeamsPhaseHost) SyncWorkspace(ctx context.Context, invocationID kernel.InvocationID) (adapter.ExecutionWorkspaceCheckpoint, error) {
+	state, err := h.executionState(ctx, invocationID)
+	if err != nil {
+		return adapter.ExecutionWorkspaceCheckpoint{}, err
+	}
+	return h.adapter.SyncExecutionWorkspace(ctx, state.Execution)
 }
 
 func (h *AgentTeamsPhaseHost) Revoke(ctx context.Context, invocationID kernel.InvocationID) error {
@@ -120,11 +147,36 @@ func (h *AgentTeamsPhaseHost) Revoke(ctx context.Context, invocationID kernel.In
 	return h.adapter.Terminate(ctx, state.Execution, string(mode))
 }
 
+// Fence ends only the invocation's Threadmill authority. Production cleanup
+// performs destructive MCP deletion and host-slot release after the provider
+// has received this call's response and submitted its terminal result.
+func (h *AgentTeamsPhaseHost) Fence(ctx context.Context, invocationID kernel.InvocationID) error {
+	state, err := h.executionState(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	return h.adapter.FenceExecution(ctx, state.Execution)
+}
+
 func (h *AgentTeamsPhaseHost) dispatch(ctx context.Context, req DispatchRequest, rehydrate bool) error {
 	if err := validateAgentTeamsDispatch(req); err != nil {
 		return err
 	}
-	invocationRef, err := agentTeamsInvocationRef(req)
+	if !rehydrate {
+		if current, ok, err := h.state.LoadAgentTeamsPhaseHostState(ctx, req.Invocation.ID); err != nil {
+			return err
+		} else if ok && current.TerminationMode == "" {
+			execution, err := h.adapter.Dispatch(ctx, current.InvocationRef)
+			if err != nil {
+				return err
+			}
+			if execution != current.Execution {
+				return kernel.IdempotencyConflict()
+			}
+			return nil
+		}
+	}
+	invocationRef, err := agentTeamsInvocationRef(req, rehydrate)
 	if err != nil {
 		return err
 	}
@@ -132,7 +184,15 @@ func (h *AgentTeamsPhaseHost) dispatch(ctx context.Context, req DispatchRequest,
 	if err != nil {
 		return err
 	}
-	if err := h.writer.SavePreparedInvocation(ctx, invocationRef, prepared); err != nil {
+	if !rehydrate {
+		if persisted, loadErr := h.writer.LoadPreparedInvocation(ctx, invocationRef); loadErr == nil {
+			prepared = persisted
+		} else if !kernel.IsCode(loadErr, kernel.CodeNotFound) {
+			return loadErr
+		} else if err := h.writer.SavePreparedInvocation(ctx, invocationRef, prepared); err != nil {
+			return err
+		}
+	} else if err := h.writer.SavePreparedInvocation(ctx, invocationRef, prepared); err != nil {
 		return err
 	}
 	execution, err := h.adapter.Dispatch(ctx, invocationRef)
@@ -183,18 +243,22 @@ func (h *AgentTeamsPhaseHost) preparedInvocation(req DispatchRequest, invocation
 	}, nil
 }
 
-func (h *AgentTeamsPhaseHost) stopEvidence(req StopRequest, state AgentTeamsPhaseHostState) StopResult {
-	if req.Binding.NonResumable || strings.TrimSpace(req.Binding.WorkspaceRevision) == "" {
+func (h *AgentTeamsPhaseHost) stopEvidence(req StopRequest, state AgentTeamsPhaseHostState, checkpoint adapter.ExecutionWorkspaceCheckpoint) StopResult {
+	workspaceRevision := strings.TrimSpace(checkpoint.WorkspaceRevision)
+	if workspaceRevision == "" {
+		workspaceRevision = strings.TrimSpace(req.Binding.WorkspaceRevision)
+	}
+	if req.Binding.NonResumable || workspaceRevision == "" {
 		return StopResult{NonResumable: true}
 	}
 	checkpointRef := strings.TrimSpace(req.Binding.CheckpointRef)
 	if checkpointRef == "" {
-		checkpointRef = deterministicWorkspaceCheckpointRef(req.Invocation.ID, req.Binding.WorkspaceRevision)
+		checkpointRef = deterministicWorkspaceCheckpointRef(req.Invocation.ID, workspaceRevision)
 	}
 	return StopResult{
 		ResumeStateRef:    deterministicResumeStateRef(req.Invocation.ID, state.Execution.AgentTeamsTaskID, checkpointRef),
 		CheckpointRef:     checkpointRef,
-		WorkspaceRevision: req.Binding.WorkspaceRevision,
+		WorkspaceRevision: workspaceRevision,
 	}
 }
 
@@ -273,7 +337,11 @@ func requiredAgentTeamsCapabilities(capability auth.Capability) []string {
 	return nil
 }
 
-func agentTeamsInvocationRef(req DispatchRequest) (string, error) {
+func agentTeamsInvocationRef(req DispatchRequest, rehydrate bool) (string, error) {
+	if !rehydrate {
+		sum := sha256.Sum256([]byte(req.Invocation.ID))
+		return agentTeamsInvocationRefPrefix + string(req.Invocation.ID) + "/" + hex.EncodeToString(sum[:16]), nil
+	}
 	spec, err := agentTeamsPhaseSpec(req)
 	if err != nil {
 		return "", err
@@ -398,16 +466,19 @@ func (s *PostgresAgentTeamsPhaseHostStore) SavePreparedInvocation(ctx context.Co
 	if err != nil {
 		return kernel.InvalidArgument("prepared required capabilities cannot be encoded")
 	}
-	// A recoverable pre-dispatch retry may re-render Context after the previous
-	// attempt was cleaned up. Until host state exists, only the newest prepared
-	// envelope is reachable; retaining every failed envelope creates unbounded
-	// rows for one deterministic Invocation.
+	// A recoverable pre-dispatch retry may re-render Context. Keep the envelope
+	// referenced by the current host state plus the newest candidate, but prune
+	// every older failed candidate so a recovery loop cannot grow this table
+	// without bound.
 	if _, err := s.db.ExecContext(ctx, `
 DELETE FROM phase_agentteams_prepared_invocations p
 WHERE p.invocation_id = $1
   AND p.invocation_ref <> $2
   AND NOT EXISTS (
-    SELECT 1 FROM phase_agentteams_host_states h WHERE h.invocation_id = $1
+    SELECT 1
+    FROM phase_agentteams_host_states h
+    WHERE h.invocation_id = $1
+      AND h.invocation_ref = p.invocation_ref
   )`, prepared.InvocationID, ref); err != nil {
 		return err
 	}

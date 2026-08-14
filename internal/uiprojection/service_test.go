@@ -210,6 +210,38 @@ func TestInspectEndpointNeverFabricatesInvocationForUnrunEndpoint(t *testing.T) 
 	}
 }
 
+func TestContextSnapshotUsesProjectACLAndContextGraphReader(t *testing.T) {
+	t.Parallel()
+	projectID := kernel.ProjectID("project-1")
+	contextSnapshot := contextgraph.ContextGraphSnapshot{
+		ProjectID: projectID,
+		Revision:  9,
+		Nodes: []contextgraph.ContextSnapshotNode{{
+			NodeID: "node-1", Kind: "fact", Statement: "hot fact", Status: "accepted",
+			SourceRefs: []string{"artifact-1"}, SubgraphIDs: []string{"general-a"}, UsageCount: 3,
+		}},
+		Edges: []contextgraph.ContextSnapshotEdge{{FromRef: "subgraph:general-a", ToNodeID: "node-1", Kind: "derives_from_subgraph"}},
+	}
+	reader := fakeContextReader{contextSnapshot: contextSnapshot}
+	service := NewService(fakeCapacityReader{}, fakeGraphReader{}, fakeInvocationReader{}, reader, fakeCursorReader{}, &fakePermissions{project: true})
+
+	got, err := service.ContextSnapshot(context.Background(), operator(projectID), projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revision != 9 || len(got.Nodes) != 1 || got.Nodes[0].UsageCount != 3 || len(got.Edges) != 1 {
+		t.Fatalf("context snapshot = %#v", got)
+	}
+	if reader.snapshotProject != "" {
+		t.Fatal("value receiver should not mutate caller copy")
+	}
+
+	_, err = service.ContextSnapshot(context.Background(), operator("other-project"), projectID)
+	if !kernel.IsCode(err, kernel.CodeForbidden) {
+		t.Fatalf("cross-project err = %v, want forbidden", err)
+	}
+}
+
 func TestProjectionRejectsCrossProjectOperator(t *testing.T) {
 	t.Parallel()
 	service := NewService(fakeCapacityReader{}, fakeGraphReader{}, fakeInvocationReader{}, fakeContextReader{}, fakeCursorReader{}, &fakePermissions{project: true})
@@ -240,10 +272,19 @@ func (f fakeInvocationReader) ListInvocations(context.Context, InvocationFilter)
 	return append([]runtime.Invocation(nil), f.items...), nil
 }
 
-type fakeContextReader struct{ inspection ContextInspection }
+type fakeContextReader struct {
+	inspection      ContextInspection
+	contextSnapshot contextgraph.ContextGraphSnapshot
+	snapshotProject kernel.ProjectID
+}
 
 func (f fakeContextReader) InspectInvocation(context.Context, auth.Principal, runtime.Invocation) (ContextInspection, error) {
 	return f.inspection, nil
+}
+
+func (f fakeContextReader) ProjectContextSnapshot(_ context.Context, projectID kernel.ProjectID) (contextgraph.ContextGraphSnapshot, error) {
+	f.snapshotProject = projectID
+	return f.contextSnapshot, nil
 }
 
 type fakeCursorReader struct{ cursor string }

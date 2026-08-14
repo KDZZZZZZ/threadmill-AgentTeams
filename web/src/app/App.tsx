@@ -13,11 +13,15 @@ import {
   RefreshCw,
   Workflow,
 } from "lucide-react";
-import { getCoordinationSnapshot } from "../api/client";
+import {
+  getContextGraphSnapshot,
+  getCoordinationSnapshot,
+} from "../api/client";
 import { openEventStream } from "../api/events";
-import type { EndpointRef, UiEvent } from "../api/types";
+import type { ContextGraphSnapshot, EndpointRef, UiEvent } from "../api/types";
 import { CapacityStrip } from "../features/capacity/CapacityStrip";
 import { CoordinationWorkspace } from "../features/coordination/CoordinationWorkspace";
+import { ContextGraphPanel } from "../features/context-graph/ContextGraphPanel";
 import { EndpointInspectorPanel } from "../features/endpoint-inspector/EndpointInspectorPanel";
 import { ManagerPanel } from "../features/manager/ManagerPanel";
 import { RequirementComposer } from "../features/requirements/RequirementComposer";
@@ -35,6 +39,13 @@ export function App() {
   );
   const [state, dispatch] = useReducer(consoleReducer, initialConsoleState);
   const [loadError, setLoadError] = useState<string>();
+  const [contextSnapshot, setContextSnapshot] =
+    useState<ContextGraphSnapshot>();
+  const [contextError, setContextError] = useState<string>();
+  const [contextLoading, setContextLoading] = useState(false);
+  const [contextNodeGrowth, setContextNodeGrowth] = useState(0);
+  const [streamEpoch, setStreamEpoch] = useState(0);
+  const initialContextNodeCount = useRef<number | undefined>(undefined);
   const requirementInputRef = useRef<HTMLTextAreaElement>(null);
 
   const refreshSnapshot = useCallback(async () => {
@@ -50,24 +61,78 @@ export function App() {
     }
   }, [projectID]);
 
+  const refreshContextSnapshot = useCallback(async () => {
+    if (!projectID) return;
+    setContextLoading(true);
+    try {
+      const snapshot = await getContextGraphSnapshot(projectID);
+      if (initialContextNodeCount.current === undefined) {
+        initialContextNodeCount.current = snapshot.nodes.length;
+      }
+      setContextNodeGrowth(
+        Math.max(0, snapshot.nodes.length - initialContextNodeCount.current),
+      );
+      setContextSnapshot(snapshot);
+      setContextError(undefined);
+    } catch (error) {
+      setContextError(
+        error instanceof Error ? error.message : "无法读取 Context Graph 快照",
+      );
+    } finally {
+      setContextLoading(false);
+    }
+  }, [projectID]);
+
   useEffect(() => {
     void refreshSnapshot();
-  }, [refreshSnapshot]);
+    void refreshContextSnapshot();
+  }, [refreshContextSnapshot, refreshSnapshot]);
 
   useEffect(() => {
     if (!projectID || !state.snapshot) return;
-    const stream = openEventStream(projectID, state.snapshot?.cursor, {
+    let disposed = false;
+    let recovering = false;
+    let recoveryTimer: number | undefined;
+    let stream: ReturnType<typeof openEventStream> | undefined;
+    const recoverFromCursor = () => {
+      if (disposed || recovering) return;
+      recovering = true;
+      dispatch({ type: "connection.changed", connection: "disconnected" });
+      stream?.close();
+      recoveryTimer = window.setTimeout(() => {
+        void refreshSnapshot().finally(() => {
+          if (!disposed) setStreamEpoch((current) => current + 1);
+        });
+      }, 250);
+    };
+    stream = openEventStream(projectID, state.snapshot.cursor, {
       onOpen: () =>
         dispatch({ type: "connection.changed", connection: "live" }),
-      onError: () =>
-        dispatch({ type: "connection.changed", connection: "disconnected" }),
+      onError: recoverFromCursor,
       onEvent: (event: UiEvent) => {
         dispatch({ type: "event.received", event });
-        if (event.type !== "capacity.updated") void refreshSnapshot();
+        if (
+          event.type === "context.delta" ||
+          event.type === "task_memory_buffer.updated"
+        ) {
+          void refreshContextSnapshot();
+        }
+        if (event.type !== "capacity.updated" && event.type !== "context.delta")
+          void refreshSnapshot();
       },
     });
-    return () => stream.close();
-  }, [projectID, refreshSnapshot, state.snapshot?.project_id]);
+    return () => {
+      disposed = true;
+      if (recoveryTimer !== undefined) window.clearTimeout(recoveryTimer);
+      stream?.close();
+    };
+  }, [
+    projectID,
+    refreshContextSnapshot,
+    refreshSnapshot,
+    state.snapshot?.project_id,
+    streamEpoch,
+  ]);
 
   const selectEndpoint = useCallback(
     (endpoint: EndpointRef, generation: number) => {
@@ -153,54 +218,68 @@ export function App() {
         ) : null}
 
         <main className="console-layout">
-          <section
-            className="coordination-region"
-            aria-labelledby="coordination-heading"
-          >
-            <div className="section-heading">
-              <div>
-                <p className="eyebrow">Authoritative projection</p>
-                <h2 id="coordination-heading">Coordination Graph</h2>
+          <div className="primary-column">
+            <section
+              className="coordination-region"
+              aria-labelledby="coordination-heading"
+            >
+              <div className="section-heading">
+                <div>
+                  <p className="eyebrow">Authoritative projection</p>
+                  <h2 id="coordination-heading">Coordination Graph</h2>
+                </div>
+                {state.selectedEndpoint ? (
+                  <button
+                    type="button"
+                    className="secondary-button rail-shortcut"
+                    onClick={() =>
+                      dispatch({ type: "rail.changed", mode: "inspector" })
+                    }
+                  >
+                    <PanelRightOpen size={16} aria-hidden="true" />
+                    Inspect selected Phase
+                  </button>
+                ) : null}
               </div>
-              {state.selectedEndpoint ? (
-                <button
-                  type="button"
-                  className="secondary-button rail-shortcut"
-                  onClick={() =>
-                    dispatch({ type: "rail.changed", mode: "inspector" })
-                  }
-                >
-                  <PanelRightOpen size={16} aria-hidden="true" />
-                  Inspect selected Phase
-                </button>
+
+              {loadError ? (
+                <div className="error-notice" role="alert">
+                  <strong>快照未更新。</strong> {loadError}
+                  <button type="button" onClick={() => void refreshSnapshot()}>
+                    重试
+                  </button>
+                </div>
               ) : null}
-            </div>
 
-            {loadError ? (
-              <div className="error-notice" role="alert">
-                <strong>快照未更新。</strong> {loadError}
-                <button type="button" onClick={() => void refreshSnapshot()}>
-                  重试
-                </button>
-              </div>
-            ) : null}
+              {state.snapshot ? (
+                <CoordinationWorkspace
+                  snapshot={state.snapshot}
+                  selectedEndpoint={state.selectedEndpoint}
+                  onSelectEndpoint={selectEndpoint}
+                  onRequestRequirement={() =>
+                    requirementInputRef.current?.focus()
+                  }
+                />
+              ) : (
+                <div className="loading-state" role="status">
+                  <RefreshCw
+                    className="spin-once"
+                    size={18}
+                    aria-hidden="true"
+                  />
+                  正在读取权限过滤后的协调图…
+                </div>
+              )}
+            </section>
 
-            {state.snapshot ? (
-              <CoordinationWorkspace
-                snapshot={state.snapshot}
-                selectedEndpoint={state.selectedEndpoint}
-                onSelectEndpoint={selectEndpoint}
-                onRequestRequirement={() =>
-                  requirementInputRef.current?.focus()
-                }
-              />
-            ) : (
-              <div className="loading-state" role="status">
-                <RefreshCw className="spin-once" size={18} aria-hidden="true" />
-                正在读取权限过滤后的协调图…
-              </div>
-            )}
-          </section>
+            <ContextGraphPanel
+              snapshot={contextSnapshot}
+              loading={contextLoading}
+              error={contextError}
+              nodeGrowth={contextNodeGrowth}
+              onRefresh={refreshContextSnapshot}
+            />
+          </div>
 
           <aside className="context-rail" aria-label="Manager 与 Phase 检查器">
             <div className="rail-tabs" role="tablist" aria-label="Context rail">

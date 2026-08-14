@@ -3,6 +3,7 @@ package contextgraph
 import (
 	"context"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/kernel"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/platform/auth"
 )
 
@@ -13,4 +14,8 @@ type ContextGraphReader interface {
 	Explore(context.Context, auth.Principal, ExploreRequest) (ContextSliceDelta, error)
 	Subscribe(context.Context, auth.Principal, SubscribeRequest) (ContextSubscription, error)
 	Unsubscribe(context.Context, auth.Principal, string) error
+}
+
+type ContextGraphSnapshotReader interface {
+	ProjectContextSnapshot(context.Context, kernel.ProjectID) (ContextGraphSnapshot, error)
 }

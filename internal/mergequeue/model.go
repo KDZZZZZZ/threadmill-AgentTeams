@@ -1,6 +1,7 @@
-// Package mergequeue owns the only Threadmill path that writes a verified
-// candidate to a managed main branch. It deliberately has no Coordination
-// Graph or Context Graph write dependency.
+// Package mergequeue owns the only Threadmill path that writes an accepted
+// execute candidate to a managed main branch. It deliberately has no
+// Coordination Graph or Context Graph write dependency. Normal acceptance
+// verification runs afterwards against the merged revision.
 package mergequeue
 
 import (
@@ -37,10 +38,13 @@ const (
 // Candidate persists references to immutable evidence and workspace state. It
 // does not copy the WorkspaceBinding or verification payload.
 type Candidate struct {
-	ID                CandidateID           `json:"id"`
-	ProjectID         kernel.ProjectID      `json:"project_id"`
-	TaskID            kernel.TaskID         `json:"task_id"`
-	WorkspaceRef      kernel.BindingRef     `json:"workspace_ref"`
+	ID           CandidateID       `json:"id"`
+	ProjectID    kernel.ProjectID  `json:"project_id"`
+	TaskID       kernel.TaskID     `json:"task_id"`
+	WorkspaceRef kernel.BindingRef `json:"workspace_ref"`
+	// VerifyResultRef is the legacy persisted column name for the accepted
+	// source Phase result. New code_merge candidates store the execute result;
+	// normal acceptance Verify runs after MergedRevision exists.
 	VerifyResultRef   evidence.ArtifactID   `json:"verify_result_ref"`
 	DiffArtifactRef   evidence.ArtifactID   `json:"diff_artifact_ref"`
 	TargetRepository  string                `json:"target_repository"`
@@ -86,6 +90,11 @@ type TargetedVerifyRequest struct {
 	Candidate          Candidate
 	WorkspaceRoot      string
 	LatestMainRevision string
+	// AllowedWritePaths is empty for a clean replay. When Prepare found merge
+	// conflicts, it contains only the exact conflicted candidate paths that the
+	// verifier may resolve in the disposable workspace.
+	AllowedWritePaths []string
+	ConflictPaths     []string
 }
 
 type TargetedVerifyResult struct {
@@ -93,8 +102,10 @@ type TargetedVerifyResult struct {
 	EvidenceRefs []evidence.ArtifactID
 }
 
-// TargetedVerifier verifies the mechanically applied candidate on latest main.
-// It may produce evidence only; it cannot edit the candidate or target repo.
+// TargetedVerifier resolves a mechanically detected merge conflict. It may
+// change only AllowedWritePaths inside the disposable workspace and produce
+// evidence. It cannot commit or push; Merge Queue owns both actions. This is
+// distinct from the Task's normal post-merge acceptance Verify.
 type TargetedVerifier interface {
 	Verify(context.Context, TargetedVerifyRequest) (TargetedVerifyResult, error)
 }

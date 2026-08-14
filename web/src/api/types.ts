@@ -54,6 +54,43 @@ export interface CoordinationSnapshot {
   capacity: CapacityState;
 }
 
+export interface ContextSnapshotNode {
+  node_id: string;
+  kind: "directive" | "fact" | "hypothesis" | string;
+  statement: string;
+  status: string;
+  source_refs: string[];
+  subgraph_ids: string[];
+  usage_count: number;
+  last_used_at?: string | null;
+}
+
+export interface ContextSnapshotEdge {
+  edge_id?: string;
+  from_node_id?: string;
+  to_node_id: string;
+  from_ref?: string;
+  kind: string;
+  status?: string;
+}
+
+export interface ContextSnapshotSubgraph {
+  subgraph_id: string;
+  name?: string;
+  summary?: string;
+  revision?: number;
+  kind?: string;
+  task_id?: string;
+}
+
+export interface ContextGraphSnapshot {
+  project_id: string;
+  revision: number;
+  nodes: ContextSnapshotNode[];
+  edges: ContextSnapshotEdge[];
+  subgraphs?: ContextSnapshotSubgraph[];
+}
+
 export interface RequirementCreateResponse {
   requirement_id: string;
   manager_input_ref: string;

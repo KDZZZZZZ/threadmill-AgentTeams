@@ -110,6 +110,161 @@ func TestPostgresErrorMapping(t *testing.T) {
 	}
 }
 
+func TestPostgresServiceTransitionPersistsActualDecisionRefAgainstPostgres(t *testing.T) {
+	dsn := os.Getenv("THREADMILL_PG_TEST_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	}
+	if dsn == "" {
+		t.Skip("THREADMILL_PG_TEST_DSN or THREADMILL_TEST_DATABASE_URL is required")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("coordination_decision_ref_%d", time.Now().UnixNano())
+	baseDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseDB.Close()
+	if _, err := baseDB.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer baseDB.ExecContext(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
+
+	db, err := sql.Open("pgx", dsnWithSearchPath(t, dsn, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewMigrator(db).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	graph := NewTaskManagerGraph(taskManagerPrincipal(), store, store, kernel.NewMemoryIdempotencyStore())
+	revision := createPostgresTask(t, graph, store, "pg-decision-ref-task")
+	transitionRef := "tmdec:actual-transition-ref"
+	transition := GraphTransition{
+		TargetKind: TargetPhaseEndpoint,
+		Endpoint:   ref("pg-decision-ref-task", EndpointPlan),
+		Action:     string(EndpointSubmitted),
+		Generation: 1,
+		Result: PhaseResult{
+			ID:         "result-pg-decision-ref-plan",
+			Endpoint:   ref("pg-decision-ref-task", EndpointPlan),
+			BindingRef: "binding://pg-decision-ref-task/plan/1",
+			OutputRef:  "artifact://pg-decision-ref-task/plan",
+			Verdict:    VerdictSubmitted,
+		},
+	}
+	if err := store.RegisterTransition(ctx, projectID, transitionRef, transition); err != nil {
+		t.Fatal(err)
+	}
+	next, err := graph.Transition(ctx, revision, transitionRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := graph.Transition(ctx, revision, transitionRef)
+	if err != nil {
+		t.Fatalf("idempotent transition replay: %v", err)
+	}
+	if replayed != next {
+		t.Fatalf("idempotent transition revision = %d, want %d", replayed, next)
+	}
+	var persistedDecisionRef string
+	if err := db.QueryRowContext(ctx, `SELECT decision_ref FROM coordination_graph_revisions WHERE project_id=$1 AND revision=$2`, projectID, next).Scan(&persistedDecisionRef); err != nil {
+		t.Fatal(err)
+	}
+	if persistedDecisionRef != transitionRef {
+		t.Fatalf("graph revision decision_ref = %q, want actual transitionRef %q", persistedDecisionRef, transitionRef)
+	}
+	if strings.HasPrefix(persistedDecisionRef, "transition:") {
+		t.Fatalf("graph revision retained payload-hash decision_ref %q", persistedDecisionRef)
+	}
+	if count := countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_graph_revisions WHERE project_id=$1 AND decision_ref=$2`, projectID, transitionRef); count != 1 {
+		t.Fatalf("graph revisions for decision_ref %q = %d, want 1", transitionRef, count)
+	}
+}
+
+func TestPostgresReopenRoundPersistsPayloadAndSnapshot(t *testing.T) {
+	dsn := os.Getenv("THREADMILL_PG_TEST_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("THREADMILL_TEST_DATABASE_URL")
+	}
+	if dsn == "" {
+		t.Skip("THREADMILL_PG_TEST_DSN or THREADMILL_TEST_DATABASE_URL is required")
+	}
+	ctx := context.Background()
+	schema := fmt.Sprintf("coordination_reopen_round_%d", time.Now().UnixNano())
+	baseDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseDB.Close()
+	if _, err := baseDB.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer baseDB.ExecContext(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
+
+	db, err := sql.Open("pgx", dsnWithSearchPath(t, dsn, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	loaded, err := postgres.LoadMigrations(migrations.FS, migrations.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.NewMigrator(db).Apply(ctx, loaded); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	store := NewPostgresStore(db)
+	graph := NewTaskManagerGraph(taskManagerPrincipal(), store, store, kernel.NewMemoryIdempotencyStore())
+	revision := createPostgresTask(t, graph, store, "pg-reopen-round-task")
+	revision = satisfyPostgresTaskRound(t, graph, store, revision, "pg-reopen-round-task", 1)
+	before := mustSnapshot(t, graph, revision)
+	transitionRef := "tmdec:pg-reopen-round"
+	transition := GraphTransition{
+		TargetKind:        TargetTask,
+		TaskID:            "pg-reopen-round-task",
+		Action:            "reopen_round",
+		ExecuteBindingRef: "binding://pg-reopen-round-task/execute/2",
+		VerifyBindingRef:  "binding://pg-reopen-round-task/verify/2",
+		EvidenceRefs:      []string{"proposal://targeted-verify/reopen"},
+	}
+	if err := store.RegisterTransition(ctx, projectID, transitionRef, transition); err != nil {
+		t.Fatal(err)
+	}
+	roundTripped, err := store.ResolveTransition(ctx, projectID, transitionRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(roundTripped, transition) {
+		t.Fatalf("round-tripped transition = %#v, want %#v", roundTripped, transition)
+	}
+	revision, err = graph.Transition(ctx, revision, transitionRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := mustSnapshot(t, graph, revision)
+	execute := mustEndpoint(t, snapshot, ref("pg-reopen-round-task", EndpointExecute))
+	verify := mustEndpoint(t, snapshot, ref("pg-reopen-round-task", EndpointVerify))
+	if execute.State != EndpointPending || execute.Generation != 2 || execute.BindingRef != transition.ExecuteBindingRef ||
+		verify.State != EndpointPending || verify.Generation != 2 || verify.BindingRef != transition.VerifyBindingRef {
+		t.Fatalf("reopened endpoints execute=%#v verify=%#v", execute, verify)
+	}
+	if len(snapshot.Results) != len(before.Results) {
+		t.Fatalf("results after postgres reopen_round = %d, want preserved audit len %d", len(snapshot.Results), len(before.Results))
+	}
+	if count := countPostgresRows(t, ctx, db, `SELECT count(*) FROM coordination_phase_results WHERE project_id=$1`, projectID); count != len(before.Results) {
+		t.Fatalf("postgres phase result rows = %d, want %d", count, len(before.Results))
+	}
+}
+
 func TestPostgresStoreRealMigrationCASConcurrencyAndRestart(t *testing.T) {
 	dsn := os.Getenv("THREADMILL_PG_TEST_DSN")
 	if dsn == "" {
@@ -371,6 +526,46 @@ func createPostgresTask(t *testing.T, graph *Service, decisions *PostgresStore, 
 	revision, err := graph.ReplacePending(context.Background(), basicSubgraph(taskID, requestID, base))
 	if err != nil {
 		t.Fatal(err)
+	}
+	return revision
+}
+
+func satisfyPostgresTaskRound(t *testing.T, graph *Service, decisions *PostgresStore, revision kernel.Revision, taskID kernel.TaskID, generation int) kernel.Revision {
+	t.Helper()
+	for _, endpointID := range []EndpointID{EndpointPlan, EndpointExecute, EndpointVerify} {
+		submitRef := fmt.Sprintf("tmdec:pg-submit-%s-%s-%d", taskID, endpointID, generation)
+		if err := decisions.RegisterTransition(context.Background(), projectID, submitRef, GraphTransition{
+			TargetKind: TargetPhaseEndpoint,
+			Endpoint:   ref(taskID, endpointID),
+			Action:     string(EndpointSubmitted),
+			Generation: generation,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		revision, err = graph.Transition(context.Background(), revision, submitRef)
+		if err != nil {
+			t.Fatal(err)
+		}
+		satisfyRef := fmt.Sprintf("tmdec:pg-satisfy-%s-%s-%d", taskID, endpointID, generation)
+		if err := decisions.RegisterTransition(context.Background(), projectID, satisfyRef, GraphTransition{
+			TargetKind: TargetPhaseEndpoint,
+			Endpoint:   ref(taskID, endpointID),
+			Action:     string(EndpointSatisfied),
+			Generation: generation,
+			Result: PhaseResult{
+				ID:         fmt.Sprintf("result-%s-%s-%d", taskID, endpointID, generation),
+				Endpoint:   ref(taskID, endpointID),
+				BindingRef: kernel.BindingRef(fmt.Sprintf("binding://%s/%s/%d", taskID, endpointID, generation)),
+				OutputRef:  fmt.Sprintf("artifact://phase-output/%s/%s/%d", taskID, endpointID, generation),
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		revision, err = graph.Transition(context.Background(), revision, satisfyRef)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	return revision
 }

@@ -15,6 +15,7 @@ type BindingStore interface {
 	Insert(context.Context, Binding) error
 	Get(context.Context, kernel.BindingRef) (Binding, error)
 	GetByRound(context.Context, kernel.TaskID, int) (Binding, bool, error)
+	GetLatestByTask(context.Context, kernel.TaskID) (Binding, bool, error)
 	GetByInvocation(context.Context, kernel.InvocationID) (Binding, bool, error)
 	UpdateCAS(context.Context, Binding, kernel.Revision) (Binding, error)
 }
@@ -99,6 +100,24 @@ func (s *MemoryStore) GetByRound(ctx context.Context, taskID kernel.TaskID, gene
 		return Binding{}, false, nil
 	}
 	return cloneBinding(s.bindings[id]), true, nil
+}
+
+func (s *MemoryStore) GetLatestByTask(ctx context.Context, taskID kernel.TaskID) (Binding, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Binding{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var latest Binding
+	found := false
+	for key, id := range s.byRound {
+		if key.taskID != taskID || (found && key.generation <= latest.Generation) {
+			continue
+		}
+		latest = s.bindings[id]
+		found = true
+	}
+	return cloneBinding(latest), found, nil
 }
 
 func (s *MemoryStore) GetByInvocation(ctx context.Context, invocationID kernel.InvocationID) (Binding, bool, error) {

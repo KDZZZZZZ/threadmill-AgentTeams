@@ -294,7 +294,7 @@ func insertRequirement(ctx context.Context, tx *sql.Tx, projectID kernel.Project
 	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO taskmanager_requirement_inputs(project_id, input_ref, task_id, contract_ref, requirement, payload_hash)
 VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-ON CONFLICT (project_id, input_ref) DO UPDATE SET input_ref = taskmanager_requirement_inputs.input_ref
+ON CONFLICT (project_id, input_ref, task_id) DO UPDATE SET input_ref = taskmanager_requirement_inputs.input_ref
 WHERE taskmanager_requirement_inputs.payload_hash = EXCLUDED.payload_hash`, projectID, input.InputRef, input.TaskID, input.ContractRef, string(raw), hashBytes(payload))
 	if err != nil {
 		return mapPostgresError(err)

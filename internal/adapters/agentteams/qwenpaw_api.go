@@ -3,8 +3,6 @@ package agentteams
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +36,7 @@ type QwenPawAPI struct {
 	baseURL      string
 	httpClient   *http.Client
 	pollInterval time.Duration
+	stableWindow time.Duration
 }
 
 func NewQwenPawAPI(baseURL string, httpClient *http.Client) (*QwenPawAPI, error) {
@@ -69,15 +68,16 @@ func NewQwenPawAPI(baseURL string, httpClient *http.Client) (*QwenPawAPI, error)
 		baseURL:      strings.TrimRight(parsed.String(), "/"),
 		httpClient:   &client,
 		pollInterval: 250 * time.Millisecond,
+		stableWindow: 3 * time.Second,
 	}, nil
 }
 
-func InvocationMCPKey(invocationID kernel.InvocationID) (string, error) {
-	if err := kernel.RequireID("invocation_id", invocationID); err != nil {
-		return "", err
+func InvocationMCPKey(agentTeamsTaskID string) (string, error) {
+	key := strings.TrimSpace(agentTeamsTaskID)
+	if !safeProviderID(key) || !strings.HasPrefix(key, "threadmill-") {
+		return "", kernel.InvalidArgument("AgentTeams task id cannot be used as an invocation MCP key")
 	}
-	sum := sha256.Sum256([]byte(invocationID))
-	return "threadmill-" + hex.EncodeToString(sum[:12]), nil
+	return key, nil
 }
 
 func (a *QwenPawAPI) Ready(ctx context.Context) error {
@@ -95,6 +95,191 @@ func (a *QwenPawAPI) Ready(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// WaitStartupReady waits until QwenPaw's management API is fully usable, not
+// merely until /api/version answers. During worker wrapper startup the version
+// endpoint can become reachable before the wrapper has finished applying its
+// desired built-in/plugin configuration; Threadmill must not install an
+// invocation MCP or delegate a task into that partially initialized window.
+func (a *QwenPawAPI) WaitStartupReady(ctx context.Context) error {
+	waitCtx := ctx
+	cancel := func() {}
+	if _, ok := waitCtx.Deadline(); !ok {
+		waitCtx, cancel = context.WithTimeout(ctx, 90*time.Second)
+	}
+	defer cancel()
+
+	var lastErr error
+	for {
+		if err := a.startupReady(waitCtx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		timer := time.NewTimer(a.pollInterval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			if lastErr != nil {
+				return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw worker did not complete startup", Recoverable: true}
+			}
+			return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw worker startup wait timed out", Recoverable: true}
+		case <-timer.C:
+		}
+	}
+}
+
+func (a *QwenPawAPI) startupReady(ctx context.Context) error {
+	if err := a.Ready(ctx); err != nil {
+		return err
+	}
+	if _, err := a.listBuiltinTools(ctx); err != nil {
+		return err
+	}
+	if _, err := a.AgentActivity(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *QwenPawAPI) AgentActivity(ctx context.Context) (HostActivity, error) {
+	var response struct {
+		Status           string     `json:"status"`
+		RunningTaskCount int        `json:"running_task_count"`
+		LastRunAt        *time.Time `json:"last_run_at"`
+		LastFinishAt     *time.Time `json:"last_finish_at"`
+	}
+	if err := a.doJSON(ctx, http.MethodGet, "/api/agents/default/agent-status", nil, &response); err != nil {
+		return HostActivity{}, err
+	}
+	response.Status = strings.TrimSpace(response.Status)
+	if response.Status == "" || response.RunningTaskCount < 0 {
+		return HostActivity{}, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw agent activity response is invalid", Recoverable: true}
+	}
+	activity := HostActivity{Status: response.Status, RunningTaskCount: response.RunningTaskCount}
+	if response.LastRunAt != nil {
+		activity.LastRunAt = response.LastRunAt.UTC()
+	}
+	if response.LastFinishAt != nil {
+		activity.LastFinishAt = response.LastFinishAt.UTC()
+	}
+	return activity, nil
+}
+
+// WaitInvocationReady closes the gap between QwenPaw's configuration
+// readback and its actual workspace lifecycle. Enabling a built-in tool or
+// changing one MCP client causes an asynchronous workspace hot reload. During
+// that reload the version, tool-list, and MCP endpoints can all answer 200
+// while the Matrix consumer that receives AgentTeams assignments is still
+// being replaced. Require one uninterrupted idle window with both native and
+// invocation tools readable before Runtime is allowed to delegate the task.
+func (a *QwenPawAPI) WaitInvocationReady(ctx context.Context, key string, expected []string) error {
+	key = strings.TrimSpace(key)
+	if !safeQwenPawKey(key) {
+		return kernel.InvalidArgument("QwenPaw MCP client key is invalid")
+	}
+	expected = normalizeToolNames(expected)
+	waitCtx := ctx
+	cancel := func() {}
+	if _, ok := waitCtx.Deadline(); !ok {
+		waitCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	}
+	defer cancel()
+
+	var stableSince time.Time
+	for {
+		ready := a.Ready(waitCtx) == nil && a.nativeProjectToolsEnabled(waitCtx) == nil && a.invocationToolsEnabled(waitCtx, key, expected) == nil
+		if ready {
+			activity, err := a.AgentActivity(waitCtx)
+			ready = err == nil && strings.EqualFold(activity.Status, "idle") && activity.RunningTaskCount == 0
+		}
+		if ready {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
+			} else if time.Since(stableSince) >= a.stableWindow {
+				return nil
+			}
+		} else {
+			stableSince = time.Time{}
+		}
+
+		timer := time.NewTimer(a.pollInterval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw workspace did not become stably idle", Recoverable: true}
+		case <-timer.C:
+		}
+	}
+}
+
+var qwenPawNativeProjectTools = map[string]struct{}{
+	"read_file": {}, "write_file": {}, "edit_file": {}, "append_file": {},
+	"grep_search": {}, "glob_search": {}, "ast_search": {}, "execute_shell_command": {},
+	"browser_use": {}, "web_search": {}, "web_fetch": {}, "view_image": {}, "view_video": {},
+}
+
+// EnsureNativeProjectTools keeps QwenPaw's normal project and research tools
+// available. Threadmill does not replace an agent's editor, search, shell, or
+// browser; it only owns the authoritative Coordination and Context Graph MCP
+// mutations. Collaboration/history/sub-agent tools are deliberately left at
+// the operator-configured state because they can create invisible scheduling
+// or memory channels outside Graph Runtime.
+func (a *QwenPawAPI) EnsureNativeProjectTools(ctx context.Context) error {
+	if err := a.Ready(ctx); err != nil {
+		return err
+	}
+	tools, err := a.listBuiltinTools(ctx)
+	if err != nil {
+		return err
+	}
+	for _, tool := range tools {
+		if _, required := qwenPawNativeProjectTools[tool.Name]; !required || tool.Enabled {
+			continue
+		}
+		path := "/api/agents/default/tools/" + url.PathEscape(tool.Name) + "/toggle"
+		if err := a.doJSON(ctx, http.MethodPatch, path, nil, nil); err != nil {
+			return err
+		}
+	}
+	return a.nativeProjectToolsEnabled(ctx)
+}
+
+func (a *QwenPawAPI) nativeProjectToolsEnabled(ctx context.Context) error {
+	tools, err := a.listBuiltinTools(ctx)
+	if err != nil {
+		return err
+	}
+	enabled := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		enabled[tool.Name] = tool.Enabled
+	}
+	for name := range qwenPawNativeProjectTools {
+		if actual, known := enabled[name]; known && !actual {
+			return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw native project tool readback mismatch", Recoverable: true}
+		}
+	}
+	return nil
+}
+
+type qwenPawBuiltinTool struct {
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+}
+
+func (a *QwenPawAPI) listBuiltinTools(ctx context.Context) ([]qwenPawBuiltinTool, error) {
+	var tools []qwenPawBuiltinTool
+	if err := a.doJSON(ctx, http.MethodGet, "/api/agents/default/tools", nil, &tools); err != nil {
+		return nil, err
+	}
+	for _, tool := range tools {
+		if !safeQwenPawKey(tool.Name) {
+			return nil, kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw returned an invalid built-in tool name", Recoverable: true}
+		}
+	}
+	return tools, nil
 }
 
 func (a *QwenPawAPI) InstallInvocationMCP(ctx context.Context, desired InvocationMCP) error {
@@ -226,6 +411,99 @@ func (a *QwenPawAPI) RevokeInvocationMCP(ctx context.Context, key string) error 
 	return nil
 }
 
+// DeleteInvocationMCPIfPresent is the cold-start recovery path for durable
+// Threadmill invocation clients. It deliberately does not call GET /api/mcp:
+// QwenPaw may block that collection endpoint while restoring a historical MCP
+// client whose bearer has already expired. Only canonical generated
+// Threadmill keys are accepted, so operator-owned MCP clients cannot be
+// removed through this path.
+func (a *QwenPawAPI) DeleteInvocationMCPIfPresent(ctx context.Context, key string) error {
+	key = strings.TrimSpace(key)
+	if !isInvocationMCPKey(key) {
+		return kernel.InvalidArgument("QwenPaw invocation MCP key is invalid")
+	}
+	if a == nil || a.httpClient == nil || a.baseURL == "" {
+		return kernel.Error{Code: kernel.CodeInternalError, Message: "QwenPaw API client is not configured"}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, a.baseURL+"/api/mcp/"+url.PathEscape(key), nil)
+	if err != nil {
+		return kernel.InvalidArgument("QwenPaw API request is invalid")
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw API is unavailable", Recoverable: true}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: fmt.Sprintf("QwenPaw API returned HTTP %d", resp.StatusCode), Recoverable: true}
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, qwenPawResponseLimit+1)); err != nil {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw API response could not be read", Recoverable: true}
+	}
+	return nil
+}
+
+// PruneInvocationMCPExcept cleans provider-local Threadmill clients that are
+// not represented in the current database (for example after switching to a
+// fresh PostgreSQL schema while reusing a durable QwenPaw volume). The caller
+// must already hold the host slot exclusively and invoke this before task
+// delegation. Operator-owned and package MCP clients are never touched.
+func (a *QwenPawAPI) PruneInvocationMCPExcept(ctx context.Context, currentKey string) error {
+	currentKey = strings.TrimSpace(currentKey)
+	if _, err := InvocationMCPKey(currentKey); err != nil {
+		return kernel.InvalidArgument("current QwenPaw invocation MCP key is invalid")
+	}
+	existing, err := a.listMCP(ctx)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(existing))
+	for key := range existing {
+		if key != currentKey && isInvocationMCPKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := a.DeleteInvocationMCPIfPresent(ctx, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isInvocationMCPKey(key string) bool {
+	if !strings.HasPrefix(key, "threadmill-") || !safeQwenPawKey(key) {
+		return false
+	}
+	suffix := strings.TrimPrefix(key, "threadmill-")
+	base, attempt, hasAttempt := strings.Cut(suffix, "-attempt-")
+	if hasAttempt {
+		if attempt == "" || strings.Contains(attempt, "-attempt-") {
+			return false
+		}
+		for _, char := range attempt {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
+		suffix = base
+	}
+	if len(suffix) != 24 && len(suffix) != 32 {
+		return false
+	}
+	for _, char := range suffix {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func validateInvocationMCP(desired InvocationMCP) error {
 	if desired.Key == "" || desired.BearerToken == "" {
 		return kernel.InvalidArgument("QwenPaw MCP key and bearer token are required")
@@ -285,22 +563,8 @@ func (a *QwenPawAPI) waitForTools(ctx context.Context, key string, expected []st
 	defer cancel()
 
 	for {
-		var tools []struct {
-			Name    string `json:"name"`
-			Enabled bool   `json:"enabled"`
-		}
-		err := a.doJSON(waitCtx, http.MethodGet, "/api/mcp/tools/"+url.PathEscape(key), nil, &tools)
-		if err == nil {
-			got := make([]string, 0, len(tools))
-			for _, tool := range tools {
-				if tool.Enabled {
-					got = append(got, tool.Name)
-				}
-			}
-			sort.Strings(got)
-			if equalStrings(got, want) {
-				return nil
-			}
+		if err := a.invocationToolsEnabled(waitCtx, key, want); err == nil {
+			return nil
 		}
 
 		timer := time.NewTimer(a.pollInterval)
@@ -311,6 +575,26 @@ func (a *QwenPawAPI) waitForTools(ctx context.Context, key string, expected []st
 		case <-timer.C:
 		}
 	}
+}
+
+func (a *QwenPawAPI) invocationToolsEnabled(ctx context.Context, key string, expected []string) error {
+	var tools []struct {
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := a.doJSON(ctx, http.MethodGet, "/api/mcp/tools/"+url.PathEscape(key), nil, &tools); err != nil {
+		return err
+	}
+	got := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Enabled {
+			got = append(got, tool.Name)
+		}
+	}
+	if !equalStrings(normalizeToolNames(got), normalizeToolNames(expected)) {
+		return kernel.Error{Code: kernel.CodeExecutorUnavailable, Message: "QwenPaw MCP tool readback mismatch", Recoverable: true}
+	}
+	return nil
 }
 
 func normalizeToolNames(values []string) []string {

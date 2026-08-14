@@ -43,6 +43,44 @@ func TestManagerMessageUsesObservedGraphRevisionOnly(t *testing.T) {
 	}
 }
 
+func TestManagerMessageRequiresExplicitScopedLifecycleIntent(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "unknown intent", body: `{"request_id":"req-unknown","project_id":"project-a","conversation_id":"conv-1","body":"change it","intent":"release"}`},
+		{name: "hold without endpoint", body: `{"request_id":"req-hold","project_id":"project-a","conversation_id":"conv-1","body":"pause it","intent":"hold"}`},
+		{name: "resume without endpoint", body: `{"request_id":"req-resume","project_id":"project-a","conversation_id":"conv-1","body":"continue it","intent":"resume"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHTTPHarness()
+			rec := h.post("/v1/manager/messages", test.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+			if h.manager.messages != 0 {
+				t.Fatal("invalid lifecycle intent reached Manager port")
+			}
+		})
+	}
+
+	h := newHTTPHarness()
+	rec := h.post("/v1/manager/messages", `{"request_id":"req-orchestrate","project_id":"project-a","conversation_id":"conv-1","body":"replan remaining work"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("omitted orchestration intent status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if h.manager.req.Intent != "" {
+		t.Fatalf("transport rewrote omitted intent = %q; Runtime should default it authoritatively", h.manager.req.Intent)
+	}
+
+	ref := `{"task_id":"task-a","endpoint_id":"execute"}`
+	rec = h.post("/v1/manager/messages", `{"request_id":"req-resume-ok","project_id":"project-a","conversation_id":"conv-1","body":"continue it","intent":"resume","selected_endpoint":`+ref+`}`)
+	if rec.Code != http.StatusAccepted || h.manager.req.Intent != ManagerIntentResume {
+		t.Fatalf("explicit resume status=%d intent=%q body=%s", rec.Code, h.manager.req.Intent, rec.Body.String())
+	}
+}
+
 func TestRequirementWriteAuthenticatesCSRFGateAndForwardsToPort(t *testing.T) {
 	h := newHTTPHarness()
 	rec := h.post("/v1/requirements", `{"request_id":"req-1","project_id":"project-a","body":"ship it","motivation":"done"}`)
@@ -81,6 +119,13 @@ func TestQueryHandlersUseReadPortsOnly(t *testing.T) {
 	}
 	if h.query.snapshotProject != "project-a" || h.query.snapshotRevision != 6 {
 		t.Fatalf("snapshot project=%q revision=%d", h.query.snapshotProject, h.query.snapshotRevision)
+	}
+	rec = h.get("/v1/context/snapshot?project_id=project-a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("context snapshot status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if h.query.contextProject != "project-a" {
+		t.Fatalf("context snapshot project=%q", h.query.contextProject)
 	}
 	rec = h.get("/v1/coordination/endpoints/task-a/execute/inspector?project_id=project-a&generation=2")
 	if rec.Code != http.StatusOK {
@@ -330,6 +375,7 @@ func (f *fakeManagerPort) Conversation(_ context.Context, _ auth.Principal, conv
 type fakeQueryPort struct {
 	snapshotProject  kernel.ProjectID
 	snapshotRevision kernel.Revision
+	contextProject   kernel.ProjectID
 	endpoint         coordination.PhaseEndpointRef
 	generation       int
 	taskID           kernel.TaskID
@@ -343,6 +389,11 @@ func (f *fakeQueryPort) Task(_ context.Context, _ auth.Principal, taskID kernel.
 func (f *fakeQueryPort) ProjectSnapshot(_ context.Context, _ auth.Principal, projectID kernel.ProjectID, revision kernel.Revision) (CoordinationSnapshot, error) {
 	f.snapshotProject, f.snapshotRevision = projectID, revision
 	return CoordinationSnapshot{ProjectID: projectID, Revision: revision, Cursor: "cursor-1", Capacity: CapacityState{ProjectID: projectID, Revision: 1, UpdatedAt: time.Now().UTC()}}, nil
+}
+
+func (f *fakeQueryPort) ContextSnapshot(_ context.Context, _ auth.Principal, projectID kernel.ProjectID) (ContextGraphSnapshot, error) {
+	f.contextProject = projectID
+	return ContextGraphSnapshot{ProjectID: projectID, Revision: 3, Nodes: []ContextSnapshotNode{}, Edges: []ContextSnapshotEdge{}, Subgraphs: []ContextSnapshotSubgraph{}}, nil
 }
 
 func (f *fakeQueryPort) InspectEndpoint(_ context.Context, _ auth.Principal, endpoint coordination.PhaseEndpointRef, generation int) (EndpointInspector, error) {

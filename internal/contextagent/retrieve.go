@@ -36,6 +36,9 @@ func (a Agent) Retrieve(ctx context.Context, principal auth.Principal, req Conte
 		return ContextRetrieveResult{}, err
 	}
 	searchReq := BuildSearchRequest(req.Query)
+	if len(searchReq.Keywords) == 0 && len(searchReq.Scope) == 0 && len(searchReq.AnchorRefs) == 0 {
+		return ContextRetrieveResult{}, kernel.InvalidArgument("query did not contain a bounded searchable entity, constraint, module, or relation")
+	}
 	result, err := a.Searcher.Search(ctx, principal, searchReq)
 	if err != nil {
 		return ContextRetrieveResult{}, err
@@ -67,17 +70,20 @@ func requireTrustedRetrievePrincipal(principal auth.Principal) error {
 	return nil
 }
 
-var tokenPattern = regexp.MustCompile(`[A-Za-z0-9_.:/-]+`)
+var tokenPattern = regexp.MustCompile(`[\p{L}\p{N}_.:/-]+`)
 
 var stopWords = map[string]struct{}{
 	"a": {}, "an": {}, "and": {}, "are": {}, "as": {}, "by": {}, "for": {},
 	"from": {}, "in": {}, "is": {}, "of": {}, "on": {}, "or": {}, "the": {},
 	"to": {}, "with": {}, "about": {}, "find": {}, "search": {}, "retrieve": {},
 	"near": {},
+	"请":    {}, "查找": {}, "搜索": {}, "检索": {}, "关于": {}, "有关": {},
+	"相关": {}, "哪些": {}, "什么": {}, "是否": {}, "的": {}, "和": {},
+	"或": {}, "与": {}, "在": {}, "中": {}, "里": {}, "节点": {}, "上下文": {},
 }
 
 func BuildSearchRequest(query string) contextgraph.SearchRequest {
-	tokens := tokenPattern.FindAllString(strings.TrimSpace(query), -1)
+	tokens := tokenPattern.FindAllString(normalizeRetrieveQuery(query), -1)
 	seenKeywords := map[string]struct{}{}
 	seenScope := map[string]struct{}{}
 	seenAnchors := map[string]struct{}{}
@@ -110,6 +116,19 @@ func BuildSearchRequest(query string) contextgraph.SearchRequest {
 		req.Keywords = append(req.Keywords, normalized)
 	}
 	return req
+}
+
+func normalizeRetrieveQuery(query string) string {
+	// Chinese intent words are frequently attached directly to the subject.
+	// Split only the navigation boilerplate; keep domain phrases intact so the
+	// mechanical substring search remains bounded and explainable.
+	replacer := strings.NewReplacer(
+		"请帮我", " ", "帮我", " ", "查找关于", " ", "搜索关于", " ", "检索关于", " ",
+		"上下文图中的", " ", "上下文图中", " ", "上下文图", " ", "上下文节点", " ", "上下文", " ", "相关的", " ",
+		"请", " ", "查找", " ", "搜索", " ", "检索", " ", "关于", " ", "有关", " ",
+		"哪些", " ", "什么", " ", "是否", " ", "的", " ", "和", " ", "或", " ", "与", " ",
+	)
+	return strings.TrimSpace(replacer.Replace(query))
 }
 
 func explain(req contextgraph.SearchRequest) string {
