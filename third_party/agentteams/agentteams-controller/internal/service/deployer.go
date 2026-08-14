@@ -195,37 +195,40 @@ type DeployerConfig struct {
 	RuntimeProjection RuntimeProjectionConfig
 
 	// NacosCredClient is used when remoteSkills use sts-agentteams (see CRD authType).
-	NacosCredClient credprovider.Client
+	NacosCredClient       credprovider.Client
+	MCPCredentialBindings MCPCredentialBindingStore
 }
 
 // Deployer orchestrates configuration deployment for workers: package resolution,
 // inline config writes, openclaw.json generation, AGENTS.md merging, skill pushing,
 // and OSS synchronization.
 type Deployer struct {
-	agentConfig       *agentconfig.Generator
-	oss               oss.StorageClient
-	executor          *executor.Shell
-	packages          *executor.PackageResolver
-	managerConfig     *ManagerConfigStore
-	agentFSDir        string
-	workerAgentDir    string
-	matrixDomain      string
-	runtimeProjection RuntimeProjectionConfig
-	nacosCredClient   credprovider.Client
+	agentConfig           *agentconfig.Generator
+	oss                   oss.StorageClient
+	executor              *executor.Shell
+	packages              *executor.PackageResolver
+	managerConfig         *ManagerConfigStore
+	agentFSDir            string
+	workerAgentDir        string
+	matrixDomain          string
+	runtimeProjection     RuntimeProjectionConfig
+	nacosCredClient       credprovider.Client
+	mcpCredentialBindings MCPCredentialBindingStore
 }
 
 func NewDeployer(cfg DeployerConfig) *Deployer {
 	return &Deployer{
-		agentConfig:       cfg.AgentConfig,
-		oss:               cfg.OSS,
-		executor:          cfg.Executor,
-		packages:          cfg.Packages,
-		managerConfig:     cfg.ManagerConfig,
-		agentFSDir:        cfg.AgentFSDir,
-		workerAgentDir:    cfg.WorkerAgentDir,
-		matrixDomain:      cfg.MatrixDomain,
-		runtimeProjection: cfg.RuntimeProjection,
-		nacosCredClient:   cfg.NacosCredClient,
+		agentConfig:           cfg.AgentConfig,
+		oss:                   cfg.OSS,
+		executor:              cfg.Executor,
+		packages:              cfg.Packages,
+		managerConfig:         cfg.ManagerConfig,
+		agentFSDir:            cfg.AgentFSDir,
+		workerAgentDir:        cfg.WorkerAgentDir,
+		matrixDomain:          cfg.MatrixDomain,
+		runtimeProjection:     cfg.RuntimeProjection,
+		nacosCredClient:       cfg.NacosCredClient,
+		mcpCredentialBindings: cfg.MCPCredentialBindings,
 	}
 }
 

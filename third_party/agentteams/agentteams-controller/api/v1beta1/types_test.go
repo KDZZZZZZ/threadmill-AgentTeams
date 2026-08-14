@@ -7,6 +7,21 @@ import (
 	"testing"
 )
 
+func TestMCPServerCredentialBindingRefJSONRoundTrip(t *testing.T) {
+	original := MCPServer{Name: "threadmill", URL: "http://threadmill/mcp", CredentialBindingRef: "mcpcred-example"}
+	payload, err := json.Marshal(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded MCPServer
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.CredentialBindingRef != original.CredentialBindingRef {
+		t.Fatalf("credentialBindingRef = %q, want %q", decoded.CredentialBindingRef, original.CredentialBindingRef)
+	}
+}
+
 // strPtr / boolPtr are tiny helpers used by the cross-cluster deployment
 // serialization tests below. Kept package-private to avoid leaking generic
 // helpers from the API package.

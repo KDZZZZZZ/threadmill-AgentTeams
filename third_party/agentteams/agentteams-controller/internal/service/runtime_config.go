@@ -71,7 +71,7 @@ type memberRuntimeConfigDesired struct {
 	AgentPackage       *memberRuntimeConfigAgentPackage  `json:"agentPackage,omitempty"`
 	InlineConfig       *memberRuntimeConfigInlineConfig  `json:"inlineConfig,omitempty"`
 	SkillRegistry      *memberRuntimeConfigSkillRegistry `json:"skillRegistry,omitempty"`
-	MCPServers         []v1beta1.MCPServer               `json:"mcpServers,omitempty"`
+	MCPServers         []memberRuntimeMCPServer          `json:"mcpServers,omitempty"`
 	ChannelPolicy      *v1beta1.ChannelPolicySpec        `json:"channelPolicy,omitempty"`
 	AgentIdentity      *v1beta1.AgentIdentitySpec        `json:"agentIdentity,omitempty"`
 	CredentialBindings []v1beta1.CredentialBinding       `json:"credentialBindings,omitempty"`
@@ -159,7 +159,7 @@ func (d *Deployer) DeployMemberRuntimeConfig(ctx context.Context, req MemberRunt
 		return err
 	}
 
-	doc, err := d.memberRuntimeConfigDocument(req, runtimeName)
+	doc, err := d.memberRuntimeConfigDocument(ctx, req, runtimeName)
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func (d *Deployer) MergeMemberRuntimeTeamContext(ctx context.Context, req Member
 	return nil
 }
 
-func (d *Deployer) memberRuntimeConfigDocument(req MemberRuntimeConfigDeployRequest, runtimeName string) (memberRuntimeConfigDocument, error) {
+func (d *Deployer) memberRuntimeConfigDocument(ctx context.Context, req MemberRuntimeConfigDeployRequest, runtimeName string) (memberRuntimeConfigDocument, error) {
 	runtime := strings.TrimSpace(req.Runtime)
 	if runtime == "" {
 		runtime = req.Spec.Runtime
@@ -250,8 +250,12 @@ func (d *Deployer) memberRuntimeConfigDocument(req MemberRuntimeConfigDeployRequ
 		role = "worker"
 	}
 
+	mcpServers, err := d.resolveMCPServers(ctx, req.Spec.McpServers, runtimeName)
+	if err != nil {
+		return memberRuntimeConfigDocument{}, err
+	}
 	desired := memberRuntimeConfigDesired{
-		MCPServers:         req.Spec.McpServers,
+		MCPServers:         mcpServers,
 		ChannelPolicy:      req.Spec.ChannelPolicy,
 		AgentIdentity:      runtimeAgentIdentity(req.Spec),
 		CredentialBindings: copyCredentialBindings(req.Spec.CredentialBindings),
@@ -332,6 +336,41 @@ func (d *Deployer) memberRuntimeConfigDocument(req MemberRuntimeConfigDeployRequ
 	applyRuntimeTeamContext(&doc, req)
 
 	return doc, nil
+}
+
+// memberRuntimeMCPServer is private controller-to-runtime configuration. It
+// is intentionally distinct from v1beta1.MCPServer so a Worker CR can never
+// carry resolved HTTP credentials.
+type memberRuntimeMCPServer struct {
+	Name                 string            `json:"name"`
+	URL                  string            `json:"url"`
+	Transport            string            `json:"transport,omitempty"`
+	CredentialBindingRef string            `json:"credentialBindingRef,omitempty"`
+	Headers              map[string]string `json:"headers,omitempty"`
+}
+
+// resolveMCPServers materializes credentials only in the private runtime
+// projection. Worker specs retain a reference and never receive header values.
+func (d *Deployer) resolveMCPServers(ctx context.Context, servers []v1beta1.MCPServer, workerName string) ([]memberRuntimeMCPServer, error) {
+	result := make([]memberRuntimeMCPServer, len(servers))
+	for i, server := range servers {
+		result[i] = memberRuntimeMCPServer{Name: server.Name, URL: server.URL, Transport: server.Transport, CredentialBindingRef: server.CredentialBindingRef}
+	}
+	for i := range result {
+		ref := strings.TrimSpace(result[i].CredentialBindingRef)
+		if ref == "" {
+			continue
+		}
+		if d.mcpCredentialBindings == nil {
+			return nil, fmt.Errorf("mcp credential binding store is not configured")
+		}
+		binding, err := d.mcpCredentialBindings.Resolve(ctx, ref, workerName)
+		if err != nil {
+			return nil, fmt.Errorf("resolve mcp credential binding %q: %w", ref, err)
+		}
+		result[i].Headers = map[string]string{binding.HeaderName: binding.Value}
+	}
+	return result, nil
 }
 
 func isNativeConfigModel(model string) bool {
