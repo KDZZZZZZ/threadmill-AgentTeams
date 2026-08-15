@@ -100,6 +100,33 @@ def test_controller_reporter_posts_ready_with_auth(monkeypatch: pytest.MonkeyPat
     assert json.loads(request["body"]) == {"lastActiveAt": "2026-05-13T00:00:00Z"}
 
 
+def test_controller_reporter_posts_redacted_runtime_apply_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, requests = _start_server({"POST /api/v1/workers/worker-a/ready": (204, None)})
+    monkeypatch.setenv("AGENTTEAMS_CONTROLLER_URL", f"http://127.0.0.1:{server.server_port}")
+    try:
+        reporter = ControllerHeartbeatReporter.from_env("worker-a")
+        assert reporter.report_ready(
+            runtime_config={
+                "appliedGeneration": "7",
+                "mcpServers": [{
+                    "name": "threadmill",
+                    "applied": True,
+                    "headerNames": ["X-Threadmill-Execution-Token"],
+                }],
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    payload = json.loads(requests[0]["body"])
+    assert payload["runtimeConfig"]["appliedGeneration"] == "7"
+    assert payload["runtimeConfig"]["mcpServers"][0]["headerNames"] == [
+        "X-Threadmill-Execution-Token",
+    ]
+    assert "test-threadmill-token-a" not in requests[0]["body"]
+
+
 def test_controller_reporter_rereads_token_file_for_heartbeat(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

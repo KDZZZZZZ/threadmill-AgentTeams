@@ -62,7 +62,7 @@ func (s *HTTPServer) call(ctx context.Context, token, method, name string, args 
 		}
 		items := make([]map[string]any, 0, len(tools))
 		for _, tool := range tools {
-			items = append(items, map[string]any{"name": tool})
+			items = append(items, mcpToolDescriptor(tool))
 		}
 		return map[string]any{"tools": items}, nil
 	case "tools/call":
@@ -70,6 +70,39 @@ func (s *HTTPServer) call(ctx context.Context, token, method, name string, args 
 	default:
 		return nil, errHTTPMethod
 	}
+}
+
+// mcpToolDescriptor supplies the MCP-required inputSchema without exposing
+// trusted binding fields. Invocation, Task, endpoint, and credentials remain
+// transport-bound and deliberately cannot be provided by an agent argument.
+func mcpToolDescriptor(name string) map[string]any {
+	descriptor := map[string]any{
+		"name":        name,
+		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+	}
+	switch name {
+	case ToolRegisterArtifact:
+		descriptor["inputSchema"] = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"controlled_path": map[string]string{"type": "string"},
+				"kind":            map[string]string{"type": "string"},
+				"media_type":      map[string]string{"type": "string"},
+			},
+			"required": []string{"controlled_path", "kind"},
+		}
+	case ToolSubmitPhaseOutput:
+		descriptor["inputSchema"] = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"phase":         map[string]string{"type": "string"},
+				"delivery_refs": map[string]any{"type": "array", "items": map[string]string{"type": "string"}},
+				"report_ref":    map[string]string{"type": "string"},
+				"evidence_refs": map[string]any{"type": "array", "items": map[string]string{"type": "string"}},
+			},
+		}
+	}
+	return descriptor
 }
 
 func (s *HTTPServer) toolCall(ctx context.Context, token, name string, raw json.RawMessage) (any, error) {

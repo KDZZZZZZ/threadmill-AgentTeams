@@ -1259,6 +1259,27 @@ class ApplyResult:
 
 
 
+@dataclass(frozen=True)
+class MCPServerApplyStatus:
+    """Redacted result of applying one controller-managed MCP client."""
+
+    name: str
+    applied: bool
+    header_names: List[str]
+    removed: bool = False
+    error: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"name": self.name, "applied": self.applied}
+        if self.header_names:
+            result["headerNames"] = list(self.header_names)
+        if self.removed:
+            result["removed"] = True
+        if self.error:
+            result["error"] = self.error
+        return result
+
+
 class RuntimeUpdater:
     """Apply controller-projected runtime desired state inside one worker pod."""
 
@@ -1283,6 +1304,19 @@ class RuntimeUpdater:
             workspace_dir=config.default_workspace_dir,
         )
         self.current_config: Optional[MemberRuntimeConfig] = None
+        self._mcp_apply_report: Dict[str, Any] = {}
+
+    def mcp_apply_report(self) -> Dict[str, Any]:
+        """Return the latest redacted MCP apply report for the worker heartbeat."""
+
+        return {
+            "appliedGeneration": _string(self._mcp_apply_report.get("appliedGeneration")),
+            "mcpServers": [
+                dict(item)
+                for item in self._mcp_apply_report.get("mcpServers", [])
+                if isinstance(item, dict)
+            ],
+        }
 
     def load(self) -> MemberRuntimeConfig:
         if self.runtime_config_pull is not None:
@@ -1549,9 +1583,23 @@ class RuntimeUpdater:
 
     def _apply_mcp_servers(self, config: MemberRuntimeConfig) -> None:
         servers = self._mcporter_servers(config)
+        statuses: List[MCPServerApplyStatus] = []
         if self.api_client is None:
             if servers:
+                self._set_mcp_apply_report(
+                    config,
+                    [
+                        MCPServerApplyStatus(
+                            name=name,
+                            applied=False,
+                            header_names=self._mcp_header_names(server),
+                            error="api_client_unavailable",
+                        )
+                        for name, server in servers.items()
+                    ],
+                )
                 raise RuntimeError("QwenPaw API client is required for MCP configuration")
+            self._set_mcp_apply_report(config, statuses)
             return
         existing = {str(item.get("key")): item for item in self.api_client.list_mcp()}
         ownership_path = self.config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
@@ -1560,7 +1608,21 @@ class RuntimeUpdater:
         except (FileNotFoundError, json.JSONDecodeError, TypeError):
             managed = set()
         for key in sorted((managed & existing.keys()) - servers.keys()):
-            self.api_client.delete_mcp(key)
+            try:
+                self.api_client.delete_mcp(key)
+            except Exception as exc:
+                statuses.append(
+                    MCPServerApplyStatus(
+                        name=key,
+                        applied=False,
+                        header_names=[],
+                        removed=True,
+                        error=self._mcp_apply_error(exc),
+                    )
+                )
+                self._set_mcp_apply_report(config, statuses)
+                raise
+            statuses.append(MCPServerApplyStatus(name=key, applied=False, header_names=[], removed=True))
         for key, server in servers.items():
             transport = _string(server.get("transport") or "http")
             payload = {
@@ -1576,15 +1638,58 @@ class RuntimeUpdater:
                 "env": dict(server.get("env") or {}),
                 "cwd": _string(server.get("cwd")),
             }
-            if key in existing:
-                self.api_client.update_mcp(key, payload)
-            else:
-                self.api_client.create_mcp(key, payload)
+            try:
+                if key in existing:
+                    self.api_client.update_mcp(key, payload)
+                else:
+                    self.api_client.create_mcp(key, payload)
+            except Exception as exc:
+                statuses.append(
+                    MCPServerApplyStatus(
+                        name=key,
+                        applied=False,
+                        header_names=self._mcp_header_names(server),
+                        error=self._mcp_apply_error(exc),
+                    )
+                )
+                self._set_mcp_apply_report(config, statuses)
+                raise
+            statuses.append(
+                MCPServerApplyStatus(
+                    name=key,
+                    applied=True,
+                    header_names=self._mcp_header_names(server),
+                )
+            )
         ownership_path.parent.mkdir(parents=True, exist_ok=True)
         ownership_path.write_text(
             json.dumps(sorted(servers), ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+        self._set_mcp_apply_report(config, statuses)
+
+    def _set_mcp_apply_report(
+        self,
+        config: MemberRuntimeConfig,
+        statuses: List[MCPServerApplyStatus],
+    ) -> None:
+        self._mcp_apply_report = {
+            "appliedGeneration": config.generation,
+            "mcpServers": [status.as_dict() for status in statuses],
+        }
+
+    @staticmethod
+    def _mcp_header_names(server: Dict[str, Any]) -> List[str]:
+        headers = server.get("headers")
+        if not isinstance(headers, dict):
+            return []
+        return sorted(_string(name) for name in headers if _string(name))
+
+    @staticmethod
+    def _mcp_apply_error(exc: Exception) -> str:
+        # Errors are reported through the controller heartbeat. Preserve only a
+        # stable type to avoid echoing an endpoint or private header value.
+        return type(exc).__name__
 
     def _apply_package_mcp_servers(self, package_dir: Optional[Path]) -> None:
         package_clients = getattr(self.package_manager, "package_mcp_clients", None)

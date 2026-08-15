@@ -9,6 +9,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+_SENSITIVE_KEYS = {"authorization", "token", "access_token", "api_key", "secret", "password", "credential", "input"}
+_ERROR_DETAIL_LIMIT = 4096
+
+def _redact(value: Any, key: str = "") -> Any:
+    if key.lower() == "input":
+        return f"<redacted:{type(value).__name__}>"
+    if any(marker in key.lower() for marker in _SENSITIVE_KEYS): return "<redacted>"
+    if isinstance(value, dict): return {str(k): _redact(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list): return [_redact(item) for item in value]
+    return value
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try: text = exc.read(_ERROR_DETAIL_LIMIT + 1).decode("utf-8", errors="replace")
+    except OSError: return ""
+    if len(text) > _ERROR_DETAIL_LIMIT: text = text[:_ERROR_DETAIL_LIMIT] + "…"
+    try: return " detail=" + json.dumps(_redact(json.loads(text)), ensure_ascii=False, separators=(",", ":"))
+    except json.JSONDecodeError:
+        return " detail=<redacted non-json detail>" if any(x in text.lower() for x in _SENSITIVE_KEYS) else f" detail={text!r}"
+
 
 class QwenPawApiError(RuntimeError):
     """Raised when QwenPaw rejects or fails to persist desired state."""
@@ -36,8 +55,9 @@ class QwenPawApiClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
             raise QwenPawApiError(
-                f"QwenPaw API {method} {path} failed with HTTP {exc.code}",
+                f"QwenPaw API {method} {path} failed with HTTP {exc.code}{detail}",
             ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise QwenPawApiError(

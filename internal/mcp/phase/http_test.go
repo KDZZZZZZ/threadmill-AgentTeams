@@ -54,6 +54,50 @@ func TestHTTPMCPRegistersArtifactAndSubmitsFormalOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHTTPMCPToolsListIncludesInputSchemas(t *testing.T) {
+	registry := NewBindingRegistry()
+	binding := mustIssue(t, registry, &fakeRuntime{}, &fakeAgent{}, "invocation-tools", "task-tools", time.Time{})
+	handler, err := NewHandler(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewHTTPServer(handler))
+	defer server.Close()
+
+	// callHTTPMCP exercises tools/call, while tools/list has no tool name.
+	// Use a direct request here to assert the MCP schema QwenPaw requires.
+	requestBody := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	request, err := http.NewRequest(http.MethodPost, server.URL, bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(ExecutionTokenHeader, binding.Token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var envelope struct {
+		Result struct {
+			Tools []struct {
+				Name        string         `json:"name"`
+				InputSchema map[string]any `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope.Result.Tools) == 0 {
+		t.Fatal("tools/list returned no tools")
+	}
+	for _, tool := range envelope.Result.Tools {
+		if tool.InputSchema["type"] != "object" {
+			t.Fatalf("tool %q missing object inputSchema", tool.Name)
+		}
+	}
+}
 func callHTTPMCP(t *testing.T, url, token, name string, arguments any) any {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": name, "arguments": arguments}})

@@ -77,6 +77,27 @@ type WorkerResponse struct {
 	ExposedPorts     []ExposedPortInfo          `json:"exposedPorts,omitempty"`
 	Team             string                     `json:"team,omitempty"`
 	Role             string                     `json:"role,omitempty"`
+	RuntimeConfig    *WorkerRuntimeConfigStatus `json:"runtimeConfig,omitempty"`
+}
+
+// WorkerRuntimeConfigStatus is the worker-reported, redacted result of applying
+// its controller-projected runtime.yaml. It intentionally excludes MCP header
+// values and all other runtime configuration material.
+type WorkerRuntimeConfigStatus struct {
+	DesiredGeneration string                       `json:"desiredGeneration,omitempty"`
+	AppliedGeneration string                       `json:"appliedGeneration,omitempty"`
+	MCPServers        []WorkerMCPServerApplyStatus `json:"mcpServers,omitempty"`
+}
+
+// WorkerMCPServerApplyStatus records application of one MCP client. HeaderNames
+// are safe identifiers only; the corresponding header values stay private to
+// the runtime process.
+type WorkerMCPServerApplyStatus struct {
+	Name        string   `json:"name"`
+	Applied     bool     `json:"applied"`
+	HeaderNames []string `json:"headerNames,omitempty"`
+	Removed     bool     `json:"removed,omitempty"`
+	Error       string   `json:"error,omitempty"`
 }
 
 type ExposedPortInfo struct {
