@@ -64,6 +64,7 @@ type WaitingRecord struct {
 	ContinuationRef     ContinuationRef             `json:"continuation_ref"`
 	State               AwaitState                  `json:"state"`
 	WorkspaceRef        string                      `json:"workspace_ref,omitempty"`
+	AllowedDirs         []string                    `json:"allowed_dirs,omitempty"`
 	ContextSliceRef     string                      `json:"context_slice_ref,omitempty"`
 	TaskMemoryBufferRef string                      `json:"task_memory_buffer_ref,omitempty"`
 	ArtifactRefs        []artifacts.ArtifactRef     `json:"artifact_refs,omitempty"`
@@ -204,6 +205,7 @@ func validAwaitTransition(from, to AwaitState) bool {
 
 func copyWaitingRecord(in WaitingRecord) WaitingRecord {
 	in.PendingInputIDs = append([]string(nil), in.PendingInputIDs...)
+	in.AllowedDirs = append([]string(nil), in.AllowedDirs...)
 	in.ArtifactRefs = append([]artifacts.ArtifactRef(nil), in.ArtifactRefs...)
 	in.EventRefs = append([]string(nil), in.EventRefs...)
 	in.EvidenceRefs = append([]string(nil), in.EvidenceRefs...)
