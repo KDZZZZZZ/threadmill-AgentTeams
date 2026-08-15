@@ -155,6 +155,85 @@ def test_runtime_updater_reconciles_model_mcp_matrix_channel_and_acl_via_api(
     assert not (updater.config.default_workspace_dir / "access_control.json").exists()
 
 
+def test_runtime_updater_reports_redacted_mcp_apply_status(tmp_path: Path) -> None:
+    updater = _runtime_updater(config=_config(tmp_path), package_manager=_NoopPackageManager())
+    secret = "test-threadmill-token-a"
+
+    updater.apply_once(
+        runtime_config=MemberRuntimeConfig(
+            path=updater.config.runtime_config_path,
+            raw={
+                "metadata": {"generation": "7"},
+                "member": {"runtime": "qwenpaw"},
+                "desired": {
+                    "mcpServers": [{
+                        "name": "threadmill",
+                        "url": "http://threadmill.test/mcp",
+                        "headers": {"X-Threadmill-Execution-Token": secret},
+                    }],
+                },
+            },
+        ),
+    )
+
+    report = updater.mcp_apply_report()
+    assert report == {
+        "appliedGeneration": "7",
+        "mcpServers": [{
+            "name": "threadmill",
+            "applied": True,
+            "headerNames": ["X-Threadmill-Execution-Token"],
+        }],
+    }
+    assert secret not in json.dumps(report)
+    assert updater.api_client.mcp["threadmill"]["headers"] == {
+        "X-Threadmill-Execution-Token": secret,
+    }
+
+
+def test_runtime_updater_reports_failed_and_removed_mcp_apply(tmp_path: Path) -> None:
+    class FailingMCPApi(_FakeQwenPawApi):
+        def create_mcp(self, _key, _payload):
+            raise RuntimeError("private endpoint connection failed")
+
+    config = _config(tmp_path)
+    managed = config.qwenpaw_working_dir / ".agentteams-managed-mcp.json"
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    managed.write_text('["old"]\n', encoding="utf-8")
+    api = FailingMCPApi()
+    api.mcp["old"] = {"key": "old"}
+    updater = RuntimeUpdater(config=config, api_client=api, package_manager=_NoopPackageManager())
+
+    with pytest.raises(RuntimeError):
+        updater.apply_once(
+            runtime_config=MemberRuntimeConfig(
+                path=config.runtime_config_path,
+                raw={
+                    "metadata": {"generation": "8"},
+                    "member": {"runtime": "qwenpaw"},
+                    "desired": {"mcpServers": [{
+                        "name": "threadmill",
+                        "url": "http://private.test/mcp",
+                        "headers": {"X-Threadmill-Execution-Token": "test-threadmill-token-a"},
+                    }]},
+                },
+            ),
+        )
+
+    report = updater.mcp_apply_report()
+    assert report["appliedGeneration"] == "8"
+    assert report["mcpServers"] == [
+        {"name": "old", "applied": False, "removed": True},
+        {
+            "name": "threadmill",
+            "applied": False,
+            "headerNames": ["X-Threadmill-Execution-Token"],
+            "error": "RuntimeError",
+        },
+    ]
+    assert "test-threadmill-token-a" not in json.dumps(report)
+
+
 def test_runtime_updater_maps_dingtalk_visibility_and_preserves_empty_secret(
     tmp_path: Path,
 ) -> None:

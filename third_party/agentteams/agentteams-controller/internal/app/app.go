@@ -86,10 +86,11 @@ type App struct {
 	remoteClientCache *remoteclient.Cache
 
 	// Service layer
-	provisioner   *service.Provisioner
-	deployer      *service.Deployer
-	envBuilder    *service.WorkerEnvBuilder
-	managerConfig *service.ManagerConfigStore
+	provisioner    *service.Provisioner
+	deployer       *service.Deployer
+	envBuilder     *service.WorkerEnvBuilder
+	managerConfig  *service.ManagerConfigStore
+	mcpCredentials service.MCPCredentialBindingStore
 }
 
 // New constructs the entire application dependency graph and wires everything
@@ -504,6 +505,19 @@ func (a *App) initServiceLayer(_ context.Context) error {
 	})
 
 	a.envBuilder = service.NewWorkerEnvBuilder(cfg.WorkerEnv)
+	// MCP credential bindings are controller-owned. They are intentionally
+	// separate from Worker credentials and are shared by the REST API and
+	// runtime projection so a reference created through the API resolves in
+	// the same controller process.
+	if cfg.KubeMode == "incluster" && a.k8sClient != nil {
+		a.mcpCredentials = &service.SecretMCPCredentialBindingStore{
+			Client: a.k8sClient, Namespace: a.namespace, ControllerName: cfg.ControllerName,
+		}
+	} else {
+		a.mcpCredentials = &service.FileMCPCredentialBindingStore{
+			Dir: filepath.Join(cfg.DataDir, "mcp-credential-bindings"),
+		}
+	}
 
 	if a.oss != nil {
 		agentFSDir := ""
@@ -518,15 +532,16 @@ func (a *App) initServiceLayer(_ context.Context) error {
 	}
 
 	a.deployer = service.NewDeployer(service.DeployerConfig{
-		AgentConfig:     a.agentGen,
-		OSS:             a.oss,
-		Executor:        a.shell,
-		Packages:        a.packages,
-		ManagerConfig:   a.managerConfig,
-		AgentFSDir:      cfg.AgentFSDir(),
-		WorkerAgentDir:  cfg.WorkerAgentDir(),
-		MatrixDomain:    cfg.MatrixDomain,
-		NacosCredClient: a.credProvider,
+		AgentConfig:           a.agentGen,
+		OSS:                   a.oss,
+		Executor:              a.shell,
+		Packages:              a.packages,
+		ManagerConfig:         a.managerConfig,
+		AgentFSDir:            cfg.AgentFSDir(),
+		WorkerAgentDir:        cfg.WorkerAgentDir(),
+		MatrixDomain:          cfg.MatrixDomain,
+		NacosCredClient:       a.credProvider,
+		MCPCredentialBindings: a.mcpCredentials,
 	})
 
 	return nil
@@ -631,18 +646,19 @@ func (a *App) initReconcilers(_ context.Context) error {
 
 func (a *App) initHTTPServer(_ context.Context) error {
 	a.httpServer = server.NewHTTPServer(a.cfg.HTTPAddr, server.ServerDeps{
-		Client:         a.mgr.GetClient(),
-		Backend:        a.registry,
-		Gateway:        a.gateway,
-		OSS:            a.oss,
-		STS:            a.stsService,
-		AuthMw:         a.authMw,
-		KubeMode:       a.cfg.KubeMode,
-		Namespace:      a.namespace,
-		ControllerName: a.cfg.ControllerName,
-		SocketPath:     a.cfg.SocketPath,
-		MatrixConfig:   a.cfg.MatrixConfig(),
-		Provisioner:    a.provisioner,
+		Client:                a.mgr.GetClient(),
+		Backend:               a.registry,
+		Gateway:               a.gateway,
+		OSS:                   a.oss,
+		STS:                   a.stsService,
+		AuthMw:                a.authMw,
+		KubeMode:              a.cfg.KubeMode,
+		Namespace:             a.namespace,
+		ControllerName:        a.cfg.ControllerName,
+		SocketPath:            a.cfg.SocketPath,
+		MatrixConfig:          a.cfg.MatrixConfig(),
+		Provisioner:           a.provisioner,
+		MCPCredentialBindings: a.mcpCredentials,
 
 		DefaultWorkerRuntime: a.cfg.DefaultWorkerRuntime,
 	})

@@ -4,3 +4,5 @@ Record image-affecting changes to `manager/`, `worker/`, `copaw/`, `hermes/`, `o
 
 ---
 
+- feat(worker): add controller-owned MCP credential bindings with private runtime header projection.
+

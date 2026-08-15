@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
@@ -133,6 +134,113 @@ func TestLifecycleEnsureReadyStartsSleepingWorker(t *testing.T) {
 	}
 	if updated.Spec.DesiredState() != "Running" {
 		t.Fatalf("expected spec.state Running, got %q", updated.Spec.DesiredState())
+	}
+}
+
+func TestLifecycleRuntimeStatusRequiresCurrentAppliedGeneration(t *testing.T) {
+	scheme := newLifecycleTestScheme(t)
+	worker := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha-dev", Namespace: "default", Generation: 7},
+		Spec: v1beta1.WorkerSpec{McpServers: []v1beta1.MCPServer{{
+			Name: "threadmill", URL: "http://threadmill.test/mcp", Transport: "streamable_http",
+		}}},
+		Status: v1beta1.WorkerStatus{Phase: "Running"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(worker).Build()
+	handler := NewLifecycleHandler(k8sClient, backend.NewRegistry([]backend.WorkerBackend{
+		&stubWorkerBackend{status: backend.StatusRunning},
+	}), "default")
+
+	ready := httptest.NewRequest(http.MethodPost, "/api/v1/workers/alpha-dev/ready", strings.NewReader(`{
+		"runtimeConfig":{"appliedGeneration":"6","mcpServers":[{
+			"name":"threadmill","applied":true,"headerNames":["X-Threadmill-Execution-Token"]
+		}]}}`))
+	ready.SetPathValue("name", "alpha-dev")
+	readyRec := httptest.NewRecorder()
+	handler.Ready(readyRec, ready)
+	if readyRec.Code != http.StatusNoContent {
+		t.Fatalf("expected stale ready report accepted, got %d: %s", readyRec.Code, readyRec.Body.String())
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/workers/alpha-dev/status", nil)
+	statusReq.SetPathValue("name", "alpha-dev")
+	statusRec := httptest.NewRecorder()
+	handler.GetWorkerRuntimeStatus(statusRec, statusReq)
+	if statusRec.Code != http.StatusOK {
+		t.Fatalf("status request: %d: %s", statusRec.Code, statusRec.Body.String())
+	}
+	var stale WorkerResponse
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &stale); err != nil {
+		t.Fatalf("decode stale status: %v", err)
+	}
+	if stale.Phase == "Ready" {
+		t.Fatal("stale applied generation must not mark worker Ready")
+	}
+	if stale.RuntimeConfig == nil || stale.RuntimeConfig.DesiredGeneration != "7" || stale.RuntimeConfig.AppliedGeneration != "6" {
+		t.Fatalf("unexpected stale runtime status: %#v", stale.RuntimeConfig)
+	}
+
+	ready = httptest.NewRequest(http.MethodPost, "/api/v1/workers/alpha-dev/ready", strings.NewReader(`{
+		"runtimeConfig":{"appliedGeneration":"7","mcpServers":[{
+			"name":"threadmill","applied":true,"headerNames":["X-Threadmill-Execution-Token"]
+		}]}}`))
+	ready.SetPathValue("name", "alpha-dev")
+	readyRec = httptest.NewRecorder()
+	handler.Ready(readyRec, ready)
+	if readyRec.Code != http.StatusNoContent {
+		t.Fatalf("expected current ready report accepted, got %d: %s", readyRec.Code, readyRec.Body.String())
+	}
+
+	statusRec = httptest.NewRecorder()
+	handler.GetWorkerRuntimeStatus(statusRec, statusReq)
+	var current WorkerResponse
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &current); err != nil {
+		t.Fatalf("decode current status: %v", err)
+	}
+	if current.Phase != "Ready" {
+		t.Fatalf("expected ready after current MCP apply, got %q", current.Phase)
+	}
+	if strings.Contains(statusRec.Body.String(), "test-threadmill-token-a") {
+		t.Fatal("runtime status must not expose MCP header values")
+	}
+}
+
+func TestLifecycleRuntimeStatusReportsFailedAndRemovedMCP(t *testing.T) {
+	scheme := newLifecycleTestScheme(t)
+	worker := &v1beta1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha-dev", Namespace: "default", Generation: 9},
+		Spec:       v1beta1.WorkerSpec{McpServers: []v1beta1.MCPServer{{Name: "threadmill", URL: "http://threadmill.test/mcp"}}},
+		Status:     v1beta1.WorkerStatus{Phase: "Running"},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(worker).Build()
+	handler := NewLifecycleHandler(k8sClient, backend.NewRegistry([]backend.WorkerBackend{
+		&stubWorkerBackend{status: backend.StatusRunning},
+	}), "default")
+
+	report := `{"runtimeConfig":{"appliedGeneration":"9","mcpServers":[{"name":"threadmill","applied":false,"error":"QwenPawApiError"},{"name":"old","applied":false,"removed":true}]}}`
+	ready := httptest.NewRequest(http.MethodPost, "/api/v1/workers/alpha-dev/ready", strings.NewReader(report))
+	ready.SetPathValue("name", "alpha-dev")
+	handler.Ready(httptest.NewRecorder(), ready)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/workers/alpha-dev/status", nil)
+	request.SetPathValue("name", "alpha-dev")
+	response := httptest.NewRecorder()
+	handler.GetWorkerRuntimeStatus(response, request)
+	var status WorkerResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.Phase == "Ready" {
+		t.Fatal("failed MCP apply must not mark worker Ready")
+	}
+	if status.RuntimeConfig == nil || len(status.RuntimeConfig.MCPServers) != 2 {
+		t.Fatalf("unexpected runtime config: %#v", status.RuntimeConfig)
+	}
+	if got := status.RuntimeConfig.MCPServers[0]; got.Error != "QwenPawApiError" || got.Applied {
+		t.Fatalf("failed MCP status lost: %#v", got)
+	}
+	if got := status.RuntimeConfig.MCPServers[1]; !got.Removed || got.Applied {
+		t.Fatalf("removed MCP status lost: %#v", got)
 	}
 }
 

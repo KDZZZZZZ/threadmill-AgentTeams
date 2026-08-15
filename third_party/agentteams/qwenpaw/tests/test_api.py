@@ -8,6 +8,7 @@ from qwenpaw_worker.api import QwenPawApiClient, QwenPawApiError
 
 
 class _ApiHandler(BaseHTTPRequestHandler):
+    error_body = None
     channel = {"enabled": False, "client_secret": "existing-secret"}
     channel_readback_override = None
     agents = [
@@ -101,6 +102,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         payload = self._payload()
+        if self.path == "/api/error":
+            body = type(self).error_body or {"detail": "missing"}
+            self._reply(422, body)
+            return
         actions = {
             "/api/access-control/whitelist/add": ("whitelist", True),
             "/api/access-control/whitelist/remove": ("whitelist", False),
@@ -153,6 +158,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture()
 def api_url():
+    _ApiHandler.error_body = None
     _ApiHandler.channel = {"enabled": False, "client_secret": "existing-secret"}
     _ApiHandler.channel_readback_override = None
     _ApiHandler.agents = [
@@ -223,6 +229,34 @@ def test_http_error_and_timeout_are_safe(api_url, monkeypatch):
     with pytest.raises(QwenPawApiError, match="unavailable: TimeoutError") as exc:
         client.get_version()
     assert "sensitive upstream detail" not in str(exc.value)
+
+
+def test_http_error_detail_is_redacted_and_bounded(api_url):
+    _ApiHandler.error_body = {
+        "detail": [{"loc": ["body", "transport"], "msg": "example validation error", "type": "example_type", "input": "validation-input-secret"}],
+        "headers": {"Authorization": "Bearer test-secret", "X-Threadmill-Execution-Token": "test-token"},
+        "credential": {"api_key": "key-secret", "password": "password-secret"},
+    }
+    with pytest.raises(QwenPawApiError) as caught:
+        QwenPawApiClient(api_url)._request("POST", "/api/error", {})
+    message = str(caught.value)
+    assert "transport" in message and "example validation error" in message and "example_type" in message
+    for secret in ("test-secret", "test-token", "key-secret", "password-secret", "validation-input-secret"):
+        assert secret not in message
+    assert "<redacted>" in message
+    assert "<redacted:str>" in message
+
+
+def test_http_error_non_json_and_oversize_are_safe(monkeypatch):
+    import urllib.error
+    import io
+    body = ("token=not-safe " + "x" * 5000).encode()
+    error = urllib.error.HTTPError("http://test", 422, "bad", {}, io.BytesIO(body))
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    with pytest.raises(QwenPawApiError) as caught:
+        QwenPawApiClient("http://test")._request("POST", "/api/mcp", {})
+    assert "not-safe" not in str(caught.value)
+    assert len(str(caught.value)) < 4300
 
 
 def test_acl_reconcile_parses_structured_entries_and_is_channel_scoped(api_url):

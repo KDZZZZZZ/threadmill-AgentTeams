@@ -19,18 +19,19 @@ import (
 
 // ServerDeps aggregates all dependencies needed by the HTTP API handlers.
 type ServerDeps struct {
-	Client         client.Client
-	Backend        *backend.Registry
-	Gateway        gateway.Client
-	OSS            oss.StorageClient
-	STS            *credentials.STSService
-	AuthMw         *authpkg.Middleware
-	KubeMode       string
-	Namespace      string
-	ControllerName string               // AGENTTEAMS_CONTROLLER_NAME; empty in embedded mode
-	SocketPath     string               // Docker proxy (embedded only)
-	MatrixConfig   matrix.Config        // for AppService rotation endpoint
-	Provisioner    *service.Provisioner // for Matrix token refresh
+	Client                client.Client
+	Backend               *backend.Registry
+	Gateway               gateway.Client
+	OSS                   oss.StorageClient
+	STS                   *credentials.STSService
+	AuthMw                *authpkg.Middleware
+	KubeMode              string
+	Namespace             string
+	ControllerName        string               // AGENTTEAMS_CONTROLLER_NAME; empty in embedded mode
+	SocketPath            string               // Docker proxy (embedded only)
+	MatrixConfig          matrix.Config        // for AppService rotation endpoint
+	Provisioner           *service.Provisioner // for Matrix token refresh
+	MCPCredentialBindings service.MCPCredentialBindingStore
 
 	DefaultWorkerRuntime string // install-time default for Worker create requests
 }
@@ -118,6 +119,13 @@ func NewHTTPServer(addr string, deps ServerDeps) *HTTPServer {
 	ch := NewCredentialsHandler(deps.STS, deps.Provisioner)
 	mux.Handle("POST /api/v1/credentials/sts", mw.RequireAuthz(authpkg.ActionSTS, "credentials", nil)(http.HandlerFunc(ch.RefreshSTS)))
 	mux.Handle("POST /api/v1/credentials/matrix-token", mw.RequireAuthz(authpkg.ActionRefreshMatrixToken, "credentials", nil)(http.HandlerFunc(ch.RefreshMatrixToken)))
+
+	// --- Controller-owned MCP credential bindings ---
+	// They are scoped to a Worker runtime and only return redacted metadata.
+	mcpCredentials := NewMCPCredentialBindingHandler(deps.MCPCredentialBindings)
+	mux.Handle("POST /api/v1/mcp-credentials", mw.RequireAuthz(authpkg.ActionCreate, "worker", nil)(http.HandlerFunc(mcpCredentials.Create)))
+	mux.Handle("GET /api/v1/mcp-credentials/{id}", mw.RequireAuthz(authpkg.ActionGet, "worker", nil)(http.HandlerFunc(mcpCredentials.Get)))
+	mux.Handle("POST /api/v1/mcp-credentials/{id}/revoke", mw.RequireAuthz(authpkg.ActionUpdate, "worker", nil)(http.HandlerFunc(mcpCredentials.Revoke)))
 
 	// --- AppService management ---
 	ash := NewAppServiceHandler(deps.MatrixConfig)
