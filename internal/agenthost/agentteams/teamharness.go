@@ -171,6 +171,37 @@ type TaskflowClient interface {
 	CheckTask(ctx context.Context, taskID string) (TeamHarnessTaskSnapshot, error)
 }
 
+// TaskflowCanceller is an optional transport capability because only await
+// relinquish needs TeamHarness cancel_task. Keeping it separate preserves the
+// fresh-execution TaskflowClient contract for existing transports.
+type TaskflowCanceller interface {
+	CancelTask(ctx context.Context, taskID, reason string) error
+}
+
+// CancelInvocationTask cancels the transient TeamHarness task associated with
+// a logical Threadmill invocation. It is physical-carrier cleanup only: it
+// does not cancel or complete the Threadmill Invocation itself.
+func (h *TeamHarnessExecutionHost) CancelInvocationTask(ctx context.Context, invocationID, reason string) error {
+	taskID, found, err := h.taskIDs.Lookup(ctx, invocationID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return contractError("no TeamHarness task is recorded for invocation_id")
+	}
+	return h.CancelTeamHarnessTask(ctx, taskID, reason)
+}
+
+// CancelTeamHarnessTask exposes the narrow carrier-level cancellation port
+// used by Runtime await relinquish after it has resolved the transient task.
+func (h *TeamHarnessExecutionHost) CancelTeamHarnessTask(ctx context.Context, taskID, reason string) error {
+	canceller, ok := h.taskflow.(TaskflowCanceller)
+	if !ok {
+		return contractError("taskflow client does not support cancellation")
+	}
+	return canceller.CancelTask(ctx, taskID, reason)
+}
+
 // TeamHarnessDelegateTaskRequest is exactly the M1 subset derived from the
 // real taskflow delegate inputs: project, task, room, assignee and spec.
 type TeamHarnessDelegateTaskRequest struct {

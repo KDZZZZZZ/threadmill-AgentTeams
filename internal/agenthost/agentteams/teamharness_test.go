@@ -14,11 +14,13 @@ import (
 )
 
 type fakeTaskflowClient struct {
-	delegates   []TeamHarnessDelegateTaskRequest
-	delegateErr error
-	snapshots   []TeamHarnessTaskSnapshot
-	checkErr    error
-	checks      int
+	delegates     []TeamHarnessDelegateTaskRequest
+	delegateErr   error
+	snapshots     []TeamHarnessTaskSnapshot
+	checkErr      error
+	checks        int
+	cancellations []string
+	cancelErr     error
 }
 
 func (f *fakeTaskflowClient) DelegateTask(_ context.Context, request TeamHarnessDelegateTaskRequest) error {
@@ -39,6 +41,11 @@ func (f *fakeTaskflowClient) CheckTask(_ context.Context, _ string) (TeamHarness
 		f.snapshots = f.snapshots[1:]
 	}
 	return snapshot, nil
+}
+
+func (f *fakeTaskflowClient) CancelTask(_ context.Context, taskID, reason string) error {
+	f.cancellations = append(f.cancellations, taskID+":"+reason)
+	return f.cancelErr
 }
 
 type fixedRouteResolver struct{ route TaskflowRoute }
@@ -66,6 +73,7 @@ func (i *fakeMCPInjector) InjectPhaseMCP(_ context.Context, executionID string, 
 }
 
 var _ TaskflowClient = (*fakeTaskflowClient)(nil)
+var _ TaskflowCanceller = (*fakeTaskflowClient)(nil)
 var _ ExecutionHost = (*TeamHarnessExecutionHost)(nil)
 
 func TestTeamHarnessHostFreshInvocationDelegatesAcknowledgesAndSubmits(t *testing.T) {
@@ -148,6 +156,22 @@ func TestWaitingIsExplicitlyUnsupported(t *testing.T) {
 	var unsupported *UnsupportedControlFlowError
 	if !errors.As(err, &unsupported) || unsupported.Flow != "waiting" {
 		t.Fatalf("waiting must be explicit unsupported control flow: %v", err)
+	}
+}
+
+func TestCancelInvocationTaskCancelsOnlyTransientTeamHarnessTask(t *testing.T) {
+	t.Parallel()
+	client := &fakeTaskflowClient{}
+	taskMap := NewInMemoryInvocationTaskMap()
+	if err := taskMap.Record(context.Background(), "invocation-a", "team-task-a"); err != nil {
+		t.Fatal(err)
+	}
+	host := newTestTeamHarnessHost(t, client, taskMap, &fakeMCPInjector{})
+	if err := host.CancelInvocationTask(context.Background(), "invocation-a", "await inputs"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(client.cancellations, ","); got != "team-task-a:await inputs" {
+		t.Fatalf("cancel call = %q", got)
 	}
 }
 
