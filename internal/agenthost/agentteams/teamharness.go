@@ -178,6 +178,70 @@ type TaskflowCanceller interface {
 	CancelTask(ctx context.Context, taskID, reason string) error
 }
 
+// TaskflowActivationObserver is the non-blocking M4-D activation seam. It
+// delegates through the existing production TaskflowClient, then observes the
+// taskflow-owned status until the worker has accepted it. It deliberately does
+// not write InvocationTaskMap: epoch-aware carrier history belongs to Runtime's
+// PhysicalExecutionStore, while InvocationTaskMap retains legacy current-task
+// compatibility for fresh execution.
+type TaskflowActivationObserver struct {
+	Taskflow     TaskflowClient
+	PollInterval time.Duration
+}
+
+type TeamHarnessTaskActivation struct {
+	TaskID       string
+	AssignedTo   string
+	Status       TeamHarnessTaskStatus
+	Acknowledged bool
+	ObservedAt   time.Time
+}
+
+func (o TaskflowActivationObserver) DelegateAndObserveAcceptance(ctx context.Context, request TeamHarnessDelegateTaskRequest) (TeamHarnessTaskActivation, error) {
+	if o.Taskflow == nil {
+		return TeamHarnessTaskActivation{}, contractError("taskflow client is required")
+	}
+	if request.TaskID == "" || request.Assignee == "" {
+		return TeamHarnessTaskActivation{}, contractError("task id and assignee are required")
+	}
+	if err := o.Taskflow.DelegateTask(ctx, request); err != nil {
+		return TeamHarnessTaskActivation{}, err
+	}
+	interval := o.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for {
+		snapshot, err := o.Taskflow.CheckTask(ctx, request.TaskID)
+		if err != nil {
+			return TeamHarnessTaskActivation{}, err
+		}
+		// check_task is authoritative for the persisted task identity. A caller
+		// supplied ID is not accepted as evidence until TeamHarness returns it.
+		if snapshot.TaskID == "" || snapshot.TaskID != request.TaskID {
+			return TeamHarnessTaskActivation{}, contractError("taskflow returned a mismatched task id")
+		}
+		if snapshot.Status == TeamHarnessTaskInProgress || (snapshot.Status == TeamHarnessTaskAssigned && snapshot.Acknowledged) {
+			return TeamHarnessTaskActivation{TaskID: snapshot.TaskID, AssignedTo: request.Assignee, Status: snapshot.Status, Acknowledged: snapshot.Acknowledged, ObservedAt: time.Now().UTC()}, nil
+		}
+		if snapshot.Status == TeamHarnessTaskSubmitted {
+			return TeamHarnessTaskActivation{}, contractError("task submitted before activation observation")
+		}
+		if snapshot.Status == TeamHarnessTaskCancelled || snapshot.Status == TeamHarnessTaskFailed {
+			return TeamHarnessTaskActivation{}, fmt.Errorf("taskflow activation ended in %s", snapshot.Status)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return TeamHarnessTaskActivation{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // CancelInvocationTask cancels the transient TeamHarness task associated with
 // a logical Threadmill invocation. It is physical-carrier cleanup only: it
 // does not cancel or complete the Threadmill Invocation itself.

@@ -1,0 +1,133 @@
+package agentteams
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
+)
+
+func TestControllerReprovisionerUsesRedactedCredentialAndReadyStatus(t *testing.T) {
+	const secret = "test-threadmill-token-b"
+	var credentialPayload map[string]any
+	var workerPayload map[string]any
+	requests := make([]string, 0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if got := r.Header.Get("Authorization"); got != "Bearer controller-auth" {
+			t.Fatalf("authorization = %q", got)
+		}
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/v1/mcp-credentials":
+			if err := json.NewDecoder(r.Body).Decode(&credentialPayload); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "credential-b", "workerName": "tm-invocation-a-g3-e2", "headerName": "X-Threadmill-Execution-Token", "state": "active"})
+		case "POST /api/v1/workers":
+			if err := json.NewDecoder(r.Body).Decode(&workerPayload); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": "tm-invocation-a-g3-e2"})
+		case "POST /api/v1/workers/tm-invocation-a-g3-e2/ensure-ready":
+			w.WriteHeader(http.StatusNoContent)
+		case "GET /api/v1/workers/tm-invocation-a-g3-e2/status":
+			_ = json.NewEncoder(w).Encode(readyWorkerStatus())
+		case "POST /api/v1/mcp-credentials/credential-b/revoke", "DELETE /api/v1/workers/tm-invocation-a-g3-e2":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected controller request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := &ControllerReprovisioner{BaseURL: server.URL, BearerToken: "controller-auth", Model: "test-model", Runtime: "qwenpaw", PollInterval: time.Millisecond}
+	credential, err := client.CreateMCPCredential(context.Background(), runtime.MCPCredentialRequest{WorkerName: "tm-invocation-a-g3-e2", HeaderName: "X-Threadmill-Execution-Token", Token: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.Ref != "credential-b" || credential.WorkerName != "tm-invocation-a-g3-e2" {
+		t.Fatalf("credential = %#v", credential)
+	}
+	worker, err := client.ProvisionWorker(context.Background(), runtime.WorkerProvisionRequest{WorkerName: credential.WorkerName, CredentialRef: credential.Ref, MCPName: "threadmill", MCPURL: "http://phase-mcp.test/mcp", Transport: "streamable_http"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.RuntimeGeneration != 7 || worker.MCPClientID != "threadmill" {
+		t.Fatalf("worker = %#v", worker)
+	}
+	readback, err := client.WaitForRuntimeReady(context.Background(), worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !readback.BackendRunning || !readback.APIVersionReady || !readback.MCPApplied || readback.AppliedGeneration != 7 {
+		t.Fatalf("readback = %#v", readback)
+	}
+	if err := client.RevokeMCPCredential(context.Background(), credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteWorker(context.Background(), worker); err != nil {
+		t.Fatal(err)
+	}
+
+	if credentialPayload["secretValue"] != secret {
+		t.Fatalf("credential payload did not contain supplied private value")
+	}
+	encoded, _ := json.Marshal(workerPayload)
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "controller-auth") {
+		t.Fatalf("worker desired state leaked a secret: %s", encoded)
+	}
+	mcpServers, ok := workerPayload["mcpServers"].([]any)
+	if !ok || len(mcpServers) != 1 {
+		t.Fatalf("mcpServers = %#v", workerPayload["mcpServers"])
+	}
+	mcp := mcpServers[0].(map[string]any)
+	if mcp["credentialBindingRef"] != "credential-b" || mcp["url"] != "http://phase-mcp.test/mcp" || mcp["transport"] != "streamable_http" {
+		t.Fatalf("mcp desired state = %#v", mcp)
+	}
+	if !containsRequest(requests, "POST /api/v1/mcp-credentials/credential-b/revoke") || !containsRequest(requests, "DELETE /api/v1/workers/tm-invocation-a-g3-e2") {
+		t.Fatalf("cleanup requests = %#v", requests)
+	}
+}
+
+func TestControllerReprovisionerRejectsUnreadyOrRedactedMCPStatus(t *testing.T) {
+	worker := runtime.ProvisionedWorker{ID: "worker", Name: "worker", RuntimeGeneration: 2, MCPClientID: "threadmill"}
+	status := controllerWorkerStatus{Name: "worker", Phase: "Ready", ContainerState: "running"}
+	status.RuntimeConfig.DesiredGeneration = "2"
+	status.RuntimeConfig.AppliedGeneration = "1"
+	status.RuntimeConfig.MCPServers = append(status.RuntimeConfig.MCPServers, struct {
+		Name        string   `json:"name"`
+		Applied     bool     `json:"applied"`
+		HeaderNames []string `json:"headerNames"`
+		Removed     bool     `json:"removed"`
+		Error       string   `json:"error"`
+	}{Name: "threadmill", Applied: true, HeaderNames: []string{"X-Threadmill-Execution-Token"}})
+	readback, err := controllerReadback(status, worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readback.AppliedGeneration == worker.RuntimeGeneration {
+		t.Fatalf("stale generation reported current: %#v", readback)
+	}
+	encoded, _ := json.Marshal(readback)
+	if strings.Contains(string(encoded), "test-threadmill-token") {
+		t.Fatalf("readback leaked token: %s", encoded)
+	}
+}
+
+func readyWorkerStatus() map[string]any {
+	return map[string]any{"name": "tm-invocation-a-g3-e2", "phase": "Ready", "containerState": "running", "runtimeConfig": map[string]any{"desiredGeneration": "7", "appliedGeneration": "7", "mcpServers": []map[string]any{{"name": "threadmill", "applied": true, "headerNames": []string{"X-Threadmill-Execution-Token"}}}}}
+}
+
+func containsRequest(requests []string, expected string) bool {
+	for _, request := range requests {
+		if request == expected {
+			return true
+		}
+	}
+	return false
+}

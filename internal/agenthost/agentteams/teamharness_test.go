@@ -175,6 +175,45 @@ func TestCancelInvocationTaskCancelsOnlyTransientTeamHarnessTask(t *testing.T) {
 	}
 }
 
+func TestTaskflowActivationObserverDelegatesAndObservesAcceptance(t *testing.T) {
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "task-b", Status: TeamHarnessTaskAssigned, Acknowledged: true}}}
+	observer := TaskflowActivationObserver{Taskflow: client, PollInterval: time.Millisecond}
+	activation, err := observer.DelegateAndObserveAcceptance(context.Background(), TeamHarnessDelegateTaskRequest{ProjectID: "project", TaskID: "task-b", RoomID: "room", Assignee: "worker-b", Title: "phase", Spec: "safe spec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activation.TaskID != "task-b" || activation.AssignedTo != "worker-b" || activation.Status != TeamHarnessTaskAssigned || !activation.Acknowledged {
+		t.Fatalf("activation=%#v", activation)
+	}
+	if len(client.delegates) != 1 {
+		t.Fatalf("delegate calls=%d", len(client.delegates))
+	}
+}
+
+func TestInvocationTaskMapRetainsLegacySingleCurrentTaskSemantics(t *testing.T) {
+	t.Parallel()
+
+	taskMap := NewInMemoryInvocationTaskMap()
+	if err := taskMap.Record(context.Background(), "invocation-a", "fresh-task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskMap.Record(context.Background(), "invocation-a", "fresh-task-b"); err == nil {
+		t.Fatal("legacy map accepted a second task for the same invocation")
+	}
+	got, found, err := taskMap.Lookup(context.Background(), "invocation-a")
+	if err != nil || !found || got != "fresh-task-a" {
+		t.Fatalf("legacy task mapping changed: task=%q found=%t err=%v", got, found, err)
+	}
+}
+
+func TestTaskflowActivationObserverDoesNotTreatSubmittedAsAcceptance(t *testing.T) {
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "task-b", Status: TeamHarnessTaskSubmitted, Acknowledged: true}}}
+	_, err := (TaskflowActivationObserver{Taskflow: client}).DelegateAndObserveAcceptance(context.Background(), TeamHarnessDelegateTaskRequest{TaskID: "task-b", Assignee: "worker-b"})
+	if err == nil {
+		t.Fatal("submitted task was accepted as activation")
+	}
+}
+
 func TestSubmitEvidenceDoesNotProducePhaseOutput(t *testing.T) {
 	t.Parallel()
 
