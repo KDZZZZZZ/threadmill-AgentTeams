@@ -205,7 +205,11 @@ type TeamHarnessTaskRequest struct {
 }
 
 type TeamHarnessTask struct {
-	ID string
+	ID           string
+	AssignedTo   string
+	Status       string
+	Acknowledged bool
+	ObservedAt   time.Time
 }
 
 type TeamHarnessTaskProvisioner interface {
@@ -223,6 +227,7 @@ type PhysicalExecution struct {
 	WorkerID                  string
 	WorkerName                string
 	TeamHarnessTaskID         string
+	TeamHarnessAssignedTo     string
 	MCPClientID               string
 	CredentialBindingRef      string
 	DesiredRuntimeGeneration  int64
@@ -257,18 +262,19 @@ var (
 // BindingRegistry, and TeamHarness seams. All partial creation is unwound in
 // reverse order before the logical record is returned to waiting.
 type PhysicalExecutionProvisioner struct {
-	Store       WaitingStore
-	Leases      WorkspaceLeaseAcquirer
-	Tokens      ExecutionAuthorizationIssuer
-	Credentials MCPCredentialProvisioner
-	Workers     WorkerProvisioner
-	MCP         MCPClientCleaner
-	Runtime     WorkerRuntimeGate
-	Discovery   MCPToolDiscoverer
-	Tasks       TeamHarnessTaskProvisioner
-	MCPName     string
-	MCPURL      string
-	Transport   string
+	Store              WaitingStore
+	PhysicalExecutions PhysicalExecutionStore
+	Leases             WorkspaceLeaseAcquirer
+	Tokens             ExecutionAuthorizationIssuer
+	Credentials        MCPCredentialProvisioner
+	Workers            WorkerProvisioner
+	MCP                MCPClientCleaner
+	Runtime            WorkerRuntimeGate
+	Discovery          MCPToolDiscoverer
+	Tasks              TeamHarnessTaskProvisioner
+	MCPName            string
+	MCPURL             string
+	Transport          string
 
 	mu       sync.Mutex
 	inflight map[physicalExecutionKey]struct{}
@@ -334,18 +340,90 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if len(tools) == 0 {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, ErrMCPDiscoveryFailed)
 	}
+	// Persist the carrier before delegation. The task ID is intentionally
+	// absent here: it is supplied only after the TeamHarness taskflow has
+	// authoritatively observed the delegated task.
+	execution := PhysicalExecution{
+		TaskID:                    plan.TaskID,
+		InvocationID:              plan.InvocationID,
+		Generation:                plan.Generation,
+		ExecutionEpoch:            plan.NextExecutionEpoch,
+		WorkerID:                  worker.ID,
+		WorkerName:                worker.Name,
+		MCPClientID:               readback.MCPClientID,
+		CredentialBindingRef:      credential.Ref,
+		DesiredRuntimeGeneration:  readback.DesiredGeneration,
+		AppliedRuntimeGeneration:  readback.AppliedGeneration,
+		WorkspaceLeaseRef:         lease.Ref,
+		ExecutionAuthorizationRef: authorization.Ref,
+		State:                     PhysicalExecutionProvisioning,
+	}
+	execution, err = p.PhysicalExecutions.Create(ctx, execution)
+	if err != nil {
+		// A duplicate epoch may already have completed its final logical CAS.
+		// Tear down only this newly-created carrier material; never roll that
+		// existing logical invocation back to waiting.
+		p.teardownCarrier(ctx, lease, authorization, credential, worker, TeamHarnessTask{})
+		return PhysicalExecution{}, fmt.Errorf("%w: %v", ErrProvisionConflict, err)
+	}
 	task, err := p.Tasks.CreateTeamHarnessTask(ctx, TeamHarnessTaskRequest{Plan: plan, Worker: worker, Execution: plan.Execution})
 	if err != nil {
-		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, err)
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, TeamHarnessTask{}, err)
 	}
 	if task.ID == "" {
-		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, task, errors.New("new TeamHarness task ID is required"))
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, errors.New("new TeamHarness task ID is required"))
 	}
-	execution := PhysicalExecution{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch, WorkerID: worker.ID, WorkerName: worker.Name, TeamHarnessTaskID: task.ID, MCPClientID: readback.MCPClientID, CredentialBindingRef: credential.Ref, DesiredRuntimeGeneration: readback.DesiredGeneration, AppliedRuntimeGeneration: readback.AppliedGeneration, WorkspaceLeaseRef: lease.Ref, ExecutionAuthorizationRef: authorization.Ref, State: PhysicalExecutionDelegated}
+	execution.TeamHarnessTaskID = task.ID
+	execution.TeamHarnessAssignedTo = task.AssignedTo
+	execution.ObservedTaskStatus = task.Status
+	execution.TaskAcknowledged = task.Acknowledged
+	execution.State = PhysicalExecutionAccepted
+	updated, swapped, err := p.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), execution.Revision, execution)
+	if err != nil || !swapped {
+		if err == nil {
+			err = errors.New("physical execution activation record changed concurrently")
+		}
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
+	}
+	execution = updated
+	if !ValidatePhysicalExecutionReady(execution) {
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, errors.New("physical execution is not ready for logical activation"))
+	}
 	if err := p.commit(ctx, plan); err != nil {
-		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, task, err)
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
 	}
-	return execution, nil
+	execution.State = PhysicalExecutionRunning
+	updated, swapped, err = p.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), execution.Revision, execution)
+	if err != nil || !swapped {
+		if err == nil {
+			err = errors.New("physical execution could not record running state")
+		}
+		return PhysicalExecution{}, err
+	}
+	return updated, nil
+}
+
+// rollbackWithPhysical preserves a failed epoch as evidence after teardown;
+// it never removes a carrier record simply because a later epoch failed.
+func (p *PhysicalExecutionProvisioner) rollbackWithPhysical(ctx context.Context, plan RehydrationPlan, execution PhysicalExecution, lease WorkspaceLease, authorization IssuedExecutionAuthorization, credential MCPCredentialBinding, worker ProvisionedWorker, task TeamHarnessTask, cause error) error {
+	rollbackErr := p.rollback(ctx, plan, lease, authorization, credential, worker, task, cause)
+	if execution.Revision == 0 || p.PhysicalExecutions == nil {
+		return rollbackErr
+	}
+	failed := execution
+	failed.State = PhysicalExecutionFailed
+	failed.Teardown = PhysicalExecutionTeardown{
+		TeamHarnessTaskCancelled: task.ID != "",
+		WorkerDeleted:            worker.ID != "" || worker.Name != "",
+		MCPCleaned:               worker.ID != "" || worker.Name != "",
+		CredentialRevoked:        credential.Ref != "",
+		TokenRevoked:             authorization.Token != "" || authorization.Ref != "",
+		LeaseReleased:            lease.Ref != "",
+	}
+	if _, swapped, updateErr := p.PhysicalExecutions.CompareAndSwap(ctx, failed.Key(), execution.Revision, failed); updateErr != nil || !swapped {
+		return fmt.Errorf("%w; physical execution teardown evidence: %v", rollbackErr, updateErr)
+	}
+	return rollbackErr
 }
 
 func (p *PhysicalExecutionProvisioner) commit(ctx context.Context, plan RehydrationPlan) error {
@@ -369,6 +447,14 @@ func (p *PhysicalExecutionProvisioner) commit(ctx context.Context, plan Rehydrat
 }
 
 func (p *PhysicalExecutionProvisioner) rollback(ctx context.Context, plan RehydrationPlan, lease WorkspaceLease, authorization IssuedExecutionAuthorization, credential MCPCredentialBinding, worker ProvisionedWorker, task TeamHarnessTask, cause error) error {
+	p.teardownCarrier(ctx, lease, authorization, credential, worker, task)
+	if rollbackErr := p.rollbackWaiting(ctx, plan); rollbackErr != nil {
+		return fmt.Errorf("provision: %w; rollback waiting: %v", cause, rollbackErr)
+	}
+	return cause
+}
+
+func (p *PhysicalExecutionProvisioner) teardownCarrier(ctx context.Context, lease WorkspaceLease, authorization IssuedExecutionAuthorization, credential MCPCredentialBinding, worker ProvisionedWorker, task TeamHarnessTask) {
 	if task.ID != "" {
 		_ = p.Tasks.CancelTeamHarnessTask(ctx, task)
 	}
@@ -387,10 +473,6 @@ func (p *PhysicalExecutionProvisioner) rollback(ctx context.Context, plan Rehydr
 	if lease.Ref != "" {
 		_ = p.Leases.ReleaseWorkspaceLease(ctx, lease)
 	}
-	if rollbackErr := p.rollbackWaiting(ctx, plan); rollbackErr != nil {
-		return fmt.Errorf("provision: %w; rollback waiting: %v", cause, rollbackErr)
-	}
-	return cause
 }
 
 func (p *PhysicalExecutionProvisioner) rollbackWaiting(ctx context.Context, plan RehydrationPlan) error {
@@ -411,7 +493,7 @@ func (p *PhysicalExecutionProvisioner) rollbackWaiting(ctx context.Context, plan
 }
 
 func (p *PhysicalExecutionProvisioner) validate(plan RehydrationPlan) error {
-	if p == nil || p.Store == nil || p.Leases == nil || p.Tokens == nil || p.Credentials == nil || p.Workers == nil || p.MCP == nil || p.Runtime == nil || p.Discovery == nil || p.Tasks == nil {
+	if p == nil || p.Store == nil || p.PhysicalExecutions == nil || p.Leases == nil || p.Tokens == nil || p.Credentials == nil || p.Workers == nil || p.MCP == nil || p.Runtime == nil || p.Discovery == nil || p.Tasks == nil {
 		return errors.New("physical execution provisioner dependencies are required")
 	}
 	if plan.TaskID == "" || plan.InvocationID == "" || plan.Generation <= 0 || plan.NextExecutionEpoch <= 0 || plan.NewBindingRef == "" || plan.NewInputRevision == "" || plan.ExpectedWaitingRevision <= 0 {

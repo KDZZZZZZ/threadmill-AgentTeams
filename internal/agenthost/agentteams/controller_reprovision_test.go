@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
 
 func TestControllerReprovisionerUsesRedactedCredentialAndReadyStatus(t *testing.T) {
@@ -116,6 +117,28 @@ func TestControllerReprovisionerRejectsUnreadyOrRedactedMCPStatus(t *testing.T) 
 	encoded, _ := json.Marshal(readback)
 	if strings.Contains(string(encoded), "test-threadmill-token") {
 		t.Fatalf("readback leaked token: %s", encoded)
+	}
+}
+
+func TestRehydratedTeamHarnessTaskActivatorUsesObservedWorkerAcceptance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/workers/worker-b/status" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": "worker-b", "roomID": "!worker-b:test"})
+	}))
+	defer server.Close()
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "tm-phase-invocation-b-g3-e2", AssignedTo: "worker-b", Status: TeamHarnessTaskInProgress, Acknowledged: true}}}
+	activator := &RehydratedTeamHarnessTaskActivator{Controller: &ControllerReprovisioner{BaseURL: server.URL}, Taskflow: client, PollInterval: time.Millisecond}
+	task, err := activator.CreateTeamHarnessTask(context.Background(), runtime.TeamHarnessTaskRequest{Plan: runtime.RehydrationPlan{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, NextExecutionEpoch: 2, Endpoint: phaseagent.PhaseEndpointRef{EndpointID: string(phaseagent.PhaseExecute)}}, Worker: runtime.ProvisionedWorker{Name: "worker-b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ID != "tm-phase-invocation-b-g3-e2" || task.AssignedTo != "worker-b" || task.Status != string(TeamHarnessTaskInProgress) || !task.Acknowledged {
+		t.Fatalf("activation=%#v", task)
+	}
+	if len(client.delegates) != 1 || client.delegates[0].RoomID != "!worker-b:test" || client.delegates[0].Assignee != "worker-b" {
+		t.Fatalf("delegate request=%#v", client.delegates)
 	}
 }
 

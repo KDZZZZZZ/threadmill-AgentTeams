@@ -14,9 +14,15 @@ runs `runner.go`. The runner:
    handler to issue the fresh epoch-2 token;
 3. asks the Controller to create the worker-scoped MCP credential and Worker;
 4. waits for the Controller's redacted applied-generation readback;
-5. performs a real `tools/list` request through the QwenPaw MCP client; and
-6. delegates a fresh TeamHarness task before the provisioner CASes the
-   `WaitingRecord` from `rehydrating` to `running`.
+5. performs a real `tools/list` request through the QwenPaw MCP client;
+6. persists epoch-B before delegation, then uses the official TeamHarness MCP
+   server for `delegate_task` and `check_task`; and
+7. observes worker `ack_task` through the real taskflow state before the
+   provisioner CASes the `WaitingRecord` from `rehydrating` to `running`.
+
+The runner also executes a separate final-CAS conflict path. It confirms the
+real TeamHarness task is cancelled, the Worker/credential/token/lease are
+released, and the failed epoch-B record remains as redacted evidence.
 
 The fixture deliberately records only token SHA-256 prefixes, never token
 material. It uses fixed local test credentials only; they are not production

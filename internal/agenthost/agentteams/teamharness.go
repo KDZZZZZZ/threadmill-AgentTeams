@@ -222,7 +222,10 @@ func (o TaskflowActivationObserver) DelegateAndObserveAcceptance(ctx context.Con
 			return TeamHarnessTaskActivation{}, contractError("taskflow returned a mismatched task id")
 		}
 		if snapshot.Status == TeamHarnessTaskInProgress || (snapshot.Status == TeamHarnessTaskAssigned && snapshot.Acknowledged) {
-			return TeamHarnessTaskActivation{TaskID: snapshot.TaskID, AssignedTo: request.Assignee, Status: snapshot.Status, Acknowledged: snapshot.Acknowledged, ObservedAt: time.Now().UTC()}, nil
+			if snapshot.AssignedTo == "" || snapshot.AssignedTo != request.Assignee {
+				return TeamHarnessTaskActivation{}, contractError("taskflow returned a mismatched assigned worker")
+			}
+			return TeamHarnessTaskActivation{TaskID: snapshot.TaskID, AssignedTo: snapshot.AssignedTo, Status: snapshot.Status, Acknowledged: snapshot.Acknowledged, ObservedAt: time.Now().UTC()}, nil
 		}
 		if snapshot.Status == TeamHarnessTaskSubmitted {
 			return TeamHarnessTaskActivation{}, contractError("task submitted before activation observation")
@@ -297,6 +300,7 @@ const (
 // evidence and are intentionally not converted to PhaseOutput in M1.
 type TeamHarnessTaskSnapshot struct {
 	TaskID       string                `json:"task_id"`
+	AssignedTo   string                `json:"assigned_to"`
 	Status       TeamHarnessTaskStatus `json:"status"`
 	Acknowledged bool                  `json:"acknowledged"`
 	Summary      string                `json:"summary"`

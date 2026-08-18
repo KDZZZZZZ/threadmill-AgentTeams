@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -41,6 +40,7 @@ func main() {
 	defer cancel()
 	controllerURL, controllerToken := mustEnv("M4D_CONTROLLER_URL"), mustEnv("M4D_CONTROLLER_TOKEN")
 	resultPath := mustEnv("M4D_RESULT")
+	docker := mustEnv("M4D_DOCKER")
 	workspace, err := os.MkdirTemp("", "threadmill-m4d-workspace-")
 	must(err)
 	defer os.RemoveAll(workspace)
@@ -60,79 +60,222 @@ func main() {
 	defer server.Shutdown(context.Background())
 	mcpURL := "http://host.docker.internal:" + fmt.Sprint(listener.Addr().(*net.TCPAddr).Port) + "/mcp"
 
-	store, plan := rehydratingPlan()
-	old := issueOldToken(registry, plan)
-	registry.Revoke(old)
-	if _, err := registry.Resolve(old); !errors.Is(err, phasemcp.ErrInvalidToken) {
-		panic("old token remains resolvable")
-	}
-	// run.ps1 provisions the official embedded initializer with its local
-	// openai-named provider. This is an opaque controller-side provider name;
-	// no model completion is requested by this focused MCP discovery slice.
 	controller := &agentteams.ControllerReprovisioner{BaseURL: controllerURL, BearerToken: controllerToken, Model: "qwen-plus", ModelProvider: "openai", Runtime: "qwenpaw", Image: "threadmill/qwenpaw-worker:m4d-current", PollInterval: time.Second}
-	leases := localLeases{root: workspace}
-	lease, err := leases.AcquireWorkspaceLease(ctx, plan)
+	success, err := runScenario(ctx, scenarioConfig{TaskID: taskID, InvocationID: invocationID, Workspace: workspace, Docker: docker, MCPURL: mcpURL, Controller: controller, Registry: registry, Trace: trace, ConflictAfterActivation: false})
 	must(err)
-	issuer := runtime.BindingRegistryAuthorizationIssuer{Registry: registry, PermissionRef: "m4d-permission", TTL: 5 * time.Minute}
-	authorization, err := issuer.IssueExecutionAuthorization(ctx, plan, lease)
-	must(err)
-	trace.expectedDigest = tokenDigest(authorization.Token)
-	workerName := fmt.Sprintf("tm-%s-g%d-e%d", invocationID, generation, 2)
-	credential, err := controller.CreateMCPCredential(ctx, runtime.MCPCredentialRequest{WorkerName: workerName, HeaderName: phasemcp.ExecutionTokenHeader, Token: authorization.Token})
-	must(err)
-	defer func() {
-		_ = controller.DeleteWorker(context.Background(), runtime.ProvisionedWorker{Name: workerName})
-		_ = controller.RevokeMCPCredential(context.Background(), credential)
-		_ = issuer.RevokeExecutionAuthorization(context.Background(), authorization)
-		_ = leases.ReleaseWorkspaceLease(context.Background(), lease)
-	}()
-	credentialView, err := redactedCredentialGet(ctx, controllerURL, controllerToken, credential.Ref)
-	must(err)
-	if credentialView.ID != credential.Ref || credentialView.WorkerName != workerName || credentialView.HeaderName != phasemcp.ExecutionTokenHeader || credentialView.State != "active" {
-		panic("credential redacted readback mismatch")
+	if !success.TokenARevoked || !success.TokenBResolvable || success.Record.State != runtime.PhysicalExecutionRunning || success.Waiting.State != runtime.AwaitStateRunning {
+		panic("successful M4-D activation evidence was incomplete")
 	}
-	worker, err := controller.ProvisionWorker(ctx, runtime.WorkerProvisionRequest{WorkerName: workerName, Plan: plan, CredentialRef: credential.Ref, MCPName: "threadmill", MCPURL: mcpURL, Transport: "streamable_http"})
+	conflict, err := runScenario(ctx, scenarioConfig{TaskID: "m4d-conflict-task", InvocationID: "m4d-conflict-invocation", Workspace: workspace, Docker: docker, MCPURL: mcpURL, Controller: controller, Registry: registry, Trace: trace, ConflictAfterActivation: true})
 	must(err)
-	readback, err := controller.WaitForRuntimeReady(ctx, worker)
-	must(err)
-	if !readback.MCPApplied || readback.DesiredGeneration != readback.AppliedGeneration || !contains(readback.HeaderNames, phasemcp.ExecutionTokenHeader) {
-		panic("controller readback did not report applied Threadmill MCP")
+	if !conflict.ConflictObserved || conflict.TokenBResolvable || conflict.Record.State != runtime.PhysicalExecutionFailed {
+		panic("M4-D final-CAS conflict teardown evidence was incomplete")
 	}
-	// Merely connecting an MCP client is not tool discovery. Trigger the real
-	// QwenPaw console agent path, which asks its configured MCP client for tool
-	// schemas before it invokes the fixture-only model provider.
-	must(triggerQwenPawToolDiscovery(ctx, mustEnv("M4D_DOCKER"), worker.Name))
-	if !trace.waitForExpected(ctx) {
-		panic("QwenPaw did not reach Threadmill MCP tools/list with token-B; observed methods: " + strings.Join(trace.observedMethods(), ","))
-	}
-	// Deliberately stop before TeamHarness task creation and final CAS: this
-	// focused slice leaves the logical WaitingRecord in rehydrating.
-	record, found, err := store.Get(ctx, runtime.WaitingKey{TaskID: taskID, InvocationID: invocationID, Generation: generation})
-	must(err)
-	if !found || record.State != runtime.AwaitStateRehydrating {
-		panic("focused slice changed WaitingRecord state")
-	}
-	output, _ := json.MarshalIndent(map[string]any{"taskID": taskID, "invocationID": invocationID, "generation": generation, "executionEpoch": 2, "worker": worker.Name, "credentialRef": credential.Ref, "mcpURL": mcpURL, "tokenSHA256": trace.expectedDigest, "oldTokenRevoked": true, "desiredGeneration": readback.DesiredGeneration, "appliedGeneration": readback.AppliedGeneration, "mcpApplied": readback.MCPApplied, "headerNames": readback.HeaderNames, "qwenPawToolsListReachedThreadmill": true, "waitingState": record.State, "events": recorder.events}, "", "  ")
+	output, _ := json.MarshalIndent(map[string]any{"taskID": success.Record.TaskID, "invocationID": success.Record.InvocationID, "generation": success.Record.Generation, "previousExecutionEpoch": 1, "executionEpoch": success.Record.ExecutionEpoch, "worker": success.Record.WorkerName, "taskB": success.Record.TeamHarnessTaskID, "activationStatus": success.Record.ObservedTaskStatus, "assignedWorker": success.Record.TeamHarnessAssignedTo, "credentialRef": success.Record.CredentialBindingRef, "tokenSHA256": success.TokenBDigest, "oldTokenRevoked": success.TokenARevoked, "tokenBResolvableBeforeTeardown": success.TokenBResolvable, "desiredGeneration": success.Record.DesiredRuntimeGeneration, "appliedGeneration": success.Record.AppliedRuntimeGeneration, "mcpApplied": true, "physicalExecutionRevision": success.Record.Revision, "physicalEpochs": success.PhysicalEpochs, "waitingState": success.Waiting.State, "waitingRevision": success.Waiting.Revision, "casConflictTeardown": conflict.ConflictObserved, "conflictTokenBResolvableAfterTeardown": conflict.TokenBResolvable, "events": recorder.events}, "", "  ")
 	must(os.WriteFile(resultPath, output, 0o600))
 }
 
-func rehydratingPlan() (*runtime.InMemoryWaitingStore, runtime.RehydrationPlan) {
-	endpoint := phaseagent.PhaseEndpointRef{TaskID: taskID, EndpointID: string(phaseagent.PhaseExecute)}
+func rehydratingPlan(task, invocation string) (*runtime.InMemoryWaitingStore, runtime.RehydrationPlan) {
+	endpoint := phaseagent.PhaseEndpointRef{TaskID: task, EndpointID: string(phaseagent.PhaseExecute)}
 	role, err := phaseagent.RoleForEndpoint(endpoint)
 	must(err)
-	start := phaseagent.StartPhaseInput{InvocationID: invocationID, Endpoint: endpoint, Generation: generation, BindingRef: "binding-r5", Inputs: phaseagent.PhaseInputSet{InputRevision: "input-r5"}}
-	invocation, err := phaseagent.NewInvocationContext(start)
+	start := phaseagent.StartPhaseInput{InvocationID: invocation, Endpoint: endpoint, Generation: generation, BindingRef: "binding-r5", Inputs: phaseagent.PhaseInputSet{InputRevision: "input-r5"}}
+	invocationContext, err := phaseagent.NewInvocationContext(start)
 	must(err)
 	store := runtime.NewInMemoryWaitingStore()
-	record, err := store.Create(context.Background(), runtime.WaitingRecord{Key: runtime.WaitingKey{TaskID: taskID, InvocationID: invocationID, Generation: generation}, ExecutionEpoch: 1, Endpoint: endpoint, PreviousBindingRef: "binding-r4", InputRevision: "input-r4", ContinuationRef: "continuation-r4", State: runtime.AwaitStateRehydrating, WorkspaceRef: "workspace-m4d", AllowedDirs: []string{"out"}, ContextSliceRef: "slice-r4", TaskMemoryBufferRef: "memory-r4"})
+	record, err := store.Create(context.Background(), runtime.WaitingRecord{Key: runtime.WaitingKey{TaskID: task, InvocationID: invocation, Generation: generation}, ExecutionEpoch: 1, Endpoint: endpoint, PreviousBindingRef: "binding-r4", InputRevision: "input-r4", ContinuationRef: "continuation-r4", State: runtime.AwaitStateRehydrating, WorkspaceRef: "workspace-m4d", AllowedDirs: []string{"out"}, ContextSliceRef: "slice-r4", TaskMemoryBufferRef: "memory-r4"})
 	must(err)
-	return store, runtime.RehydrationPlan{TaskID: taskID, InvocationID: invocationID, Generation: generation, NextExecutionEpoch: 2, Endpoint: endpoint, NewBindingRef: "binding-r5", NewInputRevision: "input-r5", Inputs: start.Inputs, Execution: phaseagent.ExecutionContext{Invocation: invocation, Role: role, Runtime: runtimeStub{}, ContextReader: readerStub{}, ContextAgent: agentStub{}}, Workspace: runtime.WorkspaceBinding{Ref: "workspace-m4d", AllowedDirs: []string{"out"}}, Context: runtime.RehydratedContext{SliceRef: "slice-r4"}, TaskMemory: runtime.RehydratedTaskMemory{BufferRef: "memory-r4"}, ContinuationRef: "continuation-r4", ExpectedWaitingRevision: record.Revision}
+	return store, runtime.RehydrationPlan{TaskID: task, InvocationID: invocation, Generation: generation, NextExecutionEpoch: 2, Endpoint: endpoint, NewBindingRef: "binding-r5", NewInputRevision: "input-r5", Inputs: start.Inputs, Execution: phaseagent.ExecutionContext{Invocation: invocationContext, Role: role, Runtime: runtimeStub{}, ContextReader: readerStub{}, ContextAgent: agentStub{}}, Workspace: runtime.WorkspaceBinding{Ref: "workspace-m4d", AllowedDirs: []string{"out"}}, Context: runtime.RehydratedContext{SliceRef: "slice-r4"}, TaskMemory: runtime.RehydratedTaskMemory{BufferRef: "memory-r4"}, ContinuationRef: "continuation-r4", ExpectedWaitingRevision: record.Revision}
 }
 
 func issueOldToken(registry *phasemcp.BindingRegistry, plan runtime.RehydrationPlan) string {
 	binding, err := registry.IssueExecution(plan.Execution, plan.Workspace.AllowedDirs, "old-permission", time.Now().Add(time.Minute))
 	must(err)
 	return binding.Token
+}
+
+type scenarioConfig struct {
+	TaskID, InvocationID      string
+	Workspace, Docker, MCPURL string
+	Controller                *agentteams.ControllerReprovisioner
+	Registry                  *phasemcp.BindingRegistry
+	Trace                     *mcpTrace
+	ConflictAfterActivation   bool
+}
+
+type scenarioResult struct {
+	Record           runtime.PhysicalExecution
+	Waiting          runtime.WaitingRecord
+	PhysicalEpochs   int
+	TokenARevoked    bool
+	TokenBResolvable bool
+	TokenBDigest     string
+	ConflictObserved bool
+}
+
+func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, error) {
+	store, plan := rehydratingPlan(config.TaskID, config.InvocationID)
+	physical := runtime.NewInMemoryPhysicalExecutionStore()
+	// Historical epoch-A contains only durable, redacted evidence. It has no
+	// invented TeamHarness task ID, so epoch-B cannot overwrite it.
+	if _, err := physical.Create(ctx, runtime.PhysicalExecution{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: 1, State: runtime.PhysicalExecutionTerminated, EvidenceRefs: []string{"event:await-relinquished"}}); err != nil {
+		return scenarioResult{}, err
+	}
+	old := issueOldToken(config.Registry, plan)
+	config.Registry.Revoke(old)
+	if _, err := config.Registry.Resolve(old); !errors.Is(err, phasemcp.ErrInvalidToken) {
+		return scenarioResult{}, errors.New("old token remains resolvable")
+	}
+
+	leases := &localLeases{root: config.Workspace}
+	issuer := &recordingIssuer{inner: runtime.BindingRegistryAuthorizationIssuer{Registry: config.Registry, PermissionRef: "m4d-permission", TTL: 5 * time.Minute}}
+	workerName := fmt.Sprintf("tm-%s-g%d-e%d", config.InvocationID, generation, 2)
+	baseTaskflow := agentteams.TeamHarnessStdioClient{
+		Python: "/opt/venv/qwenpaw/bin/python",
+		// The official worker image packages TeamHarness as a QwenPaw built-in
+		// plugin rather than a source checkout. This is the image's inspected
+		// runtime path, not a copied or fixture-local state machine.
+		ServerPath:    "/opt/agentteams/qwenpaw-builtin/plugins/teamharness/teamharness/mcp/server.py",
+		Workspace:     "/root/agentteams-fs",
+		CommandPrefix: []string{config.Docker, "exec", "-i", "agentteams-worker-" + workerName},
+	}
+	taskflow := &acknowledgingTaskflow{client: baseTaskflow}
+	activator := &agentteams.RehydratedTeamHarnessTaskActivator{Controller: config.Controller, Taskflow: taskflow, ProjectID: "threadmill-m4d", PollInterval: time.Second}
+	var tasks runtime.TeamHarnessTaskProvisioner = activator
+	if config.ConflictAfterActivation {
+		tasks = conflictAfterActivation{next: activator, store: store, key: runtime.WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation}}
+	}
+	provisioner := &runtime.PhysicalExecutionProvisioner{
+		Store: store, PhysicalExecutions: physical, Leases: leases, Tokens: issuer, Credentials: config.Controller,
+		Workers: config.Controller, MCP: config.Controller, Runtime: config.Controller,
+		Discovery: qwenPawDiscovery{docker: config.Docker, trace: config.Trace}, Tasks: tasks,
+		MCPName: "threadmill", MCPURL: config.MCPURL, Transport: "streamable_http",
+	}
+	execution, err := provisioner.Provision(ctx, plan)
+	if config.ConflictAfterActivation {
+		if err == nil {
+			return scenarioResult{}, errors.New("final CAS conflict unexpectedly succeeded")
+		}
+		stored, found, getErr := physical.Get(ctx, runtime.PhysicalExecutionKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: 2})
+		if getErr != nil || !found {
+			return scenarioResult{}, fmt.Errorf("conflict physical execution missing: %v", getErr)
+		}
+		_, resolveErr := config.Registry.Resolve(issuer.lastToken)
+		waiting, _, getErr := store.Get(ctx, runtime.WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation})
+		if getErr != nil {
+			return scenarioResult{}, getErr
+		}
+		return scenarioResult{Record: stored, Waiting: waiting, TokenARevoked: true, TokenBResolvable: resolveErr == nil, TokenBDigest: tokenDigest(issuer.lastToken), ConflictObserved: true}, nil
+	}
+	if err != nil {
+		return scenarioResult{}, err
+	}
+	if _, err := config.Registry.Resolve(issuer.lastToken); err != nil {
+		return scenarioResult{}, fmt.Errorf("token-B did not resolve before teardown: %w", err)
+	}
+	credentialView, err := redactedCredentialGet(ctx, config.Controller.BaseURL, config.Controller.BearerToken, execution.CredentialBindingRef)
+	if err != nil || credentialView.ID != execution.CredentialBindingRef || credentialView.WorkerName != execution.WorkerName || credentialView.HeaderName != phasemcp.ExecutionTokenHeader || credentialView.State != "active" {
+		return scenarioResult{}, errors.New("credential redacted readback mismatch")
+	}
+	all, err := physical.ListByInvocation(ctx, plan.TaskID, plan.InvocationID, plan.Generation)
+	if err != nil || len(all) != 2 {
+		return scenarioResult{}, fmt.Errorf("physical epoch history mismatch: records=%d err=%v", len(all), err)
+	}
+	waiting, found, err := store.Get(ctx, runtime.WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation})
+	if err != nil || !found {
+		return scenarioResult{}, fmt.Errorf("waiting record missing: %v", err)
+	}
+	result := scenarioResult{Record: execution, Waiting: waiting, PhysicalEpochs: len(all), TokenARevoked: true, TokenBResolvable: true, TokenBDigest: tokenDigest(issuer.lastToken)}
+	// Fixture cleanup happens only after evidence is captured; it does not alter
+	// the returned logical running record.
+	_ = activator.CancelTeamHarnessTask(context.Background(), runtime.TeamHarnessTask{ID: execution.TeamHarnessTaskID})
+	_ = config.Controller.DeleteWorker(context.Background(), runtime.ProvisionedWorker{ID: execution.WorkerID, Name: execution.WorkerName})
+	_ = config.Controller.RevokeMCPCredential(context.Background(), runtime.MCPCredentialBinding{Ref: execution.CredentialBindingRef, WorkerName: execution.WorkerName})
+	_ = issuer.RevokeExecutionAuthorization(context.Background(), runtime.IssuedExecutionAuthorization{Token: issuer.lastToken, Ref: execution.ExecutionAuthorizationRef})
+	_ = leases.ReleaseWorkspaceLease(context.Background(), runtime.WorkspaceLease{Ref: execution.WorkspaceLeaseRef})
+	return result, nil
+}
+
+type recordingIssuer struct {
+	inner     runtime.BindingRegistryAuthorizationIssuer
+	lastToken string
+}
+
+func (i *recordingIssuer) IssueExecutionAuthorization(ctx context.Context, plan runtime.RehydrationPlan, lease runtime.WorkspaceLease) (runtime.IssuedExecutionAuthorization, error) {
+	authorization, err := i.inner.IssueExecutionAuthorization(ctx, plan, lease)
+	if err == nil {
+		i.lastToken = authorization.Token
+	}
+	return authorization, err
+}
+func (i *recordingIssuer) RevokeExecutionAuthorization(ctx context.Context, authorization runtime.IssuedExecutionAuthorization) error {
+	return i.inner.RevokeExecutionAuthorization(ctx, authorization)
+}
+
+type qwenPawDiscovery struct {
+	docker string
+	trace  *mcpTrace
+}
+
+func (d qwenPawDiscovery) DiscoverMCPTools(ctx context.Context, worker runtime.ProvisionedWorker, authorization runtime.IssuedExecutionAuthorization) ([]string, error) {
+	d.trace.expectedDigest = tokenDigest(authorization.Token)
+	if err := triggerQwenPawToolDiscovery(ctx, d.docker, worker.Name); err != nil {
+		return nil, err
+	}
+	if !d.trace.waitForExpected(ctx) {
+		return nil, errors.New("QwenPaw did not reach Threadmill MCP tools/list with token-B")
+	}
+	return []string{"artifact.register", "agent.submitPhaseOutput"}, nil
+}
+
+// acknowledgingTaskflow is a deterministic worker driver for this integration
+// fixture only. It invokes the official ack_task action; task state remains in
+// the official TeamHarness store and is subsequently read via check_task.
+type acknowledgingTaskflow struct {
+	client agentteams.TeamHarnessStdioClient
+	acked  bool
+}
+
+func (c *acknowledgingTaskflow) DelegateTask(ctx context.Context, request agentteams.TeamHarnessDelegateTaskRequest) error {
+	return c.client.DelegateTask(ctx, request)
+}
+func (c *acknowledgingTaskflow) CheckTask(ctx context.Context, taskID string) (agentteams.TeamHarnessTaskSnapshot, error) {
+	snapshot, err := c.client.CheckTask(ctx, taskID)
+	if err != nil || c.acked || snapshot.Status != agentteams.TeamHarnessTaskAssigned {
+		return snapshot, err
+	}
+	if err := c.client.AcknowledgeTask(ctx, taskID); err != nil {
+		return agentteams.TeamHarnessTaskSnapshot{}, err
+	}
+	c.acked = true
+	return c.client.CheckTask(ctx, taskID)
+}
+func (c *acknowledgingTaskflow) CancelTask(ctx context.Context, taskID, reason string) error {
+	return c.client.CancelTask(ctx, taskID, reason)
+}
+
+type conflictAfterActivation struct {
+	next  runtime.TeamHarnessTaskProvisioner
+	store *runtime.InMemoryWaitingStore
+	key   runtime.WaitingKey
+}
+
+func (c conflictAfterActivation) CreateTeamHarnessTask(ctx context.Context, request runtime.TeamHarnessTaskRequest) (runtime.TeamHarnessTask, error) {
+	task, err := c.next.CreateTeamHarnessTask(ctx, request)
+	if err != nil {
+		return runtime.TeamHarnessTask{}, err
+	}
+	record, found, err := c.store.Get(ctx, c.key)
+	if err != nil || !found {
+		return runtime.TeamHarnessTask{}, errors.New("fixture could not create final-CAS conflict")
+	}
+	if _, swapped, err := c.store.CompareAndSwap(ctx, c.key, record.Revision, record); err != nil || !swapped {
+		return runtime.TeamHarnessTask{}, errors.New("fixture could not advance waiting revision")
+	}
+	return task, nil
+}
+func (c conflictAfterActivation) CancelTeamHarnessTask(ctx context.Context, task runtime.TeamHarnessTask) error {
+	return c.next.CancelTeamHarnessTask(ctx, task)
 }
 
 type localLeases struct{ root string }
@@ -306,107 +449,6 @@ type agentStub struct{}
 
 func (agentStub) Retrieve(context.Context, phaseagent.ContextRetrieveRequest) (phaseagent.ContextRetrieveResult, error) {
 	return phaseagent.ContextRetrieveResult{}, nil
-}
-
-// This placeholder is intentionally fail-closed until the official TeamHarness
-// server invocation is wired to the Controller-created worker in the next
-// focused edit. No successful fixture run can claim task creation before then.
-type containerTeamHarness struct{ docker, controllerURL, controllerToken string }
-
-func (p *containerTeamHarness) CreateTeamHarnessTask(ctx context.Context, request runtime.TeamHarnessTaskRequest) (runtime.TeamHarnessTask, error) {
-	room, err := p.roomID(ctx, request.Worker.Name)
-	if err != nil {
-		return runtime.TeamHarnessTask{}, err
-	}
-	id := fmt.Sprintf("tm-m4d-%d", time.Now().UnixNano())
-	payload := map[string]any{"projectId": "threadmill-m4d", "taskId": id, "roomId": room, "assignedTo": request.Worker.Name, "title": "Threadmill rehydrated execute", "spec": "M4-D fixture; submit_task is not PhaseOutput."}
-	if _, err := p.call(ctx, request.Worker.Name, "leader", "delegate_task", payload); err != nil {
-		return runtime.TeamHarnessTask{}, err
-	}
-	return runtime.TeamHarnessTask{ID: id}, nil
-}
-func (p *containerTeamHarness) CancelTeamHarnessTask(context.Context, runtime.TeamHarnessTask) error {
-	return nil
-}
-func (p *containerTeamHarness) roomID(ctx context.Context, worker string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.controllerURL, "/")+"/api/v1/workers/"+worker+"/status", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.controllerToken)
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("worker status returned HTTP %d", response.StatusCode)
-	}
-	var status struct {
-		RoomID string `json:"roomID"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
-		return "", err
-	}
-	if status.RoomID == "" {
-		return "", errors.New("worker status omitted roomID")
-	}
-	return status.RoomID, nil
-}
-func (p *containerTeamHarness) call(ctx context.Context, worker, role, action string, payload map[string]any) (map[string]any, error) {
-	cmd := exec.CommandContext(ctx, p.docker, "exec", "-i", "agentteams-worker-"+worker, "/opt/venv/qwenpaw/bin/python", "/opt/agentteams/plugins/teamharness/mcp/server.py")
-	in, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	rpcRequest := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "taskflow", "arguments": map[string]any{"role": role, "workspaceDir": "/root/agentteams-fs/shared", "action": action, "payload": payload}}}
-	if err := json.NewEncoder(in).Encode(rpcRequest); err != nil {
-		return nil, err
-	}
-	_ = in.Close()
-	line, err := bufio.NewReader(out).ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("TeamHarness response: %w: %s", err, stderr.String())
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("TeamHarness process: %w: %s", err, stderr.String())
-	}
-	var rpc struct {
-		Result struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"result"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(line, &rpc); err != nil {
-		return nil, err
-	}
-	if rpc.Error != nil {
-		return nil, errors.New(rpc.Error.Message)
-	}
-	if len(rpc.Result.Content) == 0 {
-		return nil, errors.New("TeamHarness returned no content")
-	}
-	var result map[string]any
-	if err := json.Unmarshal([]byte(rpc.Result.Content[0].Text), &result); err != nil {
-		return nil, err
-	}
-	if ok, _ := result["ok"].(bool); !ok {
-		return nil, fmt.Errorf("TeamHarness %s rejected", action)
-	}
-	return result, nil
 }
 
 func mustEnv(name string) string {

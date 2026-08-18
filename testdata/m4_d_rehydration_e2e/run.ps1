@@ -15,9 +15,16 @@ $result = Join-Path $env:TEMP 'threadmill-m4d-e2e-result.json'
 $goCache = Join-Path $env:TEMP 'threadmill-m4d-e2e-gocache'
 
 function Cleanup {
-  & $docker rm -f $name 2>$null | Out-Null
-  & $docker network rm $network 2>$null | Out-Null
-  & $docker volume rm $volume 2>$null | Out-Null
+  # Docker reports an absent resource on stderr. That is normal both before
+  # setup and after a partially completed fixture, so cleanup must be best
+  # effort even while the fixture otherwise uses ErrorActionPreference=Stop.
+  foreach ($cleanup in @(
+    { & $docker rm -f $name 2>$null | Out-Null },
+    { & $docker network rm $network 2>$null | Out-Null },
+    { & $docker volume rm $volume 2>$null | Out-Null }
+  )) {
+    try { & $cleanup } catch { }
+  }
 }
 
 & $docker info | Out-Null

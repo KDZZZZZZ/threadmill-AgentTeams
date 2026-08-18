@@ -116,7 +116,7 @@ func (p *provisionPorts) CreateTeamHarnessTask(_ context.Context, request TeamHa
 		_, _, _ = p.store.CompareAndSwap(context.Background(), record.Key, record.Revision, changed)
 	}
 	p.tasks["team-task-e2"] = true
-	return TeamHarnessTask{ID: "team-task-e2"}, nil
+	return TeamHarnessTask{ID: "team-task-e2", AssignedTo: request.Worker.Name, Status: "in_progress", Acknowledged: true, ObservedAt: time.Now().UTC()}, nil
 }
 func (p *provisionPorts) CancelTeamHarnessTask(_ context.Context, task TeamHarnessTask) error {
 	delete(p.tasks, task.ID)
@@ -132,7 +132,7 @@ func provisionFixture(t *testing.T) (*PhysicalExecutionProvisioner, RehydrationP
 	}
 	issuer := &registryAuthorizationIssuer{registry: phasemcp.NewBindingRegistry(), active: map[string]bool{}}
 	ports := newProvisionPorts(store)
-	provisioner := &PhysicalExecutionProvisioner{Store: store, Leases: ports, Tokens: issuer, Credentials: ports, Workers: ports, MCP: ports, Runtime: ports, Discovery: ports, Tasks: ports, MCPName: "threadmill", MCPURL: "http://threadmill.test/mcp", Transport: "streamable_http"}
+	provisioner := &PhysicalExecutionProvisioner{Store: store, PhysicalExecutions: NewInMemoryPhysicalExecutionStore(), Leases: ports, Tokens: issuer, Credentials: ports, Workers: ports, MCP: ports, Runtime: ports, Discovery: ports, Tasks: ports, MCPName: "threadmill", MCPURL: "http://threadmill.test/mcp", Transport: "streamable_http"}
 	return provisioner, plan, store, issuer, ports
 }
 
@@ -149,6 +149,13 @@ func TestProvisionCreatesFreshCarrierAndCommitsRunning(t *testing.T) {
 	}
 	if execution.TaskID != plan.TaskID || execution.InvocationID != plan.InvocationID || execution.Generation != plan.Generation || execution.ExecutionEpoch != plan.NextExecutionEpoch || execution.WorkerName != "tm-invocation-a-g3-e2" || execution.TeamHarnessTaskID == "team-task-a" {
 		t.Fatalf("physical execution mismatch: %#v", execution)
+	}
+	if execution.State != PhysicalExecutionRunning || execution.TeamHarnessAssignedTo != execution.WorkerName || !ValidatePhysicalExecutionReady(execution) {
+		t.Fatalf("activation evidence was not persisted as ready: %#v", execution)
+	}
+	persisted, found, err := provisioner.PhysicalExecutions.Get(context.Background(), execution.Key())
+	if err != nil || !found || persisted.Revision < 3 || persisted.State != PhysicalExecutionRunning {
+		t.Fatalf("physical execution history mismatch: %#v found=%t err=%v", persisted, found, err)
 	}
 	if len(issuer.active) != 1 || ports.lastCredential.WorkerName != execution.WorkerName || ports.lastCredential.HeaderName != "X-Threadmill-Execution-Token" || ports.lastCredential.Token == old.Token {
 		t.Fatalf("fresh token/credential mismatch: active=%v credential=%#v", issuer.active, ports.lastCredential)
@@ -188,6 +195,12 @@ func TestProvisionRollsBackEveryPartialCarrier(t *testing.T) {
 			record, _, _ := store.Get(context.Background(), WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation})
 			if record.State != AwaitStateWaiting {
 				t.Fatalf("rollback left state %s", record.State)
+			}
+			if stage == "task" || stage == "final-cas" {
+				physical, found, err := provisioner.PhysicalExecutions.Get(context.Background(), PhysicalExecutionKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch})
+				if err != nil || !found || physical.State != PhysicalExecutionFailed || !physical.Teardown.TokenRevoked || !physical.Teardown.WorkerDeleted {
+					t.Fatalf("failed physical epoch was not retained: %#v found=%t err=%v", physical, found, err)
+				}
 			}
 		})
 	}

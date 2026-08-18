@@ -176,7 +176,7 @@ func TestCancelInvocationTaskCancelsOnlyTransientTeamHarnessTask(t *testing.T) {
 }
 
 func TestTaskflowActivationObserverDelegatesAndObservesAcceptance(t *testing.T) {
-	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "task-b", Status: TeamHarnessTaskAssigned, Acknowledged: true}}}
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "task-b", AssignedTo: "worker-b", Status: TeamHarnessTaskAssigned, Acknowledged: true}}}
 	observer := TaskflowActivationObserver{Taskflow: client, PollInterval: time.Millisecond}
 	activation, err := observer.DelegateAndObserveAcceptance(context.Background(), TeamHarnessDelegateTaskRequest{ProjectID: "project", TaskID: "task-b", RoomID: "room", Assignee: "worker-b", Title: "phase", Spec: "safe spec"})
 	if err != nil {
@@ -207,7 +207,7 @@ func TestInvocationTaskMapRetainsLegacySingleCurrentTaskSemantics(t *testing.T) 
 }
 
 func TestTaskflowActivationObserverDoesNotTreatSubmittedAsAcceptance(t *testing.T) {
-	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "task-b", Status: TeamHarnessTaskSubmitted, Acknowledged: true}}}
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "task-b", AssignedTo: "worker-b", Status: TeamHarnessTaskSubmitted, Acknowledged: true}}}
 	_, err := (TaskflowActivationObserver{Taskflow: client}).DelegateAndObserveAcceptance(context.Background(), TeamHarnessDelegateTaskRequest{TaskID: "task-b", Assignee: "worker-b"})
 	if err == nil {
 		t.Fatal("submitted task was accepted as activation")

@@ -33,6 +33,79 @@ type ControllerReprovisioner struct {
 	PollInterval  time.Duration
 }
 
+// RehydratedTeamHarnessTaskActivator bridges Runtime's M4-D task port to the
+// existing TeamHarness taskflow client. TeamHarness remains authoritative for
+// the observed assignment/acknowledgement state; this adapter neither submits
+// the task nor derives a PhaseOutput from it.
+type RehydratedTeamHarnessTaskActivator struct {
+	Controller   *ControllerReprovisioner
+	Taskflow     TaskflowClient
+	ProjectID    string
+	PollInterval time.Duration
+}
+
+var _ runtime.TeamHarnessTaskProvisioner = (*RehydratedTeamHarnessTaskActivator)(nil)
+
+func (a *RehydratedTeamHarnessTaskActivator) CreateTeamHarnessTask(ctx context.Context, request runtime.TeamHarnessTaskRequest) (runtime.TeamHarnessTask, error) {
+	if a == nil || a.Controller == nil || a.Taskflow == nil {
+		return runtime.TeamHarnessTask{}, errors.New("controller and taskflow are required for rehydrated task activation")
+	}
+	if request.Worker.Name == "" || request.Plan.InvocationID == "" || request.Plan.Generation <= 0 || request.Plan.NextExecutionEpoch <= 0 {
+		return runtime.TeamHarnessTask{}, errors.New("rehydration worker and epoch identity are required")
+	}
+	roomID, err := a.Controller.WorkerRoomID(ctx, request.Worker.Name)
+	if err != nil {
+		return runtime.TeamHarnessTask{}, err
+	}
+	projectID := a.ProjectID
+	if projectID == "" {
+		projectID = "threadmill-" + taskflowSafeID(request.Plan.TaskID)
+	}
+	// TeamHarness's official delegate_task API intentionally receives a caller
+	// taskId. This stable Threadmill-generated physical ID includes the epoch;
+	// check_task then returns the persisted authoritative ID as activation
+	// evidence. It is not a fixture-generated placeholder.
+	taskID := fmt.Sprintf("tm-phase-%s-g%d-e%d", taskflowSafeID(request.Plan.InvocationID), request.Plan.Generation, request.Plan.NextExecutionEpoch)
+	activation, err := (TaskflowActivationObserver{Taskflow: a.Taskflow, PollInterval: a.PollInterval}).DelegateAndObserveAcceptance(ctx, TeamHarnessDelegateTaskRequest{
+		ProjectID: projectID,
+		TaskID:    taskID,
+		RoomID:    roomID,
+		Assignee:  request.Worker.Name,
+		Title:     "Threadmill rehydrated " + string(request.Plan.Endpoint.EndpointID),
+		Spec:      rehydratedTaskSpec(request),
+	})
+	if err != nil {
+		return runtime.TeamHarnessTask{}, err
+	}
+	return runtime.TeamHarnessTask{ID: activation.TaskID, AssignedTo: activation.AssignedTo, Status: string(activation.Status), Acknowledged: activation.Acknowledged, ObservedAt: activation.ObservedAt}, nil
+}
+
+func (a *RehydratedTeamHarnessTaskActivator) CancelTeamHarnessTask(ctx context.Context, task runtime.TeamHarnessTask) error {
+	if a == nil || a.Taskflow == nil || task.ID == "" {
+		return nil
+	}
+	canceller, ok := a.Taskflow.(TaskflowCanceller)
+	if !ok {
+		return errors.New("taskflow client does not support cancellation")
+	}
+	return canceller.CancelTask(ctx, task.ID, "rehydration activation rollback")
+}
+
+func (c *ControllerReprovisioner) WorkerRoomID(ctx context.Context, workerName string) (string, error) {
+	status, err := c.workerStatus(ctx, workerName)
+	if err != nil {
+		return "", err
+	}
+	if status.RoomID == "" {
+		return "", errors.New("controller worker status omitted roomID")
+	}
+	return status.RoomID, nil
+}
+
+func rehydratedTaskSpec(request runtime.TeamHarnessTaskRequest) string {
+	return fmt.Sprintf("# Threadmill rehydrated phase\n\n- Invocation: `%s`\n- Generation: `%d`\n- Execution epoch: `%d`\n- Phase: `%s`\n- TeamHarness submission is execution evidence only; it is not PhaseOutput.\n", request.Plan.InvocationID, request.Plan.Generation, request.Plan.NextExecutionEpoch, request.Plan.Endpoint.EndpointID)
+}
+
 var (
 	_ runtime.MCPCredentialProvisioner = (*ControllerReprovisioner)(nil)
 	_ runtime.WorkerProvisioner        = (*ControllerReprovisioner)(nil)
@@ -199,6 +272,7 @@ func (c *ControllerReprovisioner) WaitForRuntimeReady(ctx context.Context, worke
 
 type controllerWorkerStatus struct {
 	Name           string `json:"name"`
+	RoomID         string `json:"roomID"`
 	Phase          string `json:"phase"`
 	ContainerState string `json:"containerState"`
 	RuntimeConfig  struct {

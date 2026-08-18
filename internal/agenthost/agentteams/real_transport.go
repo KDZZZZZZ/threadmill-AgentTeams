@@ -26,10 +26,11 @@ import (
 // point. Each call starts a bounded child process, so Go context cancellation
 // terminates the bridge on both Windows and Unix.
 type TeamHarnessStdioClient struct {
-	Python     string
-	ServerPath string
-	Workspace  string
-	Env        []string
+	Python        string
+	ServerPath    string
+	Workspace     string
+	Env           []string
+	CommandPrefix []string
 }
 
 func (c TeamHarnessStdioClient) DelegateTask(ctx context.Context, request TeamHarnessDelegateTaskRequest) error {
@@ -42,7 +43,7 @@ func (c TeamHarnessStdioClient) CheckTask(ctx context.Context, taskID string) (T
 		return TeamHarnessTaskSnapshot{}, err
 	}
 	task, _ := result["task"].(map[string]any)
-	state := TeamHarnessTaskSnapshot{TaskID: stringValue(task["task_id"]), Status: TeamHarnessTaskStatus(stringValue(task["status"])), Acknowledged: stringValue(task["acknowledged_by_role"]) != ""}
+	state := TeamHarnessTaskSnapshot{TaskID: stringValue(task["task_id"]), AssignedTo: stringValue(task["assigned_to"]), Status: TeamHarnessTaskStatus(stringValue(task["status"])), Acknowledged: stringValue(task["acknowledged_by_role"]) != ""}
 	if output, ok := result["result"].(map[string]any); ok {
 		state.ResultStatus, state.Summary = stringValue(output["status"]), stringValue(output["summary"])
 		state.Deliverables = stringsValue(output["deliverables"])
@@ -73,12 +74,20 @@ func (c TeamHarnessStdioClient) callAs(ctx context.Context, role, action string,
 	if c.Python == "" || c.ServerPath == "" || c.Workspace == "" {
 		return nil, fmt.Errorf("python, server path, and workspace are required")
 	}
-	serverPath, err := filepath.Abs(c.ServerPath)
-	if err != nil {
-		return nil, err
+	serverPath := c.ServerPath
+	var cmd *exec.Cmd
+	if len(c.CommandPrefix) == 0 {
+		var err error
+		serverPath, err = filepath.Abs(c.ServerPath)
+		if err != nil {
+			return nil, err
+		}
+		cmd = exec.CommandContext(ctx, c.Python, serverPath)
+		cmd.Dir = filepath.Dir(serverPath)
+	} else {
+		args := append(append([]string(nil), c.CommandPrefix[1:]...), c.Python, serverPath)
+		cmd = exec.CommandContext(ctx, c.CommandPrefix[0], args...)
 	}
-	cmd := exec.CommandContext(ctx, c.Python, serverPath)
-	cmd.Dir = filepath.Dir(serverPath)
 	cmd.Env = mergedEnvironment(c.Env)
 	in, err := cmd.StdinPipe()
 	if err != nil {
