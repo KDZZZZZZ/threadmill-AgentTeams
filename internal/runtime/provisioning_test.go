@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
 	phasemcp "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mcp/phase"
 )
 
@@ -45,6 +46,23 @@ type provisionPorts struct {
 	lastCredential   MCPCredentialRequest
 	discoveryStarted chan struct{}
 	discoveryRelease chan struct{}
+}
+
+func (p *provisionPorts) MaterializeRehydratedExecution(_ context.Context, plan RehydrationPlan) (RehydratedExecutionPackage, error) {
+	if p.fail == "package" {
+		return RehydratedExecutionPackage{}, errors.New("package materialization failed")
+	}
+	return RehydratedExecutionPackage{
+		TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation,
+		ExecutionEpoch: plan.NextExecutionEpoch, Endpoint: plan.Endpoint,
+		BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision,
+		Inputs: plan.Inputs, NewlyDelivered: plan.NewlyDelivered,
+		TaskContract: "task contract", PhaseInstruction: "execute the phase",
+		Context:      AgentVisibleContext{SliceRef: plan.Context.SliceRef, BaselineRef: plan.Context.BaselineRef, Content: "authorized context"},
+		TaskMemory:   plan.TaskMemory.View,
+		Workspace:    AgentVisibleWorkspace{Ref: plan.Workspace.Ref, Revision: plan.Workspace.Revision, AllowedDirs: append([]string(nil), plan.Workspace.AllowedDirs...)},
+		ArtifactRefs: append([]artifacts.ArtifactRef(nil), plan.ArtifactRefs...), EventRefs: append([]string(nil), plan.EventRefs...), EvidenceRefs: append([]string(nil), plan.EvidenceRefs...),
+	}, nil
 }
 
 func newProvisionPorts(store *InMemoryWaitingStore) *provisionPorts {
@@ -132,7 +150,7 @@ func provisionFixture(t *testing.T) (*PhysicalExecutionProvisioner, RehydrationP
 	}
 	issuer := &registryAuthorizationIssuer{registry: phasemcp.NewBindingRegistry(), active: map[string]bool{}}
 	ports := newProvisionPorts(store)
-	provisioner := &PhysicalExecutionProvisioner{Store: store, PhysicalExecutions: NewInMemoryPhysicalExecutionStore(), Leases: ports, Tokens: issuer, Credentials: ports, Workers: ports, MCP: ports, Runtime: ports, Discovery: ports, Tasks: ports, MCPName: "threadmill", MCPURL: "http://threadmill.test/mcp", Transport: "streamable_http"}
+	provisioner := &PhysicalExecutionProvisioner{Store: store, PhysicalExecutions: NewInMemoryPhysicalExecutionStore(), Leases: ports, Tokens: issuer, Credentials: ports, Workers: ports, MCP: ports, Runtime: ports, Discovery: ports, Tasks: ports, Packages: ports, MCPName: "threadmill", MCPURL: "http://threadmill.test/mcp", Transport: "streamable_http"}
 	return provisioner, plan, store, issuer, ports
 }
 
@@ -182,7 +200,7 @@ func TestProvisionCreatesFreshCarrierAndCommitsRunning(t *testing.T) {
 }
 
 func TestProvisionRollsBackEveryPartialCarrier(t *testing.T) {
-	for _, stage := range []string{"lease", "token", "credential", "worker", "runtime", "discovery", "task", "final-cas"} {
+	for _, stage := range []string{"package", "lease", "token", "credential", "worker", "runtime", "discovery", "task", "final-cas"} {
 		t.Run(stage, func(t *testing.T) {
 			provisioner, plan, store, issuer, ports := provisionFixture(t)
 			ports.fail, issuer.fail = stage, stage == "token"
@@ -203,6 +221,17 @@ func TestProvisionRollsBackEveryPartialCarrier(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPackageFailureOccursBeforePhysicalResources(t *testing.T) {
+	provisioner, plan, _, issuer, ports := provisionFixture(t)
+	ports.fail = "package"
+	if _, err := provisioner.Provision(context.Background(), plan); err == nil {
+		t.Fatal("package failure unexpectedly provisioned")
+	}
+	if len(ports.leases) != 0 || len(ports.credentials) != 0 || len(ports.workers) != 0 || len(ports.tasks) != 0 || len(issuer.active) != 0 {
+		t.Fatalf("package failure created physical resources: leases=%v credentials=%v workers=%v tasks=%v tokens=%v", ports.leases, ports.credentials, ports.workers, ports.tasks, issuer.active)
 	}
 }
 

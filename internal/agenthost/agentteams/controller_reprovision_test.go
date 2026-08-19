@@ -9,9 +9,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
+
+type rehydrationEnvelopeResolver struct{ envelope HostEnvelope }
+
+func (r rehydrationEnvelopeResolver) ResolveHostEnvelope(context.Context, phaseagent.ExecutionContext) (HostEnvelope, error) {
+	return r.envelope, nil
+}
 
 func TestControllerReprovisionerUsesRedactedCredentialAndReadyStatus(t *testing.T) {
 	const secret = "test-threadmill-token-b"
@@ -130,7 +137,8 @@ func TestRehydratedTeamHarnessTaskActivatorUsesObservedWorkerAcceptance(t *testi
 	defer server.Close()
 	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "tm-phase-invocation-b-g3-e2", AssignedTo: "worker-b", Status: TeamHarnessTaskInProgress, Acknowledged: true}}}
 	activator := &RehydratedTeamHarnessTaskActivator{Controller: &ControllerReprovisioner{BaseURL: server.URL}, Taskflow: client, PollInterval: time.Millisecond}
-	task, err := activator.CreateTeamHarnessTask(context.Background(), runtime.TeamHarnessTaskRequest{Plan: runtime.RehydrationPlan{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, NextExecutionEpoch: 2, Endpoint: phaseagent.PhaseEndpointRef{EndpointID: string(phaseagent.PhaseExecute)}}, Worker: runtime.ProvisionedWorker{Name: "worker-b"}})
+	pkg := runtime.RehydratedExecutionPackage{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, ExecutionEpoch: 2, TaskContract: "task contract", PhaseInstruction: "execute"}
+	task, err := activator.CreateTeamHarnessTask(context.Background(), runtime.TeamHarnessTaskRequest{Plan: runtime.RehydrationPlan{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, NextExecutionEpoch: 2, Endpoint: phaseagent.PhaseEndpointRef{EndpointID: string(phaseagent.PhaseExecute)}}, Worker: runtime.ProvisionedWorker{Name: "worker-b"}, Package: pkg})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +147,45 @@ func TestRehydratedTeamHarnessTaskActivatorUsesObservedWorkerAcceptance(t *testi
 	}
 	if len(client.delegates) != 1 || client.delegates[0].RoomID != "!worker-b:test" || client.delegates[0].Assignee != "worker-b" {
 		t.Fatalf("delegate request=%#v", client.delegates)
+	}
+	if !strings.Contains(client.delegates[0].Spec, `"task_contract": "task contract"`) || !strings.Contains(client.delegates[0].Spec, "agent.submitPhaseOutput") {
+		t.Fatalf("task spec did not carry the controlled package: %s", client.delegates[0].Spec)
+	}
+}
+
+func TestRehydratedHostPackageMaterializerProjectsOnlyAgentVisibleEnvelope(t *testing.T) {
+	const secret = "private-token-value"
+	inputs := phaseagent.PhaseInputSet{InputRevision: "r5", Delivered: []phaseagent.InputDelivery{{InputID: "review", PhaseOutputRef: "phase-output-review"}}}
+	plan := runtime.RehydrationPlan{
+		TaskID: "task-a", InvocationID: "invocation-a", Generation: 3, NextExecutionEpoch: 2,
+		Endpoint: phaseagent.PhaseEndpointRef{TaskID: "task-a", EndpointID: "execute"}, NewBindingRef: "B2", NewInputRevision: "r5",
+		Inputs: inputs, NewlyDelivered: append([]phaseagent.InputDelivery(nil), inputs.Delivered...),
+		Context:      runtime.RehydratedContext{SliceRef: "context-slice", BaselineRef: "context-baseline"},
+		TaskMemory:   runtime.RehydratedTaskMemory{View: phaseagent.TaskMemoryBufferView{Candidates: []phaseagent.TaskMemoryCandidateView{{CandidateID: "memory-1"}}}},
+		Workspace:    runtime.WorkspaceBinding{Ref: "workspace-a", Revision: "workspace-r7", AllowedDirs: []string{"src"}},
+		ArtifactRefs: []artifacts.ArtifactRef{"artifact-a"}, EventRefs: []string{"event-a"}, EvidenceRefs: []string{"evidence-a"},
+	}
+	materializer := RehydratedHostPackageMaterializer{Envelopes: rehydrationEnvelopeResolver{envelope: HostEnvelope{
+		BindingRef: "B2", TaskContract: "task contract", PhaseInstruction: "continue with new input",
+		Workspace: WorkspaceMount{Root: `C:\private\workspace`, AllowedDirs: []string{"src"}},
+		Context:   MaterializedContext{Content: "authorized context"}, TaskMemory: plan.TaskMemory.View,
+		MCPBinding: TrustedMCPBinding{Token: secret},
+	}}}
+	pkg, err := materializer.MaterializeRehydratedExecution(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.ValidateRehydratedExecutionPackage(plan, pkg); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{secret, `C:\private\workspace`, "authorization", "credential", "hidden reasoning"} {
+		if strings.Contains(strings.ToLower(string(encoded)), strings.ToLower(forbidden)) {
+			t.Fatalf("package leaked %q: %s", forbidden, encoded)
+		}
 	}
 }
 

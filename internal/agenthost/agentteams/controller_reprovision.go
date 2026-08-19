@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/runtime"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
 
 // ControllerReprovisioner uses the public AgentTeams controller APIs for the
@@ -42,6 +44,38 @@ type RehydratedTeamHarnessTaskActivator struct {
 	Taskflow     TaskflowClient
 	ProjectID    string
 	PollInterval time.Duration
+}
+
+// RehydratedHostPackageMaterializer reuses the established HostEnvelope
+// authority, then projects only agent-visible logical material. It does not
+// expose the envelope's trusted MCP binding or physical workspace root.
+type RehydratedHostPackageMaterializer struct {
+	Envelopes HostEnvelopeResolver
+}
+
+func (m RehydratedHostPackageMaterializer) MaterializeRehydratedExecution(ctx context.Context, plan runtime.RehydrationPlan) (runtime.RehydratedExecutionPackage, error) {
+	if m.Envelopes == nil {
+		return runtime.RehydratedExecutionPackage{}, errors.New("host envelope resolver is required")
+	}
+	envelope, err := m.Envelopes.ResolveHostEnvelope(ctx, plan.Execution)
+	if err != nil {
+		return runtime.RehydratedExecutionPackage{}, err
+	}
+	if envelope.BindingRef != plan.NewBindingRef {
+		return runtime.RehydratedExecutionPackage{}, errors.New("host envelope binding does not match rehydration plan")
+	}
+	return runtime.RehydratedExecutionPackage{
+		TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation,
+		ExecutionEpoch: plan.NextExecutionEpoch, Endpoint: plan.Endpoint, BindingRef: plan.NewBindingRef,
+		InputRevision: plan.NewInputRevision, Inputs: plan.Inputs,
+		NewlyDelivered: append([]phaseagent.InputDelivery(nil), plan.NewlyDelivered...),
+		TaskContract:   envelope.TaskContract, PhaseInstruction: envelope.PhaseInstruction,
+		Context:      runtime.AgentVisibleContext{SliceRef: plan.Context.SliceRef, BaselineRef: plan.Context.BaselineRef, Content: envelope.Context.Content},
+		TaskMemory:   envelope.TaskMemory,
+		Workspace:    runtime.AgentVisibleWorkspace{Ref: plan.Workspace.Ref, Revision: plan.Workspace.Revision, AllowedDirs: append([]string(nil), envelope.Workspace.AllowedDirs...)},
+		ArtifactRefs: append([]artifacts.ArtifactRef(nil), plan.ArtifactRefs...),
+		EventRefs:    append([]string(nil), plan.EventRefs...), EvidenceRefs: append([]string(nil), plan.EvidenceRefs...),
+	}, nil
 }
 
 var _ runtime.TeamHarnessTaskProvisioner = (*RehydratedTeamHarnessTaskActivator)(nil)
@@ -103,7 +137,11 @@ func (c *ControllerReprovisioner) WorkerRoomID(ctx context.Context, workerName s
 }
 
 func rehydratedTaskSpec(request runtime.TeamHarnessTaskRequest) string {
-	return fmt.Sprintf("# Threadmill rehydrated phase\n\n- Invocation: `%s`\n- Generation: `%d`\n- Execution epoch: `%d`\n- Phase: `%s`\n- TeamHarness submission is execution evidence only; it is not PhaseOutput.\n", request.Plan.InvocationID, request.Plan.Generation, request.Plan.NextExecutionEpoch, request.Plan.Endpoint.EndpointID)
+	encoded, err := json.MarshalIndent(request.Package, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("# Threadmill rehydrated phase\n\nThe following package is a Runtime-authorized, agent-visible projection. Treat formal inputs and references as read-only authority.\n\n```json\n%s\n```\n\n- TeamHarness submission is execution evidence only; it is not PhaseOutput.\n- Submit formal output only through `agent.submitPhaseOutput`.\n", encoded)
 }
 
 var (

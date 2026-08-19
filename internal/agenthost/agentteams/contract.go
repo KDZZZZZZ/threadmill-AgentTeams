@@ -96,12 +96,14 @@ type HostExecutionRequest struct {
 // a spec.md projection and mounted files) and must not expose trusted binding
 // data, permissions, or MCP credentials to a worker as self-asserted fields.
 type HostEnvelope struct {
-	BindingRef string                          `json:"-"`
-	TaskSpec   string                          `json:"-"`
-	Workspace  WorkspaceMount                  `json:"-"`
-	Context    MaterializedContext             `json:"-"`
-	TaskMemory phaseagent.TaskMemoryBufferView `json:"-"`
-	MCPBinding TrustedMCPBinding               `json:"-"`
+	BindingRef       string                          `json:"-"`
+	TaskSpec         string                          `json:"-"`
+	TaskContract     string                          `json:"-"`
+	PhaseInstruction string                          `json:"-"`
+	Workspace        WorkspaceMount                  `json:"-"`
+	Context          MaterializedContext             `json:"-"`
+	TaskMemory       phaseagent.TaskMemoryBufferView `json:"-"`
+	MCPBinding       TrustedMCPBinding               `json:"-"`
 }
 
 // WorkspaceMount describes an already prepared host mount. It neither creates

@@ -172,6 +172,10 @@ type InputWaitResult struct {
 - `terminalReason` 表示已声明输入不能正常到达。Agent 可基于已有输入继续、提交编排建议，或将缺口写入最终报告；不得伪造已收交付。
 - `agent.submitPhaseOutput` 会拒绝仍缺少 completion 输入的最终输出。
 
+等待后的重承载保持同一 logical `TaskID + InvocationID + Generation`，但使用递增的 `ExecutionEpoch` 表示新的 physical carrier。Runtime 从最新完整 `PhaseInputSet`、新的不可变 `BindingRef`、当前 Context/Task Memory/Workspace 视图和已验证 continuation refs 生成受控的 `RehydratedExecutionPackage`；它不是 `RehydrationPlan` 的直接序列化，也不包含 CAS revision、token、credential、private header、旧 Worker/session/process identity 或模型 hidden reasoning。旧交付保留在完整输入集中，等待期间的新交付另行标记以便审计；上游 PhaseOutput 只能经正式 `InputDelivery` 进入该 package。
+
+该重承载不恢复 provider conversation 或旧模型会话。新的 agent session 在后续阶段只能消费上述 package 和正式 Runtime/MCP 接口；TeamHarness task 状态、`submit_task` 与 `result.md` 均只是 execution evidence，不能替代 `agent.submitPhaseOutput`。
+
 这满足 Agent 的自主性：Agent 自己决定何时已把本体工作做到不能继续，自己发起等待并在输入到达后汇总。控制面不干预每一次等待；它只持续拥有依赖事实、输入有效性和资源调度，避免 Agent 持有无法审计的长连接或轮询消息。
 
 ### 4.2 发现新前置

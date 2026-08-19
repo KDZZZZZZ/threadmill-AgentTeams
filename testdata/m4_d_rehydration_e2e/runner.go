@@ -148,7 +148,7 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 	provisioner := &runtime.PhysicalExecutionProvisioner{
 		Store: store, PhysicalExecutions: physical, Leases: leases, Tokens: issuer, Credentials: config.Controller,
 		Workers: config.Controller, MCP: config.Controller, Runtime: config.Controller,
-		Discovery: qwenPawDiscovery{docker: config.Docker, trace: config.Trace}, Tasks: tasks,
+		Discovery: qwenPawDiscovery{docker: config.Docker, trace: config.Trace}, Tasks: tasks, Packages: e2ePackageMaterializer{},
 		MCPName: "threadmill", MCPURL: config.MCPURL, Transport: "streamable_http",
 	}
 	execution, err := provisioner.Provision(ctx, plan)
@@ -194,6 +194,19 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 	_ = issuer.RevokeExecutionAuthorization(context.Background(), runtime.IssuedExecutionAuthorization{Token: issuer.lastToken, Ref: execution.ExecutionAuthorizationRef})
 	_ = leases.ReleaseWorkspaceLease(context.Background(), runtime.WorkspaceLease{Ref: execution.WorkspaceLeaseRef})
 	return result, nil
+}
+
+type e2ePackageMaterializer struct{}
+
+func (e2ePackageMaterializer) MaterializeRehydratedExecution(_ context.Context, plan runtime.RehydrationPlan) (runtime.RehydratedExecutionPackage, error) {
+	return runtime.RehydratedExecutionPackage{
+		TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch,
+		Endpoint: plan.Endpoint, BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision, Inputs: plan.Inputs, NewlyDelivered: plan.NewlyDelivered,
+		TaskContract: "M4-D carrier validation", PhaseInstruction: "activate the rehydrated physical execution",
+		Context: runtime.AgentVisibleContext{SliceRef: plan.Context.SliceRef, BaselineRef: plan.Context.BaselineRef}, TaskMemory: plan.TaskMemory.View,
+		Workspace:    runtime.AgentVisibleWorkspace{Ref: plan.Workspace.Ref, Revision: plan.Workspace.Revision, AllowedDirs: append([]string(nil), plan.Workspace.AllowedDirs...)},
+		ArtifactRefs: append([]artifacts.ArtifactRef(nil), plan.ArtifactRefs...), EventRefs: append([]string(nil), plan.EventRefs...), EvidenceRefs: append([]string(nil), plan.EvidenceRefs...),
+	}, nil
 }
 
 type recordingIssuer struct {

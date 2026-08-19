@@ -12,10 +12,11 @@ import (
 // RehydrationInputSnapshot makes input ordering and await completion explicit
 // because PhaseInputSet revisions are opaque strings, not comparable counters.
 type RehydrationInputSnapshot struct {
-	Inputs                  phaseagent.PhaseInputSet `json:"inputs"`
-	RevisionIsNewer         bool                     `json:"revision_is_newer"`
-	AwaitConditionSatisfied bool                     `json:"await_condition_satisfied"`
-	TerminalReason          string                   `json:"terminal_reason,omitempty"`
+	Inputs                  phaseagent.PhaseInputSet   `json:"inputs"`
+	NewlyDelivered          []phaseagent.InputDelivery `json:"newly_delivered,omitempty"`
+	RevisionIsNewer         bool                       `json:"revision_is_newer"`
+	AwaitConditionSatisfied bool                       `json:"await_condition_satisfied"`
+	TerminalReason          string                     `json:"terminal_reason,omitempty"`
 }
 
 type RehydrationInputResolver interface {
@@ -75,6 +76,7 @@ type RehydrationPlan struct {
 	NewBindingRef           string                      `json:"new_binding_ref"`
 	NewInputRevision        string                      `json:"new_input_revision"`
 	Inputs                  phaseagent.PhaseInputSet    `json:"inputs"`
+	NewlyDelivered          []phaseagent.InputDelivery  `json:"newly_delivered,omitempty"`
 	Execution               phaseagent.ExecutionContext `json:"-"`
 	Workspace               WorkspaceBinding            `json:"workspace"`
 	Context                 RehydratedContext           `json:"context"`
@@ -235,8 +237,9 @@ func (c RehydrationCoordinator) prepare(ctx context.Context, record WaitingRecor
 		TaskID: record.Key.TaskID, InvocationID: record.Key.InvocationID, Generation: record.Key.Generation,
 		NextExecutionEpoch: nextEpoch, Endpoint: record.Endpoint, NewBindingRef: rebound.BindingRef,
 		NewInputRevision: inputs.Inputs.InputRevision, Inputs: inputs.Inputs,
-		Execution: phaseagent.ExecutionContext{Invocation: invocation, Role: role, Runtime: c.Surfaces.Runtime, ContextReader: c.Surfaces.ContextReader, ContextAgent: c.Surfaces.ContextAgent},
-		Workspace: workspace, Context: contextBinding, TaskMemory: memory,
+		NewlyDelivered: append([]phaseagent.InputDelivery(nil), inputs.NewlyDelivered...),
+		Execution:      phaseagent.ExecutionContext{Invocation: invocation, Role: role, Runtime: c.Surfaces.Runtime, ContextReader: c.Surfaces.ContextReader, ContextAgent: c.Surfaces.ContextAgent},
+		Workspace:      workspace, Context: contextBinding, TaskMemory: memory,
 		ArtifactRefs:    mergeArtifactRefs(record.ArtifactRefs, material.ArtifactRefs),
 		EventRefs:       mergeStrings(record.EventRefs, material.EventRefs),
 		EvidenceRefs:    mergeStrings(record.EvidenceRefs, material.EvidenceRefs),

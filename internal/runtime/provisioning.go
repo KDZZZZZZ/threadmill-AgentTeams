@@ -202,6 +202,7 @@ type TeamHarnessTaskRequest struct {
 	Plan      RehydrationPlan
 	Worker    ProvisionedWorker
 	Execution phaseagent.ExecutionContext
+	Package   RehydratedExecutionPackage
 }
 
 type TeamHarnessTask struct {
@@ -272,6 +273,7 @@ type PhysicalExecutionProvisioner struct {
 	Runtime            WorkerRuntimeGate
 	Discovery          MCPToolDiscoverer
 	Tasks              TeamHarnessTaskProvisioner
+	Packages           RehydratedExecutionPackageMaterializer
 	MCPName            string
 	MCPURL             string
 	Transport          string
@@ -302,6 +304,13 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	p.inflight[key] = struct{}{}
 	p.mu.Unlock()
 	defer func() { p.mu.Lock(); delete(p.inflight, key); p.mu.Unlock() }()
+	packageValue, err := p.Packages.MaterializeRehydratedExecution(ctx, plan)
+	if err != nil {
+		return PhysicalExecution{}, p.rollbackWaitingOnly(ctx, plan, err)
+	}
+	if err := ValidateRehydratedExecutionPackage(plan, packageValue); err != nil {
+		return PhysicalExecution{}, p.rollbackWaitingOnly(ctx, plan, err)
+	}
 
 	lease, err := p.Leases.AcquireWorkspaceLease(ctx, plan)
 	if err != nil {
@@ -366,7 +375,7 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 		p.teardownCarrier(ctx, lease, authorization, credential, worker, TeamHarnessTask{})
 		return PhysicalExecution{}, fmt.Errorf("%w: %v", ErrProvisionConflict, err)
 	}
-	task, err := p.Tasks.CreateTeamHarnessTask(ctx, TeamHarnessTaskRequest{Plan: plan, Worker: worker, Execution: plan.Execution})
+	task, err := p.Tasks.CreateTeamHarnessTask(ctx, TeamHarnessTaskRequest{Plan: plan, Worker: worker, Execution: plan.Execution, Package: packageValue})
 	if err != nil {
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, TeamHarnessTask{}, err)
 	}
@@ -492,8 +501,15 @@ func (p *PhysicalExecutionProvisioner) rollbackWaiting(ctx context.Context, plan
 	return nil
 }
 
+func (p *PhysicalExecutionProvisioner) rollbackWaitingOnly(ctx context.Context, plan RehydrationPlan, cause error) error {
+	if err := p.rollbackWaiting(ctx, plan); err != nil {
+		return fmt.Errorf("materialize rehydrated execution: %w; rollback waiting: %v", cause, err)
+	}
+	return cause
+}
+
 func (p *PhysicalExecutionProvisioner) validate(plan RehydrationPlan) error {
-	if p == nil || p.Store == nil || p.PhysicalExecutions == nil || p.Leases == nil || p.Tokens == nil || p.Credentials == nil || p.Workers == nil || p.MCP == nil || p.Runtime == nil || p.Discovery == nil || p.Tasks == nil {
+	if p == nil || p.Store == nil || p.PhysicalExecutions == nil || p.Leases == nil || p.Tokens == nil || p.Credentials == nil || p.Workers == nil || p.MCP == nil || p.Runtime == nil || p.Discovery == nil || p.Tasks == nil || p.Packages == nil {
 		return errors.New("physical execution provisioner dependencies are required")
 	}
 	if plan.TaskID == "" || plan.InvocationID == "" || plan.Generation <= 0 || plan.NextExecutionEpoch <= 0 || plan.NewBindingRef == "" || plan.NewInputRevision == "" || plan.ExpectedWaitingRevision <= 0 {
