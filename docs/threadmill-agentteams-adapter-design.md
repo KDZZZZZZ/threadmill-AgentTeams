@@ -72,9 +72,9 @@ Task Manager / Coordination Graph          Context Service
 | `runtime.startPhase(StartPhaseInput)` | 将输入投影写为 `spec.md` + `phase-envelope.json`，Worker 收到 `TASK_ASSIGNED`。 | **需要 Adapter** | spec 是载体，不是 Threadmill Contract 的权威副本。 |
 | Worker 开始 | Worker 调用 `ack_task`。 | **已存在** | Adapter 记录为 `running`；不能据此改变 endpoint 状态。 |
 | Phase 工作中 | Worker 使用 Threadmill 注入 MCP：context 只读、artifact register、proposal、requirement、memory candidate。 | **需要新增** | 这些工具不属于 TeamHarness/WorkerFlow。 |
-| 已知 completion input 不足 | 结束/回收当前 AgentTeams 执行；Threadmill Invocation 标为 `waiting`，释放 capacity。 | **需要新增** | AgentTeams 没有与 `runtime.awaitInputs` 等价的持久、无占用等待/恢复。输入到达后由 Adapter 创建新的受控 task 重新启动。 |
-| 正式完成 | Worker 写 `result.md`，调用 `submit_task`。Adapter 读取受控结果后调用 Threadmill 验证。 | **需要 Adapter** | `submit_task` 成功不等于 `PhaseOutput` 被接受。 |
-| 输出被接受 | Runtime 产生/保存 PhaseOutput，Task Manager 再判定 satisfied/rejected/invalidated。 | **需要新增** | 不调用 AgentTeams project acceptance 作为权威。 |
+| 已知 completion input 不足 | Agent 通过受限 MCP 调用 `runtime.awaitInputs`；Runtime 持久化 continuation 并回收当前 AgentTeams carrier。 | **M4 已落地** | AgentTeams 没有等价的持久、无占用等待/恢复；新正式输入形成新的不可变 BindingRef 与新 task/Worker epoch。 |
+| 正式完成 | Agent 通过受限 MCP 调用 `agent.submitPhaseOutput`；`result.md` / `submit_task` 若存在只保留为 physical execution evidence。 | **M3.8 / M4-E3 已落地** | `submit_task` 成功不等于 `PhaseOutput` 被接受。 |
+| 输出被接受 | Runtime 校验当前 trusted binding、输入 revision 和 Artifact ownership，持久化 PhaseOutput / `PhaseOutputSubmitted`，随后正常回收 physical carrier。 | **M4-E3 已落地** | 不调用 AgentTeams project acceptance 作为权威。 |
 | 取消/超时/lease 失效 | Runtime 停止执行并调用 `cancel_task`（可用时），撤销 token/写 lease。 | **需要 Adapter + 需要新增** | `cancel_task` 已有；lease 与强制停止语义未在 AgentTeams 中确认。 |
 | Phase 内部并行（非 MVP） | 当前 Worker 调用 `workflow_run`，自行 `workflow_update`、合并和清理 tmp agents。 | **需要 Adapter** | 其子 agent 只产生 phase 内辅助材料；最终仍由父 Worker 提交一次 PhaseOutput。 |
 
@@ -82,7 +82,7 @@ Task Manager / Coordination Graph          Context Service
 
 ### 5.1 Threadmill Phase Runtime MCP（Phase Agent 可见）
 
-以下接口均为 **需要新增**，并由 Runtime 校验 Invocation token、角色、输入 revision、权限和 lease：
+以下为目标接口集；其中 `runtime.awaitInputs`、`artifact.register`、`agent.submitPhaseOutput` 和 `runtime.confirmPackageConsumption` 已由当前 Phase MCP 实现，其余仍按各自 milestone 演进。所有接口均由 Runtime 校验 Invocation token、角色、输入 revision、权限和 lease：
 
 ```text
 runtime.awaitInputs({ inputIds? }) -> InputWaitResult
@@ -135,31 +135,26 @@ shared/tasks/{agentteams-task-id}/
 
 `spec.md` 必须明确：不得编辑 `phase-envelope.json`；不得使用 TeamHarness `projectflow` 或自行 `delegate_task`；只可通过 Threadmill MCP 提交 PhaseOutput/提案；路径先注册才能成为交付引用。
 
-## 7. AgentTeams result 到 PhaseOutput 的转换
+## 7. AgentTeams result 与 PhaseOutput 的边界
 
 | AgentTeams 结果 | Threadmill 转换 | 标记 |
 | --- | --- | --- |
 | `submit_task.status=SUCCESS` 或 `SUCCESS_WITH_NOTES` | 仅作为“Worker 已提交”的候选信号。 | **需要 Adapter** |
-| `result.md` | 注册为 report artifact，并检查当前 endpoint `ReportSpec`。 | **需要新增** |
-| `deliverables[]` | 验证处于受控目录、注册 hash/媒体类型/来源后转为 `DeliveryRefs`。 | **需要新增** |
-| 运行日志、测试输出、diff | 由 Runtime 捕获/注册为 `EvidenceRefs`，不能把任意路径直接信任为 evidence。 | **需要新增** |
+| `result.md` | 人类可读报告或 physical execution evidence；不自动注册或映射为正式 PhaseOutput。 | **已明确边界** |
+| `deliverables[]` | 可作为候选文件，仍须 Agent 通过 `artifact.register` 取得受控 ArtifactRef。 | **M3.8 已落地** |
+| 运行日志、测试输出、diff | 可注册为 `EvidenceRefs`，但 Runtime 不信任任意路径。 | **M3.8 已落地** |
 | `REVISION_NEEDED` / `BLOCKED` | 转为结构化失败/阻塞证据；必要时要求 Worker 提交 Proposal。 | **需要 Adapter** |
-| `PhaseOutput` | Runtime 以权威 binding 补齐字段，校验 completion inputs、InputRevision、DeliverySpec、ReportSpec 和 lease，再提交。 | **需要新增** |
+| `PhaseOutput` | Agent 调用 `agent.submitPhaseOutput`；Runtime 以权威 binding 校验 completion inputs、InputRevision、Artifact ownership 和 lease 后接受。 | **M4-E3 已落地** |
 
-转换伪代码：
+正式输出路径：
 
 ```text
-result = adapter.collectResult(agentteamsTaskId)
-assert result.belongsTo(invocation) && result.submitted
-report = artifactStore.register(result.resultMd)
-deliveries = result.deliverables.map(registerAndValidateControlledPath)
-evidence = runtime.captureAndRegister(result)
-
-candidate = { phase, deliveryRefs: deliveries, reportRef: report, evidenceRefs: evidence }
-runtime.acceptPhaseOutput(invocation, candidate)  # 补 binding；不采信 Worker 自报 binding
+artifact = artifact.register(controlledPath)
+agent.submitPhaseOutput({ phase, deliveryRefs, reportRef, evidenceRefs })
+runtime.acceptPhaseOutput(currentTrustedBinding, candidate)
 ```
 
-若缺 report、未满足 `DeliverySpec`、completion input 仍 pending、输入已过期或写 lease 已失效，则拒绝转换；不将 AgentTeams 的“SUCCESS”升级为 Phase 成功。
+若缺 report、未满足 `DeliverySpec`、completion input 仍 pending、输入已过期或写 lease 已失效，则 Runtime 拒绝正式提交；不将 AgentTeams 的“SUCCESS”升级为 Phase 成功。
 
 ## 8. Context / Input / Artifact 接入
 
@@ -168,7 +163,7 @@ runtime.acceptPhaseOutput(invocation, candidate)  # 补 binding；不采信 Work
 | Context 初始注入 | Runtime 选择 Context Slice，把小摘要放入 spec/envelope；完整探索与检索经 `threadmill-ctx` MCP。 | **需要新增** |
 | Context 更新 | Context subscription executor 向有效 Invocation 推送 Delta；若处于 waiting，下次恢复时重新装配 slice。 | **需要新增** |
 | 正式 Input | Coordination Graph 生成 `PhaseInputSet`。已交付内容只能以 `PhaseOutputRef + ArtifactRef` 投影到 envelope/read-only mount。 | **需要新增** |
-| 已知输入等待 | 调用 `runtime.awaitInputs` 后结束本次 AgentTeams task；Runtime 保留 waiting 记录，不保留 Worker 线程。 | **需要新增** |
+| 已知输入等待 | 调用 `runtime.awaitInputs` 后回收本次 AgentTeams carrier；Runtime 保留 waiting 记录，不保留 Worker 线程，并以新 epoch 重新承载。 | **M4 已落地** |
 | 未知前置 | `agent.proposeOrchestration(advice=dependency)`；只有 Task Manager 改图后才形成新 Input。 | **需要新增** |
 | 产物生成 | Worker 写入受控目录；TeamHarness 文件共享可作为运输通道。 | **已存在 + 需要 Adapter** |
 | 产物正式化 | Runtime 路径验证、hash、存储、权限和 ArtifactRef 注册。 | **需要新增** |
@@ -235,11 +230,10 @@ sequenceDiagram
     CG-->>RT: "updated input projection"
     RT->>AD: "dispatch(new execution task)"
   end
-  W->>TH: "submit_task(result.md, deliverables)"
-  TH-->>AD: "submitted task result"
-  AD->>AS: "validate and register controlled files"
-  AD->>RT: "untrusted AgentTeamsResult"
-  RT->>RT: "validate input revision and output specs"
+  W->>AS: "artifact.register(controlled path)"
+  W->>RT: "agent.submitPhaseOutput(ArtifactRefs)"
+  RT->>RT: "validate trusted binding, input revision and ownership"
+  RT->>AD: "normal task/worker/credential teardown"
   RT-->>TM: "accepted PhaseOutput or rejection"
   TM->>CG: "satisfy, reject, invalidate, or replan endpoint"
 ```
