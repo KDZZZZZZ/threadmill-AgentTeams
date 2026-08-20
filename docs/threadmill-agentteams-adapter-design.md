@@ -305,4 +305,6 @@ MVP 上线前至少验证：
 
 The adapter delegates the complete rehydrated package through the existing TeamHarness task specification. Matrix carries a truncated assignment preview; `ack_task` pulls and returns the complete `spec.md`. The adapter retains the Controller's real room identity as `matrix:<room-id>` and never manufactures a `qwenpaw://` success URI.
 
+Package consumption is not Phase completion. The fresh agent must separately invoke Threadmill `agent.submitPhaseOutput`; the Runtime validates the current Task/Invocation/Generation/Epoch/BindingRef/InputRevision, persists the formal output and authoritative event, and only then performs normal AgentTeams task/Worker/credential cleanup. `cancel_task` is currently the AgentTeams reclamation primitive for both rollback and completed-task cleanup, but the adapter uses distinct reasons and does not classify accepted output as rollback.
+
 Two independent gates are required. TeamHarness assignment/acknowledgement proves physical activation. The Threadmill Phase MCP tool `runtime.confirmPackageConsumption` proves that the fresh session parsed the authoritative package. Runtime validates that call with token-bound logical identity plus the epoch-aware physical record and stores immutable per-epoch evidence. Neither gate substitutes for the other, and neither carries secret transport state.

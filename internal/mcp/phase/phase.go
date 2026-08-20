@@ -52,6 +52,12 @@ type PackageConsumptionConfirmer interface {
 	ConfirmPackageConsumption(context.Context, InvocationBinding, executionreceipt.Submission) (executionreceipt.Receipt, error)
 }
 
+// PhaseOutputEventAuthority marks a Runtime that emits the authoritative
+// PhaseOutputSubmitted event as part of its completion transaction.
+type PhaseOutputEventAuthority interface {
+	RecordsPhaseOutputSubmitted() bool
+}
+
 type BindingRegistry struct {
 	mu       sync.RWMutex
 	bindings map[string]BoundServices
@@ -129,6 +135,23 @@ func (r *BindingRegistry) Revoke(token string) {
 	r.mu.Lock()
 	delete(r.bindings, token)
 	r.mu.Unlock()
+}
+
+// RevokeBinding removes only tokens whose complete trusted execution identity
+// matches binding. Normal completion can therefore revoke the current carrier
+// without persisting raw token material.
+func (r *BindingRegistry) RevokeBinding(binding InvocationBinding) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	revoked := 0
+	for token, services := range r.bindings {
+		candidate := services.Binding
+		if candidate.TaskID == binding.TaskID && candidate.InvocationID == binding.InvocationID && candidate.Generation == binding.Generation && candidate.ExecutionEpoch == binding.ExecutionEpoch && candidate.BindingRef == binding.BindingRef && candidate.InputRevision == binding.InputRevision {
+			delete(r.bindings, token)
+			revoked++
+		}
+	}
+	return revoked
 }
 
 var (
@@ -261,7 +284,11 @@ func (h *Handler) SubmitPhaseOutput(ctx context.Context, token string, output ph
 	if err := b.Runtime.SubmitPhaseOutput(ctx, output); err != nil {
 		return err
 	}
-	if h.recorder != nil {
+	ownedEvent := false
+	if authority, ok := b.Runtime.(PhaseOutputEventAuthority); ok {
+		ownedEvent = authority.RecordsPhaseOutputSubmitted()
+	}
+	if h.recorder != nil && !ownedEvent {
 		return h.recorder.Record(ctx, artifacts.Event{Type: artifacts.EventPhaseOutputSubmitted, TaskID: b.Binding.TaskID, InvocationID: b.Binding.InvocationID, ArtifactRefs: outputReferences(output)})
 	}
 	return nil

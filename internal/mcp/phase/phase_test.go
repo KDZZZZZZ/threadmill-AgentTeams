@@ -19,6 +19,10 @@ type fakeRuntime struct {
 	candidates   []phaseagent.MemoryCandidate
 }
 
+type eventOwningRuntime struct{ fakeRuntime }
+
+func (*eventOwningRuntime) RecordsPhaseOutputSubmitted() bool { return true }
+
 func (r *fakeRuntime) AwaitInputs(context.Context, phaseagent.AwaitInputsRequest) (phaseagent.InputWaitResult, error) {
 	return phaseagent.InputWaitResult{InputRevision: "next"}, nil
 }
@@ -166,6 +170,20 @@ func TestArtifactRegistrationAndFormalOutputReferenceValidation(t *testing.T) {
 	}
 	if len(runtime.outputs) != 1 || !recorder.has(artifacts.EventPhaseOutputSubmitted) {
 		t.Fatalf("output/event mismatch: %#v %#v", runtime.outputs, recorder.events)
+	}
+}
+
+func TestCompletionRuntimeOwnsPhaseOutputSubmittedEvent(t *testing.T) {
+	registry := NewBindingRegistry()
+	runtime := &eventOwningRuntime{}
+	binding := mustIssue(t, registry, runtime, &fakeAgent{}, "invocation-a", "task-a", time.Time{})
+	recorder := &mcpRecorder{}
+	handler, _ := NewHandler(registry, artifacts.NewInMemoryRegistry(nil), recorder)
+	if err := handler.SubmitPhaseOutput(context.Background(), binding.Token, phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runtime.outputs) != 1 || len(recorder.events) != 0 {
+		t.Fatalf("completion-owned event was duplicated: outputs=%d events=%#v", len(runtime.outputs), recorder.events)
 	}
 }
 

@@ -57,6 +57,7 @@ func main() {
 	registry := phasemcp.NewBindingRegistry()
 	physical := runtime.NewInMemoryPhysicalExecutionStore()
 	receipts := executionreceipt.NewInMemoryStore()
+	outputs := runtime.NewInMemoryPhaseOutputStore()
 	receiptAuthority := &runtime.PackageConsumptionCoordinator{Store: receipts, PhysicalExecutions: physical}
 	recorder := &eventRecorder{}
 	artifactRegistry := artifacts.NewInMemoryRegistry(recorder)
@@ -71,22 +72,28 @@ func main() {
 	mcpURL := "http://host.docker.internal:" + fmt.Sprint(listener.Addr().(*net.TCPAddr).Port) + "/mcp"
 
 	controller := &agentteams.ControllerReprovisioner{BaseURL: controllerURL, BearerToken: controllerToken, Model: "qwen-plus", ModelProvider: "openai-compat", Runtime: "qwenpaw", Image: "threadmill/qwenpaw-worker:m4d-current", PollInterval: time.Second}
-	success, err := runScenario(ctx, scenarioConfig{TaskID: taskID, InvocationID: invocationID, Workspace: workspace, Docker: docker, MCPURL: mcpURL, MatrixURL: matrixURL, MatrixToken: matrixAdminToken, Controller: controller, Registry: registry, Trace: trace, Physical: physical, Receipts: receipts, ConflictAfterActivation: false})
+	success, err := runScenario(ctx, scenarioConfig{TaskID: taskID, InvocationID: invocationID, Workspace: workspace, Docker: docker, MCPURL: mcpURL, MatrixURL: matrixURL, MatrixToken: matrixAdminToken, Controller: controller, Registry: registry, Trace: trace, Physical: physical, Receipts: receipts, Outputs: outputs, Events: recorder, ConflictAfterActivation: false})
 	must(err)
-	if !success.TokenARevoked || !success.TokenBResolvable || success.Record.State != runtime.PhysicalExecutionRunning || success.Waiting.State != runtime.AwaitStateRunning {
-		panic("successful M4-D activation evidence was incomplete")
+	if !success.TokenARevoked || success.TokenBResolvable || success.Record.State != runtime.PhysicalExecutionTerminated || success.Waiting.State != runtime.AwaitStateTerminal {
+		panic("successful M4-E3 completion evidence was incomplete")
 	}
 	receipt, found, err := receipts.Get(ctx, executionreceipt.Key{TaskID: success.Record.TaskID, InvocationID: success.Record.InvocationID, Generation: success.Record.Generation, ExecutionEpoch: int64(success.Record.ExecutionEpoch)})
 	must(err)
 	if !found || !receipt.Consumed || receipt.PackageDigest != success.Record.AgentPackageDigest || receipt.SessionIdentity != success.Record.AgentSessionRef || !trace.observedTool(phasemcp.ToolConfirmPackageConsumption) {
 		panic("agent-originated package consumption receipt evidence was incomplete")
 	}
-	conflict, err := runScenario(ctx, scenarioConfig{TaskID: "m4d-conflict-task", InvocationID: "m4d-conflict-invocation", Workspace: workspace, Docker: docker, MCPURL: mcpURL, MatrixURL: matrixURL, MatrixToken: matrixAdminToken, Controller: controller, Registry: registry, Trace: trace, Physical: physical, Receipts: receipts, ConflictAfterActivation: true})
+	accepted, found, err := outputs.Get(ctx, runtime.PhaseOutputKey{TaskID: taskID, InvocationID: invocationID, Generation: generation})
+	must(err)
+	if !found || accepted.Output.ReportRef == "" || !accepted.EventRecorded || !trace.observedTool(phasemcp.ToolRegisterArtifact) || !trace.observedTool(phasemcp.ToolSubmitPhaseOutput) {
+		panic("agent-originated PhaseOutput evidence was incomplete")
+	}
+	must(artifactRegistry.ValidateReferences(ctx, artifacts.TrustedOwner{TaskID: taskID, InvocationID: invocationID}, []artifacts.ArtifactRef{artifacts.ArtifactRef(accepted.Output.ReportRef)}))
+	conflict, err := runScenario(ctx, scenarioConfig{TaskID: "m4d-conflict-task", InvocationID: "m4d-conflict-invocation", Workspace: workspace, Docker: docker, MCPURL: mcpURL, MatrixURL: matrixURL, MatrixToken: matrixAdminToken, Controller: controller, Registry: registry, Trace: trace, Physical: physical, Receipts: receipts, Outputs: outputs, Events: recorder, ConflictAfterActivation: true})
 	must(err)
 	if !conflict.ConflictObserved || conflict.TokenBResolvable || conflict.Record.State != runtime.PhysicalExecutionFailed {
 		panic("M4-D final-CAS conflict teardown evidence was incomplete")
 	}
-	output, _ := json.MarshalIndent(map[string]any{"taskID": success.Record.TaskID, "invocationID": success.Record.InvocationID, "generation": success.Record.Generation, "previousExecutionEpoch": 1, "executionEpoch": success.Record.ExecutionEpoch, "worker": success.Record.WorkerName, "taskB": success.Record.TeamHarnessTaskID, "activationStatus": success.Record.ObservedTaskStatus, "assignedWorker": success.Record.TeamHarnessAssignedTo, "credentialRef": success.Record.CredentialBindingRef, "tokenSHA256": success.TokenBDigest, "oldTokenRevoked": success.TokenARevoked, "tokenBResolvableBeforeTeardown": success.TokenBResolvable, "desiredGeneration": success.Record.DesiredRuntimeGeneration, "appliedGeneration": success.Record.AppliedRuntimeGeneration, "mcpApplied": true, "physicalExecutionRevision": success.Record.Revision, "physicalEpochs": success.PhysicalEpochs, "waitingState": success.Waiting.State, "waitingRevision": success.Waiting.Revision, "casConflictTeardown": conflict.ConflictObserved, "conflictTokenBResolvableAfterTeardown": conflict.TokenBResolvable, "events": recorder.events}, "", "  ")
+	output, _ := json.MarshalIndent(map[string]any{"taskID": success.Record.TaskID, "invocationID": success.Record.InvocationID, "generation": success.Record.Generation, "previousExecutionEpoch": 1, "executionEpoch": success.Record.ExecutionEpoch, "worker": success.Record.WorkerName, "taskB": success.Record.TeamHarnessTaskID, "activationStatus": success.Record.ObservedTaskStatus, "assignedWorker": success.Record.TeamHarnessAssignedTo, "credentialRef": success.Record.CredentialBindingRef, "tokenSHA256": success.TokenBDigest, "oldTokenRevoked": success.TokenARevoked, "tokenBResolvableAfterTeardown": success.TokenBResolvable, "desiredGeneration": success.Record.DesiredRuntimeGeneration, "appliedGeneration": success.Record.AppliedRuntimeGeneration, "mcpApplied": true, "physicalExecutionRevision": success.Record.Revision, "physicalEpochs": success.PhysicalEpochs, "waitingState": success.Waiting.State, "waitingRevision": success.Waiting.Revision, "phaseOutputReportRef": accepted.Output.ReportRef, "phaseOutputEventRecorded": accepted.EventRecorded, "casConflictTeardown": conflict.ConflictObserved, "conflictTokenBResolvableAfterTeardown": conflict.TokenBResolvable, "events": recorder.events}, "", "  ")
 	must(os.WriteFile(resultPath, output, 0o600))
 }
 
@@ -94,13 +101,15 @@ func rehydratingPlan(task, invocation string) (*runtime.InMemoryWaitingStore, ru
 	endpoint := phaseagent.PhaseEndpointRef{TaskID: task, EndpointID: string(phaseagent.PhaseExecute)}
 	role, err := phaseagent.RoleForEndpoint(endpoint)
 	must(err)
-	start := phaseagent.StartPhaseInput{InvocationID: invocation, Endpoint: endpoint, Generation: generation, BindingRef: "binding-r5", Inputs: phaseagent.PhaseInputSet{InputRevision: "input-r5"}}
+	input := phaseagent.InputDelivery{InputID: "upstream-result", FromEndpoint: phaseagent.PhaseEndpointRef{TaskID: task, EndpointID: "plan"}, PhaseOutputRef: "phase-output-upstream", ArtifactRefs: []string{"artifact-upstream"}, SourceRevision: "source-r5"}
+	inputs := phaseagent.PhaseInputSet{InputRevision: "input-r5", Required: []phaseagent.InputRequirement{{InputID: input.InputID, FromEndpoint: input.FromEndpoint, RequiredArtifacts: []string{"report"}, RequiredBy: "completion"}}, Delivered: []phaseagent.InputDelivery{input}}
+	start := phaseagent.StartPhaseInput{InvocationID: invocation, Endpoint: endpoint, Generation: generation, BindingRef: "binding-r5", Inputs: inputs}
 	invocationContext, err := phaseagent.NewInvocationContext(start)
 	must(err)
 	store := runtime.NewInMemoryWaitingStore()
 	record, err := store.Create(context.Background(), runtime.WaitingRecord{Key: runtime.WaitingKey{TaskID: task, InvocationID: invocation, Generation: generation}, ExecutionEpoch: 1, Endpoint: endpoint, PreviousBindingRef: "binding-r4", InputRevision: "input-r4", ContinuationRef: "continuation-r4", State: runtime.AwaitStateRehydrating, WorkspaceRef: "workspace-m4d", AllowedDirs: []string{"out"}, ContextSliceRef: "slice-r4", TaskMemoryBufferRef: "memory-r4"})
 	must(err)
-	return store, runtime.RehydrationPlan{TaskID: task, InvocationID: invocation, Generation: generation, NextExecutionEpoch: 2, Endpoint: endpoint, NewBindingRef: "binding-r5", NewInputRevision: "input-r5", Inputs: start.Inputs, Execution: phaseagent.ExecutionContext{Invocation: invocationContext, Role: role, Runtime: runtimeStub{}, ContextReader: readerStub{}, ContextAgent: agentStub{}}, Workspace: runtime.WorkspaceBinding{Ref: "workspace-m4d", AllowedDirs: []string{"out"}}, Context: runtime.RehydratedContext{SliceRef: "slice-r4"}, TaskMemory: runtime.RehydratedTaskMemory{BufferRef: "memory-r4"}, ContinuationRef: "continuation-r4", ExpectedWaitingRevision: record.Revision}
+	return store, runtime.RehydrationPlan{TaskID: task, InvocationID: invocation, Generation: generation, NextExecutionEpoch: 2, Endpoint: endpoint, NewBindingRef: "binding-r5", NewInputRevision: "input-r5", Inputs: start.Inputs, NewlyDelivered: []phaseagent.InputDelivery{input}, Execution: phaseagent.ExecutionContext{Invocation: invocationContext, Role: role, Runtime: runtimeStub{}, ContextReader: readerStub{}, ContextAgent: agentStub{}}, Workspace: runtime.WorkspaceBinding{Ref: "workspace-m4d", Revision: "workspace-r5", AllowedDirs: []string{"out"}}, Context: runtime.RehydratedContext{SliceRef: "slice-r5", BaselineRef: "baseline-r5"}, TaskMemory: runtime.RehydratedTaskMemory{BufferRef: "memory-r5", View: phaseagent.TaskMemoryBufferView{Candidates: []phaseagent.TaskMemoryCandidateView{{CandidateID: "memory-candidate-r5", Candidate: phaseagent.MemoryCandidate{Statement: "continue from formal input", Kind: "task"}}}}}, ArtifactRefs: []artifacts.ArtifactRef{"artifact-continuation"}, EventRefs: []string{"event-continuation"}, EvidenceRefs: []string{"evidence-continuation"}, ContinuationRef: "continuation-r4", ExpectedWaitingRevision: record.Revision}
 }
 
 func issueOldToken(registry *phasemcp.BindingRegistry, plan runtime.RehydrationPlan) string {
@@ -118,6 +127,8 @@ type scenarioConfig struct {
 	Trace                                *mcpTrace
 	Physical                             runtime.PhysicalExecutionStore
 	Receipts                             executionreceipt.Store
+	Outputs                              runtime.PhaseOutputStore
+	Events                               artifacts.EventRecorder
 	ConflictAfterActivation              bool
 }
 
@@ -129,6 +140,7 @@ type scenarioResult struct {
 	TokenBResolvable bool
 	TokenBDigest     string
 	ConflictObserved bool
+	LeaseReleased    bool
 }
 
 func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, error) {
@@ -159,6 +171,8 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 	}
 	tracedTaskflow := &matrixObservedTaskflow{client: baseTaskflow, docker: config.Docker, workerName: workerName, matrixURL: config.MatrixURL, matrixToken: config.MatrixToken}
 	activator := &agentteams.RehydratedTeamHarnessTaskActivator{Controller: config.Controller, Taskflow: tracedTaskflow, ProjectID: "threadmill-m4d", PollInterval: time.Second}
+	completion := &runtime.PhaseOutputCompletionCoordinator{Binding: phasemcp.InvocationBinding{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: int64(plan.NextExecutionEpoch), Endpoint: plan.Endpoint, BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision, Role: plan.Execution.Role.Phase, Capabilities: plan.Execution.Role.Capabilities}, Delegate: runtimeStub{}, Outputs: config.Outputs, Waiting: store, PhysicalExecutions: physical, Events: config.Events, Tasks: activator, Workers: config.Controller, MCP: config.Controller, Credentials: config.Controller, Bindings: config.Registry, Leases: leases}
+	plan.Execution.Runtime = completion
 	var tasks runtime.TeamHarnessTaskProvisioner = activator
 	if config.ConflictAfterActivation {
 		tasks = conflictAfterActivation{next: activator, store: store, key: runtime.WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation}}
@@ -189,12 +203,28 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 		return scenarioResult{}, err
 	}
 	if _, err := config.Registry.Resolve(issuer.lastToken); err != nil {
-		return scenarioResult{}, fmt.Errorf("token-B did not resolve before teardown: %w", err)
+		return scenarioResult{}, fmt.Errorf("token-B was not resolvable before completion: %w", err)
 	}
-	credentialView, err := redactedCredentialGet(ctx, config.Controller.BaseURL, config.Controller.BearerToken, execution.CredentialBindingRef)
-	if err != nil || credentialView.ID != execution.CredentialBindingRef || credentialView.WorkerName != execution.WorkerName || credentialView.HeaderName != phasemcp.ExecutionTokenHeader || credentialView.State != "active" {
-		return scenarioResult{}, errors.New("credential redacted readback mismatch")
+	completionKey := runtime.PhaseOutputKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation}
+	physicalKey := execution.Key()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		accepted, outputFound, outputErr := config.Outputs.Get(ctx, completionKey)
+		current, physicalFound, physicalErr := physical.Get(ctx, physicalKey)
+		if outputErr != nil || physicalErr != nil {
+			return scenarioResult{}, errors.New("completion evidence read failed")
+		}
+		if outputFound && accepted.EventRecorded && physicalFound && current.State == runtime.PhysicalExecutionTerminated {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return scenarioResult{}, fmt.Errorf("agent-originated PhaseOutput did not complete: %w", ctx.Err())
+		case <-ticker.C:
+		}
 	}
+	_, resolveErr := config.Registry.Resolve(issuer.lastToken)
 	all, err := physical.ListByInvocation(ctx, plan.TaskID, plan.InvocationID, plan.Generation)
 	if err != nil || len(all) != 2 {
 		return scenarioResult{}, fmt.Errorf("physical epoch history mismatch: records=%d err=%v", len(all), err)
@@ -203,15 +233,21 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 	if err != nil || !found {
 		return scenarioResult{}, fmt.Errorf("waiting record missing: %v", err)
 	}
-	result := scenarioResult{Record: execution, Waiting: waiting, PhysicalEpochs: len(all), TokenARevoked: true, TokenBResolvable: true, TokenBDigest: tokenDigest(issuer.lastToken)}
-	// Fixture cleanup happens only after evidence is captured; it does not alter
-	// the returned logical running record.
-	_ = activator.CancelTeamHarnessTask(context.Background(), runtime.TeamHarnessTask{ID: execution.TeamHarnessTaskID})
-	_ = config.Controller.DeleteWorker(context.Background(), runtime.ProvisionedWorker{ID: execution.WorkerID, Name: execution.WorkerName})
-	_ = config.Controller.RevokeMCPCredential(context.Background(), runtime.MCPCredentialBinding{Ref: execution.CredentialBindingRef, WorkerName: execution.WorkerName})
-	_ = issuer.RevokeExecutionAuthorization(context.Background(), runtime.IssuedExecutionAuthorization{Token: issuer.lastToken, Ref: execution.ExecutionAuthorizationRef})
-	_ = leases.ReleaseWorkspaceLease(context.Background(), runtime.WorkspaceLease{Ref: execution.WorkspaceLeaseRef})
-	return result, nil
+	stored, found, err := physical.Get(ctx, execution.Key())
+	if err != nil || !found {
+		return scenarioResult{}, errors.New("completed physical execution missing")
+	}
+	if teardown := stored.Teardown; !teardown.TeamHarnessTaskCancelled || !teardown.WorkerDeleted || !teardown.MCPCleaned || !teardown.CredentialRevoked || !teardown.TokenRevoked || !teardown.LeaseReleased || !leases.released {
+		return scenarioResult{}, errors.New("normal completion teardown evidence was incomplete")
+	}
+	credentialView, err := redactedCredentialGet(ctx, config.Controller.BaseURL, config.Controller.BearerToken, execution.CredentialBindingRef)
+	if err != nil || credentialView.ID != execution.CredentialBindingRef || credentialView.WorkerName != execution.WorkerName || credentialView.HeaderName != phasemcp.ExecutionTokenHeader || credentialView.State != "revoked" {
+		return scenarioResult{}, fmt.Errorf("credential-B revoke readback mismatch: state=%s err=%v", credentialView.State, err)
+	}
+	if err := waitForWorkerContainerRemoval(ctx, config.Docker, execution.WorkerName); err != nil {
+		return scenarioResult{}, err
+	}
+	return scenarioResult{Record: stored, Waiting: waiting, PhysicalEpochs: len(all), TokenARevoked: true, TokenBResolvable: resolveErr == nil, TokenBDigest: tokenDigest(issuer.lastToken), LeaseReleased: leases.released}, nil
 }
 
 type e2ePackageMaterializer struct{}
@@ -220,8 +256,8 @@ func (e2ePackageMaterializer) MaterializeRehydratedExecution(_ context.Context, 
 	return runtime.RehydratedExecutionPackage{
 		TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch,
 		Endpoint: plan.Endpoint, BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision, Inputs: plan.Inputs, NewlyDelivered: plan.NewlyDelivered,
-		TaskContract: "M4-D carrier validation", PhaseInstruction: "activate the rehydrated physical execution",
-		Context: runtime.AgentVisibleContext{SliceRef: plan.Context.SliceRef, BaselineRef: plan.Context.BaselineRef}, TaskMemory: plan.TaskMemory.View,
+		TaskContract: "M4-E3 rehydrated completion contract", PhaseInstruction: "produce the formal rehydrated PhaseOutput",
+		Context: runtime.AgentVisibleContext{SliceRef: plan.Context.SliceRef, BaselineRef: plan.Context.BaselineRef, Content: "materialized context for input-r5"}, TaskMemory: plan.TaskMemory.View,
 		Workspace:    runtime.AgentVisibleWorkspace{Ref: plan.Workspace.Ref, Revision: plan.Workspace.Revision, AllowedDirs: append([]string(nil), plan.Workspace.AllowedDirs...)},
 		ArtifactRefs: append([]artifacts.ArtifactRef(nil), plan.ArtifactRefs...), EventRefs: append([]string(nil), plan.EventRefs...), EvidenceRefs: append([]string(nil), plan.EvidenceRefs...),
 	}, nil
@@ -442,12 +478,35 @@ func (c conflictAfterActivation) CancelTeamHarnessTask(ctx context.Context, task
 	return c.next.CancelTeamHarnessTask(ctx, task)
 }
 
-type localLeases struct{ root string }
+type localLeases struct {
+	root     string
+	released bool
+}
 
 func (l *localLeases) AcquireWorkspaceLease(_ context.Context, plan runtime.RehydrationPlan) (runtime.WorkspaceLease, error) {
 	return runtime.WorkspaceLease{Ref: "lease-e2", WorkspaceRef: plan.Workspace.Ref, WorkspaceRoot: l.root, AllowedDirs: append([]string(nil), plan.Workspace.AllowedDirs...), Epoch: plan.NextExecutionEpoch}, nil
 }
-func (*localLeases) ReleaseWorkspaceLease(context.Context, runtime.WorkspaceLease) error { return nil }
+func (l *localLeases) ReleaseWorkspaceLease(context.Context, runtime.WorkspaceLease) error {
+	l.released = true
+	return nil
+}
+
+func waitForWorkerContainerRemoval(ctx context.Context, docker, workerName string) error {
+	name := "agentteams-worker-" + workerName
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := exec.CommandContext(ctx, docker, "container", "inspect", name).Run()
+		if err != nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Worker-B container remained after completion: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
 
 type eventRecorder struct{ events []artifacts.Event }
 

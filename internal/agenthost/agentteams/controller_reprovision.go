@@ -154,6 +154,20 @@ func (a *RehydratedTeamHarnessTaskActivator) CancelTeamHarnessTask(ctx context.C
 	return canceller.CancelTask(ctx, task.ID, "rehydration activation rollback")
 }
 
+// CompleteTeamHarnessTask reclaims the transient AgentTeams task after the
+// formal Threadmill PhaseOutput has been accepted. This is normal completion,
+// not rehydration rollback, even though taskflow uses the same cancel action.
+func (a *RehydratedTeamHarnessTaskActivator) CompleteTeamHarnessTask(ctx context.Context, task runtime.TeamHarnessTask) error {
+	if a == nil || a.Taskflow == nil || task.ID == "" {
+		return nil
+	}
+	canceller, ok := a.Taskflow.(TaskflowCanceller)
+	if !ok {
+		return errors.New("taskflow client does not support completion cleanup")
+	}
+	return canceller.CancelTask(ctx, task.ID, "Threadmill PhaseOutput accepted")
+}
+
 func (c *ControllerReprovisioner) WorkerRoomID(ctx context.Context, workerName string) (string, error) {
 	status, err := c.workerStatus(ctx, workerName)
 	if err != nil {

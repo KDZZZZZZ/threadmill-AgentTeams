@@ -443,3 +443,5 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 ## Await continuation evidence
 
 Returning from `runtime.awaitInputs` preserves logical invocation identity but creates a new physical execution epoch. TeamHarness acknowledgement is activation evidence only. Runtime does not commit the waiting record back to running until the new Worker runtime is applied, the task is activated, and an authenticated package-consumption receipt confirms the B2/input-r5/Epoch-2 package for the fresh Matrix session. This receipt is separate from `agent.submitPhaseOutput` and does not alter PhaseOutput acceptance semantics.
+
+After rehydration, formal completion still requires an agent-originated `agent.submitPhaseOutput` under the current trusted binding. `ack_task`, `submit_task`, a package receipt, or a fixture-side call cannot complete the logical invocation. Runtime durably records the accepted output and `PhaseOutputSubmitted` before normal physical teardown; duplicate identical output is idempotent, conflicting or stale binding/input output fails closed, and teardown retry never reopens the logical invocation.
