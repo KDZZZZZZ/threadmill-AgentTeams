@@ -20,3 +20,7 @@ $env:THREADMILL_IT_QWENPAW_URL = 'http://127.0.0.1:8088'
 QwenPaw 的 MCP registry 在当前源码中是 app 范围的 registry；`/api/mcp` 没有 invocation-to-agent 专属绑定字段。Threadmill 使用唯一 client key 和 opaque header 来隔离配置，但这尚不构成 QwenPaw 原生的 per-agent/per-invocation 强隔离；M7 需要进一步 hardening。
 
 Threadmill 的 `internal/mcp/phase/http.go` 已提供 streamable HTTP MCP transport。它只从 `X-Threadmill-Execution-Token` header 读取 token，request body 不能声明 TaskID 或 InvocationID。其 `artifact.register` 和 `agent.submitPhaseOutput` 已经以真实 HTTP 测试验证，但该测试不是 QwenPaw worker execution。
+
+## Focused rehydration receipt fixture
+
+The M4-E2 focused fixture uses the production QwenPaw Matrix/task-execution path. The deterministic provider first calls TeamHarness `ack_task`, receives the complete persisted `spec.md`, extracts the canonical package digest, and then calls Threadmill `runtime.confirmPackageConsumption` through the Controller-projected MCP client and token-B private header. The fixture does not insert receipts directly and does not treat the 500-character Matrix preview or acknowledgement alone as consumption evidence. All generated credentials and provider processes are test-only and removed during teardown.

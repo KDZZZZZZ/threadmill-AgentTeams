@@ -298,3 +298,9 @@ DeliverySpec / ReportSpec 由 Task Manager 在委派时写入 `spec.md` 与 prom
 | WorkerFlow 状态 | `<default-workspace>/shared/workerflow/<runId>/workflow.json` | `status`（running/done/failed）、`subagents`/`nodes`/`steps`、`readyInstructions`/`waitingInstructions`、`eventId` |
 | 心跳 | 本地 `heartbeat.json`；controller `POST /api/v1/workers/{name}/ready|heartbeat` | process/API 可达性、`lastActiveAt` |
 | Invocation 记录（Threadmill 新建） | Event Log + Artifact Store | invocation id、形态（delegate/workflow_run/direct）、phase、worker/temp agent id、事件流 refs、PhaseOutput refs |
+
+## Rehydrated package consumption
+
+For a rehydrated physical execution, Matrix `TASK_ASSIGNED` is notification and activation transport: its text is only a preview. TeamHarness persists the complete task in `shared/tasks/<task-id>/spec.md`, and `ack_task` returns that complete specification to the fresh agent loop. A successful acknowledgement proves task activation, not package consumption.
+
+After parsing the complete specification, the fresh session calls `runtime.confirmPackageConsumption`. Threadmill resolves the opaque execution token and derives Task, Invocation, Generation, ExecutionEpoch, BindingRef, and InputRevision from the trusted binding. It validates the canonical package digest and the Controller-derived `matrix:<room-id>` session against the epoch-aware physical execution before recording an idempotent receipt. Tokens, credentials, private headers, controller authentication, CAS revisions, hidden reasoning, and provider conversation state are never receipt fields. Rehydration starts a new session; it does not restore the old model session.

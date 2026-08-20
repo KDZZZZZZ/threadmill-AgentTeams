@@ -120,7 +120,7 @@ func (s *InMemoryPhysicalExecutionStore) ListByInvocation(_ context.Context, tas
 }
 
 func ValidatePhysicalExecutionReady(value PhysicalExecution) bool {
-	if value.WorkerID == "" || value.WorkerName == "" || value.TeamHarnessTaskID == "" || value.TeamHarnessAssignedTo == "" || value.TeamHarnessAssignedTo != value.WorkerName || value.CredentialBindingRef == "" || value.ExecutionAuthorizationRef == "" || value.MCPClientID == "" {
+	if value.WorkerID == "" || value.WorkerName == "" || value.TeamHarnessTaskID == "" || value.TeamHarnessAssignedTo == "" || value.TeamHarnessAssignedTo != value.WorkerName || value.BindingRef == "" || value.InputRevision == "" || value.AgentSessionRef == "" || value.AgentPackageDigest == "" || !value.PackageConsumed || value.CredentialBindingRef == "" || value.ExecutionAuthorizationRef == "" || value.MCPClientID == "" {
 		return false
 	}
 	if !value.Teardown.LeaseReleased && value.WorkspaceLeaseRef == "" {

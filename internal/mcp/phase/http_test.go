@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
 
@@ -96,6 +97,52 @@ func TestHTTPMCPToolsListIncludesInputSchemas(t *testing.T) {
 		if tool.InputSchema["type"] != "object" {
 			t.Fatalf("tool %q missing object inputSchema", tool.Name)
 		}
+	}
+}
+
+type recordingConsumptionConfirmer struct {
+	binding    InvocationBinding
+	submission executionreceipt.Submission
+}
+
+func (c *recordingConsumptionConfirmer) ConfirmPackageConsumption(_ context.Context, binding InvocationBinding, submission executionreceipt.Submission) (executionreceipt.Receipt, error) {
+	c.binding, c.submission = binding, submission
+	return executionreceipt.Receipt{TaskID: binding.TaskID, InvocationID: binding.InvocationID, Generation: binding.Generation, ExecutionEpoch: binding.ExecutionEpoch, BindingRef: binding.BindingRef, InputRevision: binding.InputRevision, PackageDigest: submission.PackageDigest, SessionIdentity: submission.SessionIdentity, Consumed: submission.Consumed}, nil
+}
+
+func TestHTTPMCPPackageConsumptionUsesTokenBoundIdentity(t *testing.T) {
+	registry := NewBindingRegistry()
+	binding := mustIssue(t, registry, &fakeRuntime{}, &fakeAgent{}, "invocation-rehydrated", "task-rehydrated", time.Time{})
+	services := registry.bindings[binding.Token]
+	services.Binding.ExecutionEpoch, services.Binding.InputRevision, services.Binding.BindingRef = 2, "r5", "B2"
+	registry.bindings[binding.Token] = services
+	confirmer := &recordingConsumptionConfirmer{}
+	handler, err := NewHandler(registry, confirmer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewHTTPServer(handler))
+	defer server.Close()
+	result := callHTTPMCP(t, server.URL, binding.Token, ToolConfirmPackageConsumption, map[string]any{"package_digest": "digest-b", "session_identity": "matrix:!room:test", "consumed": true, "invocation_id": "forged"})
+	var receipt executionreceipt.Receipt
+	decodeMCPText(t, result, &receipt)
+	if confirmer.binding.InvocationID != "invocation-rehydrated" || confirmer.binding.ExecutionEpoch != 2 || confirmer.binding.InputRevision != "r5" || confirmer.submission.PackageDigest != "digest-b" || !receipt.Consumed {
+		t.Fatalf("receipt authority mismatch: binding=%#v submission=%#v receipt=%#v", confirmer.binding, confirmer.submission, receipt)
+	}
+	registry.Revoke(binding.Token)
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": ToolConfirmPackageConsumption, "arguments": map[string]any{"package_digest": "digest-b", "session_identity": "matrix:!room:test", "consumed": true}}})
+	req, _ := http.NewRequest(http.MethodPost, server.URL, bytes.NewReader(body))
+	req.Header.Set(ExecutionTokenHeader, binding.Token)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var envelope struct {
+		Error any `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil || envelope.Error == nil {
+		t.Fatalf("revoked token receipt error=%#v decode=%v", envelope.Error, err)
 	}
 }
 func callHTTPMCP(t *testing.T, url, token, name string, arguments any) any {

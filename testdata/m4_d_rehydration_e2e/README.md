@@ -15,6 +15,11 @@ runs `runner.go`. The runner:
 3. asks the Controller to create the worker-scoped MCP credential and Worker;
 4. waits for the Controller's redacted applied-generation readback;
 5. performs a real `tools/list` request through the QwenPaw MCP client;
+6. lets the fresh QwenPaw Matrix session call `ack_task`, receive the complete
+   persisted `spec.md`, and submit an agent-originated
+   `runtime.confirmPackageConsumption` call with token-B;
+7. validates and persists the B2/input-r5/Epoch-2 package digest and the
+   Controller-derived Matrix session before the physical execution is Ready;
 6. persists epoch-B before delegation, then uses the official TeamHarness MCP
    server for `delegate_task` and `check_task`; and
 7. observes worker `ack_task` through the real taskflow state before the

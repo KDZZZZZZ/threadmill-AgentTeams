@@ -54,3 +54,30 @@ func TestValidateRehydratedExecutionPackagePreservesVisibleStateAndRejectsPrivat
 		t.Fatal("package expanded workspace permissions")
 	}
 }
+
+func TestRehydratedExecutionPackageDigestIsStableAndIdentitySensitive(t *testing.T) {
+	value := RehydratedExecutionPackage{TaskID: "task-a", InvocationID: "inv-a", Generation: 3, ExecutionEpoch: 2, BindingRef: "B2", InputRevision: "r5", TaskContract: "contract", PhaseInstruction: "continue"}
+	first, err := RehydratedExecutionPackageDigest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := RehydratedExecutionPackageDigest(value)
+	if err != nil || first != second {
+		t.Fatalf("digest unstable: %q %q err=%v", first, second, err)
+	}
+	for name, mutate := range map[string]func(*RehydratedExecutionPackage){
+		"binding":        func(v *RehydratedExecutionPackage) { v.BindingRef = "B1" },
+		"input-revision": func(v *RehydratedExecutionPackage) { v.InputRevision = "r4" },
+		"epoch":          func(v *RehydratedExecutionPackage) { v.ExecutionEpoch = 1 },
+		"visible-input":  func(v *RehydratedExecutionPackage) { v.TaskContract = "changed" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := value
+			mutate(&changed)
+			digest, err := RehydratedExecutionPackageDigest(changed)
+			if err != nil || digest == first {
+				t.Fatalf("digest did not change: %q err=%v", digest, err)
+			}
+		})
+	}
+}

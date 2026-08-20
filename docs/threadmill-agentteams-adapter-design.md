@@ -300,3 +300,9 @@ MVP 上线前至少验证：
 4. 上游未提交 workspace 文件不能作为下游输入；只有注册后的 ArtifactRef 可见。
 5. WorkerFlow 子 agent 的输出只能先归入父 phase 的受控目录，不能直接提交或满足 Threadmill endpoint。
 6. Task Manager 是唯一能使 endpoint satisfied、重排或标记 Task done 的组件。
+
+## Activation versus package consumption
+
+The adapter delegates the complete rehydrated package through the existing TeamHarness task specification. Matrix carries a truncated assignment preview; `ack_task` pulls and returns the complete `spec.md`. The adapter retains the Controller's real room identity as `matrix:<room-id>` and never manufactures a `qwenpaw://` success URI.
+
+Two independent gates are required. TeamHarness assignment/acknowledgement proves physical activation. The Threadmill Phase MCP tool `runtime.confirmPackageConsumption` proves that the fresh session parsed the authoritative package. Runtime validates that call with token-bound logical identity plus the epoch-aware physical record and stores immutable per-epoch evidence. Neither gate substitutes for the other, and neither carries secret transport state.

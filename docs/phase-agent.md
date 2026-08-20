@@ -439,3 +439,7 @@ Runtime 可将 Invocation 适配为两种 AgentTeams 载体：
 - [Workspace 与 Merge Queue](./workspace-merge.md)：Workspace Binding、路径和 WriteSet 边界。
 - [Event Log 与 Artifact Store](./event-artifact-store.md)：artifact 注册与证据链。
 - [总体架构](./architecture.md)：五节点与控制链。
+
+## Await continuation evidence
+
+Returning from `runtime.awaitInputs` preserves logical invocation identity but creates a new physical execution epoch. TeamHarness acknowledgement is activation evidence only. Runtime does not commit the waiting record back to running until the new Worker runtime is applied, the task is activated, and an authenticated package-consumption receipt confirms the B2/input-r5/Epoch-2 package for the fresh Matrix session. This receipt is separate from `agent.submitPhaseOutput` and does not alter PhaseOutput acceptance semantics.

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	phasemcp "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mcp/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
@@ -59,7 +60,16 @@ func (i BindingRegistryAuthorizationIssuer) IssueExecutionAuthorization(_ contex
 	if i.TTL > 0 {
 		expires = time.Now().Add(i.TTL)
 	}
-	binding, err := i.Registry.IssueExecutionWithWorkspace(plan.Execution, lease.WorkspaceRoot, lease.AllowedDirs, i.PermissionRef, expires)
+	binding, err := i.Registry.Issue(phasemcp.BoundServices{
+		Binding: phasemcp.InvocationBinding{
+			InvocationID: plan.InvocationID, TaskID: plan.TaskID, Endpoint: plan.Endpoint,
+			Generation: plan.Generation, ExecutionEpoch: int64(plan.NextExecutionEpoch), Role: plan.Execution.Role.Phase,
+			BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision,
+			WorkspaceRoot: lease.WorkspaceRoot, AllowedDirs: append([]string(nil), lease.AllowedDirs...),
+			PermissionRef: i.PermissionRef, Capabilities: plan.Execution.Role.Capabilities,
+		},
+		Runtime: plan.Execution.Runtime, Reader: plan.Execution.ContextReader, Agent: plan.Execution.ContextAgent, Expires: expires,
+	})
 	if err != nil {
 		return IssuedExecutionAuthorization{}, err
 	}
@@ -206,11 +216,13 @@ type TeamHarnessTaskRequest struct {
 }
 
 type TeamHarnessTask struct {
-	ID           string
-	AssignedTo   string
-	Status       string
-	Acknowledged bool
-	ObservedAt   time.Time
+	ID                 string
+	AssignedTo         string
+	Status             string
+	Acknowledged       bool
+	AgentSessionRef    string
+	AgentPackageDigest string
+	ObservedAt         time.Time
 }
 
 type TeamHarnessTaskProvisioner interface {
@@ -229,6 +241,11 @@ type PhysicalExecution struct {
 	WorkerName                string
 	TeamHarnessTaskID         string
 	TeamHarnessAssignedTo     string
+	BindingRef                string
+	InputRevision             string
+	AgentSessionRef           string
+	AgentPackageDigest        string
+	PackageConsumed           bool
 	MCPClientID               string
 	CredentialBindingRef      string
 	DesiredRuntimeGeneration  int64
@@ -263,20 +280,22 @@ var (
 // BindingRegistry, and TeamHarness seams. All partial creation is unwound in
 // reverse order before the logical record is returned to waiting.
 type PhysicalExecutionProvisioner struct {
-	Store              WaitingStore
-	PhysicalExecutions PhysicalExecutionStore
-	Leases             WorkspaceLeaseAcquirer
-	Tokens             ExecutionAuthorizationIssuer
-	Credentials        MCPCredentialProvisioner
-	Workers            WorkerProvisioner
-	MCP                MCPClientCleaner
-	Runtime            WorkerRuntimeGate
-	Discovery          MCPToolDiscoverer
-	Tasks              TeamHarnessTaskProvisioner
-	Packages           RehydratedExecutionPackageMaterializer
-	MCPName            string
-	MCPURL             string
-	Transport          string
+	Store               WaitingStore
+	PhysicalExecutions  PhysicalExecutionStore
+	Leases              WorkspaceLeaseAcquirer
+	Tokens              ExecutionAuthorizationIssuer
+	Credentials         MCPCredentialProvisioner
+	Workers             WorkerProvisioner
+	MCP                 MCPClientCleaner
+	Runtime             WorkerRuntimeGate
+	Discovery           MCPToolDiscoverer
+	Tasks               TeamHarnessTaskProvisioner
+	Packages            RehydratedExecutionPackageMaterializer
+	Receipts            executionreceipt.Store
+	ReceiptPollInterval time.Duration
+	MCPName             string
+	MCPURL              string
+	Transport           string
 
 	mu       sync.Mutex
 	inflight map[physicalExecutionKey]struct{}
@@ -359,6 +378,8 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 		ExecutionEpoch:            plan.NextExecutionEpoch,
 		WorkerID:                  worker.ID,
 		WorkerName:                worker.Name,
+		BindingRef:                plan.NewBindingRef,
+		InputRevision:             plan.NewInputRevision,
 		MCPClientID:               readback.MCPClientID,
 		CredentialBindingRef:      credential.Ref,
 		DesiredRuntimeGeneration:  readback.DesiredGeneration,
@@ -384,6 +405,8 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	}
 	execution.TeamHarnessTaskID = task.ID
 	execution.TeamHarnessAssignedTo = task.AssignedTo
+	execution.AgentSessionRef = task.AgentSessionRef
+	execution.AgentPackageDigest = task.AgentPackageDigest
 	execution.ObservedTaskStatus = task.Status
 	execution.TaskAcknowledged = task.Acknowledged
 	execution.State = PhysicalExecutionAccepted
@@ -391,6 +414,18 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if err != nil || !swapped {
 		if err == nil {
 			err = errors.New("physical execution activation record changed concurrently")
+		}
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
+	}
+	execution = updated
+	if err := p.waitForPackageConsumption(ctx, execution); err != nil {
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
+	}
+	execution.PackageConsumed = true
+	updated, swapped, err = p.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), execution.Revision, execution)
+	if err != nil || !swapped {
+		if err == nil {
+			err = errors.New("physical execution receipt record changed concurrently")
 		}
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
 	}
@@ -410,6 +445,35 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 		return PhysicalExecution{}, err
 	}
 	return updated, nil
+}
+
+func (p *PhysicalExecutionProvisioner) waitForPackageConsumption(ctx context.Context, execution PhysicalExecution) error {
+	key := executionreceipt.Key{TaskID: execution.TaskID, InvocationID: execution.InvocationID, Generation: execution.Generation, ExecutionEpoch: int64(execution.ExecutionEpoch)}
+	interval := p.ReceiptPollInterval
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	for {
+		receipt, found, err := p.Receipts.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			if receipt.BindingRef != execution.BindingRef || receipt.InputRevision != execution.InputRevision || receipt.PackageDigest != execution.AgentPackageDigest || receipt.SessionIdentity != execution.AgentSessionRef || !receipt.Consumed {
+				return errors.New("package consumption receipt does not match physical execution")
+			}
+			return nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // rollbackWithPhysical preserves a failed epoch as evidence after teardown;
@@ -509,7 +573,7 @@ func (p *PhysicalExecutionProvisioner) rollbackWaitingOnly(ctx context.Context, 
 }
 
 func (p *PhysicalExecutionProvisioner) validate(plan RehydrationPlan) error {
-	if p == nil || p.Store == nil || p.PhysicalExecutions == nil || p.Leases == nil || p.Tokens == nil || p.Credentials == nil || p.Workers == nil || p.MCP == nil || p.Runtime == nil || p.Discovery == nil || p.Tasks == nil || p.Packages == nil {
+	if p == nil || p.Store == nil || p.PhysicalExecutions == nil || p.Leases == nil || p.Tokens == nil || p.Credentials == nil || p.Workers == nil || p.MCP == nil || p.Runtime == nil || p.Discovery == nil || p.Tasks == nil || p.Packages == nil || p.Receipts == nil {
 		return errors.New("physical execution provisioner dependencies are required")
 	}
 	if plan.TaskID == "" || plan.InvocationID == "" || plan.Generation <= 0 || plan.NextExecutionEpoch <= 0 || plan.NewBindingRef == "" || plan.NewInputRevision == "" || plan.ExpectedWaitingRevision <= 0 {

@@ -91,6 +91,10 @@ func (a *RehydratedTeamHarnessTaskActivator) CreateTeamHarnessTask(ctx context.C
 	if err != nil {
 		return runtime.TeamHarnessTask{}, err
 	}
+	assignee, err := a.Controller.WorkerMatrixUserID(ctx, request.Worker.Name)
+	if err != nil {
+		return runtime.TeamHarnessTask{}, err
+	}
 	projectID := a.ProjectID
 	if projectID == "" {
 		projectID = "threadmill-" + taskflowSafeID(request.Plan.TaskID)
@@ -104,14 +108,39 @@ func (a *RehydratedTeamHarnessTaskActivator) CreateTeamHarnessTask(ctx context.C
 		ProjectID: projectID,
 		TaskID:    taskID,
 		RoomID:    roomID,
-		Assignee:  request.Worker.Name,
+		Assignee:  assignee,
 		Title:     "Threadmill rehydrated " + string(request.Plan.Endpoint.EndpointID),
 		Spec:      rehydratedTaskSpec(request),
 	})
 	if err != nil {
+		a.cancelUnacceptedTask(ctx, taskID)
 		return runtime.TeamHarnessTask{}, err
 	}
-	return runtime.TeamHarnessTask{ID: activation.TaskID, AssignedTo: activation.AssignedTo, Status: string(activation.Status), Acknowledged: activation.Acknowledged, ObservedAt: activation.ObservedAt}, nil
+	if !activation.Acknowledged {
+		a.cancelUnacceptedTask(ctx, taskID)
+		return runtime.TeamHarnessTask{}, errors.New("worker did not acknowledge the rehydrated agent-start package")
+	}
+	digest, err := runtime.RehydratedExecutionPackageDigest(request.Package)
+	if err != nil {
+		return runtime.TeamHarnessTask{}, fmt.Errorf("digest rehydrated execution package: %w", err)
+	}
+	// QwenPaw's production Matrix channel keys a fresh chat as
+	// "matrix:<room-id>". The room ID comes from Controller status; it is not a
+	// Threadmill-synthesized success URI.
+	sessionRef := "matrix:" + roomID
+	return runtime.TeamHarnessTask{
+		ID: activation.TaskID, AssignedTo: request.Worker.Name, Status: string(activation.Status), Acknowledged: true,
+		AgentSessionRef: sessionRef, AgentPackageDigest: digest, ObservedAt: activation.ObservedAt,
+	}, nil
+}
+
+func (a *RehydratedTeamHarnessTaskActivator) cancelUnacceptedTask(ctx context.Context, taskID string) {
+	if a == nil || a.Taskflow == nil || taskID == "" {
+		return
+	}
+	if canceller, ok := a.Taskflow.(TaskflowCanceller); ok {
+		_ = canceller.CancelTask(ctx, taskID, "rehydrated agent-start was not acknowledged")
+	}
 }
 
 func (a *RehydratedTeamHarnessTaskActivator) CancelTeamHarnessTask(ctx context.Context, task runtime.TeamHarnessTask) error {
@@ -136,12 +165,27 @@ func (c *ControllerReprovisioner) WorkerRoomID(ctx context.Context, workerName s
 	return status.RoomID, nil
 }
 
+func (c *ControllerReprovisioner) WorkerMatrixUserID(ctx context.Context, workerName string) (string, error) {
+	status, err := c.workerStatus(ctx, workerName)
+	if err != nil {
+		return "", err
+	}
+	if status.MatrixUserID == "" {
+		return "", errors.New("controller worker status omitted matrixUserID")
+	}
+	return status.MatrixUserID, nil
+}
+
 func rehydratedTaskSpec(request runtime.TeamHarnessTaskRequest) string {
 	encoded, err := json.MarshalIndent(request.Package, "", "  ")
 	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("# Threadmill rehydrated phase\n\nThe following package is a Runtime-authorized, agent-visible projection. Treat formal inputs and references as read-only authority.\n\n```json\n%s\n```\n\n- TeamHarness submission is execution evidence only; it is not PhaseOutput.\n- Submit formal output only through `agent.submitPhaseOutput`.\n", encoded)
+	digest, err := runtime.RehydratedExecutionPackageDigest(request.Package)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("# Threadmill rehydrated phase\n\nThe following package is a Runtime-authorized, agent-visible projection. Treat formal inputs and references as read-only authority.\n\n- Package digest: `%s`\n- This is a fresh physical session. Do not load or infer any previous provider conversation or hidden reasoning.\n\n```json\n%s\n```\n\n## Required continuation handshake\n\n1. Call TeamHarness `ack_task` and read the complete task specification returned by that tool.\n2. Parse the JSON package above and verify its digest is `%s`.\n3. Call Threadmill `runtime.confirmPackageConsumption` with `package_digest=%s` and `consumed=true`. Runtime binds the authoritative Matrix session identity server-side.\n4. Begin continuation work only after that call succeeds.\n\n- TeamHarness acknowledgement is activation evidence only; it is not package-consumption evidence.\n- TeamHarness submission is execution evidence only; it is not PhaseOutput.\n- Submit formal output only through `agent.submitPhaseOutput`.\n", digest, encoded, digest, digest)
 }
 
 var (
@@ -310,6 +354,7 @@ func (c *ControllerReprovisioner) WaitForRuntimeReady(ctx context.Context, worke
 
 type controllerWorkerStatus struct {
 	Name           string `json:"name"`
+	MatrixUserID   string `json:"matrixUserID"`
 	RoomID         string `json:"roomID"`
 	Phase          string `json:"phase"`
 	ContainerState string `json:"containerState"`

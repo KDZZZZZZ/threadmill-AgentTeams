@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	phasemcp "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mcp/phase"
 )
 
@@ -22,7 +23,12 @@ func (i *registryAuthorizationIssuer) IssueExecutionAuthorization(_ context.Cont
 	if i.fail {
 		return IssuedExecutionAuthorization{}, errors.New("token issue failed")
 	}
-	binding, err := i.registry.IssueExecutionWithWorkspace(plan.Execution, "", lease.AllowedDirs, "permission-e2", time.Now().Add(time.Hour))
+	binding, err := i.registry.Issue(phasemcp.BoundServices{Binding: phasemcp.InvocationBinding{
+		InvocationID: plan.InvocationID, TaskID: plan.TaskID, Endpoint: plan.Endpoint, Generation: plan.Generation,
+		ExecutionEpoch: int64(plan.NextExecutionEpoch), Role: plan.Execution.Role.Phase, BindingRef: plan.NewBindingRef,
+		InputRevision: plan.NewInputRevision, AllowedDirs: lease.AllowedDirs, PermissionRef: "permission-e2",
+		Capabilities: plan.Execution.Role.Capabilities,
+	}, Runtime: plan.Execution.Runtime, Reader: plan.Execution.ContextReader, Agent: plan.Execution.ContextAgent, Expires: time.Now().Add(time.Hour)})
 	if err != nil {
 		return IssuedExecutionAuthorization{}, err
 	}
@@ -46,6 +52,7 @@ type provisionPorts struct {
 	lastCredential   MCPCredentialRequest
 	discoveryStarted chan struct{}
 	discoveryRelease chan struct{}
+	receipts         executionreceipt.Store
 }
 
 func (p *provisionPorts) MaterializeRehydratedExecution(_ context.Context, plan RehydrationPlan) (RehydratedExecutionPackage, error) {
@@ -134,7 +141,15 @@ func (p *provisionPorts) CreateTeamHarnessTask(_ context.Context, request TeamHa
 		_, _, _ = p.store.CompareAndSwap(context.Background(), record.Key, record.Revision, changed)
 	}
 	p.tasks["team-task-e2"] = true
-	return TeamHarnessTask{ID: "team-task-e2", AssignedTo: request.Worker.Name, Status: "in_progress", Acknowledged: true, ObservedAt: time.Now().UTC()}, nil
+	digest, err := RehydratedExecutionPackageDigest(request.Package)
+	if err != nil {
+		return TeamHarnessTask{}, err
+	}
+	receipt := executionreceipt.Receipt{TaskID: request.Plan.TaskID, InvocationID: request.Plan.InvocationID, Generation: request.Plan.Generation, ExecutionEpoch: int64(request.Plan.NextExecutionEpoch), BindingRef: request.Plan.NewBindingRef, InputRevision: request.Plan.NewInputRevision, PackageDigest: digest, SessionIdentity: "matrix:!worker-e2:test", Consumed: true}
+	if p.fail != "receipt" {
+		_, _, _ = p.receipts.PutIfAbsent(context.Background(), receipt)
+	}
+	return TeamHarnessTask{ID: "team-task-e2", AssignedTo: request.Worker.Name, Status: "in_progress", Acknowledged: true, AgentSessionRef: receipt.SessionIdentity, AgentPackageDigest: digest, ObservedAt: time.Now().UTC()}, nil
 }
 func (p *provisionPorts) CancelTeamHarnessTask(_ context.Context, task TeamHarnessTask) error {
 	delete(p.tasks, task.ID)
@@ -150,7 +165,9 @@ func provisionFixture(t *testing.T) (*PhysicalExecutionProvisioner, RehydrationP
 	}
 	issuer := &registryAuthorizationIssuer{registry: phasemcp.NewBindingRegistry(), active: map[string]bool{}}
 	ports := newProvisionPorts(store)
-	provisioner := &PhysicalExecutionProvisioner{Store: store, PhysicalExecutions: NewInMemoryPhysicalExecutionStore(), Leases: ports, Tokens: issuer, Credentials: ports, Workers: ports, MCP: ports, Runtime: ports, Discovery: ports, Tasks: ports, Packages: ports, MCPName: "threadmill", MCPURL: "http://threadmill.test/mcp", Transport: "streamable_http"}
+	receipts := executionreceipt.NewInMemoryStore()
+	ports.receipts = receipts
+	provisioner := &PhysicalExecutionProvisioner{Store: store, PhysicalExecutions: NewInMemoryPhysicalExecutionStore(), Leases: ports, Tokens: issuer, Credentials: ports, Workers: ports, MCP: ports, Runtime: ports, Discovery: ports, Tasks: ports, Packages: ports, Receipts: receipts, MCPName: "threadmill", MCPURL: "http://threadmill.test/mcp", Transport: "streamable_http"}
 	return provisioner, plan, store, issuer, ports
 }
 
@@ -170,6 +187,9 @@ func TestProvisionCreatesFreshCarrierAndCommitsRunning(t *testing.T) {
 	}
 	if execution.State != PhysicalExecutionRunning || execution.TeamHarnessAssignedTo != execution.WorkerName || !ValidatePhysicalExecutionReady(execution) {
 		t.Fatalf("activation evidence was not persisted as ready: %#v", execution)
+	}
+	if execution.AgentSessionRef == "" || execution.AgentPackageDigest == "" {
+		t.Fatalf("agent-start receipt was not persisted: %#v", execution)
 	}
 	persisted, found, err := provisioner.PhysicalExecutions.Get(context.Background(), execution.Key())
 	if err != nil || !found || persisted.Revision < 3 || persisted.State != PhysicalExecutionRunning {

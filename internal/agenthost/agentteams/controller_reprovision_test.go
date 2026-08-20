@@ -132,24 +132,52 @@ func TestRehydratedTeamHarnessTaskActivatorUsesObservedWorkerAcceptance(t *testi
 		if r.URL.Path != "/api/v1/workers/worker-b/status" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"name": "worker-b", "roomID": "!worker-b:test"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": "worker-b", "roomID": "!worker-b:test", "matrixUserID": "@worker-b:test"})
 	}))
 	defer server.Close()
-	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "tm-phase-invocation-b-g3-e2", AssignedTo: "worker-b", Status: TeamHarnessTaskInProgress, Acknowledged: true}}}
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "tm-phase-invocation-b-g3-e2", AssignedTo: "@worker-b:test", Status: TeamHarnessTaskInProgress, Acknowledged: true}}}
 	activator := &RehydratedTeamHarnessTaskActivator{Controller: &ControllerReprovisioner{BaseURL: server.URL}, Taskflow: client, PollInterval: time.Millisecond}
 	pkg := runtime.RehydratedExecutionPackage{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, ExecutionEpoch: 2, TaskContract: "task contract", PhaseInstruction: "execute"}
-	task, err := activator.CreateTeamHarnessTask(context.Background(), runtime.TeamHarnessTaskRequest{Plan: runtime.RehydrationPlan{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, NextExecutionEpoch: 2, Endpoint: phaseagent.PhaseEndpointRef{EndpointID: string(phaseagent.PhaseExecute)}}, Worker: runtime.ProvisionedWorker{Name: "worker-b"}, Package: pkg})
+	task, err := activator.CreateTeamHarnessTask(context.Background(), runtime.TeamHarnessTaskRequest{Plan: runtime.RehydrationPlan{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, NextExecutionEpoch: 2, Endpoint: phaseagent.PhaseEndpointRef{EndpointID: string(phaseagent.PhaseExecute)}}, Worker: runtime.ProvisionedWorker{ID: "worker-b-id", Name: "worker-b"}, Package: pkg})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if task.ID != "tm-phase-invocation-b-g3-e2" || task.AssignedTo != "worker-b" || task.Status != string(TeamHarnessTaskInProgress) || !task.Acknowledged {
 		t.Fatalf("activation=%#v", task)
 	}
-	if len(client.delegates) != 1 || client.delegates[0].RoomID != "!worker-b:test" || client.delegates[0].Assignee != "worker-b" {
+	wantDigest, err := runtime.RehydratedExecutionPackageDigest(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.AgentPackageDigest != wantDigest || task.AgentSessionRef != "matrix:!worker-b:test" {
+		t.Fatalf("agent-start receipt=%#v", task)
+	}
+	if len(client.delegates) != 1 || client.delegates[0].RoomID != "!worker-b:test" || client.delegates[0].Assignee != "@worker-b:test" {
 		t.Fatalf("delegate request=%#v", client.delegates)
 	}
 	if !strings.Contains(client.delegates[0].Spec, `"task_contract": "task contract"`) || !strings.Contains(client.delegates[0].Spec, "agent.submitPhaseOutput") {
 		t.Fatalf("task spec did not carry the controlled package: %s", client.delegates[0].Spec)
+	}
+	if !strings.Contains(client.delegates[0].Spec, wantDigest) || !strings.Contains(client.delegates[0].Spec, "runtime.confirmPackageConsumption") || !strings.Contains(client.delegates[0].Spec, "fresh physical session") {
+		t.Fatalf("task spec omitted fresh-session package receipt: %s", client.delegates[0].Spec)
+	}
+}
+
+func TestRehydratedTaskActivationRejectsUnacknowledgedSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": "worker-b", "roomID": "!worker-b:test", "matrixUserID": "@worker-b:test"})
+	}))
+	defer server.Close()
+	client := &fakeTaskflowClient{snapshots: []TeamHarnessTaskSnapshot{{TaskID: "tm-phase-invocation-b-g3-e2", AssignedTo: "@worker-b:test", Status: TeamHarnessTaskInProgress, Acknowledged: false}}}
+	activator := &RehydratedTeamHarnessTaskActivator{Controller: &ControllerReprovisioner{BaseURL: server.URL}, Taskflow: client, PollInterval: time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := activator.CreateTeamHarnessTask(ctx, runtime.TeamHarnessTaskRequest{Plan: runtime.RehydrationPlan{TaskID: "task-b", InvocationID: "invocation-b", Generation: 3, NextExecutionEpoch: 2, Endpoint: phaseagent.PhaseEndpointRef{EndpointID: "execute"}}, Worker: runtime.ProvisionedWorker{ID: "worker-b-id", Name: "worker-b"}, Package: runtime.RehydratedExecutionPackage{TaskID: "task-b"}})
+	if err == nil {
+		t.Fatal("unacknowledged QwenPaw session was accepted")
+	}
+	if len(client.cancellations) != 1 || !strings.Contains(client.cancellations[0], "tm-phase-invocation-b-g3-e2") {
+		t.Fatalf("unaccepted task was not cancelled: %#v", client.cancellations)
 	}
 }
 

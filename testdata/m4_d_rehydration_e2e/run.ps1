@@ -13,18 +13,23 @@ $controllerImage = 'threadmill/agentteams-embedded:m4d'
 $workerImage = 'threadmill/qwenpaw-worker:m4d-current'
 $result = Join-Path $env:TEMP 'threadmill-m4d-e2e-result.json'
 $goCache = Join-Path $env:TEMP 'threadmill-m4d-e2e-gocache'
+$provider = Join-Path $env:TEMP 'threadmill-m4e2-provider.exe'
+$providerTrace = Join-Path $env:TEMP 'threadmill-m4e2-provider-trace.jsonl'
 
 function Cleanup {
   # Docker reports an absent resource on stderr. That is normal both before
   # setup and after a partially completed fixture, so cleanup must be best
   # effort even while the fixture otherwise uses ErrorActionPreference=Stop.
   foreach ($cleanup in @(
+	{ & $docker rm -f 'agentteams-worker-tm-m4d-invocation-g3-e2' 2>$null | Out-Null },
+	{ & $docker rm -f 'agentteams-worker-tm-m4d-conflict-invocation-g3-e2' 2>$null | Out-Null },
     { & $docker rm -f $name 2>$null | Out-Null },
     { & $docker network rm $network 2>$null | Out-Null },
     { & $docker volume rm $volume 2>$null | Out-Null }
   )) {
     try { & $cleanup } catch { }
   }
+  Get-Process threadmill-m4e2-provider -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 & $docker info | Out-Null
@@ -40,6 +45,15 @@ $hsToken = (& $docker run --rm --entrypoint sh $controllerImage -lc 'openssl ran
 if ($asToken.Length -ne 64 -or $hsToken.Length -ne 64) { throw 'official AppService token generation failed' }
 
 try {
+	Remove-Item $providerTrace -Force -ErrorAction SilentlyContinue
+	$env:M4E2_PROVIDER_TRACE = $providerTrace
+	& go build -o $provider (Join-Path $PSScriptRoot 'provider.go')
+	if ($LASTEXITCODE -ne 0) { throw 'failed to build deterministic M4-E2 provider' }
+	Start-Process -FilePath $provider -WindowStyle Hidden
+	for ($i = 0; $i -lt 30; $i++) {
+		try { if ((Invoke-WebRequest -UseBasicParsing http://127.0.0.1:18092/v1/models).StatusCode -eq 200) { break } } catch { }
+		Start-Sleep -Milliseconds 250
+	}
   & $docker network create $network | Out-Null
   & $docker volume create $volume | Out-Null
   # These variables mirror the official embedded installer local topology.
@@ -49,7 +63,8 @@ try {
     -e AGENTTEAMS_ADMIN_USER='admin' -e AGENTTEAMS_ADMIN_PASSWORD='threadmill-it-admin' `
     -e AGENTTEAMS_MANAGER_PASSWORD='threadmill-it-manager' -e AGENTTEAMS_REGISTRATION_TOKEN='threadmill-it-registration' `
     -e AGENTTEAMS_MINIO_USER='threadmill-it' -e AGENTTEAMS_MINIO_PASSWORD='threadmill-it-secret' `
-    -e AGENTTEAMS_LLM_PROVIDER='openai' -e AGENTTEAMS_LLM_API_KEY='test-only-key' -e AGENTTEAMS_DEFAULT_MODEL='qwen-plus' `
+	-e AGENTTEAMS_LLM_PROVIDER='openai-compat' -e AGENTTEAMS_LLM_API_KEY='test-only-key' -e AGENTTEAMS_DEFAULT_MODEL='qwen-plus' `
+	-e AGENTTEAMS_OPENAI_BASE_URL='http://host.docker.internal:18092/v1' `
     -e AGENTTEAMS_MANAGER_GATEWAY_KEY='test-only-gateway-key' `
     -e AGENTTEAMS_DEFAULT_WORKER_RUNTIME='qwenpaw' `
     -e AGENTTEAMS_QWENPAW_WORKER_IMAGE=$workerImage -e AGENTTEAMS_WORKER_IMAGE=$workerImage `
@@ -84,6 +99,10 @@ try {
   if ($bootstrapLog.Contains($asToken) -or $bootstrapLog.Contains($hsToken)) { throw 'embedded bootstrap leaked an AppService token to logs' }
   $env:M4D_CONTROLLER_URL = 'http://127.0.0.1:18090'
   $env:M4D_CONTROLLER_TOKEN = $token
+	$env:M4D_MATRIX_URL = 'http://127.0.0.1:18080'
+	$env:M4D_MATRIX_ADMIN_USER = 'admin'
+	$env:M4D_MATRIX_ADMIN_PASSWORD = 'threadmill-it-admin'
+	$env:M4D_PROVIDER_URL = 'http://127.0.0.1:18092'
   $env:M4D_DOCKER = $docker
   $env:M4D_RESULT = $result
   $env:GOCACHE = $goCache
@@ -95,15 +114,25 @@ try {
     return
   }
   Remove-Item $result -Force -ErrorAction SilentlyContinue
-  & go run (Join-Path $PSScriptRoot 'runner.go')
-  if ($LASTEXITCODE -ne 0) { throw 'M4-D focused runner failed' }
+	& go run (Join-Path $PSScriptRoot 'runner.go')
+	if ($LASTEXITCODE -ne 0) {
+		if (Test-Path $providerTrace) { Get-Content $providerTrace }
+		throw 'M4-D focused runner failed'
+	}
   Get-Content -Raw $result
 }
 finally {
   Remove-Item Env:M4D_CONTROLLER_TOKEN -ErrorAction SilentlyContinue
+	Remove-Item Env:M4D_MATRIX_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+	Remove-Item Env:M4D_MATRIX_ADMIN_USER -ErrorAction SilentlyContinue
+	Remove-Item Env:M4D_MATRIX_URL -ErrorAction SilentlyContinue
+	Remove-Item Env:M4D_PROVIDER_URL -ErrorAction SilentlyContinue
   Remove-Item Env:GOCACHE -ErrorAction SilentlyContinue
   Remove-Item Env:GOPROXY -ErrorAction SilentlyContinue
+	Remove-Item Env:M4E2_PROVIDER_TRACE -ErrorAction SilentlyContinue
   Remove-Item $goCache -Recurse -Force -ErrorAction SilentlyContinue
+	Remove-Item $provider -Force -ErrorAction SilentlyContinue
+	Remove-Item $providerTrace -Force -ErrorAction SilentlyContinue
   $asToken = $null
   $hsToken = $null
   Cleanup

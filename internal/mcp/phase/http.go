@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
 
@@ -101,6 +102,16 @@ func mcpToolDescriptor(name string) map[string]any {
 				"evidence_refs": map[string]any{"type": "array", "items": map[string]string{"type": "string"}},
 			},
 		}
+	case ToolConfirmPackageConsumption:
+		descriptor["inputSchema"] = map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"package_digest":   map[string]string{"type": "string"},
+				"session_identity": map[string]string{"type": "string"},
+				"consumed":         map[string]string{"type": "boolean"},
+			},
+			"required": []string{"package_digest", "consumed"},
+		}
 	}
 	return descriptor
 }
@@ -130,6 +141,16 @@ func (s *HTTPServer) toolCall(ctx context.Context, token, name string, raw json.
 			return nil, err
 		}
 		return mcpText(map[string]bool{"accepted": true}), nil
+	case ToolConfirmPackageConsumption:
+		var submission executionreceipt.Submission
+		if err := json.Unmarshal(raw, &submission); err != nil {
+			return nil, err
+		}
+		receipt, err := s.handler.ConfirmPackageConsumption(ctx, token, submission)
+		if err != nil {
+			return nil, err
+		}
+		return mcpText(receipt), nil
 	default:
 		return nil, ErrToolDenied
 	}

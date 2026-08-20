@@ -8,7 +8,7 @@ import (
 )
 
 func physicalRecord(epoch ExecutionEpoch, task string) PhysicalExecution {
-	return PhysicalExecution{TaskID: "task-a", InvocationID: "inv-a", Generation: 3, ExecutionEpoch: epoch, WorkerID: "worker-" + task, WorkerName: "worker-" + task, TeamHarnessTaskID: task, TeamHarnessAssignedTo: "worker-" + task, MCPClientID: "threadmill", CredentialBindingRef: "credential-" + task, ExecutionAuthorizationRef: "auth-" + task, WorkspaceLeaseRef: "lease-" + task, DesiredRuntimeGeneration: 9, AppliedRuntimeGeneration: 9, State: PhysicalExecutionAccepted, ObservedTaskStatus: "in_progress"}
+	return PhysicalExecution{TaskID: "task-a", InvocationID: "inv-a", Generation: 3, ExecutionEpoch: epoch, WorkerID: "worker-" + task, WorkerName: "worker-" + task, TeamHarnessTaskID: task, TeamHarnessAssignedTo: "worker-" + task, BindingRef: "B2", InputRevision: "r5", AgentSessionRef: "matrix:!" + task + ":test", AgentPackageDigest: "digest-" + task, PackageConsumed: true, MCPClientID: "threadmill", CredentialBindingRef: "credential-" + task, ExecutionAuthorizationRef: "auth-" + task, WorkspaceLeaseRef: "lease-" + task, DesiredRuntimeGeneration: 9, AppliedRuntimeGeneration: 9, State: PhysicalExecutionAccepted, ObservedTaskStatus: "in_progress"}
 }
 
 func TestPhysicalExecutionStorePreservesEpochHistory(t *testing.T) {
@@ -71,7 +71,7 @@ func TestValidatePhysicalExecutionReady(t *testing.T) {
 	if !ValidatePhysicalExecutionReady(ready) {
 		t.Fatal("complete physical execution not ready")
 	}
-	for name, mutate := range map[string]func(*PhysicalExecution){"worker": func(e *PhysicalExecution) { e.WorkerID = "" }, "task": func(e *PhysicalExecution) { e.TeamHarnessTaskID = "" }, "assigned-worker": func(e *PhysicalExecution) { e.TeamHarnessAssignedTo = "other-worker" }, "generation": func(e *PhysicalExecution) { e.AppliedRuntimeGeneration-- }, "mcp": func(e *PhysicalExecution) { e.MCPClientID = "" }, "acceptance": func(e *PhysicalExecution) { e.ObservedTaskStatus = "assigned"; e.TaskAcknowledged = false }} {
+	for name, mutate := range map[string]func(*PhysicalExecution){"worker": func(e *PhysicalExecution) { e.WorkerID = "" }, "task": func(e *PhysicalExecution) { e.TeamHarnessTaskID = "" }, "assigned-worker": func(e *PhysicalExecution) { e.TeamHarnessAssignedTo = "other-worker" }, "agent-session": func(e *PhysicalExecution) { e.AgentSessionRef = "" }, "package-digest": func(e *PhysicalExecution) { e.AgentPackageDigest = "" }, "receipt": func(e *PhysicalExecution) { e.PackageConsumed = false }, "binding": func(e *PhysicalExecution) { e.BindingRef = "" }, "revision": func(e *PhysicalExecution) { e.InputRevision = "" }, "generation": func(e *PhysicalExecution) { e.AppliedRuntimeGeneration-- }, "mcp": func(e *PhysicalExecution) { e.MCPClientID = "" }, "acceptance": func(e *PhysicalExecution) { e.ObservedTaskStatus = "assigned"; e.TaskAcknowledged = false }} {
 		t.Run(name, func(t *testing.T) {
 			value := ready
 			mutate(&value)

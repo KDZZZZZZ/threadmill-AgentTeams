@@ -2,12 +2,24 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
+
+func RehydratedExecutionPackageDigest(value RehydratedExecutionPackage) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
 
 // RehydratedExecutionPackage is the complete agent-visible logical material
 // for a new physical carrier. It deliberately excludes Runtime synchronization

@@ -12,20 +12,23 @@ import (
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
 
 type InvocationBinding struct {
-	InvocationID  string                       `json:"invocation_id"`
-	TaskID        string                       `json:"task_id"`
-	Endpoint      phaseagent.PhaseEndpointRef  `json:"endpoint"`
-	Generation    int                          `json:"generation"`
-	Role          phaseagent.Phase             `json:"role"`
-	BindingRef    string                       `json:"binding_ref"`
-	WorkspaceRoot string                       `json:"-"`
-	AllowedDirs   []string                     `json:"allowed_dirs"`
-	PermissionRef string                       `json:"permission_ref"`
-	Capabilities  phaseagent.PhaseCapabilities `json:"capabilities"`
+	InvocationID   string                       `json:"invocation_id"`
+	TaskID         string                       `json:"task_id"`
+	Endpoint       phaseagent.PhaseEndpointRef  `json:"endpoint"`
+	Generation     int                          `json:"generation"`
+	ExecutionEpoch int64                        `json:"execution_epoch,omitempty"`
+	Role           phaseagent.Phase             `json:"role"`
+	BindingRef     string                       `json:"binding_ref"`
+	InputRevision  string                       `json:"input_revision,omitempty"`
+	WorkspaceRoot  string                       `json:"-"`
+	AllowedDirs    []string                     `json:"allowed_dirs"`
+	PermissionRef  string                       `json:"permission_ref"`
+	Capabilities   phaseagent.PhaseCapabilities `json:"capabilities"`
 }
 
 // ExecutionBinding is passed to the host as an opaque token plus its local
@@ -43,6 +46,10 @@ type BoundServices struct {
 	Reader  phaseagent.ContextGraphReader
 	Agent   phaseagent.ContextAgent
 	Expires time.Time
+}
+
+type PackageConsumptionConfirmer interface {
+	ConfirmPackageConsumption(context.Context, InvocationBinding, executionreceipt.Submission) (executionreceipt.Receipt, error)
 }
 
 type BindingRegistry struct {
@@ -133,18 +140,19 @@ var (
 )
 
 const (
-	ToolAwaitInputs              = "runtime.awaitInputs"
-	ToolSubmitPhaseOutput        = "agent.submitPhaseOutput"
-	ToolProposeOrchestration     = "agent.proposeOrchestration"
-	ToolSubmitRequirement        = "agent.submitRequirement"
-	ToolListTaskMemoryCandidates = "agent.listTaskMemoryCandidates"
-	ToolSubmitMemoryCandidate    = "agent.submitMemoryCandidate"
-	ToolListSubgraphs            = "context.listSubgraphs"
-	ToolExplore                  = "context.explore"
-	ToolSubscribe                = "context.subscribe"
-	ToolUnsubscribe              = "context.unsubscribe"
-	ToolContextAgentRetrieve     = "contextAgent.retrieve"
-	ToolRegisterArtifact         = "artifact.register"
+	ToolAwaitInputs               = "runtime.awaitInputs"
+	ToolSubmitPhaseOutput         = "agent.submitPhaseOutput"
+	ToolProposeOrchestration      = "agent.proposeOrchestration"
+	ToolSubmitRequirement         = "agent.submitRequirement"
+	ToolListTaskMemoryCandidates  = "agent.listTaskMemoryCandidates"
+	ToolSubmitMemoryCandidate     = "agent.submitMemoryCandidate"
+	ToolListSubgraphs             = "context.listSubgraphs"
+	ToolExplore                   = "context.explore"
+	ToolSubscribe                 = "context.subscribe"
+	ToolUnsubscribe               = "context.unsubscribe"
+	ToolContextAgentRetrieve      = "contextAgent.retrieve"
+	ToolRegisterArtifact          = "artifact.register"
+	ToolConfirmPackageConsumption = "runtime.confirmPackageConsumption"
 )
 
 func ToolNames(c phaseagent.PhaseCapabilities) []string {
@@ -186,6 +194,7 @@ type Handler struct {
 	bindings  *BindingRegistry
 	artifacts artifacts.Registrar
 	recorder  artifacts.EventRecorder
+	receipts  PackageConsumptionConfirmer
 }
 
 // NewHandler accepts optional Runtime-owned artifact and event seams. A
@@ -202,6 +211,8 @@ func NewHandler(bindings *BindingRegistry, services ...interface{}) (*Handler, e
 			h.artifacts = value
 		case artifacts.EventRecorder:
 			h.recorder = value
+		case PackageConsumptionConfirmer:
+			h.receipts = value
 		}
 	}
 	return h, nil
@@ -212,7 +223,22 @@ func (h *Handler) Tools(token string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ToolNames(b.Binding.Capabilities), nil
+	tools := ToolNames(b.Binding.Capabilities)
+	if b.Binding.ExecutionEpoch > 0 && b.Binding.InputRevision != "" && h.receipts != nil {
+		tools = append(tools, ToolConfirmPackageConsumption)
+	}
+	return tools, nil
+}
+
+func (h *Handler) ConfirmPackageConsumption(ctx context.Context, token string, submission executionreceipt.Submission) (executionreceipt.Receipt, error) {
+	b, err := h.bindings.Resolve(token)
+	if err != nil {
+		return executionreceipt.Receipt{}, err
+	}
+	if h.receipts == nil || b.Binding.ExecutionEpoch <= 0 || b.Binding.InputRevision == "" {
+		return executionreceipt.Receipt{}, ErrToolDenied
+	}
+	return h.receipts.ConfirmPackageConsumption(ctx, b.Binding, submission)
 }
 func (h *Handler) AwaitInputs(ctx context.Context, token string, request phaseagent.AwaitInputsRequest) (phaseagent.InputWaitResult, error) {
 	b, err := h.allowed(token, ToolAwaitInputs)
