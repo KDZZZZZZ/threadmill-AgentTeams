@@ -264,7 +264,7 @@ func (c *ControllerReprovisioner) ProvisionWorker(ctx context.Context, request r
 	if created.Name != request.WorkerName {
 		return runtime.ProvisionedWorker{}, errors.New("controller returned a mismatched worker")
 	}
-	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/workers/"+request.WorkerName+"/ensure-ready", nil, nil); err != nil {
+	if err := c.ensureWorkerReady(ctx, request.WorkerName); err != nil {
 		return runtime.ProvisionedWorker{}, err
 	}
 	status, err := c.waitForDesiredRuntimeConfig(ctx, request.WorkerName)
@@ -276,6 +276,35 @@ func (c *ControllerReprovisioner) ProvisionWorker(ctx context.Context, request r
 		return runtime.ProvisionedWorker{}, fmt.Errorf("controller desired generation: %w", err)
 	}
 	return runtime.ProvisionedWorker{ID: status.Name, Name: status.Name, RuntimeGeneration: generation, MCPClientID: request.MCPName}, nil
+}
+
+func (c *ControllerReprovisioner) ensureWorkerReady(ctx context.Context, workerName string) error {
+	interval := c.PollInterval
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	path := "/api/v1/workers/" + workerName + "/ensure-ready"
+	for {
+		err := c.doJSON(ctx, http.MethodPost, path, nil, nil)
+		if err == nil {
+			return nil
+		}
+		// The embedded API persists Worker desired state asynchronously after
+		// create. Only this transient not-found window is retryable; auth,
+		// validation, and server errors remain fail-fast.
+		if !strings.Contains(err.Error(), "failed with HTTP 404") {
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // waitForDesiredRuntimeConfig accounts for the Controller's asynchronous

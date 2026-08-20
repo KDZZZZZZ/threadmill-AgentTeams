@@ -1,4 +1,4 @@
-# M4-D physical rehydration Docker fixture
+# M4-D through M4-E4 rehydration Docker fixture
 
 This local-only fixture validates the M4-D carrier replacement boundary with
 the official embedded AgentTeams Controller and a real QwenPaw worker. It is
@@ -8,21 +8,27 @@ not a production launcher and must never be used with shared credentials.
 images, waits for its controller-issued CLI token without printing it, and
 runs `runner.go`. The runner:
 
-1. starts the production Threadmill Phase MCP HTTP handler on a dynamic local
+1. starts Worker-A with B1/input-r4/Epoch-1 and lets its real QwenPaw session
+   acknowledge the full task and call `runtime.awaitInputs` through MCP;
+2. tears down task/Worker/credential/token/lease A and records Epoch-1 as
+   terminated before the logical invocation becomes waiting;
+3. stores the new authoritative input-r5 projection, reconstructs a new
+   BindingRef and prepares Epoch-2 without changing InvocationID/Generation;
+4. starts the production Threadmill Phase MCP HTTP handler on a dynamic local
    port;
-2. uses one `BindingRegistryAuthorizationIssuer` and the same registry-backed
+5. uses one `BindingRegistryAuthorizationIssuer` and the same registry-backed
    handler to issue the fresh epoch-2 token;
-3. asks the Controller to create the worker-scoped MCP credential and Worker;
-4. waits for the Controller's redacted applied-generation readback;
-5. performs a real `tools/list` request through the QwenPaw MCP client;
-6. lets the fresh QwenPaw Matrix session call `ack_task`, receive the complete
+6. asks the Controller to create the worker-scoped MCP credential and Worker;
+7. waits for the Controller's redacted applied-generation readback;
+8. performs a real `tools/list` request through the QwenPaw MCP client;
+9. lets the fresh QwenPaw Matrix session call `ack_task`, receive the complete
    persisted `spec.md`, and submit an agent-originated
    `runtime.confirmPackageConsumption` call with token-B;
-7. validates and persists the B2/input-r5/Epoch-2 package digest and the
+10. validates and persists the B2/input-r5/Epoch-2 package digest and the
    Controller-derived Matrix session before the physical execution is Ready;
-6. persists epoch-B before delegation, then uses the official TeamHarness MCP
+11. persists epoch-B before delegation, then uses the official TeamHarness MCP
    server for `delegate_task` and `check_task`; and
-7. observes worker `ack_task` through the real taskflow state before the
+12. observes worker `ack_task` through the real taskflow state before the
    provisioner CASes the `WaitingRecord` from `rehydrating` to `running`.
 
 The runner also executes a separate final-CAS conflict path. It confirms the

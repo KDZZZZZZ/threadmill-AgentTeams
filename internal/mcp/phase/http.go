@@ -82,6 +82,8 @@ func mcpToolDescriptor(name string) map[string]any {
 		"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 	}
 	switch name {
+	case ToolAwaitInputs:
+		descriptor["inputSchema"] = map[string]any{"type": "object", "properties": map[string]any{"input_ids": map[string]any{"type": "array", "items": map[string]string{"type": "string"}}}}
 	case ToolRegisterArtifact:
 		descriptor["inputSchema"] = map[string]any{
 			"type": "object",
@@ -118,6 +120,16 @@ func mcpToolDescriptor(name string) map[string]any {
 
 func (s *HTTPServer) toolCall(ctx context.Context, token, name string, raw json.RawMessage) (any, error) {
 	switch name {
+	case ToolAwaitInputs:
+		var request phaseagent.AwaitInputsRequest
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return nil, err
+		}
+		result, err := s.handler.AwaitInputs(ctx, token, request)
+		if err != nil {
+			return nil, err
+		}
+		return mcpText(result), nil
 	case ToolRegisterArtifact:
 		var input struct {
 			ControlledPath string                 `json:"controlled_path"`

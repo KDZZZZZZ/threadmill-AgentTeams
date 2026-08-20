@@ -112,6 +112,125 @@ func rehydratingPlan(task, invocation string) (*runtime.InMemoryWaitingStore, ru
 	return store, runtime.RehydrationPlan{TaskID: task, InvocationID: invocation, Generation: generation, NextExecutionEpoch: 2, Endpoint: endpoint, NewBindingRef: "binding-r5", NewInputRevision: "input-r5", Inputs: start.Inputs, NewlyDelivered: []phaseagent.InputDelivery{input}, Execution: phaseagent.ExecutionContext{Invocation: invocationContext, Role: role, Runtime: runtimeStub{}, ContextReader: readerStub{}, ContextAgent: agentStub{}}, Workspace: runtime.WorkspaceBinding{Ref: "workspace-m4d", Revision: "workspace-r5", AllowedDirs: []string{"out"}}, Context: runtime.RehydratedContext{SliceRef: "slice-r5", BaselineRef: "baseline-r5"}, TaskMemory: runtime.RehydratedTaskMemory{BufferRef: "memory-r5", View: phaseagent.TaskMemoryBufferView{Candidates: []phaseagent.TaskMemoryCandidateView{{CandidateID: "memory-candidate-r5", Candidate: phaseagent.MemoryCandidate{Statement: "continue from formal input", Kind: "task"}}}}}, ArtifactRefs: []artifacts.ArtifactRef{"artifact-continuation"}, EventRefs: []string{"event-continuation"}, EvidenceRefs: []string{"evidence-continuation"}, ContinuationRef: "continuation-r4", ExpectedWaitingRevision: record.Revision}
 }
 
+func awaitInputAndPrepare(ctx context.Context, config scenarioConfig) (*runtime.InMemoryWaitingStore, runtime.RehydrationPlan, error) {
+	endpoint := phaseagent.PhaseEndpointRef{TaskID: config.TaskID, EndpointID: string(phaseagent.PhaseExecute)}
+	role, err := phaseagent.RoleForEndpoint(endpoint)
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	oldInputs := phaseagent.PhaseInputSet{
+		InputRevision: "input-r4",
+		Required:      []phaseagent.InputRequirement{{InputID: "upstream-result", FromEndpoint: phaseagent.PhaseEndpointRef{TaskID: config.TaskID, EndpointID: "plan"}, RequiredArtifacts: []string{"report"}, RequiredBy: "completion"}},
+		Pending:       []phaseagent.PendingInput{{InputID: "upstream-result", FromEndpoint: phaseagent.PhaseEndpointRef{TaskID: config.TaskID, EndpointID: "plan"}, RequiredBy: "completion"}},
+	}
+	waiting := runtime.NewInMemoryWaitingStore()
+	inputs := runtime.NewInMemoryPhaseInputStore()
+	key := runtime.WaitingKey{TaskID: config.TaskID, InvocationID: config.InvocationID, Generation: generation}
+	if err := inputs.Put(key, runtime.StoredPhaseInputSet{Inputs: oldInputs}); err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	continuations := runtime.NewInMemoryContinuationStore()
+	leaseA := runtime.WorkspaceLease{Ref: "lease-a", WorkspaceRef: "workspace-m4d", WorkspaceRoot: config.Workspace, AllowedDirs: []string{"out"}, Epoch: 1}
+	cleanup := &awaitCarrierCleanup{controller: config.Controller, physical: config.Physical, leases: map[string]bool{leaseA.Ref: true}}
+	coordinator := &runtime.AwaitContinuationCoordinator{
+		Binding:  phasemcp.InvocationBinding{TaskID: config.TaskID, InvocationID: config.InvocationID, Generation: generation, ExecutionEpoch: 1, Endpoint: endpoint, BindingRef: "binding-r4", InputRevision: "input-r4", Role: phaseagent.PhaseExecute, Capabilities: role.Capabilities, WorkspaceRoot: config.Workspace, AllowedDirs: []string{"out"}},
+		Delegate: runtimeStub{}, Inputs: oldInputs, ContinuationRef: "continuation-r4",
+		Continuation:  runtime.ContinuationMaterial{Endpoint: endpoint, WorkspaceRef: "workspace-m4d", ContextSliceRef: "slice-r4", ContextBaselineRef: "baseline-r4", TaskMemoryBufferRef: "memory-r4", ArtifactRefs: []artifacts.ArtifactRef{"artifact-continuation"}, EventRefs: []string{"event-continuation"}, EvidenceRefs: []string{"evidence-continuation"}},
+		Continuations: continuations,
+	}
+	coordinator.Relinquisher = runtime.ExecutionRelinquisher{Store: waiting, PhysicalExecutions: config.Physical, Leases: cleanup, Tasks: cleanup, Tokens: registryAwaitTokenRevoker{registry: config.Registry, next: cleanup}, MCP: cleanup, Credentials: cleanup, Carriers: cleanup}
+	start := phaseagent.StartPhaseInput{InvocationID: config.InvocationID, Endpoint: endpoint, Generation: generation, BindingRef: "binding-r4", Inputs: oldInputs}
+	invocation, err := phaseagent.NewInvocationContext(start)
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	planA := runtime.RehydrationPlan{TaskID: config.TaskID, InvocationID: config.InvocationID, Generation: generation, NextExecutionEpoch: 1, Endpoint: endpoint, NewBindingRef: "binding-r4", NewInputRevision: "input-r4", Inputs: oldInputs, Execution: phaseagent.ExecutionContext{Invocation: invocation, Role: role, Runtime: coordinator, ContextReader: readerStub{}, ContextAgent: agentStub{}}, Workspace: runtime.WorkspaceBinding{Ref: "workspace-m4d", Revision: "workspace-r4", AllowedDirs: []string{"out"}}}
+	issuer := runtime.BindingRegistryAuthorizationIssuer{Registry: config.Registry, PermissionRef: "m4e4-epoch-a", TTL: 5 * time.Minute}
+	authorization, err := issuer.IssueExecutionAuthorization(ctx, planA, leaseA)
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	coordinator.ExecutionToken = authorization.Token
+	cleanup.token = authorization.Token
+	boundA, err := config.Registry.Resolve(authorization.Token)
+	if err != nil || !boundA.Binding.Capabilities.AllowAwaitInputs || boundA.Binding.ExecutionEpoch != 1 || boundA.Binding.InputRevision != "input-r4" {
+		return nil, runtime.RehydrationPlan{}, fmt.Errorf("token-A trusted binding omitted await authority: epoch=%d revision=%s allow=%t err=%v", boundA.Binding.ExecutionEpoch, boundA.Binding.InputRevision, boundA.Binding.Capabilities.AllowAwaitInputs, err)
+	}
+	workerName := fmt.Sprintf("tm-%s-g%d-e1", config.InvocationID, generation)
+	credential, err := config.Controller.CreateMCPCredential(ctx, runtime.MCPCredentialRequest{WorkerName: workerName, HeaderName: phasemcp.ExecutionTokenHeader, Token: authorization.Token})
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	worker, err := config.Controller.ProvisionWorker(ctx, runtime.WorkerProvisionRequest{WorkerName: workerName, Plan: planA, CredentialRef: credential.Ref, MCPName: "threadmill", MCPURL: config.MCPURL, Transport: "streamable_http"})
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	readback, err := config.Controller.WaitForRuntimeReady(ctx, worker)
+	if err != nil || !readback.MCPApplied || readback.DesiredGeneration != readback.AppliedGeneration {
+		return nil, runtime.RehydrationPlan{}, fmt.Errorf("Worker-A runtime was not ready: %#v err=%v", readback, err)
+	}
+	if _, err := (qwenPawDiscovery{docker: config.Docker, trace: config.Trace}).DiscoverMCPTools(ctx, worker, authorization); err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	roomID, err := config.Controller.WorkerRoomID(ctx, worker.Name)
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	assignee, err := config.Controller.WorkerMatrixUserID(ctx, worker.Name)
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	taskA := fmt.Sprintf("tm-phase-%s-g%d-e1", config.InvocationID, generation)
+	spec := "# M4-E4 initial await contract\n\nCall TeamHarness ack_task, read this complete spec, then call Threadmill runtime.awaitInputs for upstream-result. TeamHarness submit_task/result.md is not PhaseOutput."
+	digest := sha256.Sum256([]byte(spec))
+	_, err = config.Physical.Create(ctx, runtime.PhysicalExecution{TaskID: config.TaskID, InvocationID: config.InvocationID, Generation: generation, ExecutionEpoch: 1, WorkerID: worker.ID, WorkerName: worker.Name, TeamHarnessTaskID: taskA, TeamHarnessAssignedTo: worker.Name, BindingRef: "binding-r4", InputRevision: "input-r4", AgentSessionRef: "matrix:" + roomID, AgentPackageDigest: hex.EncodeToString(digest[:]), PackageConsumed: true, MCPClientID: readback.MCPClientID, CredentialBindingRef: credential.Ref, DesiredRuntimeGeneration: readback.DesiredGeneration, AppliedRuntimeGeneration: readback.AppliedGeneration, WorkspaceLeaseRef: leaseA.Ref, ExecutionAuthorizationRef: authorization.Ref, State: runtime.PhysicalExecutionRunning, ObservedTaskStatus: "in_progress", TaskAcknowledged: true})
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	baseTaskflow := agentteams.TeamHarnessStdioClient{Python: "/opt/venv/qwenpaw/bin/python", ServerPath: "/opt/agentteams/qwenpaw-builtin/plugins/teamharness/teamharness/mcp/server.py", Workspace: "/root/agentteams-fs", CommandPrefix: []string{config.Docker, "exec", "-i", "-e", "AGENTTEAMS_WORKER_MATRIX_TOKEN", "agentteams-worker-" + workerName}}
+	cleanup.taskflow = baseTaskflow
+	traced := &matrixObservedTaskflow{client: baseTaskflow, docker: config.Docker, workerName: workerName, matrixURL: config.MatrixURL, matrixToken: config.MatrixToken}
+	if err := traced.DelegateTask(ctx, agentteams.TeamHarnessDelegateTaskRequest{ProjectID: "threadmill-m4e4", TaskID: taskA, RoomID: roomID, Assignee: assignee, Title: "Threadmill initial await", Spec: spec}); err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	if err := waitForWaitingState(ctx, waiting, key, runtime.AwaitStateWaiting); err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	if _, err := config.Registry.Resolve(authorization.Token); !errors.Is(err, phasemcp.ErrInvalidToken) {
+		return nil, runtime.RehydrationPlan{}, errors.New("token-A remains resolvable after await")
+	}
+	epochA, found, err := config.Physical.Get(ctx, runtime.PhysicalExecutionKey{TaskID: config.TaskID, InvocationID: config.InvocationID, Generation: generation, ExecutionEpoch: 1})
+	if err != nil || !found || epochA.State != runtime.PhysicalExecutionTerminated || !epochA.Teardown.WorkerDeleted || !epochA.Teardown.TokenRevoked || !epochA.Teardown.CredentialRevoked || !epochA.Teardown.LeaseReleased {
+		return nil, runtime.RehydrationPlan{}, fmt.Errorf("epoch-A teardown evidence was incomplete: %#v found=%t err=%v", epochA, found, err)
+	}
+	credentialView, err := redactedCredentialGet(ctx, config.Controller.BaseURL, config.Controller.BearerToken, credential.Ref)
+	if err != nil || credentialView.State != "revoked" || credentialView.WorkerName != worker.Name || credentialView.HeaderName != phasemcp.ExecutionTokenHeader {
+		return nil, runtime.RehydrationPlan{}, fmt.Errorf("credential-A revoke readback mismatch: state=%s err=%v", credentialView.State, err)
+	}
+	if err := waitForWorkerContainerRemoval(ctx, config.Docker, worker.Name); err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	delivery := phaseagent.InputDelivery{InputID: "upstream-result", FromEndpoint: phaseagent.PhaseEndpointRef{TaskID: config.TaskID, EndpointID: "plan"}, PhaseOutputRef: "phase-output-upstream", ArtifactRefs: []string{"artifact-upstream"}, SourceRevision: "source-r5"}
+	newInputs := phaseagent.PhaseInputSet{InputRevision: "input-r5", Required: append([]phaseagent.InputRequirement(nil), oldInputs.Required...), Delivered: []phaseagent.InputDelivery{delivery}}
+	if err := inputs.Put(key, runtime.StoredPhaseInputSet{Inputs: newInputs, AwaitConditionSatisfied: true}); err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	bindingStore := runtime.NewInMemoryContinuationBindingStore()
+	rehydrator := runtime.RehydrationCoordinator{Store: waiting, Inputs: inputs, Bindings: bindingStore, Continuations: continuations, Contexts: e4ContextReconstructor{}, Workspaces: e4WorkspaceReconstructor{}, TaskMemory: e4TaskMemoryReconstructor{}, Surfaces: runtime.ExecutionSurfaces{Runtime: runtimeStub{}, ContextReader: readerStub{}, ContextAgent: agentStub{}}}
+	waitingRecord, _, err := waiting.Get(ctx, key)
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	plan, err := rehydrator.Prepare(ctx, runtime.RehydrationRequest{Key: key, ExpectedWaitingRevision: waitingRecord.Revision})
+	if err != nil {
+		return nil, runtime.RehydrationPlan{}, err
+	}
+	if plan.InvocationID != config.InvocationID || plan.Generation != generation || plan.NextExecutionEpoch != 2 || plan.NewBindingRef == "binding-r4" || plan.NewInputRevision != "input-r5" || len(plan.NewlyDelivered) != 1 || plan.NewlyDelivered[0].PhaseOutputRef != "phase-output-upstream" {
+		return nil, runtime.RehydrationPlan{}, errors.New("authoritative input arrival did not produce the expected B1-to-B2 plan")
+	}
+	return waiting, plan, nil
+}
+
 func issueOldToken(registry *phasemcp.BindingRegistry, plan runtime.RehydrationPlan) string {
 	binding, err := registry.IssueExecution(plan.Execution, plan.Workspace.AllowedDirs, "old-permission", time.Now().Add(time.Minute))
 	must(err)
@@ -144,17 +263,25 @@ type scenarioResult struct {
 }
 
 func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, error) {
-	store, plan := rehydratingPlan(config.TaskID, config.InvocationID)
 	physical := config.Physical
-	// Historical epoch-A contains only durable, redacted evidence. It has no
-	// invented TeamHarness task ID, so epoch-B cannot overwrite it.
-	if _, err := physical.Create(ctx, runtime.PhysicalExecution{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: 1, State: runtime.PhysicalExecutionTerminated, EvidenceRefs: []string{"event:await-relinquished"}}); err != nil {
-		return scenarioResult{}, err
+	var store *runtime.InMemoryWaitingStore
+	var plan runtime.RehydrationPlan
+	if config.ConflictAfterActivation {
+		store, plan = rehydratingPlan(config.TaskID, config.InvocationID)
+		if _, err := physical.Create(ctx, runtime.PhysicalExecution{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: 1, State: runtime.PhysicalExecutionTerminated, EvidenceRefs: []string{"event:await-relinquished"}}); err != nil {
+			return scenarioResult{}, err
+		}
+		old := issueOldToken(config.Registry, plan)
+		config.Registry.Revoke(old)
+	} else {
+		var err error
+		store, plan, err = awaitInputAndPrepare(ctx, config)
+		if err != nil {
+			return scenarioResult{}, err
+		}
 	}
-	old := issueOldToken(config.Registry, plan)
-	config.Registry.Revoke(old)
-	if _, err := config.Registry.Resolve(old); !errors.Is(err, phasemcp.ErrInvalidToken) {
-		return scenarioResult{}, errors.New("old token remains resolvable")
+	if !config.ConflictAfterActivation && !config.Trace.observedTool(phasemcp.ToolAwaitInputs) {
+		return scenarioResult{}, errors.New("agent-originated awaitInputs evidence mismatch")
 	}
 
 	leases := &localLeases{root: config.Workspace}
@@ -229,6 +356,9 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 	if err != nil || len(all) != 2 {
 		return scenarioResult{}, fmt.Errorf("physical epoch history mismatch: records=%d err=%v", len(all), err)
 	}
+	if !config.ConflictAfterActivation && (all[0].ExecutionEpoch != 1 || all[1].ExecutionEpoch != 2 || all[0].WorkerName == all[1].WorkerName || all[0].TeamHarnessTaskID == all[1].TeamHarnessTaskID || all[0].CredentialBindingRef == all[1].CredentialBindingRef || all[0].AgentSessionRef == all[1].AgentSessionRef) {
+		return scenarioResult{}, errors.New("epoch-A and epoch-B physical identities were not distinct")
+	}
 	waiting, found, err := store.Get(ctx, runtime.WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation})
 	if err != nil || !found {
 		return scenarioResult{}, fmt.Errorf("waiting record missing: %v", err)
@@ -253,14 +383,25 @@ func runScenario(ctx context.Context, config scenarioConfig) (scenarioResult, er
 type e2ePackageMaterializer struct{}
 
 func (e2ePackageMaterializer) MaterializeRehydratedExecution(_ context.Context, plan runtime.RehydrationPlan) (runtime.RehydratedExecutionPackage, error) {
-	return runtime.RehydratedExecutionPackage{
+	value := runtime.RehydratedExecutionPackage{
 		TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch,
 		Endpoint: plan.Endpoint, BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision, Inputs: plan.Inputs, NewlyDelivered: plan.NewlyDelivered,
 		TaskContract: "M4-E3 rehydrated completion contract", PhaseInstruction: "produce the formal rehydrated PhaseOutput",
 		Context: runtime.AgentVisibleContext{SliceRef: plan.Context.SliceRef, BaselineRef: plan.Context.BaselineRef, Content: "materialized context for input-r5"}, TaskMemory: plan.TaskMemory.View,
 		Workspace:    runtime.AgentVisibleWorkspace{Ref: plan.Workspace.Ref, Revision: plan.Workspace.Revision, AllowedDirs: append([]string(nil), plan.Workspace.AllowedDirs...)},
 		ArtifactRefs: append([]artifacts.ArtifactRef(nil), plan.ArtifactRefs...), EventRefs: append([]string(nil), plan.EventRefs...), EvidenceRefs: append([]string(nil), plan.EvidenceRefs...),
-	}, nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return runtime.RehydratedExecutionPackage{}, err
+	}
+	text := strings.ToLower(string(encoded))
+	for _, forbidden := range []string{"execution_token", "credential_value", "private_header", "controller_auth", "expected_waiting_revision", "provider_conversation", "hidden_reasoning", "old_worker", "process_id", "container_id", "session_identity"} {
+		if strings.Contains(text, forbidden) {
+			return runtime.RehydratedExecutionPackage{}, fmt.Errorf("rehydrated package exposed forbidden field %s", forbidden)
+		}
+	}
+	return value, nil
 }
 
 type recordingIssuer struct {
@@ -483,6 +624,116 @@ type localLeases struct {
 	released bool
 }
 
+type awaitCarrierCleanup struct {
+	controller *agentteams.ControllerReprovisioner
+	physical   runtime.PhysicalExecutionStore
+	taskflow   agentteams.TeamHarnessStdioClient
+	token      string
+	leases     map[string]bool
+}
+
+func (c *awaitCarrierCleanup) execution(ctx context.Context, record runtime.WaitingRecord) (runtime.PhysicalExecution, error) {
+	value, found, err := c.physical.Get(ctx, runtime.PhysicalExecutionKey{TaskID: record.Key.TaskID, InvocationID: record.Key.InvocationID, Generation: record.Key.Generation, ExecutionEpoch: record.ExecutionEpoch})
+	if err != nil || !found {
+		return value, errors.New("fixture await carrier was not found")
+	}
+	return value, nil
+}
+func (c *awaitCarrierCleanup) ReleaseWorkspaceLease(_ context.Context, record runtime.WaitingRecord) error {
+	execution, err := c.execution(context.Background(), record)
+	if err != nil {
+		return err
+	}
+	if !c.leases[execution.WorkspaceLeaseRef] {
+		return errors.New("lease-A was not active")
+	}
+	c.leases[execution.WorkspaceLeaseRef] = false
+	return nil
+}
+func (c *awaitCarrierCleanup) CancelTeamHarnessTask(ctx context.Context, taskID, reason string) error {
+	return c.taskflow.CancelTask(ctx, taskID, reason)
+}
+func (c *awaitCarrierCleanup) RevokeExecutionToken(_ context.Context, token string) error {
+	if token == "" || token != c.token {
+		return errors.New("unexpected epoch-A token")
+	}
+	// Registry revocation is injected below by the runner after construction.
+	return nil
+}
+func (c *awaitCarrierCleanup) CleanupExecutionMCP(ctx context.Context, record runtime.WaitingRecord) error {
+	execution, err := c.execution(ctx, record)
+	if err != nil {
+		return err
+	}
+	return c.controller.CleanupWorkerMCP(ctx, runtime.ProvisionedWorker{ID: execution.WorkerID, Name: execution.WorkerName, MCPClientID: execution.MCPClientID, RuntimeGeneration: execution.DesiredRuntimeGeneration})
+}
+func (c *awaitCarrierCleanup) RevokeWorkerCredential(ctx context.Context, record runtime.WaitingRecord) error {
+	execution, err := c.execution(ctx, record)
+	if err != nil {
+		return err
+	}
+	return c.controller.RevokeMCPCredential(ctx, runtime.MCPCredentialBinding{Ref: execution.CredentialBindingRef, WorkerName: execution.WorkerName})
+}
+func (c *awaitCarrierCleanup) ReleaseExecutionCarrier(ctx context.Context, record runtime.WaitingRecord) error {
+	execution, err := c.execution(ctx, record)
+	if err != nil {
+		return err
+	}
+	return c.controller.DeleteWorker(ctx, runtime.ProvisionedWorker{ID: execution.WorkerID, Name: execution.WorkerName, MCPClientID: execution.MCPClientID, RuntimeGeneration: execution.DesiredRuntimeGeneration})
+}
+
+type registryAwaitTokenRevoker struct {
+	registry *phasemcp.BindingRegistry
+	next     runtime.ExecutionTokenRevoker
+}
+
+func (r registryAwaitTokenRevoker) RevokeExecutionToken(ctx context.Context, token string) error {
+	if r.next != nil {
+		if err := r.next.RevokeExecutionToken(ctx, token); err != nil {
+			return err
+		}
+	}
+	r.registry.Revoke(token)
+	return nil
+}
+
+type e4ContextReconstructor struct{}
+
+func (e4ContextReconstructor) ReconstructContext(_ context.Context, record runtime.WaitingRecord, material runtime.ContinuationMaterial) (runtime.RehydratedContext, error) {
+	return runtime.RehydratedContext{SliceRef: record.ContextSliceRef, BaselineRef: material.ContextBaselineRef}, nil
+}
+
+type e4WorkspaceReconstructor struct{}
+
+func (e4WorkspaceReconstructor) ReconstructWorkspace(_ context.Context, record runtime.WaitingRecord, _ runtime.ContinuationMaterial) (runtime.WorkspaceBinding, error) {
+	return runtime.WorkspaceBinding{Ref: record.WorkspaceRef, Revision: "workspace-r5", AllowedDirs: append([]string(nil), record.AllowedDirs...)}, nil
+}
+
+type e4TaskMemoryReconstructor struct{}
+
+func (e4TaskMemoryReconstructor) ReconstructTaskMemory(_ context.Context, record runtime.WaitingRecord, _ runtime.ContinuationMaterial) (runtime.RehydratedTaskMemory, error) {
+	return runtime.RehydratedTaskMemory{BufferRef: record.TaskMemoryBufferRef, View: phaseagent.TaskMemoryBufferView{Candidates: []phaseagent.TaskMemoryCandidateView{{CandidateID: "memory-candidate-r5", Candidate: phaseagent.MemoryCandidate{Statement: "continue from formal input", Kind: "task"}}}}}, nil
+}
+
+func waitForWaitingState(ctx context.Context, store runtime.WaitingStore, key runtime.WaitingKey, expected runtime.AwaitState) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		record, found, err := store.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if found && record.State == expected {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting state did not reach %s: %w", expected, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 func (l *localLeases) AcquireWorkspaceLease(_ context.Context, plan runtime.RehydrationPlan) (runtime.WorkspaceLease, error) {
 	return runtime.WorkspaceLease{Ref: "lease-e2", WorkspaceRef: plan.Workspace.Ref, WorkspaceRoot: l.root, AllowedDirs: append([]string(nil), plan.Workspace.AllowedDirs...), Epoch: plan.NextExecutionEpoch}, nil
 }
@@ -553,6 +804,17 @@ func (t *mcpTrace) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if request.Method == "tools/call" && request.Params.Name == phasemcp.ToolConfirmPackageConsumption {
 		fmt.Println("[mcp] confirmPackageConsumption entered with authenticated token")
 		defer fmt.Println("[mcp] confirmPackageConsumption returned")
+	}
+	if request.Method == "tools/call" && request.Params.Name == phasemcp.ToolAwaitInputs {
+		if services, err := t.registry.Resolve(token); err == nil {
+			fmt.Printf("[mcp] awaitInputs binding epoch=%d revision=%s allowed=%t\n", services.Binding.ExecutionEpoch, services.Binding.InputRevision, services.Binding.Capabilities.AllowAwaitInputs)
+			if path := os.Getenv("M4E2_PROVIDER_TRACE"); path != "" {
+				if file, openErr := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); openErr == nil {
+					_ = json.NewEncoder(file).Encode(map[string]any{"stage": "await-binding", "executionEpoch": services.Binding.ExecutionEpoch, "inputRevision": services.Binding.InputRevision, "allowAwaitInputs": services.Binding.Capabilities.AllowAwaitInputs})
+					file.Close()
+				}
+			}
+		}
 	}
 	t.next.ServeHTTP(w, r)
 }

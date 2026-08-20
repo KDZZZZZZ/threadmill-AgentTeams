@@ -57,6 +57,7 @@ func chat(w http.ResponseWriter, r *http.Request) {
 	taskID := taskPattern.FindString(text)
 	digest := digestPattern.FindString(text)
 	taskflow, receipt := toolName(request, "taskflow"), toolName(request, "confirmPackageConsumption")
+	awaitInputs := toolName(request, "awaitInputs")
 	register, submit := toolName(request, "artifact_register"), toolName(request, "agent_submitPhaseOutput")
 	if register == "" {
 		register = toolName(request, "artifact.register")
@@ -69,9 +70,14 @@ func chat(w http.ResponseWriter, r *http.Request) {
 	name, args, callID := "", "", ""
 	stage := "done"
 	hasFullSpec := strings.Contains(text, "Required continuation handshake") || (strings.Contains(text, `task_contract`) && strings.Contains(text, `input_revision`) && strings.Contains(text, `newly_delivered_inputs`))
-	packageComplete := hasFullSpec && strings.Contains(text, "binding-r5") && strings.Contains(text, "input-r5") && strings.Contains(text, "task_contract") && strings.Contains(text, "phase_instruction") && strings.Contains(text, "inputs") && strings.Contains(text, "newly_delivered_inputs") && strings.Contains(text, "context") && strings.Contains(text, "task_memory") && strings.Contains(text, "workspace") && strings.Contains(text, "allowed_dirs") && strings.Contains(text, "artifact_refs") && strings.Contains(text, "event_refs") && strings.Contains(text, "evidence_refs")
+	hasInitialAwaitSpec := strings.Contains(text, "M4-E4 initial await contract")
+	hasAckResult := messagesContain(request.Messages, "call-ack-full-spec") && messagesContain(request.Messages, "M4-E4 initial await contract")
+	packageComplete := hasFullSpec && strings.Contains(text, "binding-continuation-") && strings.Contains(text, "input-r5") && strings.Contains(text, "task_contract") && strings.Contains(text, "phase_instruction") && strings.Contains(text, "inputs") && strings.Contains(text, "newly_delivered_inputs") && strings.Contains(text, "context") && strings.Contains(text, "task_memory") && strings.Contains(text, "workspace") && strings.Contains(text, "allowed_dirs") && strings.Contains(text, "artifact_refs") && strings.Contains(text, "event_refs") && strings.Contains(text, "evidence_refs")
 	hasReceiptResult := messagesContain(request.Messages, "recorded_at") && messagesContain(request.Messages, "session_identity") && messagesContain(request.Messages, `"consumed":true`)
-	if artifactRef != "" && submit != "" {
+	if hasInitialAwaitSpec && hasAckResult && awaitInputs != "" {
+		name, args, callID = awaitInputs, `{"input_ids":["upstream-result"]}`, "call-await-upstream-result"
+		stage = "await-inputs"
+	} else if artifactRef != "" && submit != "" {
 		name, args, callID = submit, fmt.Sprintf(`{"phase":"execute","delivery_refs":[],"report_ref":%q,"evidence_refs":[]}`, artifactRef), "call-submit-rehydrated-phase-output"
 		stage = "phase-output"
 	} else if hasReceiptResult && packageComplete && register != "" {

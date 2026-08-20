@@ -21,6 +21,7 @@ function Cleanup {
   # setup and after a partially completed fixture, so cleanup must be best
   # effort even while the fixture otherwise uses ErrorActionPreference=Stop.
   foreach ($cleanup in @(
+	{ & $docker rm -f 'agentteams-worker-tm-m4d-invocation-g3-e1' 2>$null | Out-Null },
 	{ & $docker rm -f 'agentteams-worker-tm-m4d-invocation-g3-e2' 2>$null | Out-Null },
 	{ & $docker rm -f 'agentteams-worker-tm-m4d-conflict-invocation-g3-e2' 2>$null | Out-Null },
     { & $docker rm -f $name 2>$null | Out-Null },

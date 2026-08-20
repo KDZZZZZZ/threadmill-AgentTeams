@@ -100,6 +100,23 @@ func TestHTTPMCPToolsListIncludesInputSchemas(t *testing.T) {
 	}
 }
 
+func TestHTTPMCPDispatchesAwaitInputs(t *testing.T) {
+	registry := NewBindingRegistry()
+	binding := mustIssue(t, registry, &fakeRuntime{}, &fakeAgent{}, "invocation-await", "task-await", time.Time{})
+	handler, err := NewHandler(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewHTTPServer(handler))
+	defer server.Close()
+	result := callHTTPMCP(t, server.URL, binding.Token, ToolAwaitInputs, map[string]any{"input_ids": []string{"review"}})
+	var wait phaseagent.InputWaitResult
+	decodeMCPText(t, result, &wait)
+	if wait.InputRevision != "next" {
+		t.Fatalf("await result = %#v", wait)
+	}
+}
+
 type recordingConsumptionConfirmer struct {
 	binding    InvocationBinding
 	submission executionreceipt.Submission

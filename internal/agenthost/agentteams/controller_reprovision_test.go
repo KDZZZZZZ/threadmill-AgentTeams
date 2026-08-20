@@ -24,6 +24,7 @@ func TestControllerReprovisionerUsesRedactedCredentialAndReadyStatus(t *testing.
 	const secret = "test-threadmill-token-b"
 	var credentialPayload map[string]any
 	var workerPayload map[string]any
+	ensureReadyCalls := 0
 	requests := make([]string, 0)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.Path)
@@ -42,6 +43,11 @@ func TestControllerReprovisionerUsesRedactedCredentialAndReadyStatus(t *testing.
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"name": "tm-invocation-a-g3-e2"})
 		case "POST /api/v1/workers/tm-invocation-a-g3-e2/ensure-ready":
+			ensureReadyCalls++
+			if ensureReadyCalls == 1 {
+				http.Error(w, "worker desired state is not visible yet", http.StatusNotFound)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case "GET /api/v1/workers/tm-invocation-a-g3-e2/status":
 			_ = json.NewEncoder(w).Encode(readyWorkerStatus())
@@ -67,6 +73,9 @@ func TestControllerReprovisionerUsesRedactedCredentialAndReadyStatus(t *testing.
 	}
 	if worker.RuntimeGeneration != 7 || worker.MCPClientID != "threadmill" {
 		t.Fatalf("worker = %#v", worker)
+	}
+	if ensureReadyCalls != 2 {
+		t.Fatalf("ensure-ready calls = %d, want transient 404 retry", ensureReadyCalls)
 	}
 	readback, err := client.WaitForRuntimeReady(context.Background(), worker)
 	if err != nil {
