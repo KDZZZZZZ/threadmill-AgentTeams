@@ -170,7 +170,11 @@ func (s sqliteInputStore) ResolveRehydrationInputs(ctx context.Context, r Waitin
 }
 func (s sqliteInputStore) RebindInputsForContinuation(ctx context.Context, v ContinuationBinding) (ContinuationBinding, error) {
 	if v.BindingRef == "" {
-		return ContinuationBinding{}, errors.New("durable binding_ref is required")
+		// BindingRef is repository-owned just as it is in the in-memory
+		// implementation. The timestamp is not a domain identity; the
+		// immutable binding payload remains the authority and the UNIQUE key
+		// fences a collision.
+		v.BindingRef = fmt.Sprintf("binding-durable-%d", time.Now().UTC().UnixNano())
 	}
 	if e := ValidateContinuationRebind(v); e != nil {
 		return ContinuationBinding{}, e

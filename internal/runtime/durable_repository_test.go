@@ -26,6 +26,10 @@ func TestSQLiteRuntimeStateRepositoryColdLoadsLifecycleAndCAS(t *testing.T) {
 	if err = r.InputStore().Put(ctx, k, StoredPhaseInputSet{Inputs: phaseagent.PhaseInputSet{InputRevision: "r1"}}); err != nil {
 		t.Fatal(err)
 	}
+	binding, err := r.InputStore().RebindInputsForContinuation(ctx, ContinuationBinding{InvocationID: "inv", Generation: 1, ExecutionEpoch: 2, PreviousBindingRef: "b1", PreviousRevision: "r1", InputRevision: "r2"})
+	if err != nil || binding.BindingRef == "" {
+		t.Fatalf("durable rebind=%+v err=%v", binding, err)
+	}
 	p, err := r.PhysicalExecutionStore().Create(ctx, PhysicalExecution{TaskID: "task", InvocationID: "inv", Generation: 1, ExecutionEpoch: 1, State: PhysicalExecutionRunning, BindingRef: "b1", InputRevision: "r1"})
 	if err != nil {
 		t.Fatal(err)
