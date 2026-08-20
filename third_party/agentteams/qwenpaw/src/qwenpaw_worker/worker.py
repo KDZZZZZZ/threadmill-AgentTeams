@@ -989,4 +989,5 @@ class Worker:
             self.heartbeat,
             worker_name=self.config.worker_cr_name,
             port=self.config.console_port,
+            runtime_status_provider=self.updater.mcp_apply_report,
         )

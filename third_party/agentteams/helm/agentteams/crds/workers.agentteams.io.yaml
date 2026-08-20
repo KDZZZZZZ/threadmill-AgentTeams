@@ -98,6 +98,9 @@ spec:
                         enum: [http, sse]
                         default: http
                         description: Transport protocol (http=Streamable HTTP, sse=Server-Sent Events).
+                      credentialBindingRef:
+                        type: string
+                        description: Controller-owned private HTTP credential binding for this Worker MCP server. The binding reference never exposes its secret value through the Worker CR.
                 package:
                   type: string
                   description: "Package URI: file://, http(s)://, nacos://, or packages/{name}.zip"

@@ -1,9 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 
 	v1beta1 "github.com/agentscope-ai/AgentTeams/agentteams-controller/api/v1beta1"
@@ -20,6 +24,7 @@ type LifecycleHandler struct {
 
 	readyMu sync.RWMutex
 	ready   map[string]bool
+	runtime map[string]WorkerRuntimeConfigStatus
 }
 
 func NewLifecycleHandler(k8s client.Client, registry *backend.Registry, namespace string) *LifecycleHandler {
@@ -28,6 +33,7 @@ func NewLifecycleHandler(k8s client.Client, registry *backend.Registry, namespac
 		registry:  registry,
 		namespace: namespace,
 		ready:     make(map[string]bool),
+		runtime:   make(map[string]WorkerRuntimeConfigStatus),
 	}
 }
 
@@ -167,8 +173,20 @@ func (h *LifecycleHandler) Ready(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var report workerReadyReport
+	if r.Body != nil {
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&report); err != nil && !errors.Is(err, io.EOF) {
+			httputil.WriteError(w, http.StatusBadRequest, "invalid ready report")
+			return
+		}
+	}
+
 	// Authorization (self-only for workers) is enforced by RequireAuthz middleware.
 	h.setReady(name, true)
+	if report.RuntimeConfig != nil {
+		h.setRuntimeConfig(name, *report.RuntimeConfig)
+	}
 	log.Printf("[READY] Worker %s reported ready", name)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -188,6 +206,7 @@ func (h *LifecycleHandler) GetWorkerRuntimeStatus(w http.ResponseWriter, r *http
 	}
 
 	resp := workerToResponse(&worker)
+	resp.RuntimeConfig = h.runtimeConfigStatus(name, &worker)
 
 	b := h.registry.DetectWorkerBackend(r.Context())
 	if b != nil {
@@ -198,13 +217,18 @@ func (h *LifecycleHandler) GetWorkerRuntimeStatus(w http.ResponseWriter, r *http
 				resp.Message += " message=" + result.Message
 			}
 			resp.ContainerState = string(result.Status)
-			if result.Status == backend.StatusRunning && h.isReady(name) {
+			if result.Status == backend.StatusRunning && h.isReady(name) && h.runtimeConfigReady(&worker) {
 				resp.Phase = "Ready"
 			}
 		}
 	}
 
 	httputil.WriteJSON(w, http.StatusOK, resp)
+}
+
+type workerReadyReport struct {
+	LastActiveAt  string                     `json:"lastActiveAt,omitempty"`
+	RuntimeConfig *WorkerRuntimeConfigStatus `json:"runtimeConfig,omitempty"`
 }
 
 // --- readiness helpers ---
@@ -216,6 +240,9 @@ func (h *LifecycleHandler) setReady(name string, ready bool) {
 		h.ready[name] = true
 	} else {
 		delete(h.ready, name)
+		// A stopped or restarted runtime has not yet re-applied its desired
+		// configuration, even when the desired Worker generation is unchanged.
+		delete(h.runtime, name)
 	}
 }
 
@@ -223,6 +250,62 @@ func (h *LifecycleHandler) isReady(name string) bool {
 	h.readyMu.RLock()
 	defer h.readyMu.RUnlock()
 	return h.ready[name]
+}
+
+func (h *LifecycleHandler) setRuntimeConfig(name string, status WorkerRuntimeConfigStatus) {
+	h.readyMu.Lock()
+	defer h.readyMu.Unlock()
+	h.runtime[name] = cloneRuntimeConfigStatus(status)
+}
+
+func (h *LifecycleHandler) runtimeConfigStatus(name string, worker *v1beta1.Worker) *WorkerRuntimeConfigStatus {
+	h.readyMu.RLock()
+	reported, ok := h.runtime[name]
+	h.readyMu.RUnlock()
+	if !ok && len(worker.Spec.McpServers) == 0 {
+		return nil
+	}
+
+	status := cloneRuntimeConfigStatus(reported)
+	status.DesiredGeneration = strconv.FormatInt(worker.Generation, 10)
+	return &status
+}
+
+func (h *LifecycleHandler) runtimeConfigReady(worker *v1beta1.Worker) bool {
+	if len(worker.Spec.McpServers) == 0 {
+		return true
+	}
+	status := h.runtimeConfigStatus(worker.Name, worker)
+	if status == nil || status.AppliedGeneration != status.DesiredGeneration {
+		return false
+	}
+	applied := make(map[string]bool, len(status.MCPServers))
+	for _, server := range status.MCPServers {
+		applied[server.Name] = server.Applied && !server.Removed
+	}
+	for _, server := range worker.Spec.McpServers {
+		if !applied[server.Name] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneRuntimeConfigStatus(status WorkerRuntimeConfigStatus) WorkerRuntimeConfigStatus {
+	result := WorkerRuntimeConfigStatus{
+		DesiredGeneration: status.DesiredGeneration,
+		AppliedGeneration: status.AppliedGeneration,
+	}
+	for _, server := range status.MCPServers {
+		result.MCPServers = append(result.MCPServers, WorkerMCPServerApplyStatus{
+			Name:        strings.TrimSpace(server.Name),
+			Applied:     server.Applied,
+			HeaderNames: append([]string(nil), server.HeaderNames...),
+			Removed:     server.Removed,
+			Error:       strings.TrimSpace(server.Error),
+		})
+	}
+	return result
 }
 
 func writeBackendError(w http.ResponseWriter, err error) {

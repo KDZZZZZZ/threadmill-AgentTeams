@@ -62,7 +62,7 @@ AgentTeams 没有 Event Log、Context Graph、Scheduler、git worktree 或 Merge
 | Threadmill 语义 | 适配方式 |
 | --- | --- |
 | Phase Endpoint invocation ↔ taskflow 委派 | 一次 `delegate_task` = 一次有界执行；`spec.md` 由 Task Manager 写入 Task Contract + DeliverySpec/ReportSpec + phase lease 声明；worker 按 spec 执行并提交 |
-| PhaseOutput ↔ submit_task + result.md | `submit_task(summary, deliverables, status)` 是现成载荷骨架；result.md 内嵌 Threadmill 结构化 JSON 块（PhaseOutput 形状），不改变 AgentTeams 协议 |
+| PhaseOutput 与 submit_task/result.md 的边界 | `submit_task(summary, deliverables, status)`、`result.md` 和 `check_task` 只提供 physical execution evidence；正式 PhaseOutput 必须由 Agent 通过 `agent.submitPhaseOutput` 提交，并由 Threadmill Runtime 校验与持久化。不得从 TeamHarness 状态或 result.md 自动推导 PhaseOutput。 |
 | Agent Invocation（临时计算资源）↔ WorkerFlow 临时 agent | `workflow_run / create_temp_agent` 创建 `tmp-` 前缀 agent（独立 workspace、自定义 AGENTS.md/skills 模板），bounded 任务结束即删除 |
 | Context 读工具注入 ↔ QwenPaw MCP 机制 | 注入机制直接复用（`desired.mcpServers` → `/api/mcp`）；工具本身是 Threadmill 新建的 `threadmill-ctx` MCP server |
 | Workspace 目录语义 ↔ shared/tasks 布局 | `shared/tasks/{task_id}/{workspace_ref}/`（含 workspace/、progress/、result.md）作为轮次 Workspace 的目录落点；目录所有权规则直接复用 task-execution SKILL.md |
@@ -244,41 +244,28 @@ Runtime 上下文装配以当前 `ConsumerInvocationID` 为隔离键：把初始
 
 ### 6.2 结构化输出
 
-直接复用 TaskResult 状态机作为 PhaseOutput 状态基线（server.py `ALLOWED_TASK_RESULT_STATUSES`）：
+TaskResult 状态机（server.py `ALLOWED_TASK_RESULT_STATUSES`）只描述 TeamHarness task 的物理执行结果：
 
-| TaskResult（submit_task） | PhaseOutput 语义 |
+| TaskResult（submit_task） | Threadmill 解释 |
 | --- | --- |
-| `SUCCESS` | passed |
-| `SUCCESS_WITH_NOTES` | passed + notes |
-| `REVISION_NEEDED` | failed（revision）→ verifier 提交 retry 建议，Task Manager 重开轮次 |
-| `BLOCKED` | failed（blocked）+ 建议编排（OrchestrationProposal） |
-| `FAILED` / `PARTIAL` | failed + 原因 |
+| `SUCCESS` | execution evidence：worker 已成功提交 TeamHarness task |
+| `SUCCESS_WITH_NOTES` | execution evidence：worker 已提交并附注 |
+| `REVISION_NEEDED` | execution evidence：本次 carrier 请求修订 |
+| `BLOCKED` | execution evidence：本次 carrier 报告阻塞 |
+| `FAILED` / `PARTIAL` | execution evidence：本次 carrier 失败或部分完成 |
 
-result.md 内嵌结构化载荷（Threadmill 适配，不改 AgentTeams 协议，result.md 是 worker 拥有的自由 markdown）：
+历史适配草案曾建议从 result.md 内嵌块构造 PhaseOutput；当前正式边界不再采用该路径。result.md 可以保留人类可读报告或执行证据引用，但正式输出只能通过 `agent.submitPhaseOutput` 进入 Runtime：
 
 ```jsonc
 {
-  "phase_output": {           // PhaseOutput 形状（统一设计 §5.6）
-    "binding": {
-      "task_id": "…", "task_contract_ref": "…",
-      "workspace_ref": "…",  // 轮次标识
-      "phase": "execute",
-      "workspace_id": "…", "input_revision": "…",
-      "workspace_head": "…", "context_slice_ref": "…", "task_memory_buffer_ref": "…"
-    },
-    "delivery_refs": ["shared/tasks/<task_id>/<workspace_ref>/workspace/…"],
-    "report_ref": "shared/tasks/<task_id>/<workspace_ref>/result.md",
-    "evidence_refs": ["shared/tasks/<task_id>/<workspace_ref>/evidence/…"]
-  },
-  "memory_candidates": [      // MemoryCandidate 引用摘录，四字段以 context-graph.md §3.3 为权威（逐字段一致，无扩展字段）；Runtime 自动记录并入 Task 级候选缓冲（Task done 前不审查、不落图、不推送）
-    {"statement": "…", "kind": "fact", "source_refs": ["…"], "subgraph_ids": ["…"]}
-  ],
-  "observed_write_set": {"files": ["shared/tasks/<task_id>/<workspace_ref>/workspace/src/a.py"], "contracts": []},
-  "orchestration_proposal": null  // 可选，见 §5.3
+  "phase": "execute",
+  "delivery_refs": ["artifact-ref"],
+  "report_ref": "report-artifact-ref",
+  "evidence_refs": ["evidence-ref"]
 }
 ```
 
-Runtime 校验输出形状与必填引用（统一设计 §5.6），不解释内容；`deliverables` 必须位于 `shared/tasks/{task_id}` 下（`_validate_task_deliverables` 强制）。
+Runtime 通过当前 execution binding 校验身份、BindingRef、InputRevision、引用 ownership 与 completion input 条件，不信任 agent 自报内部绑定字段。TeamHarness `deliverables` 若同时使用，仍必须位于 `shared/tasks/{task_id}` 下（`_validate_task_deliverables` 强制），但它们不会自动成为正式 `delivery_refs`。
 
 ### 6.3 输出契约
 
@@ -311,3 +298,13 @@ DeliverySpec / ReportSpec 由 Task Manager 在委派时写入 `spec.md` 与 prom
 | WorkerFlow 状态 | `<default-workspace>/shared/workerflow/<runId>/workflow.json` | `status`（running/done/failed）、`subagents`/`nodes`/`steps`、`readyInstructions`/`waitingInstructions`、`eventId` |
 | 心跳 | 本地 `heartbeat.json`；controller `POST /api/v1/workers/{name}/ready|heartbeat` | process/API 可达性、`lastActiveAt` |
 | Invocation 记录（Threadmill 新建） | Event Log + Artifact Store | invocation id、形态（delegate/workflow_run/direct）、phase、worker/temp agent id、事件流 refs、PhaseOutput refs |
+
+## Rehydrated package consumption
+
+For a rehydrated physical execution, Matrix `TASK_ASSIGNED` is notification and activation transport: its text is only a preview. TeamHarness persists the complete task in `shared/tasks/<task-id>/spec.md`, and `ack_task` returns that complete specification to the fresh agent loop. A successful acknowledgement proves task activation, not package consumption.
+
+Formal completion remains a separate Runtime-owned boundary. Only an authenticated, binding-scoped `agent.submitPhaseOutput` can persist the accepted output and the single authoritative `PhaseOutputSubmitted` event. Acceptance moves the logical waiting record from `running` to `terminal`, then reclaims the physical carrier through `running -> tearing_down -> terminated`. TeamHarness task completion, Worker/MCP credential deletion, exact execution-token revocation and workspace lease release are normal completion cleanup, not rollback. A cleanup failure leaves durable terminal/tearing-down evidence and is retried without returning the invocation to `waiting` or recreating token material.
+
+After parsing the complete specification, the fresh session calls `runtime.confirmPackageConsumption`. Threadmill resolves the opaque execution token and derives Task, Invocation, Generation, ExecutionEpoch, BindingRef, and InputRevision from the trusted binding. It validates the canonical package digest and the Controller-derived `matrix:<room-id>` session against the epoch-aware physical execution before recording an idempotent receipt. Tokens, credentials, private headers, controller authentication, CAS revisions, hidden reasoning, and provider conversation state are never receipt fields. Rehydration starts a new session; it does not restore the old model session.
+
+The complete M4 fixture now begins at the authenticated Epoch-A `runtime.awaitInputs` call. Runtime admits only declared pending input IDs, persists controlled continuation material, transitions Epoch A through teardown to `terminated`, revokes its binding and releases its carrier before exposing the logical `waiting` state. A later immutable full `PhaseInputSet` revision is the sole input-arrival authority; `RehydrationCoordinator` derives `NewlyDelivered`, creates a new BindingRef and increments the physical epoch without changing InvocationID or Generation.

@@ -10,7 +10,7 @@ import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 import urllib.error
 import urllib.request
 
@@ -128,21 +128,39 @@ class ControllerHeartbeatReporter:
     def enabled(self) -> bool:
         return bool(self.controller_url)
 
-    def report_ready(self, last_active_at: str | None = None) -> bool:
-        return self._post("ready", last_active_at)
+    def report_ready(
+        self,
+        last_active_at: str | None = None,
+        runtime_config: Dict[str, Any] | None = None,
+    ) -> bool:
+        return self._post("ready", last_active_at, runtime_config)
 
-    def report_heartbeat(self, last_active_at: str | None = None) -> bool:
+    def report_heartbeat(
+        self,
+        last_active_at: str | None = None,
+        runtime_config: Dict[str, Any] | None = None,
+    ) -> bool:
         # The controller uses repeated ready reports as worker heartbeats.
-        return self._post("ready", last_active_at)
+        return self._post("ready", last_active_at, runtime_config)
 
-    def _post(self, action: str, last_active_at: str | None) -> bool:
+    def _post(
+        self,
+        action: str,
+        last_active_at: str | None,
+        runtime_config: Dict[str, Any] | None,
+    ) -> bool:
         if not self.enabled():
             return False
         path = f"/api/v1/workers/{self.worker_name}/{action}"
         body = None
         headers = {}
+        payload: Dict[str, Any] = {}
         if last_active_at:
-            body = json.dumps({"lastActiveAt": last_active_at}).encode("utf-8")
+            payload["lastActiveAt"] = last_active_at
+        if runtime_config:
+            payload["runtimeConfig"] = runtime_config
+        if payload:
+            body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
         token = self.token or _discover_auth_token()
         if token:
@@ -182,6 +200,7 @@ async def run_worker_heartbeat_loop(
     local_interval: float = 5,
     report_interval: float | None = None,
     reporter: ControllerHeartbeatReporter | None = None,
+    runtime_status_provider: Callable[[], Dict[str, Any]] | None = None,
 ) -> None:
     """Probe QwenPaw locally and report worker status to the controller."""
 
@@ -206,6 +225,11 @@ async def run_worker_heartbeat_loop(
     try:
         while True:
             status, message, details = await asyncio.to_thread(check_qwenpaw_heartbeat, port)
+            runtime_config = runtime_status_provider() if runtime_status_provider is not None else None
+            if runtime_config:
+                # The provider is RuntimeUpdater's redacted report. Keep it in
+                # the local heartbeat and send the same data to the controller.
+                details = {**details, "runtimeConfig": runtime_config}
             heartbeat.update(status, message, details)
             status_key = (status, message)
             if status_key != last_status:
@@ -220,12 +244,20 @@ async def run_worker_heartbeat_loop(
             if status == "ready" and reporter.enabled():
                 last_active_at = await asyncio.to_thread(get_qwenpaw_last_active_at, port)
                 if not ready_reported:
-                    ready_reported = await asyncio.to_thread(reporter.report_ready, last_active_at)
+                    ready_reported = await asyncio.to_thread(
+                        reporter.report_ready,
+                        last_active_at,
+                        runtime_config,
+                    )
                     if ready_reported:
                         logger.info("controller ready report accepted component=heartbeat worker=%s", worker_name)
                 now = time.time()
                 if now >= next_report_at:
-                    reported = await asyncio.to_thread(reporter.report_heartbeat, last_active_at)
+                    reported = await asyncio.to_thread(
+                        reporter.report_heartbeat,
+                        last_active_at,
+                        runtime_config,
+                    )
                     if reported:
                         logger.debug("controller heartbeat report accepted component=heartbeat worker=%s", worker_name)
                     next_report_at = now + report_every

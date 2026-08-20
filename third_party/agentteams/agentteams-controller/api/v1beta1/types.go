@@ -99,9 +99,10 @@ type CredentialBinding struct {
 // control is the gateway operator's responsibility (or, for local Higress
 // deployments, handled out-of-band by Manager skills).
 type MCPServer struct {
-	Name      string `json:"name"`
-	URL       string `json:"url"`
-	Transport string `json:"transport,omitempty"`
+	Name                 string `json:"name"`
+	URL                  string `json:"url"`
+	Transport            string `json:"transport,omitempty"`
+	CredentialBindingRef string `json:"credentialBindingRef,omitempty"`
 }
 
 // RemoteSkill identifies one skill from a remote source.
