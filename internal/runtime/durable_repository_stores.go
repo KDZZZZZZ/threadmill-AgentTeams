@@ -434,27 +434,23 @@ func appendEvent(ctx context.Context, tx *sql.Tx, typ string, k WaitingKey, epoc
 	if epoch > 0 {
 		ep = int(epoch)
 	}
-	_, e := tx.ExecContext(ctx, "INSERT INTO runtime_events VALUES(?,?,?,?,?,?,?,?,?,?,?)", id, typ, time.Now().UTC().Format(time.RFC3339Nano), k.TaskID, k.InvocationID, k.Generation, ep, aggregate, rev, 1, payload)
+	if _, e := tx.ExecContext(ctx, "INSERT INTO runtime_events VALUES(?,?,?,?,?,?,?,?,?,?,?)", id, typ, time.Now().UTC().Format(time.RFC3339Nano), k.TaskID, k.InvocationID, k.Generation, ep, aggregate, rev, 1, payload); e != nil {
+		return e
+	}
+	_, e := tx.ExecContext(ctx, "INSERT INTO runtime_event_order(event_id) VALUES(?)", id)
 	return e
 }
 func (r *SQLiteRuntimeStateRepository) ListRuntimeEvents(ctx context.Context) ([]RuntimeEvent, error) {
-	rows, e := r.db.QueryContext(ctx, "SELECT event_id,event_type,occurred_at,task_id,invocation_id,generation,execution_epoch,aggregate_key,result_revision,payload_version,payload FROM runtime_events ORDER BY occurred_at,event_id")
+	rows, e := r.db.QueryContext(ctx, "SELECT o.event_sequence,e.event_id,e.event_type,e.occurred_at,e.task_id,e.invocation_id,e.generation,e.execution_epoch,e.aggregate_key,e.result_revision,e.payload_version,e.payload FROM runtime_event_order o JOIN runtime_events e ON e.event_id=o.event_id ORDER BY o.event_sequence")
 	if e != nil {
 		return nil, e
 	}
 	defer rows.Close()
 	var out []RuntimeEvent
 	for rows.Next() {
-		var v RuntimeEvent
-		var at string
-		var ep sql.NullInt64
-		if e = rows.Scan(&v.EventID, &v.EventType, &at, &v.TaskID, &v.InvocationID, &v.Generation, &ep, &v.AggregateKey, &v.ResultRevision, &v.PayloadVersion, &v.Payload); e != nil {
-			return nil, e
-		}
-		v.OccurredAt, _ = time.Parse(time.RFC3339Nano, at)
-		if ep.Valid {
-			x := ExecutionEpoch(ep.Int64)
-			v.ExecutionEpoch = &x
+		v, scanErr := scanRuntimeEvent(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 		out = append(out, v)
 	}

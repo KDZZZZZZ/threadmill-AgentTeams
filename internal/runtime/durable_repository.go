@@ -30,6 +30,7 @@ type RuntimeStateRepository interface {
 	PhaseOutputStore() PhaseOutputStore
 	ArtifactStore() artifacts.DurableStore
 	LifecycleMutations() LifecycleMutationStore
+	EventOutbox() RuntimeEventOutbox
 	ListRuntimeEvents(context.Context) ([]RuntimeEvent, error)
 }
 
@@ -50,6 +51,7 @@ type DurablePhaseInputStore interface {
 }
 
 type RuntimeEvent struct {
+	EventSequence  int64
 	EventID        string
 	EventType      string
 	OccurredAt     time.Time
@@ -63,7 +65,7 @@ type RuntimeEvent struct {
 	Payload        json.RawMessage
 }
 
-const latestRuntimeSchemaVersion = 2
+const latestRuntimeSchemaVersion = 3
 
 type SQLiteRuntimeStateRepository struct{ db *sql.DB }
 
@@ -118,6 +120,9 @@ func (r *SQLiteRuntimeStateRepository) ArtifactStore() artifacts.DurableStore {
 func (r *SQLiteRuntimeStateRepository) LifecycleMutations() LifecycleMutationStore {
 	return sqliteLifecycleMutations{r}
 }
+func (r *SQLiteRuntimeStateRepository) EventOutbox() RuntimeEventOutbox {
+	return sqliteRuntimeEventOutbox{r}
+}
 
 func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
 	tx, err := r.db.BeginTx(ctx, nil)
@@ -166,6 +171,22 @@ func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
 		for _, statement := range []string{
 			"CREATE TABLE runtime_artifacts (artifact_ref TEXT PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, payload BLOB NOT NULL)",
 			"CREATE TABLE runtime_artifact_access (artifact_ref TEXT NOT NULL, task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, PRIMARY KEY(artifact_ref,task_id,invocation_id))",
+		} {
+			if _, err = tx.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", 2); err != nil {
+			return err
+		}
+		version = 2
+	}
+	if version == 2 {
+		for _, statement := range []string{
+			"CREATE TABLE runtime_event_order (event_sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE)",
+			"CREATE TABLE runtime_event_consumers (consumer_id TEXT PRIMARY KEY, last_acked_sequence INTEGER NOT NULL, revision INTEGER NOT NULL, updated_at TEXT NOT NULL)",
+			"CREATE TABLE runtime_event_claims (consumer_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, expires_at TEXT NOT NULL, revision INTEGER NOT NULL)",
+			"INSERT INTO runtime_event_order(event_id) SELECT event_id FROM runtime_events ORDER BY event_id",
 		} {
 			if _, err = tx.ExecContext(ctx, statement); err != nil {
 				return err

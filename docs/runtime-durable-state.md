@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-C2-6。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
+状态：M5-C3-3。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
 
 ## 1. Authority 与边界
 
@@ -52,6 +52,12 @@ M5-C2-5 将正式 PhaseOutput acceptance 收敛为 repository-owned transaction�
 M5-C2-6 将 normal completion 与 await relinquish 的 PhysicalExecution cleanup 接入 `LifecycleMutationStore.AdvanceTeardown`。它以 physical key + expected revision 围栏，且每次 transaction 只持久化一个动作：`running` → `tearing_down` intent、一个已成功外部副作用的 redacted step completion，或在全部六个 step 已完成后 `tearing_down` → `terminated`。每一动作与对应 outbox event 原子写入；identity、state、revision 或 outbox failure 都回滚，不会留下 progress/event 半状态。已持久化的 step retry 返回既有记录且不产生第二个 success event。
 
 外部 cleanup 始终在 transaction 外，顺序保持 task → Worker → MCP → credential → token → workspace lease。Runtime 先 durable-record `tearing_down` intent，再调用外部 idempotent port；调用成功后才 durable-record 该 step。进程在两者之间退出时，新的 Runtime 从 PhysicalExecution teardown flags 读取第一个未完成 step 并可能重新调用该 idempotent effect；一旦 completion flag 已提交，cold reopen/retry 绝不重做它。final termination 只在全部 step flags 已提交后记录。opaque authorization/binding/credential refs 可以重新解析；raw token、credential、private header、controller auth、provider conversation 和旧 QwenPaw session 都不进入 database，旧 session 永远不会恢复。
+
+M5-C3-3 为已有 transactional outbox 增加 durable projection/dispatch seam，但不改变 snapshot authority。每个 Runtime event 在产生它的原事务中写入 `runtime_events` 及数据库分配的单调 `EventSequence`；读者按 sequence 而非时钟或 EventID 排序。旧 schema 的 event 在 v2→v3 migration 中一次性获得稳定 sequence，之后的 event 不会重排。payload 必须为已支持的 version 和有效 JSON；未知 version 或畸形 payload fail closed，不能被投影器静默跳过。
+
+`RuntimeEventOutbox` 提供有界 ordered read、consumer checkpoint、lease claim 与严格单调 ack。一个 logical consumer 在有效 lease 内只允许一个 owner dispatch；lease 过期后新的 process 可接管。dispatcher 在 SQLite transaction 外调用外部 sink，成功后才单条 ack，因此 delivery 是 **at-least-once**：sink 已成功但 process 在 ack 前退出时，同一 `EventID` 会在 cold reopen 后再次投递。sink/projection 必须以 `EventID` 去重；checkpoint 只在 ack transaction 成功后推进。ack、claim 或 outbox 写入失败不改变 authoritative snapshots，也不制造已确认的 checkpoint。
+
+Runtime snapshots/records 继续是 online recovery authority；outbox feed 只用于 audit、projection rebuild、reconciliation input 和可恢复 dispatch，不把本系统改成 full event sourcing。`ArtifactRegistered`（metadata/access transaction）、`PhaseOutputSubmitted`（output + terminal Waiting transaction）与 PhysicalExecution teardown 事件已经随各自 authoritative mutation 原子写入；dispatch 状态不能反推 artifact ownership、PhaseOutput 或 teardown truth。C3-3 也不负责新的 external sink、global multi-node leader election 或重放 QwenPaw session。
 
 Runtime snapshots/records 仍是 recovery authority；outbox 仅用于 audit、projection 和后续 reconciliation input。Worker/task/runtime.yaml 与 QwenPaw session 只能作为 execution-plane observed evidence，不能反推下一 cleanup step。C2-6 不实现 distributed leader election：SQLite 单 writer + revision CAS 使同一 expected revision 只有一个 teardown claimant 成功；其他 claimant 必须 reload/retry。restart recovery 只继续 cleanup，不重新接受 PhaseOutput、不重新发 `PhaseOutputSubmitted`，也不重放 agent work。
 
