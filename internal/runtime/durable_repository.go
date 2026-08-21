@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/artifacts"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	_ "modernc.org/sqlite"
 )
@@ -27,6 +28,7 @@ type RuntimeStateRepository interface {
 	PhysicalExecutionStore() PhysicalExecutionStore
 	ReceiptStore() executionreceipt.Store
 	PhaseOutputStore() PhaseOutputStore
+	ArtifactStore() artifacts.DurableStore
 	LifecycleMutations() LifecycleMutationStore
 	ListRuntimeEvents(context.Context) ([]RuntimeEvent, error)
 }
@@ -61,7 +63,7 @@ type RuntimeEvent struct {
 	Payload        json.RawMessage
 }
 
-const latestRuntimeSchemaVersion = 1
+const latestRuntimeSchemaVersion = 2
 
 type SQLiteRuntimeStateRepository struct{ db *sql.DB }
 
@@ -110,6 +112,9 @@ func (r *SQLiteRuntimeStateRepository) ReceiptStore() executionreceipt.Store {
 func (r *SQLiteRuntimeStateRepository) PhaseOutputStore() PhaseOutputStore {
 	return sqliteOutputStore{r}
 }
+func (r *SQLiteRuntimeStateRepository) ArtifactStore() artifacts.DurableStore {
+	return sqliteArtifactStore{r}
+}
 func (r *SQLiteRuntimeStateRepository) LifecycleMutations() LifecycleMutationStore {
 	return sqliteLifecycleMutations{r}
 }
@@ -148,6 +153,20 @@ func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
 			"CREATE TABLE runtime_events (event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, occurred_at TEXT NOT NULL, task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, execution_epoch INTEGER, aggregate_key TEXT NOT NULL, result_revision INTEGER NOT NULL, payload_version INTEGER NOT NULL, payload BLOB NOT NULL)",
 		}
 		for _, statement := range statements {
+			if _, err = tx.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", 1); err != nil {
+			return err
+		}
+		version = 1
+	}
+	if version == 1 {
+		for _, statement := range []string{
+			"CREATE TABLE runtime_artifacts (artifact_ref TEXT PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, payload BLOB NOT NULL)",
+			"CREATE TABLE runtime_artifact_access (artifact_ref TEXT NOT NULL, task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, PRIMARY KEY(artifact_ref,task_id,invocation_id))",
+		} {
 			if _, err = tx.ExecContext(ctx, statement); err != nil {
 				return err
 			}

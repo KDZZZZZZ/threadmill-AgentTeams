@@ -42,8 +42,11 @@ type Artifact struct {
 type ArtifactRef string
 
 type TrustedOwner struct {
-	TaskID        string
-	InvocationID  string
+	TaskID       string
+	InvocationID string
+	// Generation is audit evidence from the trusted Runtime binding; it is not
+	// part of the logical artifact ownership/access key.
+	Generation    int
 	WorkspaceRoot string
 	AllowedDirs   []string
 }
@@ -60,6 +63,79 @@ type RegisterRequest struct {
 type Registrar interface {
 	Register(context.Context, RegisterRequest) (ArtifactRef, error)
 	ValidateReferences(context.Context, TrustedOwner, []ArtifactRef) error
+}
+
+// DurableMetadata is the secret-free logical record kept by Runtime. BlobRef
+// is an opaque object-store reference, never a workspace absolute path.
+type DurableMetadata struct {
+	Ref                ArtifactRef
+	Type               ArtifactType
+	ContentHash        string
+	BlobRef            string
+	OriginTaskID       string
+	OriginInvocationID string
+	CreatedAt          time.Time
+}
+
+// DurableStore is implemented by RuntimeStateRepository. Register atomically
+// writes metadata, owner access and the Runtime outbox event.
+type DurableStore interface {
+	RegisterArtifact(context.Context, DurableMetadata, TrustedOwner) (ArtifactRef, bool, error)
+	GetArtifact(context.Context, ArtifactRef) (DurableMetadata, bool, error)
+	ValidateArtifactAccess(context.Context, TrustedOwner, []ArtifactRef) error
+}
+
+// BlobPublisher verifies and publishes bytes before metadata is committed.
+// A failed metadata transaction may therefore leave an orphan blob, but never
+// a durable record pointing at unpublished bytes.
+type BlobPublisher interface {
+	Publish(context.Context, string, string) (string, error)
+}
+
+// DurableRegistry retains the current controlled-path/hash semantics while
+// making metadata and access grants recoverable. It deliberately does not
+// expose object bytes to Runtime SQLite.
+type DurableRegistry struct {
+	store     DurableStore
+	publisher BlobPublisher
+	validator LocalPathValidator
+}
+
+func NewDurableRegistry(store DurableStore, publisher BlobPublisher) *DurableRegistry {
+	return &DurableRegistry{store: store, publisher: publisher}
+}
+
+func (r *DurableRegistry) Register(ctx context.Context, request RegisterRequest) (ArtifactRef, error) {
+	if r == nil || r.store == nil || r.publisher == nil || request.Kind == "" {
+		return "", errors.New("durable artifact registry dependencies and kind are required")
+	}
+	path, err := r.validator.Validate(request.Owner, request.ControlledPath)
+	if err != nil {
+		return "", err
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(contents)
+	hash := hex.EncodeToString(digest[:])
+	blobRef, err := r.publisher.Publish(ctx, path, hash)
+	if err != nil {
+		return "", err
+	}
+	if blobRef == "" {
+		return "", errors.New("published blob reference is required")
+	}
+	ref := ArtifactRef("artifact-" + hash[:24])
+	got, _, err := r.store.RegisterArtifact(ctx, DurableMetadata{Ref: ref, Type: request.Kind, ContentHash: hash, BlobRef: blobRef, OriginTaskID: request.Owner.TaskID, OriginInvocationID: request.Owner.InvocationID, CreatedAt: time.Now().UTC()}, request.Owner)
+	return got, err
+}
+
+func (r *DurableRegistry) ValidateReferences(ctx context.Context, owner TrustedOwner, refs []ArtifactRef) error {
+	if r == nil || r.store == nil {
+		return errors.New("durable artifact registry is unavailable")
+	}
+	return r.store.ValidateArtifactAccess(ctx, owner, refs)
 }
 
 type Event struct {

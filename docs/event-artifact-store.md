@@ -94,6 +94,8 @@ type Event struct {
 
 ## 4. Artifact Store
 
+当前 Runtime implementation 的 durable boundary 是：bytes 不复制进 Runtime SQLite；SQLite 保存 ArtifactRef、type、content hash、opaque blob ref、origin logical owner 与 TaskID+InvocationID access grant。`ArtifactRegistered` 与 metadata/access mutation 同事务进入 Runtime outbox。blob 先 publish、后提交 metadata，因此 crash 可留下可 GC orphan blob，但 metadata 不得从 bytes/path 猜测 owner/access，也不得指向未验证 blob。Runtime snapshots 是 online authority，outbox 是 audit/projection/reconciliation input，不是 full event sourcing；dispatcher cursor/ack 另行演进。
+
 ### 4.1 ArtifactRef 与内容哈希
 
 ```go
