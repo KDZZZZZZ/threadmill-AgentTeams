@@ -385,7 +385,7 @@ func (h *Handler) allowed(token, tool string) (BoundServices, error) {
 }
 
 func artifactOwner(binding InvocationBinding) artifacts.TrustedOwner {
-	return artifacts.TrustedOwner{TaskID: binding.TaskID, InvocationID: binding.InvocationID, WorkspaceRoot: binding.WorkspaceRoot, AllowedDirs: binding.AllowedDirs}
+	return artifacts.TrustedOwner{TaskID: binding.TaskID, InvocationID: binding.InvocationID, Generation: binding.Generation, WorkspaceRoot: binding.WorkspaceRoot, AllowedDirs: binding.AllowedDirs}
 }
 
 func outputReferences(output phaseagent.PhaseOutput) []artifacts.ArtifactRef {

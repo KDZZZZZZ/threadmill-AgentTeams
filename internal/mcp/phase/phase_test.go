@@ -173,6 +173,13 @@ func TestArtifactRegistrationAndFormalOutputReferenceValidation(t *testing.T) {
 	}
 }
 
+func TestArtifactOwnerUsesTrustedBindingGeneration(t *testing.T) {
+	owner := artifactOwner(InvocationBinding{TaskID: "task", InvocationID: "invocation", Generation: 7, WorkspaceRoot: "server-only", AllowedDirs: []string{"out"}})
+	if owner.Generation != 7 || owner.TaskID != "task" || owner.InvocationID != "invocation" {
+		t.Fatalf("owner=%#v", owner)
+	}
+}
+
 func TestCompletionRuntimeOwnsPhaseOutputSubmittedEvent(t *testing.T) {
 	registry := NewBindingRegistry()
 	runtime := &eventOwningRuntime{}

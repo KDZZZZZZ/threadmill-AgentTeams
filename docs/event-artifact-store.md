@@ -96,6 +96,10 @@ type Event struct {
 
 当前 Runtime implementation 的 durable boundary 是：bytes 不复制进 Runtime SQLite；SQLite 保存 ArtifactRef、type、content hash、opaque blob ref、origin logical owner 与 TaskID+InvocationID access grant。`ArtifactRegistered` 与 metadata/access mutation 同事务进入 Runtime outbox。blob 先 publish、后提交 metadata，因此 crash 可留下可 GC orphan blob，但 metadata 不得从 bytes/path 猜测 owner/access，也不得指向未验证 blob。Runtime snapshots 是 online authority，outbox 是 audit/projection/reconciliation input，不是 full event sourcing；dispatcher cursor/ack 另行演进。
 
+M5-C3-2A 提供 `internal/artifacts.S3BlobPublisher`，对 AgentTeams embedded deployment 已有的 MinIO S3-compatible API 做最小适配。它从进程内 secret/config boundary 接收 endpoint、bucket、prefix、access key 与 secret key；这些配置不写入 Runtime record、metadata 或 outbox。发布器对受控源文件重算 SHA-256，以 `threadmill/artifacts/sha256/<hash>`（可配置前缀）作为内容寻址 key，签名 `PUT` 后以签名 `HEAD` 验证 metadata hash，再返回稳定的 `s3://<bucket>/<key>` opaque ref。该 ref 不包含 workspace absolute path，因而可跨 Runtime/Worker/epoch replacement 使用。embedded MinIO 由 `third_party/agentteams/manager/scripts/init/start-minio.sh` 启动，installer 将 endpoint/bucket/worker credentials 投影为 `AGENTTEAMS_FS_*`；Threadmill 的控制面必须通过自己的 deployment secret/config boundary 提供 publisher 配置，而不读取或持久化 Worker credential。
+
+`runtime.NewDurableArtifactRegistry(repository, publisher)` 明确组合同一个 `RuntimeStateRepository.ArtifactStore()` 与该 publisher；它不创建第二个 metadata authority。本 slice 尚未将 MCP `artifact.register` 的 production registrar 切换至该组合，C3-2B 才负责该 cutover。publish 成功、SQLite transaction 失败时允许 orphan blob 留给后续 GC；publish/verify 失败时不调用 durable metadata mutation。
+
 ### 4.1 ArtifactRef 与内容哈希
 
 ```go

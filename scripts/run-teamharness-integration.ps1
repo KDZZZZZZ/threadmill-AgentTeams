@@ -19,7 +19,7 @@ try {
   & $mc mb --ignore-existing threadmill-it/threadmill-it | Out-Null
   $env:PATH = "$ToolsDir$([IO.Path]::PathSeparator)$env:PATH"
   $env:THREADMILL_IT_MINIO_ENDPOINT = 'http://127.0.0.1:19000'; $env:THREADMILL_IT_MINIO_ACCESS_KEY = 'threadmill-it'; $env:THREADMILL_IT_MINIO_SECRET_KEY = 'threadmill-it-secret'
-  Push-Location $repoRoot; try { go test -count=1 -tags=integration ./internal/agenthost/agentteams -run TestTeamHarnessStdioClientRealServer -v } finally { Pop-Location }
+  Push-Location $repoRoot; try { go test -count=1 -tags=integration ./internal/artifacts ./internal/agenthost/agentteams -v } finally { Pop-Location }
 } finally {
   if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
   Remove-Item -LiteralPath $data -Recurse -Force -ErrorAction SilentlyContinue

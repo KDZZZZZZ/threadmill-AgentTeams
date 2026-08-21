@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -152,5 +153,47 @@ func TestDurableArtifactRegistrationConcurrentDuplicateHasOneEvent(t *testing.T)
 	}
 	if count != 1 {
 		t.Fatalf("events=%d", count)
+	}
+}
+
+type durableArtifactPublisher struct {
+	ref   string
+	calls int
+}
+
+func (p *durableArtifactPublisher) Publish(context.Context, string, string) (string, error) {
+	p.calls++
+	return p.ref, nil
+}
+
+func TestDurableArtifactRegistryCompositionAllowsOrphanButNeverMetadataBeforePublish(t *testing.T) {
+	ctx := context.Background()
+	r, err := OpenSQLiteRuntimeStateRepository(filepath.Join(t.TempDir(), "runtime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err = r.db.Exec("CREATE TRIGGER reject_artifact_event BEFORE INSERT ON runtime_events WHEN NEW.event_type='ArtifactRegistered' BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END"); err != nil {
+		t.Fatal(err)
+	}
+	publisher := &durableArtifactPublisher{ref: "s3://threadmill/artifacts/sha256/known"}
+	registry, err := NewDurableArtifactRegistry(r, publisher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	if err = os.Mkdir(filepath.Join(workspace, "out"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(workspace, "out", "report.md"), []byte("report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = registry.Register(ctx, artifacts.RegisterRequest{Owner: artifacts.TrustedOwner{TaskID: "task", InvocationID: "invocation", Generation: 2, WorkspaceRoot: workspace, AllowedDirs: []string{"out"}}, ControlledPath: "out/report.md", Kind: artifacts.ArtifactTypeGeneratedReport})
+	if err == nil || publisher.calls != 1 {
+		t.Fatalf("err=%v publisher calls=%d", err, publisher.calls)
+	}
+	events, err := r.ListRuntimeEvents(ctx)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("events=%#v err=%v", events, err)
 	}
 }

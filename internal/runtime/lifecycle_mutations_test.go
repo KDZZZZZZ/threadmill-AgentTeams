@@ -188,32 +188,38 @@ func TestAcceptPhaseOutputConcurrentCurrentAndStaleCASHasSingleWinner(t *testing
 	}
 	candidate := PhaseOutputRecord{Key: PhaseOutputKey{TaskID: "task", InvocationID: "inv", Generation: 1}, BindingRef: "b2", InputRevision: "r2", ExecutionEpoch: 2, Output: phaseagent.PhaseOutput{ReportRef: "done"}}
 	start := make(chan struct{})
-	results := make(chan error, 2)
+	type result struct {
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
 	var group sync.WaitGroup
 	for _, revision := range []int64{w.Revision, w.Revision - 1} {
 		group.Add(1)
 		go func(revision int64) {
 			defer group.Done()
 			<-start
-			_, _, _, err := r.LifecycleMutations().AcceptPhaseOutput(ctx, candidate, key, revision)
-			results <- err
+			_, _, created, err := r.LifecycleMutations().AcceptPhaseOutput(ctx, candidate, key, revision)
+			results <- result{created: created, err: err}
 		}(revision)
 	}
 	close(start)
 	group.Wait()
 	close(results)
-	var accepted, conflicts int
-	for err := range results {
-		if err == nil {
-			accepted++
-		} else if errors.Is(err, ErrCompletionConflict) {
+	var created, idempotent, conflicts int
+	for result := range results {
+		if result.err == nil && result.created {
+			created++
+		} else if result.err == nil {
+			idempotent++
+		} else if errors.Is(result.err, ErrCompletionConflict) {
 			conflicts++
 		} else {
-			t.Fatalf("unexpected concurrent error: %v", err)
+			t.Fatalf("unexpected concurrent error: %v", result.err)
 		}
 	}
-	if accepted != 1 || conflicts != 1 {
-		t.Fatalf("accepted=%d conflicts=%d", accepted, conflicts)
+	if created != 1 || idempotent+conflicts != 1 {
+		t.Fatalf("created=%d idempotent=%d conflicts=%d", created, idempotent, conflicts)
 	}
 	events, err := r.ListRuntimeEvents(ctx)
 	if err != nil {
