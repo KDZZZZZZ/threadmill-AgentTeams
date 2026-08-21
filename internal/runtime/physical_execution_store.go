@@ -41,6 +41,64 @@ type PhysicalExecutionTeardown struct {
 	LeaseReleased            bool
 }
 
+// TeardownStep is Runtime-internal durable cleanup progress. It intentionally
+// contains no capability material: the external effect is re-resolved from
+// the PhysicalExecution's redacted identity and opaque refs on each retry.
+type TeardownStep string
+
+const (
+	TeardownStepBegin      TeardownStep = "begin"
+	TeardownStepTask       TeardownStep = "task"
+	TeardownStepWorker     TeardownStep = "worker"
+	TeardownStepMCP        TeardownStep = "mcp"
+	TeardownStepCredential TeardownStep = "credential"
+	TeardownStepToken      TeardownStep = "token"
+	TeardownStepLease      TeardownStep = "lease"
+	TeardownStepTerminate  TeardownStep = "terminate"
+)
+
+func teardownStepDone(value PhysicalExecutionTeardown, step TeardownStep) bool {
+	switch step {
+	case TeardownStepTask:
+		return value.TeamHarnessTaskCancelled
+	case TeardownStepWorker:
+		return value.WorkerDeleted
+	case TeardownStepMCP:
+		return value.MCPCleaned
+	case TeardownStepCredential:
+		return value.CredentialRevoked
+	case TeardownStepToken:
+		return value.TokenRevoked
+	case TeardownStepLease:
+		return value.LeaseReleased
+	}
+	return false
+}
+
+func markTeardownStep(value *PhysicalExecutionTeardown, step TeardownStep) error {
+	switch step {
+	case TeardownStepTask:
+		value.TeamHarnessTaskCancelled = true
+	case TeardownStepWorker:
+		value.WorkerDeleted = true
+	case TeardownStepMCP:
+		value.MCPCleaned = true
+	case TeardownStepCredential:
+		value.CredentialRevoked = true
+	case TeardownStepToken:
+		value.TokenRevoked = true
+	case TeardownStepLease:
+		value.LeaseReleased = true
+	default:
+		return errors.New("unknown teardown step")
+	}
+	return nil
+}
+
+func allTeardownStepsDone(value PhysicalExecutionTeardown) bool {
+	return value.TeamHarnessTaskCancelled && value.WorkerDeleted && value.MCPCleaned && value.CredentialRevoked && value.TokenRevoked && value.LeaseReleased
+}
+
 func (e PhysicalExecution) Key() PhysicalExecutionKey {
 	return PhysicalExecutionKey{TaskID: e.TaskID, InvocationID: e.InvocationID, Generation: e.Generation, ExecutionEpoch: e.ExecutionEpoch}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	phasemcp "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mcp/phase"
 )
 
 // AwaitEventRecorder records the Runtime await boundary without introducing a
@@ -50,6 +52,8 @@ type RelinquishRequest struct {
 type ExecutionRelinquisher struct {
 	Store              WaitingStore
 	PhysicalExecutions PhysicalExecutionStore
+	Mutations          LifecycleMutationStore
+	Bindings           *phasemcp.BindingRegistry
 	Events             AwaitEventRecorder
 	Leases             WorkspaceLeaseReleaser
 	Tasks              TeamHarnessTaskRelinquisher
@@ -105,11 +109,18 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		return WaitingRecord{}, errors.New("waiting record changed before relinquish")
 	}
 	if physicalFound {
-		next := physical
-		next.State = PhysicalExecutionTearingDown
-		physical, swapped, err = r.PhysicalExecutions.CompareAndSwap(ctx, physical.Key(), physical.Revision, next)
-		if err != nil || !swapped {
-			return WaitingRecord{}, errors.New("physical execution changed before await teardown")
+		if r.Mutations != nil {
+			physical, swapped, err = r.Mutations.AdvanceTeardown(ctx, physical.Key(), physical.Revision, TeardownStepBegin)
+			if err != nil || !swapped {
+				return WaitingRecord{}, errors.New("physical execution changed before await teardown")
+			}
+		} else {
+			next := physical
+			next.State = PhysicalExecutionTearingDown
+			physical, swapped, err = r.PhysicalExecutions.CompareAndSwap(ctx, physical.Key(), physical.Revision, next)
+			if err != nil || !swapped {
+				return WaitingRecord{}, errors.New("physical execution changed before await teardown")
+			}
 		}
 	}
 	// Waiting state is durable before recording/releasing a carrier.
@@ -122,7 +133,7 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		if err := r.Leases.ReleaseWorkspaceLease(ctx, releasing); err != nil {
 			return WaitingRecord{}, err
 		}
-		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, func(t *PhysicalExecutionTeardown) { t.LeaseReleased = true })
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepLease, func(t *PhysicalExecutionTeardown) { t.LeaseReleased = true })
 		if err != nil {
 			return WaitingRecord{}, err
 		}
@@ -131,7 +142,7 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		if err := r.Tasks.CancelTeamHarnessTask(ctx, request.TeamHarnessID, request.Reason); err != nil {
 			return WaitingRecord{}, err
 		}
-		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, func(t *PhysicalExecutionTeardown) { t.TeamHarnessTaskCancelled = true })
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepTask, func(t *PhysicalExecutionTeardown) { t.TeamHarnessTaskCancelled = true })
 		if err != nil {
 			return WaitingRecord{}, err
 		}
@@ -141,7 +152,13 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		if err := r.Tokens.RevokeExecutionToken(ctx, request.ExecutionToken); err != nil {
 			return WaitingRecord{}, err
 		}
-		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, func(t *PhysicalExecutionTeardown) { t.TokenRevoked = true })
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepToken, func(t *PhysicalExecutionTeardown) { t.TokenRevoked = true })
+		if err != nil {
+			return WaitingRecord{}, err
+		}
+	} else if r.Bindings != nil {
+		r.Bindings.RevokeBinding(phasemcp.InvocationBinding{TaskID: request.Record.Key.TaskID, InvocationID: request.Record.Key.InvocationID, Generation: request.Record.Key.Generation, ExecutionEpoch: int64(request.Record.ExecutionEpoch), BindingRef: request.Record.PreviousBindingRef, InputRevision: request.Record.InputRevision})
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepToken, func(t *PhysicalExecutionTeardown) { t.TokenRevoked = true })
 		if err != nil {
 			return WaitingRecord{}, err
 		}
@@ -150,7 +167,7 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		if err := r.MCP.CleanupExecutionMCP(ctx, releasing); err != nil {
 			return WaitingRecord{}, err
 		}
-		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, func(t *PhysicalExecutionTeardown) { t.MCPCleaned = true })
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepMCP, func(t *PhysicalExecutionTeardown) { t.MCPCleaned = true })
 		if err != nil {
 			return WaitingRecord{}, err
 		}
@@ -159,7 +176,7 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		if err := r.Credentials.RevokeWorkerCredential(ctx, releasing); err != nil {
 			return WaitingRecord{}, err
 		}
-		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, func(t *PhysicalExecutionTeardown) { t.CredentialRevoked = true })
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepCredential, func(t *PhysicalExecutionTeardown) { t.CredentialRevoked = true })
 		if err != nil {
 			return WaitingRecord{}, err
 		}
@@ -168,16 +185,22 @@ func (r ExecutionRelinquisher) Relinquish(ctx context.Context, request Relinquis
 		if err := r.Carriers.ReleaseExecutionCarrier(ctx, releasing); err != nil {
 			return WaitingRecord{}, err
 		}
-		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, func(t *PhysicalExecutionTeardown) { t.WorkerDeleted = true })
+		physical, err = r.recordPhysicalTeardown(ctx, physical, physicalFound, TeardownStepWorker, func(t *PhysicalExecutionTeardown) { t.WorkerDeleted = true })
 		if err != nil {
 			return WaitingRecord{}, err
 		}
 	}
 	if physicalFound {
-		terminated := physical
-		terminated.State = PhysicalExecutionTerminated
-		if _, swapped, err := r.PhysicalExecutions.CompareAndSwap(ctx, physical.Key(), physical.Revision, terminated); err != nil || !swapped {
-			return WaitingRecord{}, errors.New("physical execution changed before await termination")
+		if r.Mutations != nil {
+			if _, swapped, err := r.Mutations.AdvanceTeardown(ctx, physical.Key(), physical.Revision, TeardownStepTerminate); err != nil || !swapped {
+				return WaitingRecord{}, errors.New("physical execution changed before await termination")
+			}
+		} else {
+			terminated := physical
+			terminated.State = PhysicalExecutionTerminated
+			if _, swapped, err := r.PhysicalExecutions.CompareAndSwap(ctx, physical.Key(), physical.Revision, terminated); err != nil || !swapped {
+				return WaitingRecord{}, errors.New("physical execution changed before await termination")
+			}
 		}
 	}
 	waiting := releasing
@@ -206,9 +229,13 @@ func (r ExecutionRelinquisher) currentPhysical(ctx context.Context, record Waiti
 	return execution, true, nil
 }
 
-func (r ExecutionRelinquisher) recordPhysicalTeardown(ctx context.Context, execution PhysicalExecution, found bool, update func(*PhysicalExecutionTeardown)) (PhysicalExecution, error) {
+func (r ExecutionRelinquisher) recordPhysicalTeardown(ctx context.Context, execution PhysicalExecution, found bool, step TeardownStep, update func(*PhysicalExecutionTeardown)) (PhysicalExecution, error) {
 	if !found {
 		return execution, nil
+	}
+	if r.Mutations != nil {
+		next, _, err := r.Mutations.AdvanceTeardown(ctx, execution.Key(), execution.Revision, step)
+		return next, err
 	}
 	update(&execution.Teardown)
 	next, swapped, err := r.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), execution.Revision, execution)

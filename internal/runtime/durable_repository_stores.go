@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 )
 
 type sqliteWaitingStore struct{ r *SQLiteRuntimeStateRepository }
+
+var runtimeEventSequence atomic.Uint64
 
 func (s sqliteWaitingStore) Create(ctx context.Context, v WaitingRecord) (WaitingRecord, error) {
 	if err := v.Validate(); err != nil {
@@ -426,7 +429,7 @@ func (s sqliteOutputStore) CompareAndSwap(ctx context.Context, k PhaseOutputKey,
 }
 
 func appendEvent(ctx context.Context, tx *sql.Tx, typ string, k WaitingKey, epoch ExecutionEpoch, aggregate string, rev int64, payload []byte) error {
-	id := fmt.Sprintf("evt-%d", time.Now().UnixNano())
+	id := fmt.Sprintf("evt-%d-%d", time.Now().UnixNano(), runtimeEventSequence.Add(1))
 	var ep any = nil
 	if epoch > 0 {
 		ep = int(epoch)

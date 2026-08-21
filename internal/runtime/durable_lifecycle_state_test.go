@@ -52,7 +52,7 @@ func TestDurableLifecycleStateColdReopenRetainsEveryM4LogicalAuthority(t *testin
 	if _, _, err := state.Receipts.PutIfAbsent(ctx, executionreceipt.Receipt{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation, ExecutionEpoch: 1, BindingRef: "binding-r4", InputRevision: "input-r4", PackageDigest: "digest-a", SessionIdentity: "matrix:room-a", Consumed: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := state.Outputs.PutIfAbsent(ctx, PhaseOutputRecord{Key: PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}, BindingRef: "binding-r4", InputRevision: "input-r4", ExecutionEpoch: 1, Output: phaseagent.PhaseOutput{Summary: "accepted"}}); err != nil {
+	if _, _, err := state.Outputs.PutIfAbsent(ctx, PhaseOutputRecord{Key: PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}, BindingRef: "binding-r4", InputRevision: "input-r4", ExecutionEpoch: 1, Output: phaseagent.PhaseOutput{ReportRef: "accepted"}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := repository.Close(); err != nil {
@@ -87,7 +87,7 @@ func TestDurableLifecycleStateColdReopenRetainsEveryM4LogicalAuthority(t *testin
 	if got, found, err := recovered.Receipts.Get(ctx, executionreceipt.Key{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation, ExecutionEpoch: 1}); err != nil || !found || !got.Consumed {
 		t.Fatalf("receipt recovery = %#v, found=%t, err=%v", got, found, err)
 	}
-	if got, found, err := recovered.Outputs.Get(ctx, PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}); err != nil || !found || got.Output.Summary != "accepted" {
+	if got, found, err := recovered.Outputs.Get(ctx, PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}); err != nil || !found || got.Output.ReportRef != "accepted" {
 		t.Fatalf("output recovery = %#v, found=%t, err=%v", got, found, err)
 	}
 }

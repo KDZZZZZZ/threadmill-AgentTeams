@@ -477,6 +477,66 @@ func TestDurableCompletionSeamConcurrentConflictFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDurableCompletionTeardownResumesAfterColdReopen(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "runtime.db")
+	c, repo, ports, _ := durableCompletionFixtureAt(t, databasePath)
+	ports.failOnce = "mcp"
+	output := phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}
+	if err := c.SubmitPhaseOutput(context.Background(), output); err == nil {
+		t.Fatal("expected cleanup failure")
+	}
+	key := PhysicalExecutionKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3, ExecutionEpoch: 2}
+	execution, found, err := repo.PhysicalExecutionStore().Get(context.Background(), key)
+	if err != nil || !found || execution.State != PhysicalExecutionTearingDown || !execution.Teardown.TeamHarnessTaskCancelled || !execution.Teardown.WorkerDeleted || execution.Teardown.MCPCleaned {
+		t.Fatalf("partial durable teardown=%#v err=%v", execution, err)
+	}
+	if err = repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteRuntimeStateRepository(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	state, err := NewDurableLifecycleState(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	portsAfterReopen, eventsAfterReopen := &completionPorts{}, &completionEvents{}
+	coordinator := durableCompletionCoordinator(state, WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}, phaseagent.PhaseEndpointRef{TaskID: "task-d", EndpointID: "execute"}, portsAfterReopen, eventsAfterReopen)
+	if err = coordinator.RetryCompletion(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(portsAfterReopen.calls, []string{"mcp", "credential", "lease"}) {
+		t.Fatalf("reopen repeated completed cleanup: %v", portsAfterReopen.calls)
+	}
+	if len(eventsAfterReopen.values) != 0 {
+		t.Fatalf("legacy event replay=%v", eventsAfterReopen.values)
+	}
+	execution, found, err = reopened.PhysicalExecutionStore().Get(context.Background(), key)
+	if err != nil || !found || execution.State != PhysicalExecutionTerminated || !allTeardownStepsDone(execution.Teardown) {
+		t.Fatalf("reopen did not terminate=%#v err=%v", execution, err)
+	}
+	events, err := reopened.ListRuntimeEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var submitted, started, terminated int
+	for _, event := range events {
+		switch event.EventType {
+		case "PhaseOutputSubmitted":
+			submitted++
+		case "PhysicalExecutionTeardownStarted":
+			started++
+		case "PhysicalExecutionTerminated":
+			terminated++
+		}
+	}
+	if submitted != 1 || started != 1 || terminated != 1 {
+		t.Fatalf("unexpected reopen outbox submitted=%d started=%d terminated=%d", submitted, started, terminated)
+	}
+}
+
 func TestPhaseOutputCompletionRejectsStaleIdentityAndCASConflictBeforeTeardown(t *testing.T) {
 	c, waiting, physical, _, _, ports, _, _ := completionFixture(t)
 	c.Binding.InputRevision = "input-r4"

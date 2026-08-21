@@ -20,6 +20,7 @@ type LifecycleMutationStore interface {
 	RecordPackageConsumption(context.Context, executionreceipt.Receipt, PhysicalExecutionKey, int64) (executionreceipt.Receipt, PhysicalExecution, bool, error)
 	ActivatePhysicalExecution(context.Context, WaitingKey, int64, PhysicalExecutionKey, int64) (WaitingRecord, PhysicalExecution, bool, error)
 	AcceptPhaseOutput(context.Context, PhaseOutputRecord, WaitingKey, int64) (PhaseOutputRecord, WaitingRecord, bool, error)
+	AdvanceTeardown(context.Context, PhysicalExecutionKey, int64, TeardownStep) (PhysicalExecution, bool, error)
 }
 
 type sqliteLifecycleMutations struct{ r *SQLiteRuntimeStateRepository }
@@ -380,4 +381,97 @@ func (s sqliteLifecycleMutations) AcceptPhaseOutput(ctx context.Context, output 
 		return PhaseOutputRecord{}, WaitingRecord{}, false, err
 	}
 	return output, waiting, true, tx.Commit()
+}
+
+// AdvanceTeardown records exactly one intent, completed external cleanup step,
+// or final termination. Callers must invoke the external side effect outside
+// this transaction and only then advance its matching completion step.
+func (s sqliteLifecycleMutations) AdvanceTeardown(ctx context.Context, key PhysicalExecutionKey, expected int64, step TeardownStep) (PhysicalExecution, bool, error) {
+	if key.TaskID == "" || key.InvocationID == "" || key.Generation <= 0 || key.ExecutionEpoch <= 0 {
+		return PhysicalExecution{}, false, errors.New("physical execution identity is required")
+	}
+	tx, err := s.r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	defer tx.Rollback()
+	var payload []byte
+	err = tx.QueryRowContext(ctx, "SELECT payload FROM runtime_physical_executions WHERE task_id=? AND invocation_id=? AND generation=? AND execution_epoch=? AND revision=?", key.TaskID, key.InvocationID, key.Generation, key.ExecutionEpoch, expected).Scan(&payload)
+	if isNoRows(err) {
+		return PhysicalExecution{}, false, ErrCompletionConflict
+	}
+	if err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	var execution PhysicalExecution
+	if err = jsonUnmarshal(payload, &execution); err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	if execution.Key() != key {
+		return PhysicalExecution{}, false, errors.New("physical execution key does not match record")
+	}
+	changed := false
+	eventType := ""
+	switch step {
+	case TeardownStepBegin:
+		if execution.State == PhysicalExecutionTearingDown || execution.State == PhysicalExecutionTerminated {
+			return execution, false, tx.Commit()
+		}
+		if execution.State != PhysicalExecutionRunning {
+			return PhysicalExecution{}, false, ErrStaleCompletion
+		}
+		execution.State = PhysicalExecutionTearingDown
+		eventType = "PhysicalExecutionTeardownStarted"
+		changed = true
+	case TeardownStepTerminate:
+		if execution.State == PhysicalExecutionTerminated {
+			return execution, false, tx.Commit()
+		}
+		if execution.State != PhysicalExecutionTearingDown || !allTeardownStepsDone(execution.Teardown) {
+			return PhysicalExecution{}, false, ErrStaleCompletion
+		}
+		execution.State = PhysicalExecutionTerminated
+		eventType = "PhysicalExecutionTerminated"
+		changed = true
+	case TeardownStepTask, TeardownStepWorker, TeardownStepMCP, TeardownStepCredential, TeardownStepToken, TeardownStepLease:
+		if execution.State == PhysicalExecutionTerminated {
+			if teardownStepDone(execution.Teardown, step) {
+				return execution, false, tx.Commit()
+			}
+			return PhysicalExecution{}, false, ErrStaleCompletion
+		}
+		if execution.State != PhysicalExecutionTearingDown {
+			return PhysicalExecution{}, false, ErrStaleCompletion
+		}
+		if teardownStepDone(execution.Teardown, step) {
+			return execution, false, tx.Commit()
+		}
+		if err = markTeardownStep(&execution.Teardown, step); err != nil {
+			return PhysicalExecution{}, false, err
+		}
+		eventType = "PhysicalExecutionTeardownStepCompleted"
+		changed = true
+	default:
+		return PhysicalExecution{}, false, errors.New("unknown teardown step")
+	}
+	if !changed {
+		return execution, false, tx.Commit()
+	}
+	execution.Revision++
+	execution.UpdatedAt = nowUTC()
+	payload, err = runtimeJSON(execution)
+	if err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	if err = noSecrets(payload); err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE runtime_physical_executions SET revision=?,state=?,payload=? WHERE task_id=? AND invocation_id=? AND generation=? AND execution_epoch=? AND revision=?", execution.Revision, execution.State, payload, key.TaskID, key.InvocationID, key.Generation, key.ExecutionEpoch, expected); err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	waitingKey := WaitingKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}
+	if err = appendEvent(ctx, tx, eventType, waitingKey, key.ExecutionEpoch, "physical_teardown", execution.Revision, payload); err != nil {
+		return PhysicalExecution{}, false, err
+	}
+	return execution, true, tx.Commit()
 }

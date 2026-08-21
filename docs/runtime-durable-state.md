@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-C2-5。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
+状态：M5-C2-6。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
 
 ## 1. Authority 与边界
 
@@ -49,4 +49,8 @@ M5-C2-5 将正式 PhaseOutput acceptance 收敛为 repository-owned transaction�
 
 关闭并重新打开 repository 后，PhaseOutput、terminal WaitingRecord 和唯一 outbox event 仍是同一 acceptance 的 recovery authority；重开本身不重新提交 output、不重新发 success event，也不自动启动 logical completion。`PhaseOutputCompletionCoordinator` 在配置 durable mutation seam 时不再使用旧的 output → external event → Waiting CAS 分步 authority；只有该 transaction 成功后才进入现有 normal cleanup。
 
-本 slice **不**持久化 teardown progress，也不承诺 restart 后继续 cleanup、`tearing_down` → `terminated` recovery 或 external cleanup side-effect deduplication。这些 durable teardown/retry/recovery contract 明确留给 M5-C2-6；C2-5 只保证 acceptance failure 不会开始 teardown。
+M5-C2-6 将 normal completion 与 await relinquish 的 PhysicalExecution cleanup 接入 `LifecycleMutationStore.AdvanceTeardown`。它以 physical key + expected revision 围栏，且每次 transaction 只持久化一个动作：`running` → `tearing_down` intent、一个已成功外部副作用的 redacted step completion，或在全部六个 step 已完成后 `tearing_down` → `terminated`。每一动作与对应 outbox event 原子写入；identity、state、revision 或 outbox failure 都回滚，不会留下 progress/event 半状态。已持久化的 step retry 返回既有记录且不产生第二个 success event。
+
+外部 cleanup 始终在 transaction 外，顺序保持 task → Worker → MCP → credential → token → workspace lease。Runtime 先 durable-record `tearing_down` intent，再调用外部 idempotent port；调用成功后才 durable-record 该 step。进程在两者之间退出时，新的 Runtime 从 PhysicalExecution teardown flags 读取第一个未完成 step 并可能重新调用该 idempotent effect；一旦 completion flag 已提交，cold reopen/retry 绝不重做它。final termination 只在全部 step flags 已提交后记录。opaque authorization/binding/credential refs 可以重新解析；raw token、credential、private header、controller auth、provider conversation 和旧 QwenPaw session 都不进入 database，旧 session 永远不会恢复。
+
+Runtime snapshots/records 仍是 recovery authority；outbox 仅用于 audit、projection 和后续 reconciliation input。Worker/task/runtime.yaml 与 QwenPaw session 只能作为 execution-plane observed evidence，不能反推下一 cleanup step。C2-6 不实现 distributed leader election：SQLite 单 writer + revision CAS 使同一 expected revision 只有一个 teardown claimant 成功；其他 claimant 必须 reload/retry。restart recovery 只继续 cleanup，不重新接受 PhaseOutput、不重新发 `PhaseOutputSubmitted`，也不重放 agent work。

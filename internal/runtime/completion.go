@@ -165,9 +165,14 @@ func (c *PhaseOutputCompletionCoordinator) SubmitPhaseOutput(ctx context.Context
 		if getErr != nil || !found {
 			return ErrStaleCompletion
 		}
-		_, _, _, err := c.Mutations.AcceptPhaseOutput(ctx, candidate, waiting.Key, waiting.Revision)
+		_, _, created, err := c.Mutations.AcceptPhaseOutput(ctx, candidate, waiting.Key, waiting.Revision)
 		if err != nil {
 			return err
+		}
+		// An already-authoritative output never starts a second teardown
+		// claimant. RetryCompletion is the sole explicit recovery entrypoint.
+		if !created {
+			return nil
 		}
 		return c.finalize(ctx)
 	}
@@ -242,6 +247,9 @@ func (c *PhaseOutputCompletionCoordinator) RetryCompletion(ctx context.Context) 
 }
 
 func (c *PhaseOutputCompletionCoordinator) finalize(ctx context.Context) error {
+	if c.Mutations != nil {
+		return c.finalizeDurable(ctx)
+	}
 	key := WaitingKey{TaskID: c.Binding.TaskID, InvocationID: c.Binding.InvocationID, Generation: c.Binding.Generation}
 	waiting, found, err := c.Waiting.Get(ctx, key)
 	if err != nil || !found {
@@ -329,6 +337,75 @@ func (c *PhaseOutputCompletionCoordinator) finalize(ctx context.Context) error {
 		return ErrCompletionConflict
 	}
 	return nil
+}
+
+// finalizeDurable intentionally keeps external effects outside SQLite while
+// making intent and each successful completion durable. A crash after an
+// effect but before its progress commit may repeat that idempotent effect;
+// once progress is committed, later retries skip it.
+func (c *PhaseOutputCompletionCoordinator) finalizeDurable(ctx context.Context) error {
+	key := WaitingKey{TaskID: c.Binding.TaskID, InvocationID: c.Binding.InvocationID, Generation: c.Binding.Generation}
+	waiting, found, err := c.Waiting.Get(ctx, key)
+	if err != nil || !found || waiting.State != AwaitStateTerminal {
+		return ErrStaleCompletion
+	}
+	physicalKey := PhysicalExecutionKey{TaskID: c.Binding.TaskID, InvocationID: c.Binding.InvocationID, Generation: c.Binding.Generation, ExecutionEpoch: ExecutionEpoch(c.Binding.ExecutionEpoch)}
+	execution, found, err := c.PhysicalExecutions.Get(ctx, physicalKey)
+	if err != nil || !found || execution.BindingRef != c.Binding.BindingRef || execution.InputRevision != c.Binding.InputRevision {
+		return ErrStaleCompletion
+	}
+	if execution.State == PhysicalExecutionTerminated {
+		return nil
+	}
+	if execution.State == PhysicalExecutionRunning {
+		execution, _, err = c.Mutations.AdvanceTeardown(ctx, physicalKey, execution.Revision, TeardownStepBegin)
+		if err != nil {
+			return err
+		}
+	}
+	if execution.State != PhysicalExecutionTearingDown {
+		return ErrStaleCompletion
+	}
+	steps := []struct {
+		step TeardownStep
+		run  func() error
+	}{
+		{TeardownStepTask, func() error {
+			return c.Tasks.CompleteTeamHarnessTask(ctx, TeamHarnessTask{ID: execution.TeamHarnessTaskID, AssignedTo: execution.TeamHarnessAssignedTo})
+		}},
+		{TeardownStepWorker, func() error {
+			return c.Workers.DeleteWorker(ctx, ProvisionedWorker{ID: execution.WorkerID, Name: execution.WorkerName, MCPClientID: execution.MCPClientID, RuntimeGeneration: execution.DesiredRuntimeGeneration})
+		}},
+		{TeardownStepMCP, func() error {
+			return c.MCP.CleanupWorkerMCP(ctx, ProvisionedWorker{ID: execution.WorkerID, Name: execution.WorkerName, MCPClientID: execution.MCPClientID, RuntimeGeneration: execution.DesiredRuntimeGeneration})
+		}},
+		{TeardownStepCredential, func() error {
+			return c.Credentials.RevokeMCPCredential(ctx, MCPCredentialBinding{Ref: execution.CredentialBindingRef, WorkerName: execution.WorkerName})
+		}},
+		{TeardownStepToken, func() error { c.Bindings.RevokeBinding(c.Binding); return nil }},
+		{TeardownStepLease, func() error {
+			return c.Leases.ReleaseWorkspaceLease(ctx, WorkspaceLease{Ref: execution.WorkspaceLeaseRef, Epoch: execution.ExecutionEpoch})
+		}},
+	}
+	for _, item := range steps {
+		if teardownStepDone(execution.Teardown, item.step) {
+			continue
+		}
+		if err := item.run(); err != nil {
+			return err
+		}
+		execution, _, err = c.Mutations.AdvanceTeardown(ctx, physicalKey, execution.Revision, item.step)
+		if err != nil {
+			return err
+		}
+	}
+	if c.TransientExecutions != nil {
+		if err := c.TransientExecutions.ReleaseTransientExecution(ctx, execution); err != nil {
+			return err
+		}
+	}
+	_, _, err = c.Mutations.AdvanceTeardown(ctx, physicalKey, execution.Revision, TeardownStepTerminate)
+	return err
 }
 
 func (c *PhaseOutputCompletionCoordinator) validate() error {
