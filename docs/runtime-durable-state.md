@@ -41,3 +41,5 @@ M4 的 InMemory stores 继续保留给 unit tests 和 single-process fixture。M
 M5-C1 将上述七类 M4 logical-state seam 收敛为 `DurableLifecycleState`：同一 repository 同时提供 Waiting、Continuation、immutable input/binding（含 cold-reopen 读取）、PhysicalExecution、receipt 和 PhaseOutput store，禁止 recovery path 混用 durable 与 process-local authority。协调器继续接收既有窄接口，因而不改变 `phaseagent` public API；InMemory store 仍只用于 unit tests 和显式 fixture。
 
 后续 M5-C2/D 才补齐 input/binding/continuation 事件 outbox、recovery claim、partial-teardown retry、stale carrier fencing 和 restart reconciliation；QwenPaw session 始终 disposable，任何新 carrier 都必须重新 materialize context/workspace/memory 并获得新 capability material。
+
+M5-C2-4 将 rehydrated activation 收敛为 repository-owned transaction：receipt 已确认的 epoch PhysicalExecution 从 `accepted` 转为 `running` 时，WaitingRecord 同时从 `rehydrating` 转为 `running`，并写入唯一 `PhysicalExecutionActivated` outbox event。任何 CAS、identity、state 或 outbox failure 都 rollback 两个 snapshot；相同已完成 activation 的 retry 是幂等的。外部 carrier 创建仍在 transaction 外，Runtime snapshot 仍是 recovery authority；outbox 仅供 audit、projection 与后续 reconciliation input。

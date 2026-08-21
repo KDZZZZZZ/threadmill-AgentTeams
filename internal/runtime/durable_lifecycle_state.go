@@ -22,6 +22,7 @@ type DurableLifecycleState struct {
 	PhysicalExecutions PhysicalExecutionStore
 	Receipts           executionreceipt.Store
 	Outputs            PhaseOutputStore
+	Mutations          LifecycleMutationStore
 }
 
 // NewDurableLifecycleState wires every M4 logical-state authority to the same
@@ -39,8 +40,9 @@ func NewDurableLifecycleState(repository RuntimeStateRepository) (DurableLifecyc
 		PhysicalExecutions: repository.PhysicalExecutionStore(),
 		Receipts:           repository.ReceiptStore(),
 		Outputs:            repository.PhaseOutputStore(),
+		Mutations:          repository.LifecycleMutations(),
 	}
-	if state.Waiting == nil || state.Continuations == nil || state.Inputs == nil || state.PhysicalExecutions == nil || state.Receipts == nil || state.Outputs == nil {
+	if state.Waiting == nil || state.Continuations == nil || state.Inputs == nil || state.PhysicalExecutions == nil || state.Receipts == nil || state.Outputs == nil || state.Mutations == nil {
 		return DurableLifecycleState{}, errors.New("runtime state repository returned an incomplete lifecycle authority")
 	}
 	return state, nil

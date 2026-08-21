@@ -15,6 +15,7 @@ import (
 type PackageConsumptionCoordinator struct {
 	Store              executionreceipt.Store
 	PhysicalExecutions PhysicalExecutionStore
+	Mutations          LifecycleMutationStore
 	PollInterval       time.Duration
 }
 
@@ -51,11 +52,16 @@ func (c *PackageConsumptionCoordinator) ConfirmPackageConsumption(ctx context.Co
 			if !strings.HasPrefix(execution.AgentSessionRef, "matrix:") || (submission.SessionIdentity != "" && submission.SessionIdentity != execution.AgentSessionRef) {
 				return executionreceipt.Receipt{}, errors.New("session identity does not match authoritative Matrix session")
 			}
-			receipt, _, err := c.Store.PutIfAbsent(ctx, executionreceipt.Receipt{
+			candidate := executionreceipt.Receipt{
 				TaskID: binding.TaskID, InvocationID: binding.InvocationID, Generation: binding.Generation,
 				ExecutionEpoch: binding.ExecutionEpoch, BindingRef: binding.BindingRef, InputRevision: binding.InputRevision,
 				PackageDigest: submission.PackageDigest, SessionIdentity: execution.AgentSessionRef, Consumed: true,
-			})
+			}
+			if c.Mutations != nil {
+				receipt, _, _, err := c.Mutations.RecordPackageConsumption(ctx, candidate, key, execution.Revision)
+				return receipt, err
+			}
+			receipt, _, err := c.Store.PutIfAbsent(ctx, candidate)
 			return receipt, err
 		}
 		timer := time.NewTimer(interval)

@@ -27,6 +27,7 @@ type RuntimeStateRepository interface {
 	PhysicalExecutionStore() PhysicalExecutionStore
 	ReceiptStore() executionreceipt.Store
 	PhaseOutputStore() PhaseOutputStore
+	LifecycleMutations() LifecycleMutationStore
 	ListRuntimeEvents(context.Context) ([]RuntimeEvent, error)
 }
 
@@ -108,6 +109,9 @@ func (r *SQLiteRuntimeStateRepository) ReceiptStore() executionreceipt.Store {
 }
 func (r *SQLiteRuntimeStateRepository) PhaseOutputStore() PhaseOutputStore {
 	return sqliteOutputStore{r}
+}
+func (r *SQLiteRuntimeStateRepository) LifecycleMutations() LifecycleMutationStore {
+	return sqliteLifecycleMutations{r}
 }
 
 func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {

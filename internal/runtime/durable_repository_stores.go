@@ -71,6 +71,15 @@ func (s sqliteWaitingStore) CompareAndSwap(ctx context.Context, k WaitingKey, ol
 		return WaitingRecord{}, false, e
 	}
 	defer tx.Rollback()
+	var currentState AwaitState
+	if e = tx.QueryRowContext(ctx, "SELECT state FROM runtime_waiting WHERE task_id=? AND invocation_id=? AND generation=? AND revision=?", k.TaskID, k.InvocationID, k.Generation, old).Scan(&currentState); errors.Is(e, sql.ErrNoRows) {
+		return WaitingRecord{}, false, nil
+	} else if e != nil {
+		return WaitingRecord{}, false, e
+	}
+	if !validAwaitTransition(currentState, v.State) {
+		return WaitingRecord{}, false, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, currentState, v.State)
+	}
 	res, e := tx.ExecContext(ctx, "UPDATE runtime_waiting SET revision=?,state=?,payload=? WHERE task_id=? AND invocation_id=? AND generation=? AND revision=?", v.Revision, v.State, b, k.TaskID, k.InvocationID, k.Generation, old)
 	if e != nil {
 		return WaitingRecord{}, false, e
@@ -241,6 +250,12 @@ func (s sqlitePhysicalStore) Get(ctx context.Context, k PhysicalExecutionKey) (P
 	return v, e == nil, e
 }
 func (s sqlitePhysicalStore) CompareAndSwap(ctx context.Context, k PhysicalExecutionKey, old int64, v PhysicalExecution) (PhysicalExecution, bool, error) {
+	if v.Key() != k {
+		return PhysicalExecution{}, false, errors.New("physical execution key cannot change")
+	}
+	if e := validatePhysicalExecution(v); e != nil {
+		return PhysicalExecution{}, false, e
+	}
 	v.Revision = old + 1
 	v.UpdatedAt = time.Now().UTC()
 	b, _ := runtimeJSON(v)

@@ -292,6 +292,7 @@ type PhysicalExecutionProvisioner struct {
 	Tasks               TeamHarnessTaskProvisioner
 	Packages            RehydratedExecutionPackageMaterializer
 	Receipts            executionreceipt.Store
+	Mutations           LifecycleMutationStore
 	ReceiptPollInterval time.Duration
 	MCPName             string
 	MCPURL              string
@@ -421,17 +422,34 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if err := p.waitForPackageConsumption(ctx, execution); err != nil {
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
 	}
-	execution.PackageConsumed = true
-	updated, swapped, err = p.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), execution.Revision, execution)
-	if err != nil || !swapped {
-		if err == nil {
-			err = errors.New("physical execution receipt record changed concurrently")
+	if p.Mutations == nil {
+		execution.PackageConsumed = true
+		updated, swapped, err = p.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), execution.Revision, execution)
+		if err != nil || !swapped {
+			if err == nil {
+				err = errors.New("physical execution receipt record changed concurrently")
+			}
+			return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
 		}
-		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
+		execution = updated
+	} else {
+		execution, _, err = p.PhysicalExecutions.Get(ctx, execution.Key())
+		if err != nil || !execution.PackageConsumed {
+			return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, errors.New("durable receipt did not mark physical execution consumed"))
+		}
 	}
-	execution = updated
 	if !ValidatePhysicalExecutionReady(execution) {
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, errors.New("physical execution is not ready for logical activation"))
+	}
+	if p.Mutations != nil {
+		_, updated, activated, activationErr := p.Mutations.ActivatePhysicalExecution(ctx, WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation}, plan.ExpectedWaitingRevision, execution.Key(), execution.Revision)
+		if activationErr != nil || !activated {
+			if activationErr == nil {
+				activationErr = ErrProvisionConflict
+			}
+			return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, activationErr)
+		}
+		return updated, nil
 	}
 	if err := p.commit(ctx, plan); err != nil {
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
