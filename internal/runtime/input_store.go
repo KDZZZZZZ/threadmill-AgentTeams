@@ -108,6 +108,11 @@ func (s *InMemoryContinuationBindingStore) Resolve(bindingRef string) (Continuat
 	return value, ok
 }
 
+func (s *InMemoryContinuationBindingStore) ResolveContinuationBinding(_ context.Context, bindingRef string) (ContinuationBinding, bool, error) {
+	value, found := s.Resolve(bindingRef)
+	return value, found, nil
+}
+
 func newlyDelivered(previous, current []phaseagent.InputDelivery) []phaseagent.InputDelivery {
 	seen := make(map[string]struct{}, len(previous))
 	for _, delivery := range previous {

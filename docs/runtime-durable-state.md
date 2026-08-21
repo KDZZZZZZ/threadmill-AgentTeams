@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-B MVP。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
+状态：M5-C1。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
 
 ## 1. Authority 与边界
 
@@ -38,4 +38,6 @@ event envelope 包含 EventID、EventType、occurredAt、TaskID、InvocationID�
 
 M4 的 InMemory stores 继续保留给 unit tests 和 single-process fixture。M5-B 只保证 fresh repository instance 可以 cold-load durable facts，并继续执行 CAS；它不创建 Worker、重新签 token/credential、重放 QwenPaw session、reconcile Controller，或决定应继续/rollback/recreate carrier。
 
-M5-C/D 才根据这些 records 实现 recovery claim、partial-teardown retry、stale carrier fencing 和 restart reconciliation；QwenPaw session 始终 disposable，任何新 carrier 都必须重新 materialize context/workspace/memory 并获得新 capability material。
+M5-C1 将上述七类 M4 logical-state seam 收敛为 `DurableLifecycleState`：同一 repository 同时提供 Waiting、Continuation、immutable input/binding（含 cold-reopen 读取）、PhysicalExecution、receipt 和 PhaseOutput store，禁止 recovery path 混用 durable 与 process-local authority。协调器继续接收既有窄接口，因而不改变 `phaseagent` public API；InMemory store 仍只用于 unit tests 和显式 fixture。
+
+后续 M5-C2/D 才补齐 input/binding/continuation 事件 outbox、recovery claim、partial-teardown retry、stale carrier fencing 和 restart reconciliation；QwenPaw session 始终 disposable，任何新 carrier 都必须重新 materialize context/workspace/memory 并获得新 capability material。

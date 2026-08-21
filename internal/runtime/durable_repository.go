@@ -42,6 +42,7 @@ type DurableContinuationStore interface {
 type DurablePhaseInputStore interface {
 	RehydrationInputResolver
 	InputContinuationRebinder
+	ContinuationBindingResolver
 	Put(context.Context, WaitingKey, StoredPhaseInputSet) error
 }
 

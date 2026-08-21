@@ -184,6 +184,22 @@ func (s sqliteInputStore) RebindInputsForContinuation(ctx context.Context, v Con
 	return v, e
 }
 
+func (s sqliteInputStore) ResolveContinuationBinding(ctx context.Context, bindingRef string) (ContinuationBinding, bool, error) {
+	var b []byte
+	e := s.r.db.QueryRowContext(ctx, "SELECT payload FROM runtime_bindings WHERE binding_ref=?", bindingRef).Scan(&b)
+	if errors.Is(e, sql.ErrNoRows) {
+		return ContinuationBinding{}, false, nil
+	}
+	if e != nil {
+		return ContinuationBinding{}, false, e
+	}
+	var v ContinuationBinding
+	if e = json.Unmarshal(b, &v); e != nil {
+		return ContinuationBinding{}, false, e
+	}
+	return v, true, nil
+}
+
 type sqlitePhysicalStore struct{ r *SQLiteRuntimeStateRepository }
 
 func (s sqlitePhysicalStore) Create(ctx context.Context, v PhysicalExecution) (PhysicalExecution, error) {

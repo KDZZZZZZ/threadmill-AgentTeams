@@ -25,6 +25,12 @@ type InputContinuationRebinder interface {
 	RebindInputsForContinuation(context.Context, ContinuationBinding) (ContinuationBinding, error)
 }
 
+// ContinuationBindingResolver reads immutable binding history after a Runtime
+// process is reopened. It exposes only logical identifiers and revisions.
+type ContinuationBindingResolver interface {
+	ResolveContinuationBinding(context.Context, string) (ContinuationBinding, bool, error)
+}
+
 // ValidateContinuationRebind enforces the await-specific invariant: new
 // inputs require a new BindingRef while logical InvocationID and generation
 // remain stable. Checkpoint resume is deliberately outside this contract.
