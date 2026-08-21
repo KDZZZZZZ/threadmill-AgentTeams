@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +14,39 @@ import (
 	phasemcp "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mcp/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
+
+func durableCompletionFixture(t *testing.T) (*PhaseOutputCompletionCoordinator, *SQLiteRuntimeStateRepository, *completionPorts, *completionEvents) {
+	t.Helper()
+	return durableCompletionFixtureAt(t, filepath.Join(t.TempDir(), "runtime.db"))
+}
+
+func durableCompletionFixtureAt(t *testing.T, databasePath string) (*PhaseOutputCompletionCoordinator, *SQLiteRuntimeStateRepository, *completionPorts, *completionEvents) {
+	t.Helper()
+	ctx := context.Background()
+	repo, err := OpenSQLiteRuntimeStateRepository(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewDurableLifecycleState(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}
+	endpoint := phaseagent.PhaseEndpointRef{TaskID: key.TaskID, EndpointID: "execute"}
+	if _, err = state.Waiting.Create(ctx, WaitingRecord{Key: key, ExecutionEpoch: 2, Endpoint: endpoint, PreviousBindingRef: "binding-b2", InputRevision: "input-r5", ContinuationRef: "c", State: AwaitStateRunning, WorkspaceRef: "workspace-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = state.PhysicalExecutions.Create(ctx, PhysicalExecution{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation, ExecutionEpoch: 2, WorkerID: "worker-b", WorkerName: "worker-b", TeamHarnessTaskID: "task-b", TeamHarnessAssignedTo: "worker-b", BindingRef: "binding-b2", InputRevision: "input-r5", AgentSessionRef: "matrix:!room:test", AgentPackageDigest: "digest", PackageConsumed: true, MCPClientID: "threadmill", CredentialBindingRef: "credential-b", DesiredRuntimeGeneration: 1, AppliedRuntimeGeneration: 1, WorkspaceLeaseRef: "lease-b", ExecutionAuthorizationRef: "auth-b", State: PhysicalExecutionRunning, ObservedTaskStatus: "in_progress", TaskAcknowledged: true}); err != nil {
+		t.Fatal(err)
+	}
+	ports, events := &completionPorts{}, &completionEvents{}
+	return durableCompletionCoordinator(state, key, endpoint, ports, events), repo, ports, events
+}
+
+func durableCompletionCoordinator(state DurableLifecycleState, key WaitingKey, endpoint phaseagent.PhaseEndpointRef, ports *completionPorts, events *completionEvents) *PhaseOutputCompletionCoordinator {
+	binding := phasemcp.InvocationBinding{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation, ExecutionEpoch: 2, Endpoint: endpoint, BindingRef: "binding-b2", InputRevision: "input-r5", Role: phaseagent.PhaseExecute, Capabilities: phaseagent.PhaseCapabilities{AllowOutputSubmission: true}}
+	return &PhaseOutputCompletionCoordinator{Binding: binding, Delegate: noopRuntime{}, Outputs: state.Outputs, Mutations: state.Mutations, Waiting: state.Waiting, PhysicalExecutions: state.PhysicalExecutions, Events: events, Tasks: ports, Workers: ports, MCP: ports, Credentials: ports, Bindings: phasemcp.NewBindingRegistry(), Leases: ports}
+}
 
 type completionPorts struct {
 	calls    []string
@@ -62,6 +96,26 @@ func (r *completionEvents) Record(_ context.Context, event artifacts.Event) erro
 type conflictWaitingStore struct {
 	WaitingStore
 	conflict bool
+}
+
+// staleSecondReadWaitingStore makes the coordinator obtain a stale expected
+// revision after validateCurrentExecution has already observed the current
+// record. The durable transaction must reject it without any teardown.
+type staleSecondReadWaitingStore struct {
+	WaitingStore
+	reads int
+}
+
+func (s *staleSecondReadWaitingStore) Get(ctx context.Context, key WaitingKey) (WaitingRecord, bool, error) {
+	record, found, err := s.WaitingStore.Get(ctx, key)
+	if err != nil || !found {
+		return record, found, err
+	}
+	s.reads++
+	if s.reads == 2 && record.Revision > 0 {
+		record.Revision--
+	}
+	return record, found, nil
 }
 
 func (s *conflictWaitingStore) CompareAndSwap(ctx context.Context, key WaitingKey, revision int64, next WaitingRecord) (WaitingRecord, bool, error) {
@@ -132,6 +186,294 @@ func TestPhaseOutputCompletionTerminalizesAndPreservesEvidence(t *testing.T) {
 	}
 	if err := c.SubmitPhaseOutput(context.Background(), phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "different"}); !errors.Is(err, ErrConflictingOutput) {
 		t.Fatalf("conflict=%v", err)
+	}
+}
+
+func TestDurableCompletionSeamAcceptsOnceAndFencesLegacyEventPath(t *testing.T) {
+	c, repo, ports, events := durableCompletionFixture(t)
+	defer repo.Close()
+	output := phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}
+	if err := c.SubmitPhaseOutput(context.Background(), output); err != nil {
+		t.Fatal(err)
+	}
+	if len(events.values) != 0 {
+		t.Fatalf("legacy event path invoked: %#v", events.values)
+	}
+	if len(ports.calls) != 5 {
+		t.Fatalf("cleanup=%v", ports.calls)
+	}
+	if err := c.SubmitPhaseOutput(context.Background(), output); err != nil {
+		t.Fatal(err)
+	}
+	if len(ports.calls) != 5 {
+		t.Fatalf("duplicate cleanup=%v", ports.calls)
+	}
+	if err := c.SubmitPhaseOutput(context.Background(), phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "different"}); !errors.Is(err, ErrConflictingOutput) {
+		t.Fatalf("conflict=%v", err)
+	}
+	eventsOut, err := repo.ListRuntimeEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range eventsOut {
+		if e.EventType == "PhaseOutputSubmitted" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("durable events=%d", n)
+	}
+}
+
+func TestDurableCompletionSeamRejectsStaleAuthorityBeforeTeardown(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*PhaseOutputCompletionCoordinator)
+	}{
+		{"binding", func(c *PhaseOutputCompletionCoordinator) { c.Binding.BindingRef = "stale" }},
+		{"input", func(c *PhaseOutputCompletionCoordinator) { c.Binding.InputRevision = "stale" }},
+		{"generation", func(c *PhaseOutputCompletionCoordinator) { c.Binding.Generation++ }},
+		{"epoch", func(c *PhaseOutputCompletionCoordinator) { c.Binding.ExecutionEpoch++ }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, repo, ports, _ := durableCompletionFixture(t)
+			defer repo.Close()
+			tc.mutate(c)
+			if err := c.SubmitPhaseOutput(context.Background(), phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}); err == nil {
+				t.Fatal("stale authority accepted")
+			}
+			if len(ports.calls) != 0 {
+				t.Fatalf("teardown=%v", ports.calls)
+			}
+			if _, found, err := repo.PhaseOutputStore().Get(context.Background(), PhaseOutputKey{TaskID: c.Binding.TaskID, InvocationID: c.Binding.InvocationID, Generation: c.Binding.Generation}); err != nil || found {
+				t.Fatalf("stale authority persisted output found=%t err=%v", found, err)
+			}
+			waiting, found, err := repo.WaitingStore().Get(context.Background(), WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3})
+			if err != nil || !found || waiting.State != AwaitStateRunning {
+				t.Fatalf("stale authority changed waiting=%#v err=%v", waiting, err)
+			}
+			events, err := repo.ListRuntimeEvents(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range events {
+				if e.EventType == "PhaseOutputSubmitted" {
+					t.Fatal("success outbox recorded")
+				}
+			}
+		})
+	}
+}
+
+func TestDurableCompletionSeamRejectsStaleWaitingRevisionBeforeTeardown(t *testing.T) {
+	c, repo, ports, _ := durableCompletionFixture(t)
+	defer repo.Close()
+	key := WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}
+	c.Waiting = &staleSecondReadWaitingStore{WaitingStore: c.Waiting}
+	if err := c.SubmitPhaseOutput(context.Background(), phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}); !errors.Is(err, ErrCompletionConflict) {
+		t.Fatal("stale revision accepted")
+	}
+	if len(ports.calls) != 0 {
+		t.Fatalf("teardown=%v", ports.calls)
+	}
+	waiting, found, err := repo.WaitingStore().Get(context.Background(), key)
+	if err != nil || !found || waiting.State != AwaitStateRunning {
+		t.Fatalf("stale revision changed waiting: %#v err=%v", waiting, err)
+	}
+	if _, found, err = repo.PhaseOutputStore().Get(context.Background(), PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}); err != nil || found {
+		t.Fatalf("stale revision persisted output found=%t err=%v", found, err)
+	}
+}
+
+func TestDurableCompletionSeamOutboxFailureRollsBackAndDoesNotTeardown(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "runtime.db")
+	c, repo, ports, events := durableCompletionFixtureAt(t, databasePath)
+	if _, err := repo.db.Exec("CREATE TRIGGER reject_output BEFORE INSERT ON runtime_events WHEN NEW.event_type='PhaseOutputSubmitted' BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END"); err != nil {
+		t.Fatal(err)
+	}
+	output := phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}
+	if err := c.SubmitPhaseOutput(context.Background(), output); err == nil {
+		t.Fatal("outbox failure accepted output")
+	}
+	key := WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}
+	waiting, found, err := repo.WaitingStore().Get(context.Background(), key)
+	if err != nil || !found || waiting.State != AwaitStateRunning {
+		t.Fatalf("outbox failure left waiting=%#v err=%v", waiting, err)
+	}
+	if _, found, err = repo.PhaseOutputStore().Get(context.Background(), PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}); err != nil || found {
+		t.Fatalf("outbox failure left output found=%t err=%v", found, err)
+	}
+	if len(ports.calls) != 0 || len(events.values) != 0 {
+		t.Fatalf("failure started teardown or legacy events: calls=%v events=%v", ports.calls, events.values)
+	}
+	runtimeEvents, err := repo.ListRuntimeEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range runtimeEvents {
+		if event.EventType == "PhaseOutputSubmitted" {
+			t.Fatal("outbox failure left success event")
+		}
+	}
+	if err = repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteRuntimeStateRepository(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	waiting, found, err = reopened.WaitingStore().Get(context.Background(), key)
+	if err != nil || !found || waiting.State != AwaitStateRunning {
+		t.Fatalf("reopened rollback waiting=%#v err=%v", waiting, err)
+	}
+	if _, found, err = reopened.PhaseOutputStore().Get(context.Background(), PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}); err != nil || found {
+		t.Fatalf("reopened rollback output found=%t err=%v", found, err)
+	}
+	if _, err = reopened.db.Exec("DROP TRIGGER reject_output"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := NewDurableLifecycleState(reopened)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryPorts, retryEvents := &completionPorts{}, &completionEvents{}
+	c = durableCompletionCoordinator(state, key, phaseagent.PhaseEndpointRef{TaskID: key.TaskID, EndpointID: "execute"}, retryPorts, retryEvents)
+	if err = c.SubmitPhaseOutput(context.Background(), output); err != nil {
+		t.Fatalf("retry after restored outbox: %v", err)
+	}
+	if len(retryPorts.calls) != 5 || len(retryEvents.values) != 0 {
+		t.Fatalf("retry cleanup=%v legacy=%v", retryPorts.calls, retryEvents.values)
+	}
+}
+
+func TestDurableCompletionAcceptanceSurvivesColdReopenWithoutReplay(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "runtime.db")
+	c, repo, _, _ := durableCompletionFixtureAt(t, databasePath)
+	output := phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}
+	if err := c.SubmitPhaseOutput(context.Background(), output); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteRuntimeStateRepository(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	key := WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}
+	waiting, found, err := reopened.WaitingStore().Get(context.Background(), key)
+	if err != nil || !found || waiting.State != AwaitStateTerminal {
+		t.Fatalf("reopened waiting=%#v err=%v", waiting, err)
+	}
+	outputKey := PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}
+	recorded, found, err := reopened.PhaseOutputStore().Get(context.Background(), outputKey)
+	if err != nil || !found || !reflect.DeepEqual(recorded.Output, output) {
+		t.Fatalf("reopened output=%#v err=%v", recorded, err)
+	}
+	events, err := reopened.ListRuntimeEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.EventType == "PhaseOutputSubmitted" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("reopened phase output events=%d", count)
+	}
+	_, _, created, err := reopened.LifecycleMutations().AcceptPhaseOutput(context.Background(), PhaseOutputRecord{Key: outputKey, BindingRef: "binding-b2", InputRevision: "input-r5", ExecutionEpoch: 2, Output: output}, key, waiting.Revision)
+	if err != nil || created {
+		t.Fatalf("reopened duplicate created=%t err=%v", created, err)
+	}
+}
+
+func TestDurableCompletionSeamConcurrentAcceptanceHasOneEvent(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "runtime.db")
+	c1, repo, ports1, events1 := durableCompletionFixtureAt(t, databasePath)
+	defer repo.Close()
+	state, err := NewDurableLifecycleState(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}
+	endpoint := phaseagent.PhaseEndpointRef{TaskID: key.TaskID, EndpointID: "execute"}
+	ports2, events2 := &completionPorts{}, &completionEvents{}
+	c2 := durableCompletionCoordinator(state, key, endpoint, ports2, events2)
+	output := phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "report"}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, coordinator := range []*PhaseOutputCompletionCoordinator{c1, c2} {
+		go func(coordinator *PhaseOutputCompletionCoordinator) {
+			<-start
+			errs <- coordinator.SubmitPhaseOutput(context.Background(), output)
+		}(coordinator)
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("identical concurrent acceptance: %v", err)
+		}
+	}
+	if len(ports1.calls)+len(ports2.calls) != 5 || len(events1.values)+len(events2.values) != 0 {
+		t.Fatalf("duplicate effects ports=%v/%v legacy=%v/%v", ports1.calls, ports2.calls, events1.values, events2.values)
+	}
+	events, err := repo.ListRuntimeEvents(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.EventType == "PhaseOutputSubmitted" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("identical concurrent events=%d", count)
+	}
+}
+
+func TestDurableCompletionSeamConcurrentConflictFailsClosed(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "runtime.db")
+	c1, repo, ports1, _ := durableCompletionFixtureAt(t, databasePath)
+	defer repo.Close()
+	state, err := NewDurableLifecycleState(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := WaitingKey{TaskID: "task-d", InvocationID: "inv-d", Generation: 3}
+	ports2 := &completionPorts{}
+	c2 := durableCompletionCoordinator(state, key, phaseagent.PhaseEndpointRef{TaskID: key.TaskID, EndpointID: "execute"}, ports2, &completionEvents{})
+	start := make(chan struct{})
+	type result struct{ err error }
+	results := make(chan result, 2)
+	go func() {
+		<-start
+		results <- result{c1.SubmitPhaseOutput(context.Background(), phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "one"})}
+	}()
+	go func() {
+		<-start
+		results <- result{c2.SubmitPhaseOutput(context.Background(), phaseagent.PhaseOutput{Phase: phaseagent.PhaseExecute, ReportRef: "two"})}
+	}()
+	close(start)
+	var successes, conflicts int
+	for range 2 {
+		result := <-results
+		if result.err == nil {
+			successes++
+		} else if errors.Is(result.err, ErrConflictingOutput) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected concurrent conflict error: %v", result.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 || len(ports1.calls)+len(ports2.calls) != 5 {
+		t.Fatalf("successes=%d conflicts=%d cleanup=%v/%v", successes, conflicts, ports1.calls, ports2.calls)
 	}
 }
 

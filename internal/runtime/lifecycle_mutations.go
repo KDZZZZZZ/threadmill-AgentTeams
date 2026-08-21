@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
@@ -18,6 +19,7 @@ type LifecycleMutationStore interface {
 	PrepareRehydration(context.Context, WaitingKey, int64, ContinuationBinding) (WaitingRecord, ContinuationBinding, bool, error)
 	RecordPackageConsumption(context.Context, executionreceipt.Receipt, PhysicalExecutionKey, int64) (executionreceipt.Receipt, PhysicalExecution, bool, error)
 	ActivatePhysicalExecution(context.Context, WaitingKey, int64, PhysicalExecutionKey, int64) (WaitingRecord, PhysicalExecution, bool, error)
+	AcceptPhaseOutput(context.Context, PhaseOutputRecord, WaitingKey, int64) (PhaseOutputRecord, WaitingRecord, bool, error)
 }
 
 type sqliteLifecycleMutations struct{ r *SQLiteRuntimeStateRepository }
@@ -301,4 +303,81 @@ func (s sqliteLifecycleMutations) ActivatePhysicalExecution(ctx context.Context,
 		return WaitingRecord{}, PhysicalExecution{}, false, err
 	}
 	return waiting, physical, true, tx.Commit()
+}
+
+func (s sqliteLifecycleMutations) AcceptPhaseOutput(ctx context.Context, output PhaseOutputRecord, waitingKey WaitingKey, waitingRevision int64) (PhaseOutputRecord, WaitingRecord, bool, error) {
+	if output.Key.TaskID != waitingKey.TaskID || output.Key.InvocationID != waitingKey.InvocationID || output.Key.Generation != waitingKey.Generation || output.BindingRef == "" || output.InputRevision == "" || output.ExecutionEpoch <= 0 {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, errors.New("phase output identity does not match waiting invocation")
+	}
+	tx, err := s.r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	defer tx.Rollback()
+	var ob []byte
+	err = tx.QueryRowContext(ctx, "SELECT payload FROM runtime_phase_outputs WHERE task_id=? AND invocation_id=? AND generation=?", output.Key.TaskID, output.Key.InvocationID, output.Key.Generation).Scan(&ob)
+	if err == nil {
+		var old PhaseOutputRecord
+		if err = jsonUnmarshal(ob, &old); err != nil {
+			return PhaseOutputRecord{}, WaitingRecord{}, false, err
+		}
+		if old.BindingRef != output.BindingRef || old.InputRevision != output.InputRevision || old.ExecutionEpoch != output.ExecutionEpoch || !reflect.DeepEqual(old.Output, output.Output) {
+			return old, WaitingRecord{}, false, ErrConflictingOutput
+		}
+		var wb []byte
+		if err = tx.QueryRowContext(ctx, "SELECT payload FROM runtime_waiting WHERE task_id=? AND invocation_id=? AND generation=?", waitingKey.TaskID, waitingKey.InvocationID, waitingKey.Generation).Scan(&wb); err != nil {
+			return old, WaitingRecord{}, false, err
+		}
+		var waiting WaitingRecord
+		err = jsonUnmarshal(wb, &waiting)
+		return old, waiting, false, err
+	}
+	if !isNoRows(err) {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	var wb []byte
+	err = tx.QueryRowContext(ctx, "SELECT payload FROM runtime_waiting WHERE task_id=? AND invocation_id=? AND generation=? AND revision=?", waitingKey.TaskID, waitingKey.InvocationID, waitingKey.Generation, waitingRevision).Scan(&wb)
+	if isNoRows(err) {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, ErrCompletionConflict
+	}
+	if err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	var waiting WaitingRecord
+	if err = jsonUnmarshal(wb, &waiting); err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	if waiting.State != AwaitStateRunning || waiting.ExecutionEpoch != output.ExecutionEpoch || waiting.PreviousBindingRef != output.BindingRef || waiting.InputRevision != output.InputRevision {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, ErrStaleCompletion
+	}
+	output.Revision = 1
+	output.AcceptedAt = nowUTC()
+	output.EventRecorded = true
+	ob, err = runtimeJSON(output)
+	if err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	if err = noSecrets(ob); err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	waiting.State = AwaitStateTerminal
+	waiting.Revision++
+	waiting.UpdatedAt = output.AcceptedAt
+	wb, err = runtimeJSON(waiting)
+	if err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	if err = noSecrets(wb); err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO runtime_phase_outputs VALUES(?,?,?,?,?)", output.Key.TaskID, output.Key.InvocationID, output.Key.Generation, output.Revision, ob); err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE runtime_waiting SET revision=?,state=?,payload=? WHERE task_id=? AND invocation_id=? AND generation=? AND revision=?", waiting.Revision, waiting.State, wb, waitingKey.TaskID, waitingKey.InvocationID, waitingKey.Generation, waitingRevision); err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	if err = appendEvent(ctx, tx, "PhaseOutputSubmitted", waitingKey, output.ExecutionEpoch, "phase_output", output.Revision, ob); err != nil {
+		return PhaseOutputRecord{}, WaitingRecord{}, false, err
+	}
+	return output, waiting, true, tx.Commit()
 }

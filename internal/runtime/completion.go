@@ -119,6 +119,7 @@ type PhaseOutputCompletionCoordinator struct {
 	Binding             phasemcp.InvocationBinding
 	Delegate            phaseagent.Runtime
 	Outputs             PhaseOutputStore
+	Mutations           LifecycleMutationStore
 	Waiting             WaitingStore
 	PhysicalExecutions  PhysicalExecutionStore
 	Events              artifacts.EventRecorder
@@ -154,11 +155,23 @@ func (c *PhaseOutputCompletionCoordinator) SubmitPhaseOutput(ctx context.Context
 	} else if err := c.validateCurrentExecution(ctx); err != nil {
 		return err
 	}
-	record, _, err := c.Outputs.PutIfAbsent(ctx, PhaseOutputRecord{
+	candidate := PhaseOutputRecord{
 		Key:        outputKey,
 		BindingRef: c.Binding.BindingRef, InputRevision: c.Binding.InputRevision,
 		ExecutionEpoch: ExecutionEpoch(c.Binding.ExecutionEpoch), Output: output,
-	})
+	}
+	if c.Mutations != nil {
+		waiting, found, getErr := c.Waiting.Get(ctx, WaitingKey{TaskID: c.Binding.TaskID, InvocationID: c.Binding.InvocationID, Generation: c.Binding.Generation})
+		if getErr != nil || !found {
+			return ErrStaleCompletion
+		}
+		_, _, _, err := c.Mutations.AcceptPhaseOutput(ctx, candidate, waiting.Key, waiting.Revision)
+		if err != nil {
+			return err
+		}
+		return c.finalize(ctx)
+	}
+	record, _, err := c.Outputs.PutIfAbsent(ctx, candidate)
 	if err != nil {
 		return err
 	}

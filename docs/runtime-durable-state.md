@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-C1。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
+状态：M5-C2-5。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
 
 ## 1. Authority 与边界
 
@@ -24,13 +24,14 @@ schema 预留 recovery claim owner/ref、claim revision 和 epoch 边界，但 M
 
 ## 4. Transactional outbox
 
-关键 mutation 在同一个 SQLite transaction 中提交 authoritative snapshot 和 append-only `runtime_events` outbox：
+已经接入 repository-owned transaction 的关键 mutation，在同一个 SQLite transaction 中提交 authoritative snapshot 和 append-only `runtime_events` outbox：
 
 - Waiting created/state transitioned；
 - PhysicalExecution created/state transitioned；
 - package receipt recorded；
 - PhaseOutput recorded；
-- teardown progress recorded。
+
+其余 lifecycle state 的 durable outbox 接入按各 slice 逐步补齐；不能因某个 typed store 自己可持久化就推断它已经拥有跨 aggregate transaction。
 
 event envelope 包含 EventID、EventType、occurredAt、TaskID、InvocationID、Generation、optional ExecutionEpoch、aggregate key、resulting revision、payload version 与 redacted payload。Event Log 不是唯一 recovery authority：snapshots 用于在线恢复，outbox 用于审计、projection rebuild 和后续 reconciliation input。transaction rollback 或 CAS conflict 时不得留下 state 或 success event。
 
@@ -43,3 +44,9 @@ M5-C1 将上述七类 M4 logical-state seam 收敛为 `DurableLifecycleState`：
 后续 M5-C2/D 才补齐 input/binding/continuation 事件 outbox、recovery claim、partial-teardown retry、stale carrier fencing 和 restart reconciliation；QwenPaw session 始终 disposable，任何新 carrier 都必须重新 materialize context/workspace/memory 并获得新 capability material。
 
 M5-C2-4 将 rehydrated activation 收敛为 repository-owned transaction：receipt 已确认的 epoch PhysicalExecution 从 `accepted` 转为 `running` 时，WaitingRecord 同时从 `rehydrating` 转为 `running`，并写入唯一 `PhysicalExecutionActivated` outbox event。任何 CAS、identity、state 或 outbox failure 都 rollback 两个 snapshot；相同已完成 activation 的 retry 是幂等的。外部 carrier 创建仍在 transaction 外，Runtime snapshot 仍是 recovery authority；outbox 仅供 audit、projection 与后续 reconciliation input。
+
+M5-C2-5 将正式 PhaseOutput acceptance 收敛为 repository-owned transaction。`LifecycleMutationStore.AcceptPhaseOutput` 在同一 SQLite transaction 中完成三项 authoritative mutation：以 logical TaskID / InvocationID / Generation key 写入唯一 PhaseOutput、将同一 WaitingRecord 从 `running` 转为 `terminal`，并追加唯一 `PhaseOutputSubmitted` outbox event。BindingRef、InputRevision、Generation、ExecutionEpoch、Waiting revision 和状态都在提交前验证；stale、CAS conflict 与不同 output fail closed。outbox insert 失败会回滚 output 和 Waiting transition，因而 failure 不会启动 completion cleanup。相同 output 的 retry 返回既有 acceptance，不覆盖 output，也不会追加第二个 success event。
+
+关闭并重新打开 repository 后，PhaseOutput、terminal WaitingRecord 和唯一 outbox event 仍是同一 acceptance 的 recovery authority；重开本身不重新提交 output、不重新发 success event，也不自动启动 logical completion。`PhaseOutputCompletionCoordinator` 在配置 durable mutation seam 时不再使用旧的 output → external event → Waiting CAS 分步 authority；只有该 transaction 成功后才进入现有 normal cleanup。
+
+本 slice **不**持久化 teardown progress，也不承诺 restart 后继续 cleanup、`tearing_down` → `terminated` recovery 或 external cleanup side-effect deduplication。这些 durable teardown/retry/recovery contract 明确留给 M5-C2-6；C2-5 只保证 acceptance failure 不会开始 teardown。
