@@ -32,7 +32,12 @@ func (i ArtifactEvidenceIngestor) RecordExecutionFailure(ctx context.Context, re
 }
 
 func (i ArtifactEvidenceIngestor) IngestExecutionEvidence(ctx context.Context, request HostExecutionRequest, result TeamHarnessTaskSnapshot) (ExecutionEvidence, error) {
-	owner := artifacts.TrustedOwner{TaskID: request.Endpoint.TaskID, InvocationID: request.InvocationID, WorkspaceRoot: request.Envelope.Workspace.Root, AllowedDirs: request.Envelope.Workspace.AllowedDirs}
+	if i.Registrar == nil {
+		return ExecutionEvidence{}, contractError("artifact registrar is required")
+	}
+	// HostExecutionRequest is Runtime-built; taskflow result metadata never
+	// chooses the logical owner or generation of evidence artifacts.
+	owner := artifacts.TrustedOwner{TaskID: request.Endpoint.TaskID, InvocationID: request.InvocationID, Generation: request.Generation, WorkspaceRoot: request.Envelope.Workspace.Root, AllowedDirs: request.Envelope.Workspace.AllowedDirs}
 	evidence := ExecutionEvidence{}
 	if result.ResultPath != "" {
 		ref, err := i.Registrar.Register(ctx, artifacts.RegisterRequest{Owner: owner, ControlledPath: result.ResultPath, Kind: artifacts.ArtifactTypeGeneratedReport})

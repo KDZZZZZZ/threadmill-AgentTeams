@@ -100,6 +100,8 @@ M5-C3-2A 提供 `internal/artifacts.S3BlobPublisher`，对 AgentTeams embedded d
 
 `runtime.NewDurableArtifactRegistry(repository, publisher)` 明确组合同一个 `RuntimeStateRepository.ArtifactStore()` 与该 publisher；它不创建第二个 metadata authority。本 slice 尚未将 MCP `artifact.register` 的 production registrar 切换至该组合，C3-2B 才负责该 cutover。publish 成功、SQLite transaction 失败时允许 orphan blob 留给后续 GC；publish/verify 失败时不调用 durable metadata mutation。
 
+M5-C3-2B 由 `internal/agenthost/agentteams.NewDurableArtifactAuthority` 完成 production composition：它只创建一个 `DurableRegistry`，并用同一实例构造 Phase MCP handler 与 `ArtifactEvidenceIngestor`。因此 `artifact.register`、AgentTeams taskflow evidence 与 `agent.submitPhaseOutput` 的 ArtifactRef access validation 都读写同一 Runtime durable metadata/access authority；`InMemoryRegistry` 只保留给显式 unit test/non-durable fixture。`ArtifactRegistered` 只由 metadata/access transaction 的 Runtime outbox 产生，外部 `EventRecorder` 仅记录 AgentTeams execution-plane evidence，不能决定 registration success。
+
 ### 4.1 ArtifactRef 与内容哈希
 
 ```go

@@ -156,6 +156,37 @@ func TestDurableArtifactRegistrationConcurrentDuplicateHasOneEvent(t *testing.T)
 	}
 }
 
+func TestDurableArtifactRegistrationRejectsConflictingMetadataForSameHash(t *testing.T) {
+	ctx := context.Background()
+	r, err := OpenSQLiteRuntimeStateRepository(filepath.Join(t.TempDir(), "runtime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	owner := artifacts.TrustedOwner{TaskID: "task", InvocationID: "inv", Generation: 2}
+	metadata := durableArtifactMetadata(owner, "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "s3://bucket/sha256/d")
+	if _, _, err = r.ArtifactStore().RegisterArtifact(ctx, metadata, owner); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := metadata
+	conflicting.Type = artifacts.ArtifactTypeToolOutput
+	if _, _, err = r.ArtifactStore().RegisterArtifact(ctx, conflicting, owner); err == nil {
+		t.Fatal("same hash with conflicting artifact type accepted")
+	}
+	conflicting = metadata
+	conflicting.BlobRef = "s3://bucket/other/d"
+	if _, _, err = r.ArtifactStore().RegisterArtifact(ctx, conflicting, owner); err == nil {
+		t.Fatal("same hash with conflicting blob ref accepted")
+	}
+	events, err := r.ListRuntimeEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventType != artifacts.EventArtifactRegistered {
+		t.Fatalf("events=%#v", events)
+	}
+}
+
 type durableArtifactPublisher struct {
 	ref   string
 	calls int

@@ -89,7 +89,11 @@ func (p *S3BlobPublisher) Publish(ctx context.Context, sourcePath, expectedHash 
 		return "", err
 	}
 	key := p.objectKey(expectedHash)
-	if err = p.put(ctx, key, f, expectedHash); err != nil {
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if err = p.put(ctx, key, f, expectedHash, info.Size()); err != nil {
 		return "", err
 	}
 	if err = p.verify(ctx, key, expectedHash); err != nil {
@@ -102,11 +106,12 @@ func (p *S3BlobPublisher) objectKey(hash string) string {
 	return path.Join(p.prefix, "sha256", hash)
 }
 
-func (p *S3BlobPublisher) put(ctx context.Context, key string, body io.Reader, hash string) error {
+func (p *S3BlobPublisher) put(ctx context.Context, key string, body io.Reader, hash string, size int64) error {
 	req, err := p.newRequest(ctx, http.MethodPut, key, body, hash)
 	if err != nil {
 		return err
 	}
+	req.ContentLength = size
 	req.Header.Set("If-None-Match", "*")
 	req.Header.Set("x-amz-meta-content-sha256", hash)
 	response, err := p.client.Do(req)

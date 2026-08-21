@@ -43,7 +43,10 @@ func (s sqliteArtifactStore) RegisterArtifact(ctx context.Context, metadata arti
 		if existing.Ref != metadata.Ref {
 			return "", false, errors.New("content hash maps to conflicting artifact ref")
 		}
-		ref = existing.Ref // existing contract: first metadata wins for identical bytes.
+		if existing.Type != metadata.Type || existing.BlobRef != metadata.BlobRef {
+			return "", false, errors.New("content hash maps to conflicting durable artifact metadata")
+		}
+		ref = existing.Ref
 	} else if isNoRows(err) {
 		if _, err = tx.ExecContext(ctx, "INSERT INTO runtime_artifacts VALUES(?,?,?)", metadata.Ref, metadata.ContentHash, payload); err != nil {
 			return "", false, err

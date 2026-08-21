@@ -166,7 +166,7 @@ runtime.acceptPhaseOutput(currentTrustedBinding, candidate)
 | 已知输入等待 | 调用 `runtime.awaitInputs` 后回收本次 AgentTeams carrier；Runtime 保留 waiting 记录，不保留 Worker 线程，并以新 epoch 重新承载。 | **M4 已落地** |
 | 未知前置 | `agent.proposeOrchestration(advice=dependency)`；只有 Task Manager 改图后才形成新 Input。 | **需要新增** |
 | 产物生成 | Worker 写入受控目录；TeamHarness 文件共享可作为运输通道。 | **已存在 + 需要 Adapter** |
-| 产物正式化 | Runtime 路径验证、hash、存储、权限和 ArtifactRef 注册。 | **需要新增** |
+| 产物正式化 | Runtime 路径验证、hash、MinIO bytes publish/verify、durable metadata/access 与 ArtifactRef 注册。 | **M5-C3-2B 已落地** |
 
 ## 9. 可直接复用、不可复用和缺口
 
