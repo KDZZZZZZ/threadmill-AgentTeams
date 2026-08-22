@@ -10,9 +10,11 @@ import (
 )
 
 var (
-	ErrRecoveryClaimed              = errors.New("logical invocation recovery is claimed by another owner")
-	ErrRecoveryClaimLost            = errors.New("logical invocation recovery claim is stale or not held")
-	ErrRecoverySnapshotInconsistent = errors.New("durable recovery snapshot is inconsistent")
+	ErrRecoveryClaimed                = errors.New("logical invocation recovery is claimed by another owner")
+	ErrRecoveryClaimLost              = errors.New("logical invocation recovery claim is stale or not held")
+	ErrRecoverySnapshotInconsistent   = errors.New("durable recovery snapshot is inconsistent")
+	ErrRecoverySnapshotStale          = errors.New("durable recovery snapshot changed before mutation")
+	ErrRecoveryDispositionUnsupported = errors.New("recovery disposition is not supported by this coordinator")
 )
 
 // RecoveryClaim is a Runtime-internal lease for one logical invocation. It is
