@@ -189,7 +189,10 @@ func validAwaitTransition(from, to AwaitState) bool {
 	}
 	switch from {
 	case AwaitStateRunning:
-		return to == AwaitStatePreparingAwait || to == AwaitStateTerminal
+		// A recovery-only carrier replacement fences the active physical epoch
+		// and returns the same logical invocation to rehydrating before C4-5
+		// provisions its already-reserved successor epoch.
+		return to == AwaitStatePreparingAwait || to == AwaitStateRehydrating || to == AwaitStateTerminal
 	case AwaitStatePreparingAwait:
 		return to == AwaitStateRelinquishing || to == AwaitStateTerminal
 	case AwaitStateRelinquishing:

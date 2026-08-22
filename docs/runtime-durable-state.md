@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-C4-1。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 external carrier 的 restart reconciliation。
+状态：M5-C4-4。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API。
 
 ## 1. Authority 与边界
 
@@ -80,6 +80,14 @@ AgentTeams observer 只调用 Controller `GET /api/v1/workers/{name}/status` 和
 observer 以 durable Worker name/ID、epoch-encoded deterministic Worker/task name、runtime generation、MCP client ID 和已有安全 Matrix room ref 交叉验证 identity。Controller status API 不提供 namespace、labels、annotations 或 deletionTimestamp，因此 C4-3 不伪造这些证据；无法证明匹配时返回 identity mismatch，交由 C4-4 决策。Matrix/QwenPaw session 不单独读取，room 仅为 redacted evidence，绝不恢复 provider conversation。Controller bearer token 是进程内 deployment configuration，不会写入 request/result/database/outbox。
 
 Runtime durable snapshots仍是 logical truth；AgentTeams Worker/task/runtime.yaml readback 是 external observed evidence；C4-4 才能依据两者作 fencing/lost-carrier decision。特别地，task completed 不等于 PhaseOutput accepted，task in-progress 不等于 package receipt，Worker Ready 不等于 logical continuation；C4-3 不 cleanup、不创建 epoch/Worker/task/session、不 delegate、不重放 output。
+
+M5-C4-4 将 confirmed lost carrier 的 replacement 收敛为 LifecycleMutationStore.FenceAndAllocateReplacement 的单一 SQLite transaction。它必须持有未过期且 matching revision/fence 的 RecoveryClaim，重新核验 RecoverySnapshotFingerprint（epoch、Waiting/physical/output revision、BindingRef、InputRevision），并验证非 terminal 的旧 PhysicalExecution。仅 Worker not_found、Worker failed 或 durable PhysicalExecution 已 failed 能直接进入 replacement；ready + verified identity、generation pending、MCP not applied、unknown/source error 都不会增加 epoch。identity mismatch 和 Worker terminating 明确只进入后续 reconcile policy，本 slice 不重叠 provision 新 carrier。
+
+replacement transaction 原子地：将旧 epoch 标为 fenced、在全量 runtime_physical_executions history 的最大 epoch 后分配唯一 successor、创建 reserved PhysicalExecution、将 Waiting 从 running 转为 rehydrating 且指向新 epoch，并追加 PhysicalExecutionFenced、ReplacementEpochAllocated 两条 secret-free outbox evidence。reserved 严格表示 epoch 已 durable 保留但没有 Worker/task/token/credential/session/lease/package receipt；C4-5 才可消费该 reservation 创建 execution-plane carrier。Runtime restart、claim acquisition、outbox replay 与 duplicate recovery request 本身永不增加 epoch。
+
+旧 epoch history 从不删除。fence 后 Waiting 的 current epoch、BindingRef/InputRevision identity 与 PhysicalExecution state 共同拒绝旧 activation、receipt、output 和其他 token-bound authoritative mutation；仅进程内 BindingRegistry revoke 不是 correctness 边界。BindingRef/InputRevision 不因 crash 自动变化；若 input/binding 在 observation 期间改变，fingerprint mismatch fail closed 并重新 classify。旧 receipt 仍是 epoch 历史证据，不能授权 successor；reserved successor 必须取得新的 package materialization与 fresh consumption receipt。Artifact ownership 继续只用 TaskID+InvocationID，因而旧 ArtifactRef 可在新 epoch 合法引用，但 artifact existence 绝不等同 PhaseOutput。
+
+allocator 在同一个 SQLite transaction/单 writer 中扫描 durable history，故 history 为 1,2,4 时 successor 是 5，而不是 Waiting epoch 的简单 +1。并发 actor 通过 RecoveryClaim 和 transaction CAS 只能创建一份 reservation；同一 recovery retry cold reopen 后读取并返回相同 reservation，不会分配第二个 epoch。claim stale、snapshot stale、CAS/identity/state failure，或任一 outbox insert failure 会 rollback old fence、new reservation、Waiting transition 和 success events。C4-4 不调用任何 external cleanup 或 provisioning port，也不恢复 QwenPaw/provider conversation。
 
 M5-C3-1 将 Artifact 的 logical metadata、hash→ref mapping 与 TaskID+InvocationID access grant 纳入同一 Runtime SQLite authority。artifact bytes 仍属于外部 blob/object store；publisher 成功但 SQLite metadata transaction 失败会留下可 GC orphan blob，反向绝不提交指向未验证 blob 的 metadata。metadata insert、origin-owner grant 和唯一 `ArtifactRegistered` outbox 在一个 transaction 中完成；相同 content hash 的相同 metadata/grant retry 幂等，但不同 ArtifactType 或 blob ref fail closed。ExecutionEpoch 仅可作为审计 evidence，绝不进入 logical ownership key。此处仍不是 full event sourcing：snapshot 是 online recovery authority，outbox 仅为 audit/projection/reconciliation input；dispatcher/cursor 不属于 C3-1。
 

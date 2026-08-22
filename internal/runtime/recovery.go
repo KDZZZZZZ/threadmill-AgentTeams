@@ -62,10 +62,12 @@ type RecoverySnapshotFingerprint struct {
 	WaitingRevision  int64
 	PhysicalRevision int64
 	OutputRevision   int64
+	BindingRef       string
+	InputRevision    string
 }
 
 func (s RecoverySnapshot) Fingerprint() RecoverySnapshotFingerprint {
-	return RecoverySnapshotFingerprint{ExecutionEpoch: s.CurrentExecutionEpoch, WaitingRevision: s.WaitingRevision, PhysicalRevision: s.PhysicalRevision, OutputRevision: s.OutputRevision}
+	return RecoverySnapshotFingerprint{ExecutionEpoch: s.CurrentExecutionEpoch, WaitingRevision: s.WaitingRevision, PhysicalRevision: s.PhysicalRevision, OutputRevision: s.OutputRevision, BindingRef: s.BindingRef, InputRevision: s.InputRevision}
 }
 
 // RecoveryStateStore owns recovery lease fencing and consistent snapshot
@@ -93,6 +95,7 @@ const (
 	RecoveryContinueTerminalTeardown             RecoveryDisposition = "continue_terminal_teardown"
 	RecoveryTerminalNoOp                         RecoveryDisposition = "terminal_noop"
 	RecoveryFailedPhysicalExecutionNeedsDecision RecoveryDisposition = "failed_physical_execution_needs_recovery_decision"
+	RecoveryReplacementProvisioningPending       RecoveryDisposition = "replacement_provisioning_pending"
 )
 
 // ClassifyRecoverySnapshot performs no I/O and no repair. In particular, a
@@ -152,7 +155,10 @@ func ClassifyRecoverySnapshot(snapshot RecoverySnapshot) (RecoveryDisposition, e
 		if snapshot.CurrentPhysical == nil {
 			return RecoveryRehydrationIncomplete, nil
 		}
-		if snapshot.CurrentPhysical.State == PhysicalExecutionProvisioning || snapshot.CurrentPhysical.State == PhysicalExecutionDelegated || snapshot.CurrentPhysical.State == PhysicalExecutionAccepted {
+		if snapshot.CurrentPhysical.State == PhysicalExecutionReserved || snapshot.CurrentPhysical.State == PhysicalExecutionProvisioning || snapshot.CurrentPhysical.State == PhysicalExecutionDelegated || snapshot.CurrentPhysical.State == PhysicalExecutionAccepted {
+			if snapshot.CurrentPhysical.State == PhysicalExecutionReserved {
+				return RecoveryReplacementProvisioningPending, nil
+			}
 			return RecoveryCarrierProvisioningIncomplete, nil
 		}
 		return "", ErrRecoverySnapshotInconsistent

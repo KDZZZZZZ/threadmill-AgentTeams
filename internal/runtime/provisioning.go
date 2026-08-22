@@ -252,6 +252,12 @@ type PhysicalExecution struct {
 	AppliedRuntimeGeneration  int64
 	WorkspaceLeaseRef         string
 	ExecutionAuthorizationRef string
+	// ReplacesExecutionEpoch is set only on a durable pre-provision reservation.
+	// It is an epoch identity, never a Worker/session/token reference.
+	ReplacesExecutionEpoch ExecutionEpoch
+	// RequiresFreshPackageReceipt ensures an old epoch receipt cannot authorize
+	// a fresh carrier after lost-carrier replacement.
+	RequiresFreshPackageReceipt bool
 	// EvidenceRefs are opaque Artifact/Event evidence references. They never
 	// contain private transport credentials or model/session material.
 	EvidenceRefs []string

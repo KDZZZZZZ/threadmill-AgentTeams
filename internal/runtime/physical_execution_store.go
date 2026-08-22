@@ -21,6 +21,9 @@ type PhysicalExecutionKey struct {
 type PhysicalExecutionState string
 
 const (
+	// PhysicalExecutionReserved records a durable epoch allocation before any
+	// physical carrier exists. C4-5 is the only slice allowed to provision it.
+	PhysicalExecutionReserved     PhysicalExecutionState = "reserved"
 	PhysicalExecutionProvisioning PhysicalExecutionState = "provisioning"
 	PhysicalExecutionDelegated    PhysicalExecutionState = "delegated"
 	PhysicalExecutionAccepted     PhysicalExecutionState = "accepted"
@@ -28,6 +31,9 @@ const (
 	PhysicalExecutionTearingDown  PhysicalExecutionState = "tearing_down"
 	PhysicalExecutionTerminated   PhysicalExecutionState = "terminated"
 	PhysicalExecutionFailed       PhysicalExecutionState = "failed"
+	// PhysicalExecutionFenced is immutable historical evidence that this epoch
+	// cannot again become the logical invocation's current carrier.
+	PhysicalExecutionFenced PhysicalExecutionState = "fenced"
 )
 
 // PhysicalExecutionTeardown is redacted evidence of carrier cleanup. It has

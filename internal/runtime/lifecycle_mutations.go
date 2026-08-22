@@ -21,6 +21,7 @@ type LifecycleMutationStore interface {
 	ActivatePhysicalExecution(context.Context, WaitingKey, int64, PhysicalExecutionKey, int64) (WaitingRecord, PhysicalExecution, bool, error)
 	AcceptPhaseOutput(context.Context, PhaseOutputRecord, WaitingKey, int64) (PhaseOutputRecord, WaitingRecord, bool, error)
 	AdvanceTeardown(context.Context, PhysicalExecutionKey, int64, TeardownStep) (PhysicalExecution, bool, error)
+	FenceAndAllocateReplacement(context.Context, RecoveryClaim, RecoverySnapshotFingerprint, CarrierRecoveryDecision) (RecoveryReplacementPlan, bool, error)
 }
 
 type sqliteLifecycleMutations struct{ r *SQLiteRuntimeStateRepository }
