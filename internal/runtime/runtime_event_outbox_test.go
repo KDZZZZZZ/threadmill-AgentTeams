@@ -228,6 +228,7 @@ func TestRuntimeEventOutboxMigratesV2EventsToOrderedFeed(t *testing.T) {
 	appendOutboxTestEvent(t, r, "ArtifactRegistered")
 	appendOutboxTestEvent(t, r, "PhaseOutputSubmitted")
 	for _, statement := range []string{
+		"DROP TABLE runtime_recovery_claims",
 		"DROP TABLE runtime_event_claims",
 		"DROP TABLE runtime_event_consumers",
 		"DROP TABLE runtime_event_order",

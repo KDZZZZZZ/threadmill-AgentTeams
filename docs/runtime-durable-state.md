@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-C3-3。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 restart 后的执行 reconciliation。
+状态：M5-C4-1。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API，也不实现 external carrier 的 restart reconciliation。
 
 ## 1. Authority 与边界
 
@@ -58,6 +58,10 @@ M5-C3-3 为已有 transactional outbox 增加 durable projection/dispatch seam�
 `RuntimeEventOutbox` 提供有界 ordered read、consumer checkpoint、lease claim 与严格单调 ack。一个 logical consumer 在有效 lease 内只允许一个 owner dispatch；lease 过期后新的 process 可接管。dispatcher 在 SQLite transaction 外调用外部 sink，成功后才单条 ack，因此 delivery 是 **at-least-once**：sink 已成功但 process 在 ack 前退出时，同一 `EventID` 会在 cold reopen 后再次投递。sink/projection 必须以 `EventID` 去重；checkpoint 只在 ack transaction 成功后推进。ack、claim 或 outbox 写入失败不改变 authoritative snapshots，也不制造已确认的 checkpoint。
 
 Runtime snapshots/records 继续是 online recovery authority；outbox feed 只用于 audit、projection rebuild、reconciliation input 和可恢复 dispatch，不把本系统改成 full event sourcing。`ArtifactRegistered`（metadata/access transaction）、`PhaseOutputSubmitted`（output + terminal Waiting transaction）与 PhysicalExecution teardown 事件已经随各自 authoritative mutation 原子写入；dispatch 状态不能反推 artifact ownership、PhaseOutput 或 teardown truth。C3-3 也不负责新的 external sink、global multi-node leader election 或重放 QwenPaw session。
+
+M5-C4-1 新增 Runtime-internal durable `RecoveryClaim`，以 logical `TaskID + InvocationID + Generation` 为唯一 key；`ExecutionEpoch` 只作为 claim 时的 observed physical epoch，不允许不同 epoch 并行取得同一 logical invocation 的 recovery ownership。claim 保存 recovery actor `OwnerID`、expiry、单调 `Fence`、CAS `Revision` 与审计时间；它不是 Worker lease、workspace lease、execution token 或 agent authorization。active claim 拒绝其他 owner；过期或显式释放后的接管递增 Fence；renew/release/assert 都要求当前 owner、Fence、Revision 和有效 lease 一致，故过期后恢复的旧 actor 不能再提交后续 authoritative recovery mutation。
+
+repository 的 `LoadRecoverySnapshot` 在一次 SQLite read transaction 中读取 Waiting、latest PhaseInputSet、continuation/binding refs、physical epoch history/current epoch、receipt、PhaseOutput 和可见 ArtifactRefs，并生成 aggregate revision fingerprint。snapshot 从不包含 workspace absolute path、token、credential value、private header、controller auth、provider conversation、hidden reasoning 或 QwenPaw session state。C4-1 classifier 只按该 durable truth 产生 `AwaitingInput`、`RelinquishmentIncomplete`、`RehydrationIncomplete`、`CarrierProvisioningIncomplete`、`CarrierActiveNeedsObservation`、`CarrierConsumedNoOutput`、`ContinueTerminalTeardown`、`TerminalNoOp` 或 `FailedPhysicalExecutionNeedsRecoveryDecision`；矛盾状态 fail closed。它不查询 AgentTeams、不分配 epoch、不执行 cleanup 或重建 carrier。external observation、terminal cleanup drive、lost-carrier fencing 与 fresh provisioning 属于后续 C4 slices。
 
 Runtime snapshots/records 仍是 recovery authority；outbox 仅用于 audit、projection 和后续 reconciliation input。Worker/task/runtime.yaml 与 QwenPaw session 只能作为 execution-plane observed evidence，不能反推下一 cleanup step。C2-6 不实现 distributed leader election：SQLite 单 writer + revision CAS 使同一 expected revision 只有一个 teardown claimant 成功；其他 claimant 必须 reload/retry。restart recovery 只继续 cleanup，不重新接受 PhaseOutput、不重新发 `PhaseOutputSubmitted`，也不重放 agent work。
 

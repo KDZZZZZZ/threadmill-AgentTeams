@@ -31,6 +31,7 @@ type RuntimeStateRepository interface {
 	ArtifactStore() artifacts.DurableStore
 	LifecycleMutations() LifecycleMutationStore
 	EventOutbox() RuntimeEventOutbox
+	Recovery() RecoveryStateStore
 	ListRuntimeEvents(context.Context) ([]RuntimeEvent, error)
 }
 
@@ -65,9 +66,17 @@ type RuntimeEvent struct {
 	Payload        json.RawMessage
 }
 
-const latestRuntimeSchemaVersion = 3
+const latestRuntimeSchemaVersion = 4
 
-type SQLiteRuntimeStateRepository struct{ db *sql.DB }
+type recoveryClock interface{ Now() time.Time }
+type systemRecoveryClock struct{}
+
+func (systemRecoveryClock) Now() time.Time { return time.Now() }
+
+type SQLiteRuntimeStateRepository struct {
+	db    *sql.DB
+	clock recoveryClock
+}
 
 func OpenSQLiteRuntimeStateRepository(path string) (*SQLiteRuntimeStateRepository, error) {
 	if path == "" {
@@ -84,7 +93,7 @@ func OpenSQLiteRuntimeStateRepository(path string) (*SQLiteRuntimeStateRepositor
 		return nil, err
 	}
 	db.SetMaxOpenConns(1) // M5-B is explicitly a single-writer deployment.
-	r := &SQLiteRuntimeStateRepository{db: db}
+	r := &SQLiteRuntimeStateRepository{db: db, clock: systemRecoveryClock{}}
 	if err := r.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -122,6 +131,9 @@ func (r *SQLiteRuntimeStateRepository) LifecycleMutations() LifecycleMutationSto
 }
 func (r *SQLiteRuntimeStateRepository) EventOutbox() RuntimeEventOutbox {
 	return sqliteRuntimeEventOutbox{r}
+}
+func (r *SQLiteRuntimeStateRepository) Recovery() RecoveryStateStore {
+	return sqliteRecoveryStateStore{r}
 }
 
 func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
@@ -191,6 +203,15 @@ func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
 			if _, err = tx.ExecContext(ctx, statement); err != nil {
 				return err
 			}
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", 3); err != nil {
+			return err
+		}
+		version = 3
+	}
+	if version == 3 {
+		if _, err = tx.ExecContext(ctx, "CREATE TABLE runtime_recovery_claims (task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, observed_execution_epoch INTEGER NOT NULL, owner_id TEXT NOT NULL, lease_expires_at TEXT NOT NULL, fence INTEGER NOT NULL, revision INTEGER NOT NULL, claimed_at TEXT NOT NULL, renewed_at TEXT NOT NULL, PRIMARY KEY(task_id,invocation_id,generation))"); err != nil {
+			return err
 		}
 		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", latestRuntimeSchemaVersion); err != nil {
 			return err
