@@ -18,6 +18,9 @@ import (
 // WorkspaceLease is a physical write lease acquired for one execution epoch.
 // It is intentionally separate from the logical WorkspaceBinding in a plan.
 type WorkspaceLease struct {
+	TaskID        string
+	InvocationID  string
+	Generation    int
 	Ref           string
 	WorkspaceRef  string
 	WorkspaceRoot string

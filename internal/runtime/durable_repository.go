@@ -32,6 +32,7 @@ type RuntimeStateRepository interface {
 	LifecycleMutations() LifecycleMutationStore
 	EventOutbox() RuntimeEventOutbox
 	Recovery() RecoveryStateStore
+	Reconstruction() DurableReconstructionStore
 	ListRuntimeEvents(context.Context) ([]RuntimeEvent, error)
 }
 
@@ -66,7 +67,24 @@ type RuntimeEvent struct {
 	Payload        json.RawMessage
 }
 
-const latestRuntimeSchemaVersion = 4
+const latestRuntimeSchemaVersion = 6
+
+// DurableReconstructionStore owns all production reconstruction records in
+// the Runtime database. It deliberately stores opaque refs and redacted
+// content only; runtime-local filesystem paths and capabilities stay outside.
+type DurableReconstructionStore interface {
+	PutWorkspace(context.Context, DurableWorkspace) (DurableWorkspace, error)
+	GetWorkspace(context.Context, string, WaitingKey) (DurableWorkspace, bool, error)
+	AcquireWorkspaceLease(context.Context, DurableWorkspaceLease) (DurableWorkspaceLease, error)
+	ReadWorkspaceLease(context.Context, string, WaitingKey, ExecutionEpoch) (DurableWorkspaceLease, bool, error)
+	ReleaseWorkspaceLease(context.Context, DurableWorkspaceLease, int64) (DurableWorkspaceLease, bool, error)
+	PutContextSlice(context.Context, DurableContextSlice) (DurableContextSlice, error)
+	GetContextSlice(context.Context, string, WaitingKey) (DurableContextSlice, bool, error)
+	PutTaskMemory(context.Context, DurableTaskMemory) (DurableTaskMemory, error)
+	GetTaskMemory(context.Context, string, WaitingKey) (DurableTaskMemory, bool, error)
+	PutExecutionDescriptor(context.Context, DurableExecutionDescriptor) (DurableExecutionDescriptor, error)
+	GetExecutionDescriptor(context.Context, WaitingKey) (DurableExecutionDescriptor, bool, error)
+}
 
 type recoveryClock interface{ Now() time.Time }
 type systemRecoveryClock struct{}
@@ -134,6 +152,9 @@ func (r *SQLiteRuntimeStateRepository) EventOutbox() RuntimeEventOutbox {
 }
 func (r *SQLiteRuntimeStateRepository) Recovery() RecoveryStateStore {
 	return sqliteRecoveryStateStore{r}
+}
+func (r *SQLiteRuntimeStateRepository) Reconstruction() DurableReconstructionStore {
+	return sqliteReconstructionStore{r}
 }
 
 func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
@@ -211,6 +232,31 @@ func (r *SQLiteRuntimeStateRepository) migrate(ctx context.Context) error {
 	}
 	if version == 3 {
 		if _, err = tx.ExecContext(ctx, "CREATE TABLE runtime_recovery_claims (task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, observed_execution_epoch INTEGER NOT NULL, owner_id TEXT NOT NULL, lease_expires_at TEXT NOT NULL, fence INTEGER NOT NULL, revision INTEGER NOT NULL, claimed_at TEXT NOT NULL, renewed_at TEXT NOT NULL, PRIMARY KEY(task_id,invocation_id,generation))"); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", 4); err != nil {
+			return err
+		}
+		version = 4
+	}
+	if version == 4 {
+		for _, statement := range []string{
+			"CREATE TABLE IF NOT EXISTS runtime_reconstruction_workspaces (task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, workspace_ref TEXT NOT NULL, revision INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(task_id,invocation_id,generation,workspace_ref))",
+			"CREATE TABLE IF NOT EXISTS runtime_reconstruction_workspace_leases (lease_ref TEXT PRIMARY KEY, task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, execution_epoch INTEGER NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL, payload BLOB NOT NULL, UNIQUE(task_id,invocation_id,generation,execution_epoch))",
+			"CREATE TABLE IF NOT EXISTS runtime_reconstruction_context_slices (context_ref TEXT PRIMARY KEY, task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL, payload BLOB NOT NULL)",
+			"CREATE TABLE IF NOT EXISTS runtime_reconstruction_task_memory (memory_ref TEXT PRIMARY KEY, task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL, payload BLOB NOT NULL)",
+		} {
+			if _, err = tx.ExecContext(ctx, statement); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", 5); err != nil {
+			return err
+		}
+		version = 5
+	}
+	if version == 5 {
+		if _, err = tx.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS runtime_reconstruction_execution_descriptors (task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(task_id,invocation_id,generation))"); err != nil {
 			return err
 		}
 		if _, err = tx.ExecContext(ctx, "UPDATE runtime_schema_version SET version=?", latestRuntimeSchemaVersion); err != nil {

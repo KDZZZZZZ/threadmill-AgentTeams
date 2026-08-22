@@ -1,6 +1,6 @@
 # Runtime Durable State（M5-B）
 
-状态：M5-C4-4。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API。
+状态：M5-C4-5P。本文冻结单 Runtime / 单 control-plane deployment 的 durable Runtime state contract；不改变 Phase Agent public API。
 
 ## 1. Authority 与边界
 
@@ -94,3 +94,9 @@ M5-C3-1 将 Artifact 的 logical metadata、hash→ref mapping 与 TaskID+Invoca
 M5-C3-2A 补齐 C3-1 所需的 production-capable bytes publisher 与组合 seam：`artifacts.S3BlobPublisher` 使用 S3-compatible MinIO `PUT` + `HEAD` verification 发布 content-addressed bytes，`runtime.NewDurableArtifactRegistry` 只将该 publisher 与同一 repository 的 `ArtifactStore()` 组合。S3 endpoint/bucket/prefix/access key/secret key 是进程内 deployment configuration；credential 不进入 SQLite、outbox 或日志。MCP handler 暂未切换 registrar，因而 InMemoryRegistry 仍是当前未完成 C3-2 的旧 production path，不能被误认为 durable authority。C3-2B 必须在该 publisher 已验证的前提下完成唯一 registrar cutover，且仍不得改变 Phase Agent/MCP public contract。
 
 M5-C3-2B 将 `NewDurableArtifactAuthority` 作为 AgentTeams production composition：同一 RuntimeStateRepository 的 ArtifactStore 与同一 S3 publisher 只构造一个 DurableRegistry，随后同时注入 Phase MCP handler 和 AgentTeams evidence ingestion。MCP token resolve 后的 `InvocationBinding` 是 TaskID、InvocationID、Generation 与 workspace fence 的唯一来源；taskflow result、agent request body、Worker/session/epoch 都不能重定 owner。`DurableRegistry` 先经 canonical/symlink-safe workspace fence 读取控制文件并计算 hash，publisher 复用同一已打开文件重新校验 hash 后上传，故文件在两次读取之间变化会 fail closed，metadata 不会把 A 的 hash 指向 B 的 bytes。重开 repository 后同一 TaskID+InvocationID 的新 Epoch 仍有 access；另一 Invocation 被拒绝。C3-2B 不改变 public MCP schema，也不把 InMemoryRegistry 作为 durable mirror。
+
+M5-C4-5P 将 Workspace logical descriptor、epoch-fenced workspace lease、Context slice、Task Memory view 和 execution descriptor 收敛到同一个 `RuntimeStateRepository` 的 v6 migration；它们不是独立 SQLite authority。workspace 只持久化 logical ref、revision 和相对 AllowedDirs，绝对路径/mount root 由每个 physical execution 在进程内重新派生，不能写入 Runtime database。Context/Task Memory refs 是不可变 logical history：相同 ref 和相同内容的 retry 幂等，不同 payload fail closed。execution descriptor 只保存受控的 Task Contract、Phase instruction、task spec 与上述 refs，而不是序列化 HostEnvelope、token、credential、private header、controller auth、provider conversation 或旧 session。
+
+`DurableReconstructionAuthority` 复用既有 M4 reconstruction interfaces，因此 `RehydrationCoordinator` 从 durable refs 恢复 workspace/context/memory，拒绝 owner/ref/baseline/AllowedDirs 不匹配。`DurableWorkspaceLeaseAuthority` 以 TaskID/InvocationID/Generation/Epoch 唯一约束获取 durable lease；相同 lease request 可重试，其他 epoch/owner/ref 不能劫持，release 使用 revision CAS。lease record 不保存本机 root；`WorkspaceRootResolver` 在 transaction 外创建或重新定位可释放的本机资源。
+
+AgentTeams 的 `DurableHostEnvelopeResolver` 是 production-facing composition seam：它从同一 repository 读取 descriptor、workspace、context、Task Memory，并在进程内接收已签发的 trusted MCP binding 与 local mount resolver。它核对 TaskID、InvocationID、Generation、Endpoint 与 BindingRef，拒绝 mount 扩大 durable AllowedDirs；host envelope 只在内存中形成。cold reopen 后 Runtime 读取相同 logical descriptors，再由新的 epoch/worker/session 重新 materialize，绝不恢复旧 QwenPaw/provider conversation。C4-5P 只提供 reconstruction foundations；reservation 到真实 Worker/credential/task provision 与 replay policy 仍属于 C4-5A/C4-5/C4-6。
