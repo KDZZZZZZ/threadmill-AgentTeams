@@ -405,6 +405,7 @@ func (c *ControllerReprovisioner) WaitForRuntimeReady(ctx context.Context, worke
 
 type controllerWorkerStatus struct {
 	Name           string `json:"name"`
+	State          string `json:"state"`
 	MatrixUserID   string `json:"matrixUserID"`
 	RoomID         string `json:"roomID"`
 	Phase          string `json:"phase"`

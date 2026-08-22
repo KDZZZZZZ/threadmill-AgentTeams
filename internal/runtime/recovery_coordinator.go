@@ -63,6 +63,7 @@ type RecoveryCoordinator struct {
 	Repository RuntimeStateRepository
 	Mutations  LifecycleMutationStore
 	Cleanup    TerminalRecoveryCleanupPorts
+	Observer   PhysicalExecutionObserver
 	OwnerID    string
 	ClaimTTL   time.Duration
 

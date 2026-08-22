@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/KDZZZZZZ/threadmill-AgentTeams/internal/executionreceipt"
 	phasemcp "github.com/KDZZZZZZ/threadmill-AgentTeams/internal/mcp/phase"
 	"github.com/KDZZZZZZ/threadmill-AgentTeams/phaseagent"
 )
@@ -79,6 +81,28 @@ type failTeardownMutation struct {
 	once sync.Once
 }
 
+type observingPhysicalExecution struct {
+	mu      sync.Mutex
+	value   PhysicalExecutionObservation
+	err     error
+	calls   int
+	after   func()
+	request PhysicalExecutionObservationRequest
+}
+
+func (o *observingPhysicalExecution) Observe(_ context.Context, request PhysicalExecutionObservationRequest) (PhysicalExecutionObservation, error) {
+	o.mu.Lock()
+	o.calls++
+	o.request = request
+	after := o.after
+	value, err := o.value, o.err
+	o.mu.Unlock()
+	if after != nil {
+		after()
+	}
+	return value, err
+}
+
 func (s *failTeardownMutation) AdvanceTeardown(ctx context.Context, key PhysicalExecutionKey, revision int64, step TeardownStep) (PhysicalExecution, bool, error) {
 	if step == s.step {
 		failed := false
@@ -99,6 +123,32 @@ func acceptedTerminalRecoveryFixture(t *testing.T, path string) (*SQLiteRuntimeS
 		t.Fatalf("accept terminal output created=%t err=%v", created, err)
 	}
 	return r, key, physical
+}
+
+func activeRecoveryObservationFixture(t *testing.T, path string) (*SQLiteRuntimeStateRepository, WaitingKey, PhysicalExecution) {
+	t.Helper()
+	ctx := context.Background()
+	r, key, _, physical := recoveryFixture(t, path, AwaitStateRunning, PhysicalExecutionRunning)
+	physical.WorkerID = "tm-invocation-g2-e2"
+	physical.WorkerName = physical.WorkerID
+	physical.TeamHarnessTaskID = "tm-phase-invocation-g2-e2"
+	physical.TeamHarnessAssignedTo = physical.WorkerName
+	physical.AgentSessionRef = "matrix:!room:test"
+	physical.AgentPackageDigest = "digest"
+	physical.PackageConsumed = true
+	physical.MCPClientID = "threadmill"
+	physical.CredentialBindingRef = "credential"
+	physical.DesiredRuntimeGeneration = 7
+	physical.AppliedRuntimeGeneration = 7
+	physical.WorkspaceLeaseRef = "lease"
+	physical.ExecutionAuthorizationRef = "authorization-ref"
+	physical.ObservedTaskStatus = "in_progress"
+	physical.TaskAcknowledged = true
+	updated, swapped, err := r.PhysicalExecutionStore().CompareAndSwap(ctx, physical.Key(), physical.Revision, physical)
+	if err != nil || !swapped {
+		t.Fatalf("seed active physical swapped=%t err=%v", swapped, err)
+	}
+	return r, key, updated
 }
 
 func newRecoveryCoordinator(r RuntimeStateRepository, owner string, ports *recoveryCleanupPorts, mutations LifecycleMutationStore) *RecoveryCoordinator {
@@ -475,5 +525,115 @@ func TestRecoveryCoordinatorOutboxFailureLeavesNoProgressAfterColdReopen(t *test
 	}
 	if got := countRuntimeEvents(t, r, "PhysicalExecutionTeardownStepCompleted"); got != 0 {
 		t.Fatalf("outbox failure survived event=%d", got)
+	}
+}
+
+func TestRecoveryCoordinatorObservesActiveCarrierAfterColdReopenWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "runtime.db")
+	r, key, physical := activeRecoveryObservationFixture(t, path)
+	beforeWaiting, found, err := r.WaitingStore().Get(ctx, key)
+	if err != nil || !found {
+		t.Fatal(err)
+	}
+	beforeEvents := countRuntimeEvents(t, r, "PhaseOutputSubmitted")
+	if err = r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err = OpenSQLiteRuntimeStateRepository(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	observer := &observingPhysicalExecution{value: PhysicalExecutionObservation{ObservedAt: time.Now().UTC(), Worker: ObservedWorkerReady, Task: ObservedTaskInProgress, Runtime: ObservedRuntimeApplied, MCP: ObservedMCPApplied, Identity: ObservedCarrierIdentityVerified}}
+	coordinator := newRecoveryCoordinator(r, "runtime-a", &recoveryCleanupPorts{}, nil)
+	coordinator.Observer = observer
+	result, err := coordinator.ObserveCarrier(ctx, key)
+	if err != nil || result.Disposition != RecoveryCarrierActiveNeedsObservation || observer.calls != 1 {
+		t.Fatalf("result=%#v calls=%d err=%v", result, observer.calls, err)
+	}
+	if observer.request.WorkerName != physical.WorkerName || observer.request.ExecutionEpoch != physical.ExecutionEpoch || observer.request.MCPClientID != physical.MCPClientID || observer.request.AgentSessionRef != physical.AgentSessionRef {
+		t.Fatalf("request=%#v", observer.request)
+	}
+	afterWaiting, found, err := r.WaitingStore().Get(ctx, key)
+	if err != nil || !found || !reflect.DeepEqual(afterWaiting, beforeWaiting) {
+		t.Fatalf("observation mutated waiting before=%#v after=%#v err=%v", beforeWaiting, afterWaiting, err)
+	}
+	afterPhysical := currentPhysical(t, r, key, physical.ExecutionEpoch)
+	if !reflect.DeepEqual(afterPhysical, physical) || countRuntimeEvents(t, r, "PhaseOutputSubmitted") != beforeEvents || observer.request.ExecutionEpoch != physical.ExecutionEpoch {
+		t.Fatalf("observation mutated physical/events physical=%#v", afterPhysical)
+	}
+}
+
+func TestRecoveryCoordinatorObservationFencesStaleClaimAndSnapshot(t *testing.T) {
+	ctx := context.Background()
+	t.Run("stale claim", func(t *testing.T) {
+		r, key, _ := activeRecoveryObservationFixture(t, filepath.Join(t.TempDir(), "runtime.db"))
+		defer r.Close()
+		clock := &fixedRecoveryClock{now: time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)}
+		r.clock = clock
+		observer := &observingPhysicalExecution{value: PhysicalExecutionObservation{}, after: func() { clock.now = clock.now.Add(2 * time.Minute) }}
+		coordinator := newRecoveryCoordinator(r, "runtime-a", &recoveryCleanupPorts{}, nil)
+		coordinator.Observer, coordinator.now = observer, clock.Now
+		if _, err := coordinator.ObserveCarrier(ctx, key); !errors.Is(err, ErrRecoveryClaimLost) {
+			t.Fatalf("stale claim err=%v", err)
+		}
+	})
+	t.Run("stale snapshot", func(t *testing.T) {
+		r, key, physical := activeRecoveryObservationFixture(t, filepath.Join(t.TempDir(), "runtime.db"))
+		defer r.Close()
+		observer := &observingPhysicalExecution{value: PhysicalExecutionObservation{}, after: func() {
+			value := currentPhysical(t, r, key, physical.ExecutionEpoch)
+			if _, swapped, err := r.PhysicalExecutionStore().CompareAndSwap(context.Background(), value.Key(), value.Revision, value); err != nil || !swapped {
+				t.Errorf("mutate snapshot swapped=%t err=%v", swapped, err)
+			}
+		}}
+		coordinator := newRecoveryCoordinator(r, "runtime-a", &recoveryCleanupPorts{}, nil)
+		coordinator.Observer = observer
+		if _, err := coordinator.ObserveCarrier(ctx, key); !errors.Is(err, ErrRecoverySnapshotStale) {
+			t.Fatalf("stale snapshot err=%v", err)
+		}
+	})
+}
+
+func TestRecoveryCoordinatorObservationSingleClaimantAndUnsupportedNoEffect(t *testing.T) {
+	ctx := context.Background()
+	r, key, _ := activeRecoveryObservationFixture(t, filepath.Join(t.TempDir(), "runtime.db"))
+	defer r.Close()
+	started, release := make(chan struct{}), make(chan struct{})
+	firstObserver := &observingPhysicalExecution{after: func() { close(started); <-release }}
+	first := newRecoveryCoordinator(r, "runtime-a", &recoveryCleanupPorts{}, nil)
+	first.Observer = firstObserver
+	secondObserver := &observingPhysicalExecution{}
+	second := newRecoveryCoordinator(r, "runtime-b", &recoveryCleanupPorts{}, nil)
+	second.Observer = secondObserver
+	result := make(chan error, 1)
+	go func() { _, err := first.ObserveCarrier(ctx, key); result <- err }()
+	<-started
+	if _, err := second.ObserveCarrier(ctx, key); !errors.Is(err, ErrRecoveryClaimed) || secondObserver.calls != 0 {
+		t.Fatalf("second observation err=%v calls=%d", err, secondObserver.calls)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveryCoordinatorObservesConsumedCarrierWithoutSynthesizingOutput(t *testing.T) {
+	ctx := context.Background()
+	r, key, physical := activeRecoveryObservationFixture(t, filepath.Join(t.TempDir(), "runtime.db"))
+	defer r.Close()
+	if _, _, err := r.ReceiptStore().PutIfAbsent(ctx, executionreceipt.Receipt{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation, ExecutionEpoch: int64(physical.ExecutionEpoch), BindingRef: physical.BindingRef, InputRevision: physical.InputRevision, PackageDigest: "digest", SessionIdentity: physical.AgentSessionRef, Consumed: true}); err != nil {
+		t.Fatal(err)
+	}
+	observer := &observingPhysicalExecution{value: PhysicalExecutionObservation{Worker: ObservedWorkerReady, Task: ObservedTaskCompleted, Runtime: ObservedRuntimeApplied, MCP: ObservedMCPApplied, Identity: ObservedCarrierIdentityVerified}}
+	coordinator := newRecoveryCoordinator(r, "runtime-a", &recoveryCleanupPorts{}, nil)
+	coordinator.Observer = observer
+	result, err := coordinator.ObserveCarrier(ctx, key)
+	if err != nil || result.Disposition != RecoveryCarrierConsumedNoOutput || result.Observation.Task != ObservedTaskCompleted {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if _, found, err := r.PhaseOutputStore().Get(ctx, PhaseOutputKey{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation}); err != nil || found {
+		t.Fatalf("task observation synthesized phase output found=%t err=%v", found, err)
 	}
 }
