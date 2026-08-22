@@ -136,6 +136,20 @@ func TestControllerReprovisionerRejectsUnreadyOrRedactedMCPStatus(t *testing.T) 
 	}
 }
 
+func TestControllerReprovisionerDeleteWorkerTreatsNotFoundAsIdempotentCleanup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/api/v1/workers/worker-gone" {
+			t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+		}
+		http.Error(w, "delete worker: not found", http.StatusNotFound)
+	}))
+	defer server.Close()
+	client := &ControllerReprovisioner{BaseURL: server.URL}
+	if err := client.DeleteWorker(context.Background(), runtime.ProvisionedWorker{Name: "worker-gone"}); err != nil {
+		t.Fatalf("repeated worker cleanup must accept not-found: %v", err)
+	}
+}
+
 func TestRehydratedTeamHarnessTaskActivatorUsesObservedWorkerAcceptance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/workers/worker-b/status" {

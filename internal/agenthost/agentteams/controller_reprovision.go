@@ -340,7 +340,15 @@ func (c *ControllerReprovisioner) DeleteWorker(ctx context.Context, worker runti
 	if worker.Name == "" {
 		return nil
 	}
-	return c.doJSON(ctx, http.MethodDelete, "/api/v1/workers/"+worker.Name, nil, nil)
+	err := c.doJSON(ctx, http.MethodDelete, "/api/v1/workers/"+worker.Name, nil, nil)
+	// A Runtime can stop after Controller deletion succeeds but before the
+	// corresponding durable teardown flag commits. Controller DELETE reports
+	// that retry as 404, which is the desired physical end state for this
+	// idempotent Runtime cleanup port.
+	if err != nil && strings.Contains(err.Error(), "failed with HTTP 404") {
+		return nil
+	}
+	return err
 }
 
 // CleanupWorkerMCP has no separate controller endpoint: deleting the Worker
