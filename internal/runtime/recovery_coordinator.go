@@ -64,12 +64,53 @@ type RecoveryCoordinator struct {
 	Mutations  LifecycleMutationStore
 	Cleanup    TerminalRecoveryCleanupPorts
 	Observer   PhysicalExecutionObserver
-	OwnerID    string
-	ClaimTTL   time.Duration
+	// Reprovision consumes a C4-4 reservation only.  It is deliberately an
+	// internal seam so reconciliation cannot recreate Worker/token/credential
+	// plumbing or invent a second execution lifecycle.
+	Reprovision ReplacementEpochReprovisioner
+	OwnerID     string
+	ClaimTTL    time.Duration
 
 	// now is intentionally private and replaceable by package tests. Recovery
 	// lease tests use a fake clock; production defaults to wall clock.
 	now func() time.Time
+}
+
+// ReplacementEpochReprovisioner is satisfied by C4-5A's
+// ReplacementReprovisionCoordinator.  The returned execution is redacted
+// durable evidence, never a capability or a restored agent session.
+type ReplacementEpochReprovisioner interface {
+	Reprovision(context.Context, WaitingKey) (PhysicalExecution, error)
+}
+
+// RecoveryAction describes the single authoritative action chosen by one
+// reconciliation attempt.  It is intentionally secret-free so callers may
+// log or expose it as operational evidence.
+type RecoveryAction string
+
+const (
+	RecoveryActionNoDurableInvocation RecoveryAction = "no_durable_invocation"
+	RecoveryActionAwaitingInput       RecoveryAction = "awaiting_input"
+	RecoveryActionTerminalNoOp        RecoveryAction = "terminal_noop"
+	RecoveryActionTerminalCleanup     RecoveryAction = "terminal_cleanup"
+	RecoveryActionCarrierActive       RecoveryAction = "carrier_still_active"
+	RecoveryActionRetryRequired       RecoveryAction = "retry_required"
+	RecoveryActionFailClosed          RecoveryAction = "fail_closed"
+	RecoveryActionReplacementReserved RecoveryAction = "replacement_reserved"
+	RecoveryActionReplacementActive   RecoveryAction = "replacement_reprovisioned"
+)
+
+// RecoveryReconciliationResult is the deterministic, secret-free outcome of
+// one invocation recovery attempt.  Snapshot records remain authority; this
+// result is only an operational explanation of the selected action.
+type RecoveryReconciliationResult struct {
+	Key            WaitingKey
+	Disposition    RecoveryDisposition
+	Action         RecoveryAction
+	ExecutionEpoch ExecutionEpoch
+	PhysicalState  PhysicalExecutionState
+	Retryable      bool
+	Reason         string
 }
 
 func (c *RecoveryCoordinator) validate() error {
@@ -89,54 +130,168 @@ func (c *RecoveryCoordinator) clockNow() time.Time {
 	return time.Now()
 }
 
-// Reconcile claims one logical invocation and handles only terminal_noop or
-// continue_terminal_teardown. All other classifier outcomes are intentionally
-// left for later C4 slices and execute no external side effect.
+// Reconcile is retained for existing callers.  ReconcileInvocation is the C4-5
+// production entrypoint and returns the deterministic action as well.
 func (c *RecoveryCoordinator) Reconcile(ctx context.Context, key WaitingKey) error {
+	_, err := c.ReconcileInvocation(ctx, key)
+	return err
+}
+
+// ReconcileInvocation serializes one complete recovery decision for a durable
+// logical invocation.  It uses Runtime SQLite records as truth; controller,
+// taskflow and QwenPaw observations are evidence only.  A reservation is the
+// hand-off between the claim-fenced decision and C4-5A reprovisioning, so a
+// retry can never allocate another epoch.
+func (c *RecoveryCoordinator) ReconcileInvocation(ctx context.Context, key WaitingKey) (RecoveryReconciliationResult, error) {
 	if err := c.validate(); err != nil {
-		return err
+		return RecoveryReconciliationResult{Key: key, Action: RecoveryActionFailClosed}, err
 	}
 	seed, err := c.Repository.Recovery().LoadRecoverySnapshot(ctx, key)
 	if err != nil {
-		return err
+		return RecoveryReconciliationResult{Key: key, Action: RecoveryActionFailClosed}, err
 	}
 	if seed.CurrentExecutionEpoch <= 0 {
-		return ErrRecoveryDispositionUnsupported
+		disposition, classifyErr := ClassifyRecoverySnapshot(seed)
+		if classifyErr != nil {
+			return RecoveryReconciliationResult{Key: key, Action: RecoveryActionFailClosed}, classifyErr
+		}
+		if disposition == RecoveryNoDurableInvocation {
+			return RecoveryReconciliationResult{Key: key, Disposition: disposition, Action: RecoveryActionNoDurableInvocation}, nil
+		}
+		return RecoveryReconciliationResult{Key: key, Disposition: disposition, Action: RecoveryActionFailClosed}, ErrRecoveryDispositionUnsupported
 	}
 	claim, err := c.Repository.Recovery().AcquireRecoveryClaim(ctx, key, seed.CurrentExecutionEpoch, c.OwnerID, c.ClaimTTL)
 	if err != nil {
-		return err
+		return RecoveryReconciliationResult{Key: key, Action: RecoveryActionRetryRequired, Retryable: true}, err
 	}
-	defer func() { _ = c.Repository.Recovery().ReleaseRecoveryClaim(context.Background(), claim) }()
-	return c.reconcileClaimed(ctx, &claim)
+	defer func() {
+		if claim.OwnerID != "" {
+			_ = c.Repository.Recovery().ReleaseRecoveryClaim(context.Background(), claim)
+		}
+	}()
+	return c.reconcileInvocationClaimed(ctx, &claim)
 }
 
-func (c *RecoveryCoordinator) reconcileClaimed(ctx context.Context, claim *RecoveryClaim) error {
+func recoveryResult(snapshot RecoverySnapshot, disposition RecoveryDisposition, action RecoveryAction) RecoveryReconciliationResult {
+	result := RecoveryReconciliationResult{Key: snapshot.Key, Disposition: disposition, Action: action, ExecutionEpoch: snapshot.CurrentExecutionEpoch}
+	if snapshot.CurrentPhysical != nil {
+		result.PhysicalState = snapshot.CurrentPhysical.State
+	}
+	return result
+}
+
+func (c *RecoveryCoordinator) reconcileInvocationClaimed(ctx context.Context, claim *RecoveryClaim) (RecoveryReconciliationResult, error) {
 	for {
 		snapshot, err := c.currentSnapshot(ctx, claim, RecoverySnapshotFingerprint{})
 		if err != nil {
-			return err
+			return RecoveryReconciliationResult{Key: claim.Key, Action: RecoveryActionFailClosed}, err
 		}
 		disposition, err := ClassifyRecoverySnapshot(snapshot)
 		if err != nil {
-			return err
+			return recoveryResult(snapshot, "", RecoveryActionFailClosed), err
 		}
 		switch disposition {
 		case RecoveryTerminalNoOp:
-			return nil
+			return recoveryResult(snapshot, disposition, RecoveryActionTerminalNoOp), nil
 		case RecoveryContinueTerminalTeardown:
 			if snapshot.CurrentPhysical == nil {
-				return ErrRecoverySnapshotInconsistent
+				return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), ErrRecoverySnapshotInconsistent
 			}
 			if err = c.reconcileTerminalStep(ctx, claim, snapshot); err != nil {
-				return err
+				return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), err
 			}
-			// Each successful authoritative mutation changes the snapshot
-			// fingerprint. Reload and classify before the next step.
+			// Each durable teardown mutation changes the fingerprint; reload
+			// before choosing the next (and only next) action.
+			continue
+		case RecoveryAwaitingInput:
+			return recoveryResult(snapshot, disposition, RecoveryActionAwaitingInput), nil
+		case RecoveryCarrierActiveNeedsObservation, RecoveryCarrierConsumedNoOutput, RecoveryFailedPhysicalExecutionNeedsDecision:
+			return c.reconcileCarrier(ctx, claim, snapshot, disposition)
+		case RecoveryReplacementProvisioningPending:
+			return c.consumeReplacement(ctx, claim, snapshot, disposition)
+		case RecoveryRelinquishmentIncomplete, RecoveryRehydrationIncomplete, RecoveryCarrierProvisioningIncomplete:
+			return recoveryResult(snapshot, disposition, RecoveryActionRetryRequired), nil
 		default:
-			return ErrRecoveryDispositionUnsupported
+			return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), ErrRecoveryDispositionUnsupported
 		}
 	}
+}
+
+func (c *RecoveryCoordinator) reconcileCarrier(ctx context.Context, claim *RecoveryClaim, snapshot RecoverySnapshot, disposition RecoveryDisposition) (RecoveryReconciliationResult, error) {
+	if snapshot.CurrentPhysical == nil {
+		return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), ErrRecoverySnapshotInconsistent
+	}
+	decision := CarrierRecoveryReplaceLost
+	if disposition != RecoveryFailedPhysicalExecutionNeedsDecision {
+		if c.Observer == nil {
+			return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), ErrRecoveryDispositionUnsupported
+		}
+		request := observationRequest(*snapshot.CurrentPhysical)
+		if err := request.validate(); err != nil {
+			return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), err
+		}
+		observation, err := c.Observer.Observe(ctx, request)
+		if err != nil {
+			return recoveryResult(snapshot, disposition, RecoveryActionRetryRequired), err
+		}
+		if _, err = c.currentSnapshot(ctx, claim, snapshot.Fingerprint()); err != nil {
+			return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), err
+		}
+		decision = DecideCarrierRecovery(snapshot, observation)
+	}
+	switch decision {
+	case CarrierRecoveryContinueExisting:
+		return recoveryResult(snapshot, disposition, RecoveryActionCarrierActive), nil
+	case CarrierRecoveryWaitObservation:
+		result := recoveryResult(snapshot, disposition, RecoveryActionRetryRequired)
+		result.Retryable = true
+		return result, nil
+	case CarrierRecoveryReplaceLost:
+		if err := c.ensureClaim(ctx, claim); err != nil {
+			return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), err
+		}
+		plan, _, err := c.Mutations.FenceAndAllocateReplacement(ctx, *claim, snapshot.Fingerprint(), decision)
+		if err != nil {
+			return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), err
+		}
+		// A fully composed production coordinator consumes the durable
+		// reservation immediately through C4-5A.  A deliberately partial
+		// composition may stop here; the immutable reservation makes that safe
+		// and lets a later reconcile continue without allocating another epoch.
+		if c.Reprovision != nil {
+			reserved, reloadErr := c.currentSnapshot(ctx, claim, RecoverySnapshotFingerprint{})
+			if reloadErr != nil {
+				return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), reloadErr
+			}
+			return c.consumeReplacement(ctx, claim, reserved, RecoveryReplacementProvisioningPending)
+		}
+		return RecoveryReconciliationResult{Key: claim.Key, Disposition: disposition, Action: RecoveryActionReplacementReserved, ExecutionEpoch: plan.NewExecutionEpoch, PhysicalState: PhysicalExecutionReserved}, nil
+	default:
+		return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), ErrRecoveryDispositionUnsupported
+	}
+}
+
+func (c *RecoveryCoordinator) consumeReplacement(ctx context.Context, claim *RecoveryClaim, snapshot RecoverySnapshot, disposition RecoveryDisposition) (RecoveryReconciliationResult, error) {
+	if c.Reprovision == nil || snapshot.CurrentPhysical == nil || snapshot.CurrentPhysical.State != PhysicalExecutionReserved {
+		return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), ErrRecoveryDispositionUnsupported
+	}
+	// C4-5A reacquires a claim at the reserved epoch and fences every external
+	// effect.  Release the old-epoch claim first: the durable reservation is the
+	// immutable hand-off and prevents a second allocation during this boundary.
+	if err := c.Repository.Recovery().ReleaseRecoveryClaim(ctx, *claim); err != nil {
+		return recoveryResult(snapshot, disposition, RecoveryActionFailClosed), err
+	}
+	*claim = RecoveryClaim{}
+	physical, err := c.Reprovision.Reprovision(ctx, snapshot.Key)
+	if err != nil {
+		return recoveryResult(snapshot, disposition, RecoveryActionRetryRequired), err
+	}
+	return RecoveryReconciliationResult{Key: snapshot.Key, Disposition: disposition, Action: RecoveryActionReplacementActive, ExecutionEpoch: physical.ExecutionEpoch, PhysicalState: physical.State}, nil
+}
+
+func (c *RecoveryCoordinator) reconcileClaimed(ctx context.Context, claim *RecoveryClaim) error {
+	_, err := c.reconcileInvocationClaimed(ctx, claim)
+	return err
 }
 
 // currentSnapshot renews only at a step boundary, asserts claim ownership,
