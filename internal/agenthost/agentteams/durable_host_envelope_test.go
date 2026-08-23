@@ -106,3 +106,53 @@ func TestDurableHostEnvelopeResolverRejectsBindingAndMountExpansion(t *testing.T
 		t.Fatalf("mount expansion err=%v", err)
 	}
 }
+
+func TestDurableHostEnvelopeResolverMaterializesPackageBeforeTokenIssue(t *testing.T) {
+	repo, err := runtime.OpenSQLiteRuntimeStateRepository(filepath.Join(t.TempDir(), "runtime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	key := runtime.WaitingKey{TaskID: "task", InvocationID: "invocation", Generation: 1}
+	store := repo.Reconstruction()
+	for _, put := range []func() error{
+		func() error {
+			_, err := store.PutWorkspace(context.Background(), runtime.DurableWorkspace{Key: key, Ref: "workspace", AllowedDirs: []string{"src"}})
+			return err
+		},
+		func() error {
+			_, err := store.PutContextSlice(context.Background(), runtime.DurableContextSlice{Key: key, Ref: "context", BaselineRef: "base", Content: "context"})
+			return err
+		},
+		func() error {
+			_, err := store.PutTaskMemory(context.Background(), runtime.DurableTaskMemory{Key: key, Ref: "memory"})
+			return err
+		},
+		func() error {
+			_, err := store.PutExecutionDescriptor(context.Background(), runtime.DurableExecutionDescriptor{Key: key, TaskContract: "contract", PhaseInstruction: "instruction", TaskSpec: "spec", WorkspaceRef: "workspace", ContextSliceRef: "context", TaskMemoryRef: "memory"})
+			return err
+		},
+	} {
+		if err := put(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	endpoint := phaseagent.PhaseEndpointRef{TaskID: key.TaskID, EndpointID: string(phaseagent.PhaseExecute)}
+	role, err := phaseagent.RoleForEndpoint(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocation, err := phaseagent.NewInvocationContext(phaseagent.StartPhaseInput{InvocationID: key.InvocationID, Endpoint: endpoint, Generation: key.Generation, BindingRef: "binding", Inputs: phaseagent.PhaseInputSet{InputRevision: "r5"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := runtime.RehydrationPlan{TaskID: key.TaskID, InvocationID: key.InvocationID, Generation: key.Generation, NextExecutionEpoch: 3, Endpoint: endpoint, NewBindingRef: "binding", NewInputRevision: "r5", Inputs: invocation.Start.Inputs, Execution: phaseagent.ExecutionContext{Invocation: invocation, Role: role}, Workspace: runtime.WorkspaceBinding{Ref: "workspace", AllowedDirs: []string{"src"}}, Context: runtime.RehydratedContext{SliceRef: "context", BaselineRef: "base"}, TaskMemory: runtime.RehydratedTaskMemory{BufferRef: "memory"}}
+	materializer := RehydratedHostPackageMaterializer{Envelopes: DurableHostEnvelopeResolver{Reconstruction: store}}
+	pkg, err := materializer.MaterializeRehydratedExecution(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkg.TaskContract != "contract" || pkg.PhaseInstruction != "instruction" || pkg.Context.Content != "context" || pkg.BindingRef != "binding" {
+		t.Fatalf("package=%+v", pkg)
+	}
+}

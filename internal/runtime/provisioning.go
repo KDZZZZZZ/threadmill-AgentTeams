@@ -306,10 +306,19 @@ type PhysicalExecutionProvisioner struct {
 	MCPName             string
 	MCPURL              string
 	Transport           string
+	// Fence is optional for ordinary M4 provisioning. C4-5A supplies a
+	// RecoveryClaim-backed fence; every external effect is bracketed by it so
+	// a taken-over actor cannot commit a replacement carrier.
+	Fence ProvisioningFence
 
 	mu       sync.Mutex
 	inflight map[physicalExecutionKey]struct{}
 }
+
+// ProvisioningFence protects a sequence of external provisioning effects.
+// It is deliberately internal: it carries no token and does not change the
+// Phase Agent or MCP public contract.
+type ProvisioningFence interface{ AssertProvisioning(context.Context) error }
 
 type physicalExecutionKey struct {
 	TaskID, InvocationID string
@@ -333,6 +342,9 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	p.inflight[key] = struct{}{}
 	p.mu.Unlock()
 	defer func() { p.mu.Lock(); delete(p.inflight, key); p.mu.Unlock() }()
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, err
+	}
 	packageValue, err := p.Packages.MaterializeRehydratedExecution(ctx, plan)
 	if err != nil {
 		return PhysicalExecution{}, p.rollbackWaitingOnly(ctx, plan, err)
@@ -340,7 +352,15 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if err := ValidateRehydratedExecutionPackage(plan, packageValue); err != nil {
 		return PhysicalExecution{}, p.rollbackWaitingOnly(ctx, plan, err)
 	}
+	if plan.ReservedReplacement {
+		if _, err := p.beginExecution(ctx, plan, PhysicalExecution{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch, BindingRef: plan.NewBindingRef, InputRevision: plan.NewInputRevision, State: PhysicalExecutionProvisioning}); err != nil {
+			return PhysicalExecution{}, err
+		}
+	}
 
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, err
+	}
 	lease, err := p.Leases.AcquireWorkspaceLease(ctx, plan)
 	if err != nil {
 		return PhysicalExecution{}, p.rollback(ctx, plan, WorkspaceLease{}, IssuedExecutionAuthorization{}, MCPCredentialBinding{}, ProvisionedWorker{}, TeamHarnessTask{}, err)
@@ -348,11 +368,17 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if lease.WorkspaceRef != plan.Workspace.Ref || lease.Epoch != plan.NextExecutionEpoch || !allowedDirsWithin(lease.AllowedDirs, plan.Workspace.AllowedDirs) {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, IssuedExecutionAuthorization{}, MCPCredentialBinding{}, ProvisionedWorker{}, TeamHarnessTask{}, errors.New("acquired workspace lease is incompatible with rehydration plan"))
 	}
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollback(ctx, plan, lease, IssuedExecutionAuthorization{}, MCPCredentialBinding{}, ProvisionedWorker{}, TeamHarnessTask{}, err)
+	}
 	authorization, err := p.Tokens.IssueExecutionAuthorization(ctx, plan, lease)
 	if err != nil {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, IssuedExecutionAuthorization{}, MCPCredentialBinding{}, ProvisionedWorker{}, TeamHarnessTask{}, err)
 	}
 	workerName := physicalWorkerName(plan)
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, MCPCredentialBinding{}, ProvisionedWorker{}, TeamHarnessTask{}, err)
+	}
 	credential, err := p.Credentials.CreateMCPCredential(ctx, MCPCredentialRequest{WorkerName: workerName, HeaderName: "X-Threadmill-Execution-Token", Token: authorization.Token})
 	if err != nil {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, MCPCredentialBinding{}, ProvisionedWorker{}, TeamHarnessTask{}, err)
@@ -360,9 +386,15 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if credential.Ref == "" || credential.WorkerName != workerName {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, ProvisionedWorker{}, TeamHarnessTask{}, errors.New("credential binding does not belong to provisioned worker"))
 	}
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, ProvisionedWorker{}, TeamHarnessTask{}, err)
+	}
 	worker, err := p.Workers.ProvisionWorker(ctx, WorkerProvisionRequest{WorkerName: workerName, Plan: plan, CredentialRef: credential.Ref, MCPName: p.MCPName, MCPURL: p.MCPURL, Transport: p.Transport})
 	if err != nil {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, ProvisionedWorker{}, TeamHarnessTask{}, err)
+	}
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, err)
 	}
 	readback, err := p.Runtime.WaitForRuntimeReady(ctx, worker)
 	if err != nil {
@@ -371,6 +403,9 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if !runtimeReady(worker, readback) {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, ErrRuntimeNotReady)
 	}
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, err)
+	}
 	tools, err := p.Discovery.DiscoverMCPTools(ctx, worker, authorization)
 	if err != nil {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, err)
@@ -378,9 +413,9 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 	if len(tools) == 0 {
 		return PhysicalExecution{}, p.rollback(ctx, plan, lease, authorization, credential, worker, TeamHarnessTask{}, ErrMCPDiscoveryFailed)
 	}
-	// Persist the carrier before delegation. The task ID is intentionally
-	// absent here: it is supplied only after the TeamHarness taskflow has
-	// authoritatively observed the delegated task.
+	// Persist the carrier before delegation. For ordinary plans this creates a
+	// new epoch; C4-5A instead consumes the durable C4-4 reservation and
+	// advances that exact row from reserved to provisioning.
 	execution := PhysicalExecution{
 		TaskID:                    plan.TaskID,
 		InvocationID:              plan.InvocationID,
@@ -398,13 +433,27 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 		ExecutionAuthorizationRef: authorization.Ref,
 		State:                     PhysicalExecutionProvisioning,
 	}
-	execution, err = p.PhysicalExecutions.Create(ctx, execution)
-	if err != nil {
-		// A duplicate epoch may already have completed its final logical CAS.
-		// Tear down only this newly-created carrier material; never roll that
-		// existing logical invocation back to waiting.
-		p.teardownCarrier(ctx, lease, authorization, credential, worker, TeamHarnessTask{})
-		return PhysicalExecution{}, fmt.Errorf("%w: %v", ErrProvisionConflict, err)
+	if plan.ReservedReplacement {
+		current, found, getErr := p.PhysicalExecutions.Get(ctx, execution.Key())
+		if getErr != nil || !found || current.State != PhysicalExecutionProvisioning {
+			p.teardownCarrier(ctx, lease, authorization, credential, worker, TeamHarnessTask{})
+			return PhysicalExecution{}, ErrProvisionConflict
+		}
+		execution.ReplacesExecutionEpoch = current.ReplacesExecutionEpoch
+		execution.RequiresFreshPackageReceipt = true
+		execution, _, err = p.PhysicalExecutions.CompareAndSwap(ctx, execution.Key(), current.Revision, execution)
+		if err != nil {
+			return PhysicalExecution{}, err
+		}
+	} else {
+		execution, err = p.beginExecution(ctx, plan, execution)
+		if err != nil {
+			p.teardownCarrier(ctx, lease, authorization, credential, worker, TeamHarnessTask{})
+			return PhysicalExecution{}, err
+		}
+	}
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, TeamHarnessTask{}, err)
 	}
 	task, err := p.Tasks.CreateTeamHarnessTask(ctx, TeamHarnessTaskRequest{Plan: plan, Worker: worker, Execution: plan.Execution, Package: packageValue})
 	if err != nil {
@@ -428,6 +477,9 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
 	}
 	execution = updated
+	if err := p.assertFence(ctx); err != nil {
+		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
+	}
 	if err := p.waitForPackageConsumption(ctx, execution); err != nil {
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
 	}
@@ -451,6 +503,9 @@ func (p *PhysicalExecutionProvisioner) Provision(ctx context.Context, plan Rehyd
 		return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, errors.New("physical execution is not ready for logical activation"))
 	}
 	if p.Mutations != nil {
+		if err := p.assertFence(ctx); err != nil {
+			return PhysicalExecution{}, p.rollbackWithPhysical(ctx, plan, execution, lease, authorization, credential, worker, task, err)
+		}
 		_, updated, activated, activationErr := p.Mutations.ActivatePhysicalExecution(ctx, WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation}, plan.ExpectedWaitingRevision, execution.Key(), execution.Revision)
 		if activationErr != nil || !activated {
 			if activationErr == nil {
@@ -503,9 +558,53 @@ func (p *PhysicalExecutionProvisioner) waitForPackageConsumption(ctx context.Con
 	}
 }
 
+func (p *PhysicalExecutionProvisioner) assertFence(ctx context.Context) error {
+	if p.Fence == nil {
+		return nil
+	}
+	return p.Fence.AssertProvisioning(ctx)
+}
+
+func (p *PhysicalExecutionProvisioner) beginExecution(ctx context.Context, plan RehydrationPlan, replacement PhysicalExecution) (PhysicalExecution, error) {
+	if !plan.ReservedReplacement {
+		created, err := p.PhysicalExecutions.Create(ctx, replacement)
+		if err != nil {
+			return PhysicalExecution{}, fmt.Errorf("%w: %v", ErrProvisionConflict, err)
+		}
+		return created, nil
+	}
+	key := replacement.Key()
+	reserved, found, err := p.PhysicalExecutions.Get(ctx, key)
+	if err != nil {
+		return PhysicalExecution{}, err
+	}
+	if !found || reserved.State != PhysicalExecutionReserved || reserved.TaskID != plan.TaskID || reserved.InvocationID != plan.InvocationID || reserved.Generation != plan.Generation || reserved.ExecutionEpoch != plan.NextExecutionEpoch || reserved.BindingRef != plan.NewBindingRef || reserved.InputRevision != plan.NewInputRevision || !reserved.RequiresFreshPackageReceipt || reserved.ReplacesExecutionEpoch <= 0 {
+		return PhysicalExecution{}, ErrProvisionConflict
+	}
+	// Preserve only C4-4's reservation provenance while adding fresh carrier
+	// evidence. A raw token never enters this replacement record.
+	replacement.ReplacesExecutionEpoch = reserved.ReplacesExecutionEpoch
+	replacement.RequiresFreshPackageReceipt = true
+	updated, swapped, err := p.PhysicalExecutions.CompareAndSwap(ctx, key, reserved.Revision, replacement)
+	if err != nil {
+		return PhysicalExecution{}, err
+	}
+	if !swapped {
+		return PhysicalExecution{}, ErrProvisionConflict
+	}
+	return updated, nil
+}
+
 // rollbackWithPhysical preserves a failed epoch as evidence after teardown;
 // it never removes a carrier record simply because a later epoch failed.
 func (p *PhysicalExecutionProvisioner) rollbackWithPhysical(ctx context.Context, plan RehydrationPlan, execution PhysicalExecution, lease WorkspaceLease, authorization IssuedExecutionAuthorization, credential MCPCredentialBinding, worker ProvisionedWorker, task TeamHarnessTask, cause error) error {
+	if plan.ReservedReplacement {
+		p.teardownCarrier(ctx, lease, authorization, credential, worker, task)
+		if err := p.restoreReservation(ctx, plan); err != nil {
+			return fmt.Errorf("%w; replacement reservation restore: %v", cause, err)
+		}
+		return cause
+	}
 	rollbackErr := p.rollback(ctx, plan, lease, authorization, credential, worker, task, cause)
 	if execution.Revision == 0 || p.PhysicalExecutions == nil {
 		return rollbackErr
@@ -531,7 +630,8 @@ func (p *PhysicalExecutionProvisioner) commit(ctx context.Context, plan Rehydrat
 	if err != nil {
 		return err
 	}
-	if !found || record.State != AwaitStateRehydrating || record.Revision != plan.ExpectedWaitingRevision || record.ExecutionEpoch+1 != plan.NextExecutionEpoch {
+	reservedSuccessor := plan.ReservedReplacement && record.ExecutionEpoch == plan.NextExecutionEpoch
+	if !found || record.State != AwaitStateRehydrating || record.Revision != plan.ExpectedWaitingRevision || (!reservedSuccessor && record.ExecutionEpoch+1 != plan.NextExecutionEpoch) {
 		return ErrProvisionConflict
 	}
 	running := record
@@ -548,10 +648,39 @@ func (p *PhysicalExecutionProvisioner) commit(ctx context.Context, plan Rehydrat
 
 func (p *PhysicalExecutionProvisioner) rollback(ctx context.Context, plan RehydrationPlan, lease WorkspaceLease, authorization IssuedExecutionAuthorization, credential MCPCredentialBinding, worker ProvisionedWorker, task TeamHarnessTask, cause error) error {
 	p.teardownCarrier(ctx, lease, authorization, credential, worker, task)
+	if plan.ReservedReplacement {
+		if err := p.restoreReservation(ctx, plan); err != nil {
+			return fmt.Errorf("%w; replacement reservation restore: %v", cause, err)
+		}
+		return cause
+	}
 	if rollbackErr := p.rollbackWaiting(ctx, plan); rollbackErr != nil {
 		return fmt.Errorf("provision: %w; rollback waiting: %v", cause, rollbackErr)
 	}
 	return cause
+}
+
+func (p *PhysicalExecutionProvisioner) restoreReservation(ctx context.Context, plan RehydrationPlan) error {
+	key := PhysicalExecutionKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation, ExecutionEpoch: plan.NextExecutionEpoch}
+	current, found, err := p.PhysicalExecutions.Get(ctx, key)
+	if err != nil || !found {
+		if err != nil {
+			return err
+		}
+		return ErrProvisionConflict
+	}
+	if current.State == PhysicalExecutionReserved {
+		return nil
+	}
+	if current.ReplacesExecutionEpoch <= 0 {
+		return ErrProvisionConflict
+	}
+	reserved := PhysicalExecution{TaskID: current.TaskID, InvocationID: current.InvocationID, Generation: current.Generation, ExecutionEpoch: current.ExecutionEpoch, BindingRef: current.BindingRef, InputRevision: current.InputRevision, ReplacesExecutionEpoch: current.ReplacesExecutionEpoch, RequiresFreshPackageReceipt: true, State: PhysicalExecutionReserved}
+	_, swapped, err := p.PhysicalExecutions.CompareAndSwap(ctx, key, current.Revision, reserved)
+	if err != nil || !swapped {
+		return ErrProvisionConflict
+	}
+	return nil
 }
 
 func (p *PhysicalExecutionProvisioner) teardownCarrier(ctx context.Context, lease WorkspaceLease, authorization IssuedExecutionAuthorization, credential MCPCredentialBinding, worker ProvisionedWorker, task TeamHarnessTask) {
@@ -593,6 +722,9 @@ func (p *PhysicalExecutionProvisioner) rollbackWaiting(ctx context.Context, plan
 }
 
 func (p *PhysicalExecutionProvisioner) rollbackWaitingOnly(ctx context.Context, plan RehydrationPlan, cause error) error {
+	if plan.ReservedReplacement {
+		return cause
+	}
 	if err := p.rollbackWaiting(ctx, plan); err != nil {
 		return fmt.Errorf("materialize rehydrated execution: %w; rollback waiting: %v", cause, err)
 	}

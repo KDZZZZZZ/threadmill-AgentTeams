@@ -86,6 +86,10 @@ type RehydrationPlan struct {
 	EvidenceRefs            []string                    `json:"evidence_refs"`
 	ContinuationRef         ContinuationRef             `json:"continuation_ref"`
 	ExpectedWaitingRevision int64                       `json:"expected_waiting_revision"`
+	// ReservedReplacement is Runtime-internal recovery control flow. C4-5A
+	// sets it only after C4-4 has durably allocated NextExecutionEpoch; it is
+	// never an agent-visible package field and never allocates an epoch.
+	ReservedReplacement bool `json:"-"`
 }
 
 // RehydrationCoordinator rebuilds logical state and owns only the

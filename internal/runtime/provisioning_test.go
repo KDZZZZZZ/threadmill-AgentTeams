@@ -53,6 +53,7 @@ type provisionPorts struct {
 	discoveryStarted chan struct{}
 	discoveryRelease chan struct{}
 	receipts         executionreceipt.Store
+	taskHook         func(TeamHarnessTaskRequest)
 }
 
 func (p *provisionPorts) MaterializeRehydratedExecution(_ context.Context, plan RehydrationPlan) (RehydratedExecutionPackage, error) {
@@ -148,6 +149,9 @@ func (p *provisionPorts) CreateTeamHarnessTask(_ context.Context, request TeamHa
 	receipt := executionreceipt.Receipt{TaskID: request.Plan.TaskID, InvocationID: request.Plan.InvocationID, Generation: request.Plan.Generation, ExecutionEpoch: int64(request.Plan.NextExecutionEpoch), BindingRef: request.Plan.NewBindingRef, InputRevision: request.Plan.NewInputRevision, PackageDigest: digest, SessionIdentity: "matrix:!worker-e2:test", Consumed: true}
 	if p.fail != "receipt" {
 		_, _, _ = p.receipts.PutIfAbsent(context.Background(), receipt)
+	}
+	if p.taskHook != nil {
+		p.taskHook(request)
 	}
 	return TeamHarnessTask{ID: "team-task-e2", AssignedTo: request.Worker.Name, Status: "in_progress", Acknowledged: true, AgentSessionRef: receipt.SessionIdentity, AgentPackageDigest: digest, ObservedAt: time.Now().UTC()}, nil
 }

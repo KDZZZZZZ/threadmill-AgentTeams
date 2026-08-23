@@ -88,6 +88,52 @@ func (r DurableHostEnvelopeResolver) ResolveHostEnvelope(ctx context.Context, ex
 	return HostEnvelope{BindingRef: start.BindingRef, TaskSpec: descriptor.TaskSpec, TaskContract: descriptor.TaskContract, PhaseInstruction: descriptor.PhaseInstruction, Workspace: mount, Context: MaterializedContext{Content: contextValue.Content}, TaskMemory: memory.View, MCPBinding: binding}, nil
 }
 
+// ResolveRehydratedPackageEnvelope is deliberately narrower than the normal
+// host resolver. Package materialization happens before the fresh token is
+// issued; it therefore projects only durable agent-visible material and never
+// synthesizes a trusted MCP binding or local mount root.
+func (r DurableHostEnvelopeResolver) ResolveRehydratedPackageEnvelope(ctx context.Context, plan runtime.RehydrationPlan) (HostEnvelope, error) {
+	if r.Reconstruction == nil {
+		return HostEnvelope{}, errors.New("durable reconstruction store is required")
+	}
+	key := runtime.WaitingKey{TaskID: plan.TaskID, InvocationID: plan.InvocationID, Generation: plan.Generation}
+	descriptor, found, err := r.Reconstruction.GetExecutionDescriptor(ctx, key)
+	if err != nil {
+		return HostEnvelope{}, err
+	}
+	if !found {
+		return HostEnvelope{}, errors.New("durable execution descriptor is missing")
+	}
+	if descriptor.WorkspaceRef != plan.Workspace.Ref || descriptor.ContextSliceRef != plan.Context.SliceRef || descriptor.TaskMemoryRef != plan.TaskMemory.BufferRef {
+		return HostEnvelope{}, errors.New("durable execution descriptor does not match rehydration plan")
+	}
+	workspace, found, err := r.Reconstruction.GetWorkspace(ctx, descriptor.WorkspaceRef, key)
+	if err != nil {
+		return HostEnvelope{}, err
+	}
+	if !found {
+		return HostEnvelope{}, errors.New("durable workspace descriptor is missing")
+	}
+	contextValue, found, err := r.Reconstruction.GetContextSlice(ctx, descriptor.ContextSliceRef, key)
+	if err != nil {
+		return HostEnvelope{}, err
+	}
+	if !found {
+		return HostEnvelope{}, errors.New("durable context slice is missing")
+	}
+	memory, found, err := r.Reconstruction.GetTaskMemory(ctx, descriptor.TaskMemoryRef, key)
+	if err != nil {
+		return HostEnvelope{}, err
+	}
+	if !found {
+		return HostEnvelope{}, errors.New("durable task memory is missing")
+	}
+	if !sameDirs(plan.Workspace.AllowedDirs, workspace.AllowedDirs) {
+		return HostEnvelope{}, errors.New("rehydration plan expands durable workspace allowed directories")
+	}
+	return HostEnvelope{BindingRef: plan.NewBindingRef, TaskSpec: descriptor.TaskSpec, TaskContract: descriptor.TaskContract, PhaseInstruction: descriptor.PhaseInstruction, Workspace: WorkspaceMount{AllowedDirs: append([]string(nil), workspace.AllowedDirs...)}, Context: MaterializedContext{Content: contextValue.Content}, TaskMemory: memory.View}, nil
+}
+
 func sameDirs(got, want []string) bool {
 	if len(got) != len(want) {
 		return false

@@ -266,7 +266,9 @@ func (s sqliteLifecycleMutations) ActivatePhysicalExecution(ctx context.Context,
 	if waiting.Revision != waitingRevision || physical.Revision != physicalRevision {
 		return WaitingRecord{}, PhysicalExecution{}, false, nil
 	}
-	if waiting.State != AwaitStateRehydrating || physical.State != PhysicalExecutionAccepted || !physical.PackageConsumed || waiting.ExecutionEpoch+1 != physicalKey.ExecutionEpoch {
+	reservedSuccessor := physical.ReplacesExecutionEpoch > 0 && physical.RequiresFreshPackageReceipt && waiting.ExecutionEpoch == physicalKey.ExecutionEpoch
+	ordinarySuccessor := waiting.ExecutionEpoch+1 == physicalKey.ExecutionEpoch
+	if waiting.State != AwaitStateRehydrating || physical.State != PhysicalExecutionAccepted || !physical.PackageConsumed || (!ordinarySuccessor && !reservedSuccessor) {
 		return WaitingRecord{}, PhysicalExecution{}, false, errors.New("execution is not eligible for activation")
 	}
 	if physical.BindingRef == "" || physical.InputRevision == "" {

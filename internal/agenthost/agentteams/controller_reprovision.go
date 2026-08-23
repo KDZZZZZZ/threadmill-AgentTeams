@@ -53,11 +53,25 @@ type RehydratedHostPackageMaterializer struct {
 	Envelopes HostEnvelopeResolver
 }
 
+// RehydratedPackageEnvelopeResolver is the narrow production seam for the
+// pre-token package projection. The normal HostEnvelopeResolver remains the
+// token-bearing execution seam; this interface prevents package creation from
+// inventing a token merely to read durable task/context/workspace material.
+type RehydratedPackageEnvelopeResolver interface {
+	ResolveRehydratedPackageEnvelope(context.Context, runtime.RehydrationPlan) (HostEnvelope, error)
+}
+
 func (m RehydratedHostPackageMaterializer) MaterializeRehydratedExecution(ctx context.Context, plan runtime.RehydrationPlan) (runtime.RehydratedExecutionPackage, error) {
 	if m.Envelopes == nil {
 		return runtime.RehydratedExecutionPackage{}, errors.New("host envelope resolver is required")
 	}
-	envelope, err := m.Envelopes.ResolveHostEnvelope(ctx, plan.Execution)
+	var envelope HostEnvelope
+	var err error
+	if durable, ok := m.Envelopes.(RehydratedPackageEnvelopeResolver); ok {
+		envelope, err = durable.ResolveRehydratedPackageEnvelope(ctx, plan)
+	} else {
+		envelope, err = m.Envelopes.ResolveHostEnvelope(ctx, plan.Execution)
+	}
 	if err != nil {
 		return runtime.RehydratedExecutionPackage{}, err
 	}
