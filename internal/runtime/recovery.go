@@ -80,6 +80,10 @@ type RecoveryStateStore interface {
 	GetRecoveryClaim(context.Context, WaitingKey) (RecoveryClaim, bool, error)
 	AssertRecoveryClaim(context.Context, RecoveryClaim) error
 	LoadRecoverySnapshot(context.Context, WaitingKey) (RecoverySnapshot, error)
+	// ListRecoveryCandidates discovers only durable logical identities. It
+	// performs no external observation and no mutation; every returned key must
+	// still be claim-fenced and reclassified by RestartRecoverySupervisor.
+	ListRecoveryCandidates(context.Context, int) ([]WaitingKey, error)
 }
 
 type RecoveryDisposition string

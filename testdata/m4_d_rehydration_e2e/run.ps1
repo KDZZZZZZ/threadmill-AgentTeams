@@ -1,6 +1,6 @@
 # Local-only M4-D focused fixture. All credentials below are isolated test
 # credentials only; they are not for production.
-param([switch]$BootstrapOnly)
+param([switch]$BootstrapOnly, [switch]$WorkerSmoke, [switch]$ActiveRuntimeSmoke)
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -15,6 +15,7 @@ $result = Join-Path $env:TEMP 'threadmill-m4d-e2e-result.json'
 $goCache = Join-Path $env:TEMP 'threadmill-m4d-e2e-gocache'
 $provider = Join-Path $env:TEMP 'threadmill-m4e2-provider.exe'
 $providerTrace = Join-Path $env:TEMP 'threadmill-m4e2-provider-trace.jsonl'
+$c46Descriptor = Join-Path $env:TEMP ("threadmill-c46-worker-descriptor-" + [guid]::NewGuid().ToString('N') + '.json')
 
 function Cleanup {
   # Docker reports an absent resource on stderr. That is normal both before
@@ -114,6 +115,118 @@ try {
     [pscustomobject]@{ controllerReady = $true; cliTokenPresent = $true; cliTokenMode = $tokenMode; workersStatus = $response.StatusCode; appServiceTokensRedacted = $true } | ConvertTo-Json
     return
   }
+  if ($WorkerSmoke -or $ActiveRuntimeSmoke) {
+    $invocationID = "c46-" + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $taskID = "tm-phase-$invocationID-g1-e1"
+    $workerName = "tm-$invocationID-g1-e1"
+    $credential = $null
+    try {
+      $credential = Invoke-RestMethod -Method Post -Uri "$env:M4D_CONTROLLER_URL/api/v1/mcp-credentials" -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body (@{ workerName = $workerName; headerName = 'X-Threadmill-Execution-Token'; secretValue = 'c4-6-test-only-token' } | ConvertTo-Json -Compress)
+      $body = @{ name = $workerName; workerName = $workerName; model = 'qwen-plus'; modelProvider = 'openai-compat'; runtime = 'qwenpaw'; image = $workerImage; mcpServers = @(@{ name = 'threadmill'; url = 'http://host.docker.internal:18091/mcp'; transport = 'streamable_http'; credentialBindingRef = $credential.id }) } | ConvertTo-Json -Depth 6 -Compress
+      Invoke-RestMethod -Method Post -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers" -Headers @{ Authorization = "Bearer $token" } -ContentType 'application/json' -Body $body | Out-Null
+      $ready = $false
+      for ($i = 0; $i -lt 180; $i++) {
+        try {
+          Invoke-RestMethod -Method Post -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers/$workerName/ensure-ready" -Headers @{ Authorization = "Bearer $token" } | Out-Null
+          $status = Invoke-RestMethod -Method Get -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers/$workerName/status" -Headers @{ Authorization = "Bearer $token" }
+          if ($status.name -eq $workerName -and $status.phase -eq 'ready' -and $status.containerState -eq 'running') { $ready = $true; break }
+        } catch { }
+        Start-Sleep -Seconds 1
+      }
+      if (-not $ready) { throw 'Worker did not reach Controller Ready state' }
+      $mcp = @($status.runtimeConfig.mcpServers | Where-Object { $_.name -eq 'threadmill' }) | Select-Object -First 1
+      if (-not $mcp -or -not $mcp.applied -or $mcp.removed -or $mcp.error) { throw 'Worker MCP readback was not applied' }
+      if (-not $status.runtimeConfig.desiredGeneration -or $status.runtimeConfig.desiredGeneration -ne $status.runtimeConfig.appliedGeneration) { throw 'Worker runtime generation readback was not applied' }
+      # Invoke the official TeamHarness MCP stdio server in the real Worker.
+      # This mirrors the existing Go adapter's public taskflow calls; task
+      # state remains owned by TeamHarness and is polled below.
+      $container = "agentteams-worker-$workerName"
+      $server = '/opt/agentteams/qwenpaw-builtin/plugins/teamharness/teamharness/mcp/server.py'
+      $baseArgs = @('exec','-i','-e','AGENTTEAMS_WORKER_MATRIX_TOKEN',$container,'/opt/venv/qwenpaw/bin/python',$server)
+      $delegate = @{jsonrpc='2.0';id=1;method='tools/call';params=@{name='taskflow';arguments=@{role='leader';workspaceDir='/root/agentteams-fs';action='delegate_task';payload=@{projectId='threadmill-c46';taskId=$taskID;roomId=$status.roomID;assignedTo=$status.matrixUserID;title='C4-6 active carrier';spec='Keep this TeamHarness task active; do not submit a result or PhaseOutput.'}}}}
+      ($delegate | ConvertTo-Json -Depth 12 -Compress) | & $docker @baseArgs | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'TeamHarness delegate_task failed' }
+      $ack = @{jsonrpc='2.0';id=1;method='tools/call';params=@{name='taskflow';arguments=@{role='worker';workspaceDir='/root/agentteams-fs';action='ack_task';payload=@{taskId=$taskID}}}}
+      ($ack | ConvertTo-Json -Depth 10 -Compress) | & $docker @baseArgs | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw 'TeamHarness ack_task failed' }
+      $taskActive = $false
+      for ($i = 0; $i -lt 60; $i++) {
+        $check = @{jsonrpc='2.0';id=1;method='tools/call';params=@{name='taskflow';arguments=@{role='leader';workspaceDir='/root/agentteams-fs';action='check_task';payload=@{taskId=$taskID}}}}
+        $taskReadback = (($check | ConvertTo-Json -Depth 10 -Compress) | & $docker @baseArgs | Out-String)
+        if ($LASTEXITCODE -eq 0 -and $taskReadback -match 'in_progress') { $taskActive = $true; break }
+        Start-Sleep -Milliseconds 500
+      }
+      if (-not $taskActive) { throw 'TeamHarness task did not reach in_progress' }
+      $descriptor = [ordered]@{
+		taskID = 'c46-real-worker'
+		invocationID = $invocationID
+		generation = 1
+		executionEpoch = 1
+        workerReady = $true
+        workerName = $status.name
+        workerID = $status.name
+        workerPhase = $status.phase
+        containerState = $status.containerState
+        runtimeDesiredGeneration = [long]$status.runtimeConfig.desiredGeneration
+        runtimeAppliedGeneration = [long]$status.runtimeConfig.appliedGeneration
+        mcpClientID = $mcp.name
+        mcpApplied = [bool]$mcp.applied
+        credentialRef = $credential.id
+        matrixRoomRef = if ($status.roomID) { "matrix:$($status.roomID)" } else { $null }
+		teamHarnessTaskID = $taskID
+      }
+      if ($descriptor.workerName -ne $workerName -or $descriptor.workerID -ne $workerName -or $descriptor.workerPhase -ne 'ready' -or $descriptor.containerState -ne 'running' -or $descriptor.mcpClientID -eq '' -or $descriptor.credentialRef -eq '') { throw 'Worker execution descriptor identity mismatch' }
+      # Cross a real process boundary with only the redacted descriptor. The
+      # Go test parent starts Runtime A; Runtime A alone opens and writes the
+      # temporary SQLite repository, closes it, and verifies a cold reopen.
+      [System.IO.File]::WriteAllText($c46Descriptor, ($descriptor | ConvertTo-Json -Depth 5 -Compress), [System.Text.UTF8Encoding]::new($false))
+      $env:THREADMILL_C46_WORKER_DESCRIPTOR = $c46Descriptor
+      if ($ActiveRuntimeSmoke) {
+        $env:THREADMILL_C46_ACTIVE_CRASH_POINT = '1'
+        $env:THREADMILL_C46_CONTROLLER_URL = $env:M4D_CONTROLLER_URL
+        $env:THREADMILL_C46_CONTROLLER_TOKEN = $token
+        $env:THREADMILL_C46_DOCKER = $docker
+        $env:THREADMILL_C46_WORKER_CONTAINER = $container
+        $env:THREADMILL_C46_TEAMHARNESS_PYTHON = '/opt/venv/qwenpaw/bin/python'
+        $env:THREADMILL_C46_TEAMHARNESS_SERVER = $server
+        $env:THREADMILL_C46_TEAMHARNESS_WORKSPACE = '/root/agentteams-fs'
+      }
+      Remove-Item Env:M4D_CONTROLLER_TOKEN -ErrorAction SilentlyContinue
+      Remove-Item Env:M4D_MATRIX_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+      & go test ./internal/runtime -run '^TestC46RealWorkerDescriptorDurablePhysicalExecution$' -count=1 -v
+      if ($LASTEXITCODE -ne 0) { throw 'C4-6 real Worker descriptor durable Runtime A test failed' }
+      $env:M4D_CONTROLLER_TOKEN = $token
+      $env:M4D_MATRIX_ADMIN_PASSWORD = 'threadmill-it-admin'
+      if ($ActiveRuntimeSmoke) {
+        # This is a fresh Controller readback after Runtime A was killed by
+        # its parent test process. It proves the fixture did not use Runtime
+        # shutdown/teardown to reach the crash point.
+        $afterCrash = Invoke-RestMethod -Method Get -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers/$workerName/status" -Headers @{ Authorization = "Bearer $token" }
+        $afterCrashMCP = @($afterCrash.runtimeConfig.mcpServers | Where-Object { $_.name -eq $descriptor.mcpClientID }) | Select-Object -First 1
+        & $docker container inspect ("agentteams-worker-" + $workerName) | Out-Null
+        $postKillTaskActive = $false
+        $postKillTaskIdentity = $false
+        for ($i = 0; $i -lt 60; $i++) {
+          $check = @{jsonrpc='2.0';id=1;method='tools/call';params=@{name='taskflow';arguments=@{role='leader';workspaceDir='/root/agentteams-fs';action='check_task';payload=@{taskId=$descriptor.teamHarnessTaskID}}}}
+          $postKillTask = (($check | ConvertTo-Json -Depth 10 -Compress) | & $docker @baseArgs | Out-String)
+          if ($LASTEXITCODE -eq 0 -and $postKillTask -match [regex]::Escape($descriptor.teamHarnessTaskID) -and $postKillTask -match [regex]::Escape($workerName) -and $postKillTask -match 'in_progress') { $postKillTaskActive = $true; $postKillTaskIdentity = $true; break }
+          Start-Sleep -Milliseconds 500
+        }
+        $postKillWorkerReady = $LASTEXITCODE -eq 0 -and $afterCrash.name -eq $workerName -and $afterCrash.phase -eq 'ready' -and $afterCrash.containerState -eq 'running' -and $afterCrash.runtimeConfig.desiredGeneration -eq $afterCrash.runtimeConfig.appliedGeneration -and $afterCrashMCP -and $afterCrashMCP.applied
+        if (-not $postKillWorkerReady -or -not $postKillTaskActive) { throw 'Runtime crash point did not retain active Worker/task/controller evidence' }
+        [pscustomobject]@{ runtimeACrashed=$true; postKillWorkerReady=$true; postKillTaskReadback=$true; postKillTaskActive=$postKillTaskActive; teamHarnessTaskIDMatches=$postKillTaskIdentity; observerIdentityInputsAligned=($postKillWorkerReady -and $postKillTaskIdentity); productionObserverReady=($postKillWorkerReady -and $postKillTaskActive -and $postKillTaskIdentity) } | ConvertTo-Json -Compress
+      }
+      Invoke-RestMethod -Method Delete -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers/$workerName" -Headers @{ Authorization = "Bearer $token" } | Out-Null
+      $deleted = $false
+      for ($i = 0; $i -lt 60; $i++) { try { Invoke-RestMethod -Method Get -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers/$workerName/status" -Headers @{ Authorization = "Bearer $token" } | Out-Null } catch { $deleted = $true; break }; Start-Sleep -Milliseconds 500 }
+      if (-not $deleted) { throw 'Worker delete did not converge to not-found' }
+      [pscustomobject]@{ workerCreated = $true; workerReady = $true; workerDeleted = $true; workerNameMatches = $true; descriptor = $descriptor } | ConvertTo-Json -Depth 5
+      return
+    } finally {
+      try { Invoke-RestMethod -Method Delete -Uri "$env:M4D_CONTROLLER_URL/api/v1/workers/$workerName" -Headers @{ Authorization = "Bearer $token" } | Out-Null } catch { }
+      if ($credential -and $credential.id) { try { Invoke-RestMethod -Method Post -Uri "$env:M4D_CONTROLLER_URL/api/v1/mcp-credentials/$($credential.id)/revoke" -Headers @{ Authorization = "Bearer $token" } | Out-Null } catch { } }
+    }
+  }
   Remove-Item $result -Force -ErrorAction SilentlyContinue
 	& go run (Join-Path $PSScriptRoot 'runner.go')
 	if ($LASTEXITCODE -ne 0) {
@@ -131,6 +244,16 @@ finally {
   Remove-Item Env:GOCACHE -ErrorAction SilentlyContinue
   Remove-Item Env:GOPROXY -ErrorAction SilentlyContinue
 	Remove-Item Env:M4E2_PROVIDER_TRACE -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_WORKER_DESCRIPTOR -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_ACTIVE_CRASH_POINT -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_CONTROLLER_URL -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_CONTROLLER_TOKEN -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_DOCKER -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_WORKER_CONTAINER -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_TEAMHARNESS_PYTHON -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_TEAMHARNESS_SERVER -ErrorAction SilentlyContinue
+  Remove-Item Env:THREADMILL_C46_TEAMHARNESS_WORKSPACE -ErrorAction SilentlyContinue
+  Remove-Item $c46Descriptor -Force -ErrorAction SilentlyContinue
   Remove-Item $goCache -Recurse -Force -ErrorAction SilentlyContinue
 	Remove-Item $provider -Force -ErrorAction SilentlyContinue
 	Remove-Item $providerTrace -Force -ErrorAction SilentlyContinue

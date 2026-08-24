@@ -268,7 +268,11 @@ func (s sqliteLifecycleMutations) ActivatePhysicalExecution(ctx context.Context,
 	}
 	reservedSuccessor := physical.ReplacesExecutionEpoch > 0 && physical.RequiresFreshPackageReceipt && waiting.ExecutionEpoch == physicalKey.ExecutionEpoch
 	ordinarySuccessor := waiting.ExecutionEpoch+1 == physicalKey.ExecutionEpoch
-	if waiting.State != AwaitStateRehydrating || physical.State != PhysicalExecutionAccepted || !physical.PackageConsumed || (!ordinarySuccessor && !reservedSuccessor) {
+	// A Runtime may durably adopt its first accepted carrier at the same epoch
+	// as a rehydrating WaitingRecord. This is distinct from a replacement: it
+	// has no predecessor epoch and must still pass receipt + dual-CAS fencing.
+	sameEpochInitial := waiting.ExecutionEpoch == physicalKey.ExecutionEpoch && physical.ReplacesExecutionEpoch == 0 && !physical.RequiresFreshPackageReceipt
+	if waiting.State != AwaitStateRehydrating || physical.State != PhysicalExecutionAccepted || !physical.PackageConsumed || (!ordinarySuccessor && !reservedSuccessor && !sameEpochInitial) {
 		return WaitingRecord{}, PhysicalExecution{}, false, errors.New("execution is not eligible for activation")
 	}
 	if physical.BindingRef == "" || physical.InputRevision == "" {

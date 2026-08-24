@@ -190,6 +190,58 @@ func (s sqliteRecoveryStateStore) LoadRecoverySnapshot(ctx context.Context, key 
 	return snapshot, nil
 }
 
+// ListRecoveryCandidates is intentionally a durable-first scan.  It gathers
+// identities from Runtime records only, then uses the same consistent snapshot
+// classifier as reconciliation to exclude fully terminated history. A corrupt
+// record remains a candidate so a supervisor can surface it fail-closed rather
+// than allowing one bad invocation to hide the rest of the database.
+func (s sqliteRecoveryStateStore) ListRecoveryCandidates(ctx context.Context, limit int) ([]WaitingKey, error) {
+	if limit <= 0 {
+		return nil, errors.New("recovery candidate limit is required")
+	}
+	rows, err := s.r.db.QueryContext(ctx, `
+		SELECT task_id, invocation_id, generation FROM (
+			SELECT task_id, invocation_id, generation FROM runtime_waiting
+			UNION
+			SELECT task_id, invocation_id, generation FROM runtime_physical_executions
+			UNION
+			SELECT task_id, invocation_id, generation FROM runtime_phase_outputs
+		) ORDER BY task_id, invocation_id, generation LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []WaitingKey
+	for rows.Next() {
+		var key WaitingKey
+		if err = rows.Scan(&key.TaskID, &key.InvocationID, &key.Generation); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	// SQLite repository uses one connection by design. Close the discovery
+	// cursor before opening the per-key consistent read transaction below.
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	var candidates []WaitingKey
+	for _, key := range keys {
+		snapshot, loadErr := s.LoadRecoverySnapshot(ctx, key)
+		if loadErr != nil {
+			candidates = append(candidates, key)
+			continue
+		}
+		disposition, classifyErr := ClassifyRecoverySnapshot(snapshot)
+		if classifyErr != nil || disposition != RecoveryTerminalNoOp && disposition != RecoveryNoDurableInvocation {
+			candidates = append(candidates, key)
+		}
+	}
+	return candidates, nil
+}
+
 func loadRecoveryWaiting(ctx context.Context, tx *sql.Tx, snapshot *RecoverySnapshot) error {
 	var payload []byte
 	err := tx.QueryRowContext(ctx, "SELECT payload FROM runtime_waiting WHERE task_id=? AND invocation_id=? AND generation=?", snapshot.Key.TaskID, snapshot.Key.InvocationID, snapshot.Key.Generation).Scan(&payload)
